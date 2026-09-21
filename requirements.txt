@@ -1,0 +1,14 @@
+numpy>=1.24
+scipy>=1.11
+requests>=2.31
+
+# Web service (Railway)
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# Optional — only for `harvest` (wallet discovery over websocket)
+websocket-client>=1.7
+
+# Dev
+pytest>=8.0
+httpx>=0.27

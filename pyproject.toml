@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liqmap"
+version = "0.1.0"
+description = "Liquidation cluster mapping for Hyperliquid, with the validation that decides whether it means anything"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "scipy>=1.11", "requests>=2.31"]
+
+[project.optional-dependencies]
+harvest = ["websocket-client>=1.7"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+liqmap = "liqmap.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["liqmap*"]
