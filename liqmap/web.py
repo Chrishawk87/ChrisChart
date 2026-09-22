@@ -72,6 +72,7 @@ class Runtime:
         self.watch_info: dict[str, Any] = {"running": False, "coin": None,
                                            "level": None, "started": None,
                                            "finished": None, "error": None}
+        self._calibrations: dict[tuple[str, str], Any] = {}
         self._lock = threading.Lock()
         self._client = None
         self._store = None
@@ -352,6 +353,58 @@ class Runtime:
                     f"{asked} right now. Harvest for longer, or lower the minimum "
                     f"wallet size in Settings so smaller {asked} traders get picked up.")
             return out
+
+    def calibration(self, coin: str, interval: str):
+        """Measured hit rate per market and timeframe.
+
+        Kept per (coin, interval) because they are genuinely different
+        questions. A lean that is worth something on a 15-minute gold candle
+        says nothing about a 4-hour BTC one, and pooling them would hide both.
+        """
+        from .candleread import Calibration
+        return self._calibrations.setdefault((coin, interval), Calibration())
+
+    def replay_calibration(self, coin: str, interval: str,
+                           bars: int = 500) -> int:
+        """Score past closed candles and record how each resolved.
+
+        Uses only what candles alone can reconstruct -- structure, zones,
+        VWAP, position in range. Flow, absorption and book depth were not
+        recorded historically, so the replay is deliberately blind to the
+        three strongest live signals. Treat the resulting rate as a floor,
+        not as what the live read achieves.
+        """
+        from . import candleread
+        from .structure import (session_anchor, structure as read_structure,
+                                vwap as make_vwap, zones)
+
+        candles = self.client().candles(coin, interval, bars=bars)
+        if len(candles) < 60:
+            raise RuntimeError(f"only {len(candles)} candles — need 60+ to replay")
+
+        step = self.client().INTERVALS.get(interval, 900)
+        cal = self.calibration(coin, interval)
+        scored = 0
+
+        # Walk forward. Everything each read sees comes from bars strictly
+        # before the one being predicted, so the replay cannot peek.
+        for i in range(50, len(candles)):
+            past = candles[:i]
+            target = candles[i]
+
+            zs = zones(past)
+            in_zone = next((z for z in zs if z.contains(target.open)), None)
+            vw = make_vwap(past, session_anchor(past))
+
+            r = candleread.read(
+                coin=coin, interval_s=float(step), elapsed_s=float(step),
+                open_px=target.open, high_px=target.open, low_px=target.open,
+                last_px=target.open,
+                higher=read_structure(past), zone=in_zone, vw=vw)
+            if r.signals:
+                cal.observe(r.score, candleread.outcome(target))
+                scored += 1
+        return scored
 
     def resolve_symbol(self, typed: str) -> tuple[str, list[str]]:
         """Turn what someone typed into a symbol that exists.
@@ -889,6 +942,145 @@ def create_app() -> FastAPI:
             "never_swept": [c for c in cfg.coins if c not in names],
         }
 
+    @app.get("/api/read", dependencies=[Depends(require_token)])
+    def api_read(coin: str = "BTC", interval: str = "15m",
+                 higher: str = "4h", size: float = 0.0) -> dict[str, Any]:
+        """The live directional read on the candle still forming.
+
+        Everything this service knows, assembled into one answer: flow inside
+        the candle, whether it is being absorbed, the book, where price sits
+        in its own range and against VWAP, the higher-timeframe structure, the
+        zone it is in, and the liquidation fuel either side.
+
+        Missing feeds are simply absent rather than filled with neutral
+        values. A read built from four signals says four.
+        """
+        from . import candleread
+        from .structure import (atr, session_anchor, structure as read_structure,
+                                vwap as make_vwap, zones)
+
+        coin = rt.resolve_symbol(coin)[0] or coin.upper()
+        client = rt.client()
+        out: dict[str, Any] = {"coin": coin, "interval": interval}
+
+        try:
+            bars = client.candles(coin, interval, bars=200)
+        except Exception as exc:
+            return {**out, "error": f"candles unavailable: {exc}"}
+        if len(bars) < 10:
+            return {**out, "error": f"only {len(bars)} candles came back — "
+                                    f"not enough to read structure"}
+
+        step = client.INTERVALS.get(interval, 900)
+        current = bars[-1]
+        closed = bars[:-1]
+        elapsed = max(0.0, min(float(step), time.time() - current.ts))
+
+        # higher timeframe
+        higher_struct = None
+        try:
+            hb = client.candles(coin, higher, bars=200)
+            if len(hb) >= 20:
+                higher_struct = read_structure(hb)
+        except Exception as exc:
+            out["higher_error"] = str(exc)
+
+        # zone price is currently sitting in
+        zs = zones(closed)
+        in_zone = next((z for z in zs if z.contains(current.close)), None)
+
+        vw = make_vwap(bars, session_anchor(bars))
+
+        # book, and absorption if a watch happens to be running on this coin
+        book = None
+        try:
+            book = client.book(coin)
+        except Exception as exc:
+            out["book_error"] = str(exc)
+
+        absorption = tape = None
+        w = rt.watcher
+        if w is not None and w.coin == coin:
+            absorption = w.watch.absorption()
+            tape = w.watch.tape
+
+        # nearest liquidation cluster, signed by side
+        magnet_bps = magnet_notional = 0.0
+        try:
+            m = rt.maps(coin)
+            clusters = (m.get("weighted") or {}).get("clusters") or []
+            spot = float(m.get("spot") or current.close)
+            best = None
+            for cl in clusters:
+                px = float(cl.get("price") or 0)
+                notional = float(cl.get("notional") or 0)
+                if px <= 0 or notional <= 0 or spot <= 0:
+                    continue
+                bps = (px - spot) / spot * 10_000.0
+                pull = notional / max(abs(bps), 1.0)
+                if best is None or pull > best[0]:
+                    best = (pull, bps, notional)
+            if best:
+                magnet_bps, magnet_notional = best[1], best[2]
+        except Exception:
+            pass
+
+        r = candleread.read(
+            coin=coin, interval_s=float(step), elapsed_s=elapsed,
+            open_px=current.open, high_px=current.high, low_px=current.low,
+            last_px=current.close, tape=tape, book=book,
+            absorption=absorption, higher=higher_struct, zone=in_zone, vw=vw,
+            magnet_bps=magnet_bps, magnet_notional=magnet_notional,
+            calibration=rt.calibration(coin, interval))
+
+        out.update({
+            "open": current.open, "high": current.high, "low": current.low,
+            "last": current.close,
+            "elapsed_fraction": r.elapsed_fraction,
+            "seconds_left": r.seconds_left,
+            "change_bps": r.change_bps,
+            "position_in_range": r.position_in_range,
+            "lean": r.lean, "score": r.score, "agreement": r.agreement,
+            "confidence": r.confidence, "early": r.early,
+            "verdict": r.verdict(),
+            "signals": [{"name": s.name, "direction": s.direction,
+                         "strength": s.strength, "weighted": s.weighted(),
+                         "note": s.note} for s in
+                        sorted(r.signals, key=lambda x: -abs(x.weighted()))],
+            "higher_timeframe": (higher_struct.describe()
+                                 if higher_struct else None),
+            "atr": atr(closed),
+            "vwap": (None if vw is None else
+                     {"value": vw.value, "band": vw.band_of(current.close)}),
+            "zone": (None if in_zone is None else
+                     {"kind": in_zone.kind, "low": in_zone.low,
+                      "high": in_zone.high, "tested": in_zone.tested,
+                      "fresh": in_zone.fresh}),
+            "calibration": rt.calibration(coin, interval).table(),
+            "has_watch": absorption is not None,
+        })
+        if size > 0 and book is not None and not book.empty:
+            out["round_trip_bps"] = book.round_trip_bps(size)
+        return out
+
+    @app.post("/api/calibrate", dependencies=[Depends(require_token)])
+    def api_calibrate(coin: str = "BTC", interval: str = "15m") -> dict[str, Any]:
+        """Score every closed candle and record how it actually resolved.
+
+        This is what turns the lean into a measurable number. It replays
+        history with the signals that were available from candles alone --
+        NOT flow or absorption, which were not recorded at the time and
+        cannot be reconstructed. So the replayed hit rate is a floor: the
+        live read has strictly more information than this.
+        """
+        coin = rt.resolve_symbol(coin)[0] or coin.upper()
+        try:
+            n = rt.replay_calibration(coin, interval)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "coin": coin, "interval": interval,
+                "scored": n, "table": rt.calibration(coin, interval).table()}
+
     @app.get("/api/dexes", dependencies=[Depends(require_token)])
     def api_dexes() -> dict[str, Any]:
         """Which perp DEXes this service can see.
@@ -1035,6 +1227,28 @@ DASHBOARD = """<!doctype html>
   <div id="venueNote" class="say" style="display:none;margin-bottom:14px"></div>
 
   <div class="grid">
+    <div class="panel full" id="readPanel"><h2>Candle read — live</h2>
+      <div class="msg" style="margin-bottom:8px">Everything this service knows,
+        assembled into one direction on the candle still forming. Absorption
+        <b>inverts</b> flow: heavy buying that is not moving price is a bearish
+        reading, not a bullish one.</div>
+      <div class="conbar">
+        <label>candle <select id="rInt" onchange="loadRead()">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label>higher TF <select id="rHigh" onchange="loadRead()">
+          <option>1h</option><option selected>4h</option><option>12h</option>
+          <option>1d</option></select></label>
+        <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
+          auto-refresh 10s</label>
+        <button onclick="loadRead()">Read now</button>
+        <button onclick="doCalibrate()">Calibrate</button>
+      </div>
+      <div id="readHead" class="msg">—</div>
+      <div id="readSignals"></div>
+      <div id="readSay" class="say" style="display:none"></div>
+    </div>
+
     <div class="panel full" id="conPanel"><h2>Who is winning, and which way</h2>
       <div class="msg" style="margin-bottom:8px">Of the wallets holding this coin right now,
         how much winning money is on each side — and how much worse you would enter than
@@ -1120,8 +1334,9 @@ function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (
 async function loadAll() {
   note('loading…');
   try {
-    await Promise.all([loadStatus(), loadCoins(), loadConsensus(), loadLiquidity(),
-                       loadMap(), loadChanges(), loadPositions(), loadReport()]);
+    await Promise.all([loadStatus(), loadCoins(), loadRead(), loadConsensus(),
+                       loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
+                       loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
   } catch (e) { note(e.message, true); }
 }
@@ -1233,6 +1448,77 @@ async function saveSettings() {
     const r = await api('/api/settings', {method: 'POST', body: JSON.stringify(body)});
     note(r.ok ? 'settings saved' : 'rejected: ' + (r.problems || []).join('; '), !r.ok);
     if (r.ok) loadStatus();
+  } catch (e) { note(e.message, true); }
+}
+
+let readPoll = null;
+
+function toggleReadAuto() {
+  if (readPoll) { clearInterval(readPoll); readPoll = null; }
+  if ($('rAuto').checked) { readPoll = setInterval(loadRead, 10000); loadRead(); }
+}
+
+async function loadRead() {
+  let d;
+  try {
+    d = await api('/api/read?coin=' + coin() + '&interval=' + $('rInt').value
+                  + '&higher=' + $('rHigh').value
+                  + '&size=' + (parseFloat($('liqSize').value || '0') || 0));
+  } catch (e) { $('readHead').textContent = e.message; return; }
+
+  if (d.error) {
+    $('readHead').textContent = d.error;
+    $('readSignals').innerHTML = ''; $('readSay').style.display = 'none'; return;
+  }
+
+  const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
+  const flags = (d.early ? '<span class="flag late">EARLY</span>' : '')
+              + (d.has_watch ? '' : '<span class="flag">NO LEVEL WATCH — flow and absorption missing</span>');
+
+  $('readHead').innerHTML =
+      `<div class="verdict-big ${cls}">${d.lean.toUpperCase()}`
+    + `<span style="font-size:15px;color:var(--dim);font-weight:400">`
+    + `&nbsp;score ${d.score >= 0 ? '+' : ''}${d.score.toFixed(2)}</span></div>`
+    + `<div style="font-size:12px;color:var(--dim)">${flags}</div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${(d.seconds_left/60).toFixed(1)}m</b><span>left in candle</span></div>`
+    + `<div class="stat"><b>${(d.elapsed_fraction*100).toFixed(0)}%</b><span>elapsed</span></div>`
+    + `<div class="stat"><b>${(d.agreement*100).toFixed(0)}%</b><span>signals agree</span></div>`
+    + `<div class="stat"><b>${(d.confidence*100).toFixed(0)}%</b><span>confidence</span></div>`
+    + `<div class="stat"><b class="${d.change_bps >= 0 ? 'long' : 'short'}">`
+    + `${d.change_bps >= 0 ? '+' : ''}${d.change_bps.toFixed(1)}bps</b><span>on the candle</span></div>`
+    + `<div class="stat"><b>${(d.position_in_range*100).toFixed(0)}%</b><span>of candle range</span></div>`
+    + (d.round_trip_bps != null
+       ? `<div class="stat"><b>${d.round_trip_bps.toFixed(1)}bps</b><span>round trip cost</span></div>` : '')
+    + '</div>';
+
+  const sigs = d.signals || [];
+  $('readSignals').innerHTML = !sigs.length ? '' :
+    '<table style="margin-top:12px"><tr><th>signal</th><th class="r">weight</th>'
+    + '<th>reading</th></tr>'
+    + sigs.map(s => `<tr>
+        <td class="${s.direction === 'up' ? 'long' : s.direction === 'down' ? 'short' : ''}">
+          ${s.direction === 'up' ? '▲' : s.direction === 'down' ? '▼' : '·'} ${s.name}</td>
+        <td class="r ${s.weighted >= 0 ? 'long' : 'short'}">${s.weighted >= 0 ? '+' : ''}${s.weighted.toFixed(2)}</td>
+        <td style="color:var(--dim)">${s.note}</td></tr>`).join('')
+    + '</table>';
+
+  $('readSay').style.display = '';
+  $('readSay').innerHTML = d.verdict
+    + (d.higher_timeframe ? `<div style="margin-top:6px;color:var(--dim)">Higher timeframe: ${d.higher_timeframe}</div>` : '')
+    + (d.vwap ? `<div style="color:var(--dim)">VWAP ${Number(d.vwap.value).toLocaleString(undefined,{maximumFractionDigits:2})} — ${d.vwap.band}</div>` : '');
+}
+
+async function doCalibrate() {
+  note('replaying history — this measures the lean instead of asserting it…');
+  try {
+    const r = await api('/api/calibrate?coin=' + coin() + '&interval=' + $('rInt').value,
+                        {method: 'POST'});
+    if (!r.ok) { note(r.error, true); return; }
+    const rows = (r.table || []).filter(t => t.n > 0)
+      .map(t => `${t.band}: ${(t.up_rate*100).toFixed(0)}% up (n=${t.n})`);
+    note(`scored ${r.scored} past candles — ` + (rows.join(' · ') || 'no bands populated'));
+    loadRead();
   } catch (e) { note(e.message, true); }
 }
 

@@ -216,6 +216,33 @@ class InfoClient:
     def l2_book(self, coin: str) -> dict:
         return self.post({"type": "l2Book", "coin": coin})
 
+    # Intervals the exchange accepts. Anything else is rejected outright.
+    INTERVALS = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                 "1h": 3600, "2h": 7200, "4h": 14400, "8h": 28800,
+                 "12h": 43200, "1d": 86400, "3d": 259200, "1w": 604800}
+
+    def candles(self, coin: str, interval: str = "15m", bars: int = 200):
+        """OHLCV as `structure.Candle`s, oldest first.
+
+        `bars` is how many of the most recent candles to ask for; the window
+        is computed from the interval rather than passed in, because getting
+        those two out of step returns a silently truncated series.
+        """
+        from .structure import parse_candles
+
+        step = self.INTERVALS.get(interval)
+        if step is None:
+            raise HyperliquidError(
+                f"unknown interval {interval!r} -- "
+                f"use one of {', '.join(self.INTERVALS)}")
+
+        end = int(time.time() * 1000)
+        start = end - step * 1000 * max(bars, 2)
+        raw = self.post({"type": "candleSnapshot",
+                         "req": {"coin": coin, "interval": interval,
+                                 "startTime": start, "endTime": end}})
+        return parse_candles(raw)
+
     def book(self, coin: str):
         """An L2 snapshot as a `flow.Book`."""
         return parse_book(coin, self.l2_book(coin))

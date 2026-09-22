@@ -582,3 +582,117 @@ def test_empty_coin_message_names_what_does_have_data(multi_coin, client):
     d = client.get(f"/api/map?coin=XRP&token={TOKEN}").json()
     assert "No data for XRP" in d["error"]
     assert "BTC" in d["error"]              # tells you where to look instead
+
+
+# --------------------------------------------------------------------------
+# the live candle read
+# --------------------------------------------------------------------------
+
+def _synthetic_candles(n=200, step=900, start=4000.0, drift=-0.4):
+    from liqmap.structure import Candle
+    import time as _t
+    out = []
+    px = start
+    now = _t.time()
+    for i in range(n):
+        o = px
+        cl = px + drift * (1 if i % 7 else -3)
+        out.append(Candle(ts=now - (n - i) * step, open=o,
+                          high=max(o, cl) + 2, low=min(o, cl) - 2,
+                          close=cl, volume=1000.0))
+        px = cl
+    return out
+
+
+class _CandleClient(_FakeClient):
+    INTERVALS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+
+    def __init__(self, candles=None, fail=False, **kw):
+        super().__init__(**kw)
+        self._candles = candles if candles is not None else _synthetic_candles()
+        self.candle_fail = fail
+
+    def candles(self, coin, interval="15m", bars=200):
+        if self.candle_fail:
+            raise RuntimeError("candleSnapshot unavailable")
+        return list(self._candles)
+
+
+def test_read_requires_a_token(client):
+    assert client.get("/api/read").status_code == 401
+
+
+def test_read_assembles_signals_from_candles_alone(client):
+    web.runtime()._client = _CandleClient()
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+
+    assert "error" not in d
+    assert d["lean"] in ("up", "down", "flat")
+    assert isinstance(d["signals"], list)
+    assert 0.0 <= d["elapsed_fraction"] <= 1.0
+    assert d["has_watch"] is False      # no level watch running
+
+
+def test_read_never_quotes_a_probability_it_has_not_measured(client):
+    web.runtime()._client = _CandleClient()
+    d = client.get(f"/api/read?token={TOKEN}").json()
+    assert "No calibration yet" in d["verdict"]
+
+
+def test_read_reports_missing_candles_rather_than_guessing(client):
+    web.runtime()._client = _CandleClient(fail=True)
+    d = client.get(f"/api/read?token={TOKEN}").json()
+    assert "candles unavailable" in d["error"]
+
+
+def test_read_refuses_a_series_too_short_to_mean_anything(client):
+    web.runtime()._client = _CandleClient(candles=_synthetic_candles(n=5))
+    d = client.get(f"/api/read?token={TOKEN}").json()
+    assert "not enough to read structure" in d["error"]
+
+
+def test_read_rejects_an_interval_the_exchange_does_not_have(client):
+    from liqmap.hl import HyperliquidError, InfoClient
+
+    class Strict(_CandleClient):
+        def candles(self, coin, interval="15m", bars=200):
+            if interval not in InfoClient.INTERVALS:
+                raise HyperliquidError(f"unknown interval {interval!r}")
+            return list(self._candles)
+
+    web.runtime()._client = Strict()
+    d = client.get(f"/api/read?interval=7m&token={TOKEN}").json()
+    assert "unknown interval" in d["error"]
+
+
+def test_calibration_replay_measures_instead_of_asserting(client):
+    web.runtime()._client = _CandleClient(candles=_synthetic_candles(n=300))
+    r = client.post(f"/api/calibrate?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert r["ok"]
+    assert r["scored"] > 0
+    bands = {row["band"] for row in r["table"]}
+    assert bands == {"strong down", "down", "flat", "up", "strong up"}
+
+
+def test_calibration_refuses_a_series_too_short_to_replay(client):
+    web.runtime()._client = _CandleClient(candles=_synthetic_candles(n=30))
+    r = client.post(f"/api/calibrate?token={TOKEN}").json()
+    assert not r["ok"]
+    assert "need 60+" in r["error"]
+
+
+def test_calibrations_are_kept_per_market_and_timeframe(client):
+    """A lean worth something on 15m gold says nothing about 4h BTC."""
+    rt = web.runtime()
+    a = rt.calibration("BTC", "15m")
+    b = rt.calibration("BTC", "1h")
+    c2 = rt.calibration("vntl:GOLD", "15m")
+    a.observe(0.6, True)
+    assert a.samples == 1 and b.samples == 0 and c2.samples == 0
+    assert rt.calibration("BTC", "15m") is a
+
+
+def test_dashboard_carries_the_read_panel(client):
+    html = client.get("/").text
+    for marker in ("loadRead", "doCalibrate", "Candle read", "toggleReadAuto"):
+        assert marker in html
