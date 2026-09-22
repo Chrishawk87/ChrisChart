@@ -65,6 +65,13 @@ class Runtime:
         self.harvest: dict[str, Any] = {"running": False, "found": 0,
                                         "started": None, "finished": None,
                                         "error": None, "minutes": 0}
+        # One level watch at a time. Watching several would multiply the book
+        # polls against a shared rate-limit budget that the position sweep
+        # also draws on, and in practice you are looking at one level.
+        self.watcher = None
+        self.watch_info: dict[str, Any] = {"running": False, "coin": None,
+                                           "level": None, "started": None,
+                                           "finished": None, "error": None}
         self._lock = threading.Lock()
         self._client = None
         self._store = None
@@ -175,6 +182,57 @@ class Runtime:
 
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, **self.harvest}
+
+    # -- watching a level --------------------------------------------------
+
+    def start_watch(self, coin: str, level: float, minutes: float,
+                    band_bps: float = 10.0,
+                    window_s: float = 300.0) -> dict[str, Any]:
+        """Watch one price level: book depth, refills, and aggression into it.
+
+        Starting a new watch replaces the previous one rather than queueing.
+        The point of this is to look at the level in front of you, and a
+        stale watch on yesterday's level is worse than none.
+        """
+        if level <= 0:
+            return {"ok": False, "error": "level must be a positive price"}
+        if self.watch_info["running"]:
+            return {**self.watch_info, "ok": False,
+                    "error": (f"already watching {self.watch_info['coin']} at "
+                              f"{self.watch_info['level']} — stop it first")}
+
+        try:
+            from .hl import LevelWatcher
+            watcher = LevelWatcher(self.client(), coin, level,
+                                   band_bps=band_bps, window_s=window_s)
+        except Exception as exc:
+            return {"ok": False, "error": f"could not start: {exc}"}
+
+        self.watcher = watcher
+        self.watch_info.update({
+            "running": True, "coin": coin, "level": level, "error": None,
+            "minutes": minutes, "band_bps": band_bps, "window_s": window_s,
+            "started": datetime.now(timezone.utc).isoformat(),
+            "finished": None})
+
+        def run() -> None:
+            try:
+                watcher.run(seconds=minutes * 60)
+            except Exception as exc:
+                self.watch_info["error"] = str(exc)
+                self.last_error = f"watch: {exc}"
+            finally:
+                self.watch_info["running"] = False
+                self.watch_info["finished"] = datetime.now(timezone.utc).isoformat()
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"ok": True, **self.watch_info}
+
+    def stop_watch(self) -> dict[str, Any]:
+        if self.watcher is not None:
+            self.watcher.stop()
+        self.watch_info["running"] = False
+        return {"ok": True, **self.watch_info}
 
     # -- the actual work ---------------------------------------------------
 
@@ -581,6 +639,70 @@ def create_app() -> FastAPI:
     def get_harvest() -> dict[str, Any]:
         return {"wallets": len(rt.load_wallets()), **rt.harvest}
 
+    # -- liquidity --------------------------------------------------------
+
+    @app.post("/api/watch", dependencies=[Depends(require_token)])
+    def api_watch(coin: str = "BTC", level: float = 0.0, minutes: float = 15.0,
+                  band_bps: float = 10.0, window_s: float = 300.0,
+                  stop: bool = False) -> dict[str, Any]:
+        """Start (or stop) a level watch."""
+        if stop:
+            return rt.stop_watch()
+        out = rt.start_watch(coin.upper(), level, minutes,
+                             band_bps=band_bps, window_s=window_s)
+        if not out.get("ok"):
+            raise HTTPException(409, out.get("error") or "could not start watch")
+        return out
+
+    @app.get("/api/liquidity", dependencies=[Depends(require_token)])
+    def api_liquidity(size: float = 0.0, coin: str = "BTC") -> dict[str, Any]:
+        """Current liquidity picture.
+
+        With a watch running this returns the full reading. Without one it
+        still answers the question that does not need history — what does the
+        book cost you right now — by pulling a single snapshot. That is the
+        useful default: slippage is the one number here that is exact rather
+        than learned, so it should not be gated behind a fifteen-minute wait.
+        """
+        if rt.watcher is not None:
+            out = rt.watcher.snapshot(size=size)
+            out["watch"] = dict(rt.watch_info)
+            return out
+
+        try:
+            b = rt.client().book(coin.upper())
+        except Exception as exc:
+            return {"coin": coin.upper(), "error": str(exc)}
+        if b.empty:
+            return {"coin": coin.upper(), "error": "book came back empty"}
+
+        out: dict[str, Any] = {
+            "coin": coin.upper(),
+            "watch": dict(rt.watch_info),
+            "book": {
+                "bid": b.best_bid, "ask": b.best_ask, "mid": b.mid,
+                "spread_bps": b.spread_bps,
+                "depth_bid_25bps": b.depth(25.0, "buy"),
+                "depth_ask_25bps": b.depth(25.0, "sell"),
+                "imbalance_25bps": b.imbalance(25.0),
+                "shelves": [{"px": s.px, "notional": s.notional,
+                             "multiple": s.multiple, "side": s.side}
+                            for s in b.shelves()],
+            },
+        }
+        if size > 0:
+            buy, sell = b.walk(size, "buy"), b.walk(size, "sell")
+            out["cost"] = {
+                "size": size,
+                "entry_bps": buy.slippage_bps,
+                "exit_bps": sell.slippage_bps,
+                "round_trip_bps": buy.slippage_bps + sell.slippage_bps,
+                "entry_avg_px": buy.avg_px, "exit_avg_px": sell.avg_px,
+                "exhausted": buy.exhausted or sell.exhausted,
+                "levels": max(buy.levels_consumed, sell.levels_consumed),
+            }
+        return out
+
     @app.post("/api/harvest", dependencies=[Depends(require_token)])
     def post_harvest(minutes: float = 5.0,
                      then_sweep: bool = True) -> JSONResponse:
@@ -743,6 +865,29 @@ DASHBOARD = """<!doctype html>
       <div id="conTraders"></div>
     </div>
 
+    <div class="panel full" id="liqPanel"><h2>Liquidity — what it costs and who is winning the level</h2>
+      <div class="msg" style="margin-bottom:8px">Slippage works immediately off a
+        single book read. Absorption needs a running watch, because it has to learn
+        how far price normally moves per dollar before it can say whether this is
+        a lot of volume or a little.</div>
+      <div class="conbar">
+        <label>your size $<input id="liqSize" type="number" value="25000" step="5000"
+          style="width:110px" onchange="loadLiquidity()"></label>
+        <label>level <input id="wLevel" type="number" value="0" step="1"
+          style="width:110px" title="price to watch"></label>
+        <label>±bps <input id="wBand" type="number" value="10" step="1"
+          style="width:64px"></label>
+        <label>minutes <input id="wMins" type="number" value="15" min="1" max="120"
+          style="width:64px"></label>
+        <button onclick="startWatch()">Watch level</button>
+        <button onclick="stopWatch()">Stop</button>
+      </div>
+      <div id="liqCost" class="msg">—</div>
+      <div id="liqBook" class="msg"></div>
+      <div id="liqAbs" class="say" style="display:none"></div>
+      <div id="liqShelves"></div>
+    </div>
+
     <div class="panel"><h2>Status</h2><div id="status" class="msg">—</div>
       <div id="firstrun" class="msg"></div></div>
     <div class="panel"><h2>Conviction flow · 24h</h2><div id="flow" class="msg">—</div></div>
@@ -789,8 +934,8 @@ function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (
 async function loadAll() {
   note('loading…');
   try {
-    await Promise.all([loadStatus(), loadConsensus(), loadMap(), loadChanges(),
-                       loadPositions(), loadReport()]);
+    await Promise.all([loadStatus(), loadConsensus(), loadLiquidity(), loadMap(),
+                       loadChanges(), loadPositions(), loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
   } catch (e) { note(e.message, true); }
 }
@@ -900,6 +1045,103 @@ async function saveSettings() {
     note(r.ok ? 'settings saved' : 'rejected: ' + (r.problems || []).join('; '), !r.ok);
     if (r.ok) loadStatus();
   } catch (e) { note(e.message, true); }
+}
+
+let watchPoll = null;
+
+async function startWatch() {
+  const lvl = parseFloat($('wLevel').value || '0');
+  if (!isFinite(lvl) || lvl <= 0) { note('enter the price level you want watched', true); return; }
+  const mins = parseFloat($('wMins').value || '15');
+  const band = parseFloat($('wBand').value || '10');
+  try {
+    const r = await api(`/api/watch?coin=${coin()}&level=${lvl}&minutes=${mins}&band_bps=${band}`,
+                        {method: 'POST'});
+    if (!r || r.ok === false) { note('could not start watch: ' + ((r && r.error) || 'unknown'), true); return; }
+    note(`watching ${coin()} at ${lvl} for ${mins} min`);
+    if (watchPoll) clearInterval(watchPoll);
+    watchPoll = setInterval(loadLiquidity, 10000);
+    loadLiquidity();
+  } catch (e) { note(e.message, true); }
+}
+
+async function stopWatch() {
+  if (watchPoll) { clearInterval(watchPoll); watchPoll = null; }
+  try { await api('/api/watch?stop=true', {method: 'POST'}); note('watch stopped'); }
+  catch (e) { note(e.message, true); }
+  loadLiquidity();
+}
+
+async function loadLiquidity() {
+  const size = parseFloat($('liqSize').value || '0') || 0;
+  let d;
+  try {
+    d = await api('/api/liquidity?coin=' + coin() + '&size=' + size);
+  } catch (e) { $('liqCost').textContent = e.message; return; }
+
+  if (d.error) {
+    $('liqCost').textContent = d.error;
+    $('liqBook').innerHTML = ''; $('liqAbs').style.display = 'none';
+    $('liqShelves').innerHTML = ''; return;
+  }
+
+  const c = d.cost, b = d.book;
+  if (c) {
+    const bad = c.exhausted || c.round_trip_bps > 20;
+    $('liqCost').innerHTML = '<div class="conrow">'
+      + `<div class="stat"><b>${c.entry_bps.toFixed(1)}bps</b><span>cost to get in</span></div>`
+      + `<div class="stat"><b>${c.exit_bps.toFixed(1)}bps</b><span>cost to get out</span></div>`
+      + `<div class="stat ${bad ? 'gap-bad' : 'gap-ok'}"><b>${c.round_trip_bps.toFixed(1)}bps</b>`
+      + `<span>round trip on ${money(c.size)}</span></div>`
+      + `<div class="stat"><b>${c.levels}</b><span>levels eaten</span></div>`
+      + '</div>'
+      + (c.exhausted
+         ? '<div class="say">The book cannot fill that size at all. Anything this '
+           + 'tool says about entries at this size is theoretical.</div>' : '');
+  } else {
+    $('liqCost').textContent = 'set your size above to price the entry and exit';
+  }
+
+  if (b) {
+    const imb = b.imbalance_25bps;
+    $('liqBook').innerHTML = '<div class="conrow">'
+      + `<div class="stat"><b>${b.spread_bps.toFixed(2)}bps</b><span>spread</span></div>`
+      + `<div class="stat"><b>${money(b.depth_bid_25bps)}</b><span>bid depth ±25bps</span></div>`
+      + `<div class="stat"><b>${money(b.depth_ask_25bps)}</b><span>ask depth ±25bps</span></div>`
+      + `<div class="stat"><b class="${imb >= 0 ? 'long' : 'short'}">${imb >= 0 ? '+' : ''}`
+      + `${imb.toFixed(2)}</b><span>${imb >= 0 ? 'bid heavy' : 'offer heavy'}</span></div>`
+      + '</div>';
+
+    const sh = b.shelves || [];
+    $('liqShelves').innerHTML = !sh.length ? '' :
+      '<table style="margin-top:12px"><tr><th>resting shelf</th><th>side</th>'
+      + '<th class="r">size</th><th class="r">vs typical level</th></tr>'
+      + sh.map(s => `<tr>
+          <td>${Number(s.px).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td class="${s.side === 'buy' ? 'long' : 'short'}">${s.side === 'buy' ? 'support' : 'supply'}</td>
+          <td class="r">${money(s.notional)}</td>
+          <td class="r">${s.multiple.toFixed(1)}x</td></tr>`).join('')
+      + '</table>';
+  } else { $('liqBook').innerHTML = ''; $('liqShelves').innerHTML = ''; }
+
+  const a = d.absorption;
+  if (a) {
+    const band = d.band || {};
+    const flag = a.absorbing ? '<span class="flag crowded">ABSORBING</span>'
+               : a.thin ? '<span class="flag late">THIN</span>' : '';
+    const div = d.divergence && d.divergence.disagrees
+      ? `<div style="margin-top:6px;color:var(--dim)">Divergence: ${d.divergence.note}</div>` : '';
+    $('liqAbs').style.display = '';
+    $('liqAbs').innerHTML = flag + a.verdict
+      + `<div style="margin-top:6px;color:var(--dim)">`
+      + `${d.trades_seen} trades and ${d.books_seen} book reads so far`
+      + (band.refill_events ? ` · ${band.refill_events} refills` : '')
+      + `</div>` + div
+      + (d.side_report && d.side_report.indexOf('ambiguous') === -1 ? ''
+         : `<div style="margin-top:6px;color:var(--dim)">side convention: ${d.side_report || '—'}</div>`);
+  } else {
+    $('liqAbs').style.display = 'none';
+  }
 }
 
 async function loadConsensus() {

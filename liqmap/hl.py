@@ -6,7 +6,7 @@ Hyperliquid's docs plus two independent mirrors), but the sandbox this was
 built in cannot reach exchange APIs. Expect to fix something on first run, and
 treat `check()` as the thing to run before anything else.
 
-Two jobs:
+Three jobs:
 
   WALLET DISCOVERY. There is no endpoint that lists positions across users, and
   no official leaderboard. But the public `trades` WebSocket carries
@@ -18,6 +18,13 @@ Two jobs:
   `liquidationPx` per position. Weight 2 against a 1200/minute budget, so 600
   wallets a minute is the ceiling. The limiter below enforces it rather than
   discovering it through 429s.
+
+  LIQUIDITY AND FLOW. `l2Book` polled for resting depth, the same trades
+  WebSocket read for aggression, both fed into `flow.LevelWatch`. Two silent
+  failure modes here rather than loud ones, so there is a smoke test for each:
+  `check_book()` catches the bid/ask groups arriving swapped, and
+  `LevelWatcher.side_report` re-derives the aggressor convention from the tape
+  instead of trusting the documented codes.
 """
 
 from __future__ import annotations
@@ -136,6 +143,13 @@ class InfoClient:
     def clearinghouse_state(self, wallet: str) -> dict:
         return self.post({"type": "clearinghouseState", "user": wallet})
 
+    def l2_book(self, coin: str) -> dict:
+        return self.post({"type": "l2Book", "coin": coin})
+
+    def book(self, coin: str):
+        """An L2 snapshot as a `flow.Book`."""
+        return parse_book(coin, self.l2_book(coin))
+
     def check(self) -> str:
         """Smoke test. Run this first -- it is the cheapest way to find out
         whether the API shape has moved since this was written."""
@@ -144,6 +158,28 @@ class InfoClient:
             return "allMids returned nothing -- endpoint or shape has changed"
         sample = ", ".join(f"{k}={v:,.4f}" for k, v in list(mids.items())[:3])
         return f"ok -- {len(mids)} markets. {sample}"
+
+    def check_book(self, coin: str = "BTC") -> str:
+        """Second smoke test, for the liquidity side.
+
+        `l2Book`'s `levels` field is documented as [bids, asks]. If that ever
+        flips, every depth and slippage number inverts silently, so this
+        checks the invariant that actually matters rather than the field name:
+        the first group must sit BELOW the second.
+        """
+        raw = self.l2_book(coin)
+        b = parse_book(coin, raw)
+        if b.empty:
+            return f"l2Book returned no levels for {coin} -- shape has changed"
+        if not (b.bids and b.asks):
+            return f"l2Book gave only one side for {coin}"
+        if b.best_bid >= b.best_ask:
+            return (f"BOOK IS CROSSED: bid {b.best_bid} >= ask {b.best_ask}. "
+                    f"The bid/ask groups are probably swapped -- do not trust "
+                    f"any depth or slippage number until this is fixed.")
+        return (f"ok -- {coin} {b.best_bid:,.2f} / {b.best_ask:,.2f}, "
+                f"spread {b.spread_bps:.2f}bps, "
+                f"{len(b.bids)}x{len(b.asks)} levels")
 
 
 # --------------------------------------------------------------------------
@@ -290,3 +326,292 @@ def sweep_positions(client: InfoClient, wallets: Iterable[str],
             on_progress(i + 1, len(wallets))
 
     return positions, failed
+
+
+# --------------------------------------------------------------------------
+# liquidity and order flow
+# --------------------------------------------------------------------------
+
+def parse_book(coin: str, raw: dict) -> "Book":
+    """`l2Book` -> `flow.Book`.
+
+    Documented shape is {"coin", "time", "levels": [bids, asks]} with each
+    level {"px", "sz", "n"}. Anything unparseable is dropped rather than
+    raising: a book missing one bad level is usable, a book that throws is not.
+    """
+    from .flow import Book, Level
+
+    groups = (raw or {}).get("levels") or []
+    out: list[list[Level]] = [[], []]
+
+    for i in (0, 1):
+        if i >= len(groups):
+            continue
+        for lv in groups[i] or []:
+            try:
+                px = float(lv["px"])
+                sz = float(lv["sz"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if px <= 0 or sz <= 0:
+                continue
+            try:
+                n = int(lv.get("n", 0) or 0)
+            except (TypeError, ValueError):
+                n = 0
+            out[i].append(Level(px=px, sz=sz, n=n))
+
+    return Book(coin=coin, ts=_ms_to_s((raw or {}).get("time")),
+                bids=out[0], asks=out[1])
+
+
+def _ms_to_s(raw_ms: Any) -> float:
+    """Epoch milliseconds -> seconds, falling back to now only when the field
+    is genuinely absent.
+
+    `float(x or 0) / 1000 or time.time()` looks equivalent and is not: a
+    timestamp of 0 is falsy, so it silently becomes the wall clock. One trade
+    stamped with the wall clock among trades stamped with the feed's clock
+    puts them billions of seconds apart, and every window and bucket
+    downstream stops working.
+    """
+    if raw_ms is None or raw_ms == "":
+        return time.time()
+    try:
+        return float(raw_ms) / 1000.0
+    except (TypeError, ValueError):
+        return time.time()
+
+
+# Which raw `side` code means the aggressor was buying. Hyperliquid documents
+# "B" for buy, but see `InfoClient`'s note -- none of this has been run
+# against the live feed, so `LevelWatcher` re-derives it from the tape and
+# reports what it found rather than trusting this constant.
+BUY_CODES = {"B", "b", "buy", "Buy", "BUY", "bid"}
+
+
+def parse_trade(raw: dict, buy_codes: Iterable[str] = BUY_CODES):
+    """One entry from the trades feed -> `flow.Trade`. None if unusable."""
+    from .flow import Trade
+
+    try:
+        px = float(raw["px"])
+        sz = float(raw["sz"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if px <= 0 or sz <= 0:
+        return None
+
+    ts = _ms_to_s(raw.get("time"))
+    code = str(raw.get("side", ""))
+    return Trade(px=px, sz=sz,
+                 aggressor="buy" if code in set(buy_codes) else "sell",
+                 ts=ts)
+
+
+class LevelWatcher:
+    """Drive a `flow.LevelWatch` from the live feeds.
+
+    Trades stream over the WebSocket; the book is polled, because there is no
+    reason to process every book delta when what you need is a depth reading
+    every few seconds. At weight 2 a poll every 3 seconds costs 40/minute
+    against a 1200 budget, so it coexists with a position sweep.
+
+    NOT EXERCISED AGAINST THE LIVE API. Two things to check on the first run,
+    both of which produce plausible-looking wrong numbers rather than errors:
+
+      1. `side_report` after a minute. It re-derives the aggressor convention
+         from where prints land relative to mid. If it disagrees with
+         BUY_CODES, every flow number is inverted.
+      2. `InfoClient.check_book`, which catches the bid/ask groups arriving
+         swapped.
+    """
+
+    def __init__(self, client: "InfoClient", coin: str, level: float,
+                 band_bps: float = 10.0, window_s: float = 300.0,
+                 book_every_s: float = 3.0, ws_url: str = WS_MAINNET):
+        from .flow import LevelWatch
+
+        self.client = client
+        self.coin = coin
+        self.watch = LevelWatch(coin, level, band_bps=band_bps,
+                                window_s=window_s)
+        self.book_every_s = book_every_s
+        self.ws_url = ws_url
+
+        self.last_book = None
+        self.trades_seen = 0
+        self.books_seen = 0
+        self.errors: list[str] = []
+        self.side_report = "not checked yet"
+
+        self._side_samples: list[tuple[str, float]] = []
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+
+    # -- ingest -----------------------------------------------------------
+
+    def _on_trades(self, entries: list[dict]) -> None:
+        from .flow import check_side_convention
+
+        for raw in entries or []:
+            t = parse_trade(raw)
+            if t is None:
+                continue
+            with self._lock:
+                self.watch.on_trade(t)
+                self.trades_seen += 1
+                if len(self._side_samples) < 400:
+                    self._side_samples.append((str(raw.get("side", "")), t.px))
+
+        if self.last_book is not None and len(self._side_samples) >= 40:
+            mid = self.last_book.mid
+            if mid > 0:
+                self.side_report = check_side_convention(self._side_samples, mid)
+
+    def _poll_book(self) -> None:
+        try:
+            b = self.client.book(self.coin)
+        except (HyperliquidError, requests.RequestException) as exc:
+            self._note(f"book poll failed: {exc}")
+            return
+        if b.empty:
+            self._note("book poll returned no levels")
+            return
+        with self._lock:
+            self.watch.on_book(b)
+            self.last_book = b
+            self.books_seen += 1
+
+    def _note(self, msg: str) -> None:
+        self.errors.append(f"{time.strftime('%H:%M:%S')} {msg}")
+        del self.errors[:-20]
+
+    # -- run --------------------------------------------------------------
+
+    def run(self, seconds: float = 900.0,
+            on_progress: Callable[[int, int], None] | None = None) -> None:
+        try:
+            import websocket
+        except ImportError as exc:
+            raise ImportError(
+                "pip install websocket-client to watch a level") from exc
+
+        deadline = time.time() + seconds
+
+        def on_message(_ws, payload):
+            try:
+                msg = json.loads(payload)
+            except (json.JSONDecodeError, TypeError):
+                return
+            if msg.get("channel") == "trades":
+                self._on_trades(msg.get("data") or [])
+
+        def on_open(ws):
+            ws.send(json.dumps({
+                "method": "subscribe",
+                "subscription": {"type": "trades", "coin": self.coin},
+            }))
+
+        self._poll_book()      # one immediately, so there is a reading at once
+        next_book = time.time() + self.book_every_s
+        last_report = 0.0
+
+        while time.time() < deadline and not self._stop.is_set():
+            try:
+                ws = websocket.WebSocketApp(self.ws_url, on_open=on_open,
+                                            on_message=on_message)
+                t = threading.Thread(
+                    target=ws.run_forever,
+                    kwargs={"ping_interval": 30, "ping_timeout": 10},
+                    daemon=True)
+                t.start()
+
+                while (time.time() < deadline and t.is_alive()
+                       and not self._stop.is_set()):
+                    time.sleep(0.25)
+                    now = time.time()
+                    if now >= next_book:
+                        next_book = now + self.book_every_s
+                        self._poll_book()
+                    if on_progress and now - last_report > 15:
+                        last_report = now
+                        on_progress(self.trades_seen, self.books_seen)
+                ws.close()
+                t.join(timeout=5)
+            except Exception as exc:        # reconnect rather than die
+                self._note(f"websocket: {exc}")
+                time.sleep(3.0)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    # -- read -------------------------------------------------------------
+
+    def snapshot(self, size: float = 0.0) -> dict:
+        with self._lock:
+            a = self.watch.absorption()
+            b = self.last_book
+            div = self.watch.tape.divergence(self.watch.window_s)
+            cvd = self.watch.tape.cvd
+
+        out: dict[str, Any] = {
+            "coin": self.coin,
+            "level": self.watch.level,
+            "trades_seen": self.trades_seen,
+            "books_seen": self.books_seen,
+            "side_report": self.side_report,
+            "errors": self.errors[-5:],
+            "cvd": cvd,
+            "divergence": {
+                "price_change_bps": div.price_change_bps,
+                "delta_notional": div.delta_notional,
+                "disagrees": div.disagrees,
+                "note": div.note,
+            },
+            "absorption": {
+                "direction": a.direction,
+                "aggressive_notional": a.aggressive_notional,
+                "observed_bps": a.observed_bps,
+                "expected_bps": a.expected_bps,
+                "impact_ratio": a.impact_ratio,
+                "confident": a.confident,
+                "absorbing": a.absorbing,
+                "thin": a.thin,
+                "verdict": a.verdict(),
+                "trades": a.trades,
+            },
+            "band": {
+                "consumed": a.band.consumed,
+                "replenished": a.band.replenished,
+                "refill_events": a.band.refill_events,
+                "replenish_ratio": a.band.replenish_ratio,
+                "defended": a.band.defended,
+                "last_notional": a.band.last_notional,
+            },
+        }
+
+        if b is not None and not b.empty:
+            out["book"] = {
+                "bid": b.best_bid, "ask": b.best_ask, "mid": b.mid,
+                "spread_bps": b.spread_bps,
+                "depth_bid_25bps": b.depth(25.0, "buy"),
+                "depth_ask_25bps": b.depth(25.0, "sell"),
+                "imbalance_25bps": b.imbalance(25.0),
+                "shelves": [{"px": s.px, "notional": s.notional,
+                             "multiple": s.multiple, "side": s.side}
+                            for s in b.shelves()],
+            }
+            if size > 0:
+                buy, sell = b.walk(size, "buy"), b.walk(size, "sell")
+                out["cost"] = {
+                    "size": size,
+                    "entry_bps": buy.slippage_bps,
+                    "exit_bps": sell.slippage_bps,
+                    "round_trip_bps": buy.slippage_bps + sell.slippage_bps,
+                    "entry_avg_px": buy.avg_px,
+                    "exit_avg_px": sell.avg_px,
+                    "exhausted": buy.exhausted or sell.exhausted,
+                    "levels": max(buy.levels_consumed, sell.levels_consumed),
+                }
+        return out

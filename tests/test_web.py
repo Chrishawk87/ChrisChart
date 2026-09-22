@@ -377,3 +377,100 @@ def test_dashboard_guides_a_first_run(client):
     assert "Harvest wallets" in html
     assert "No wallet universe yet" in html
     assert "cannot appear until the next one" in html
+
+
+# --------------------------------------------------------------------------
+# liquidity
+# --------------------------------------------------------------------------
+
+def _fake_book(coin="BTC"):
+    from liqmap.flow import Book, Level
+    bids = [Level(50_000 - i * 5, 0.4) for i in range(30)]
+    asks = [Level(50_010 + i * 5, 0.4) for i in range(30)]
+    bids.append(Level(49_800, 20.0))          # a deliberate shelf
+    return Book(coin=coin, ts=0.0, bids=bids, asks=asks)
+
+
+class _FakeClient:
+    def __init__(self, book=None, fail=False):
+        self._book = book
+        self.fail = fail
+
+    def book(self, coin):
+        if self.fail:
+            raise RuntimeError("exchange unreachable")
+        return self._book if self._book is not None else _fake_book(coin)
+
+
+def test_liquidity_requires_a_token(client):
+    assert client.get("/api/liquidity").status_code == 401
+
+
+def test_liquidity_prices_entry_and_exit_without_a_watch(client):
+    """Slippage is exact arithmetic on one book read, so it must not be gated
+    behind starting a watch and waiting."""
+    web.runtime()._client = _FakeClient()
+    d = client.get(f"/api/liquidity?coin=BTC&size=250000&token={TOKEN}").json()
+
+    assert d["book"]["bid"] == 50_000 and d["book"]["ask"] == 50_010
+    assert d["book"]["spread_bps"] == pytest.approx(2.0, rel=1e-3)
+    c = d["cost"]
+    assert c["entry_bps"] > 0 and c["exit_bps"] > 0
+    assert c["round_trip_bps"] == pytest.approx(c["entry_bps"] + c["exit_bps"])
+    assert not c["exhausted"]
+    assert "absorption" not in d          # no watch running, so no verdict
+
+
+def test_liquidity_finds_the_shelf(client):
+    web.runtime()._client = _FakeClient()
+    d = client.get(f"/api/liquidity?coin=BTC&size=0&token={TOKEN}").json()
+    shelves = d["book"]["shelves"]
+    assert any(s["px"] == 49_800 and s["side"] == "buy" for s in shelves)
+
+
+def test_liquidity_reports_a_size_the_book_cannot_fill(client):
+    web.runtime()._client = _FakeClient()
+    d = client.get(f"/api/liquidity?size=999000000&token={TOKEN}").json()
+    assert d["cost"]["exhausted"] is True
+
+
+def test_liquidity_reports_an_unreachable_exchange_rather_than_500ing(client):
+    web.runtime()._client = _FakeClient(fail=True)
+    d = client.get(f"/api/liquidity?token={TOKEN}").json()
+    assert "exchange unreachable" in d["error"]
+
+
+def test_liquidity_handles_an_empty_book(client):
+    from liqmap.flow import Book
+    web.runtime()._client = _FakeClient(book=Book(coin="BTC", ts=0.0))
+    d = client.get(f"/api/liquidity?token={TOKEN}").json()
+    assert d["error"] == "book came back empty"
+
+
+def test_watch_rejects_a_missing_level(client):
+    r = client.post(f"/api/watch?coin=BTC&level=0&token={TOKEN}")
+    assert r.status_code == 409
+    assert "positive price" in r.json()["detail"]
+
+
+def test_watch_refuses_to_start_a_second_one(client):
+    rt = web.runtime()
+    rt.watch_info.update({"running": True, "coin": "BTC", "level": 50_000})
+    try:
+        r = client.post(f"/api/watch?coin=ETH&level=3000&token={TOKEN}")
+        assert r.status_code == 409
+        assert "already watching" in r.json()["detail"]
+    finally:
+        rt.watch_info["running"] = False
+
+
+def test_stop_is_safe_with_nothing_running(client):
+    r = client.post(f"/api/watch?stop=true&token={TOKEN}")
+    assert r.status_code == 200
+    assert r.json()["running"] is False
+
+
+def test_dashboard_carries_the_liquidity_panel(client):
+    html = client.get("/").text
+    for marker in ("loadLiquidity", "startWatch", "liqSize", "wLevel"):
+        assert marker in html
