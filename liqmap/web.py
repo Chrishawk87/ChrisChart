@@ -642,6 +642,9 @@ DASHBOARD = """<!doctype html>
     <input id="coin" value="BTC" size="6">
     <button class="go" onclick="loadAll()">Load</button>
     <button onclick="doHarvest()">Harvest wallets</button>
+    <input id="hmin" type="number" value="5" min="1" max="180" step="1"
+           title="minutes to listen to the trade feed" style="width:62px">
+    <span class="msg" style="margin-right:6px">min</span>
     <button onclick="doSweep()">Sweep now</button>
     <button onclick="doResolve()">Resolve</button>
     <span id="msg" class="msg"></span>
@@ -702,25 +705,41 @@ async function loadAll() {
 let harvestPoll = null;
 
 async function doHarvest() {
-  const mins = prompt('Listen to the trade feed for how many minutes?\n\n' +
-    '5 is enough to see it work. An hour or more builds a universe worth trusting.', '5');
-  if (!mins) return;
+  // No prompt() here on purpose: browsers block modal prompts in plenty of
+  // situations, and when they do the handler returns with no explanation at
+  // all -- which looks exactly like a dead button.
+  const mins = parseFloat(($('hmin') && $('hmin').value) || '5');
+  if (!isFinite(mins) || mins <= 0) { note('enter a positive number of minutes', true); return; }
+  if (!tok()) { note('paste your access token first', true); return; }
+
+  note('starting harvest…');
   try {
     const r = await api('/api/harvest?minutes=' + encodeURIComponent(mins) + '&then_sweep=true',
                         {method: 'POST'});
-    if (!r.ok) { note(r.error || 'could not start', true); return; }
-    note('harvesting… the page will update as wallets come in');
+    if (!r || r.ok === false) { note('could not start: ' + ((r && r.error) || 'unknown'), true); return; }
+    note(`harvesting for ${mins} min — watching the trade feed…`);
+
     if (harvestPoll) clearInterval(harvestPoll);
     harvestPoll = setInterval(async () => {
       try {
         const h = await api('/api/harvest');
-        if (h.running) { note(`harvesting… ${h.found} wallets so far`); }
-        else {
+        if (h.running) {
+          note(`harvesting… ${h.found} wallet${h.found === 1 ? '' : 's'} so far`);
+        } else {
           clearInterval(harvestPoll); harvestPoll = null;
-          note(h.error ? ('harvest failed: ' + h.error) : `harvest done — ${h.wallets} wallets, sweeping…`, !!h.error);
-          setTimeout(loadAll, 3000);
+          if (h.error) { note('harvest failed: ' + h.error, true); }
+          else if (!h.wallets) {
+            note('harvest finished but found no wallets — try a longer run, or lower '
+                 + 'min_wallet_notional in Settings', true);
+          } else {
+            note(`harvest done — ${h.wallets} wallets. Sweeping…`);
+            setTimeout(loadAll, 4000);
+          }
         }
-      } catch (e) { clearInterval(harvestPoll); harvestPoll = null; }
+      } catch (e) {
+        clearInterval(harvestPoll); harvestPoll = null;
+        note('lost track of the harvest: ' + e.message, true);
+      }
     }, 5000);
   } catch (e) { note(e.message, true); }
 }
