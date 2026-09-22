@@ -189,12 +189,16 @@ def test_wallets_accept_a_list_or_a_blob(client):
 
 def test_map_reports_no_sweep_rather_than_crashing(client):
     d = client.get("/api/map", params={"token": TOKEN, "coin": "BTC"}).json()
-    assert "no sweep" in d["error"]
+    # The message has to say what to DO, not just that there is nothing:
+    # "no sweep recorded yet" reads identically for a coin you never
+    # configured, a coin nobody holds, and a service that has never run.
+    assert "Nothing has been swept yet" in d["error"]
+    assert "Harvest wallets" in d["error"]
 
 
 def test_positions_reports_no_sweep(client):
     d = client.get("/api/positions", params={"token": TOKEN}).json()
-    assert "no sweep" in d["error"]
+    assert "Nothing has been swept yet" in d["error"]
 
 
 def test_report_explains_why_it_is_empty(client):
@@ -352,8 +356,9 @@ def test_harvest_duration_is_clamped(client, monkeypatch):
     """A typo of 10000 minutes should not pin a thread for a week."""
     started = {}
 
-    def fake(self, minutes, then_sweep=True):
+    def fake(self, minutes, then_sweep=True, coins=None):
         started["minutes"] = minutes
+        started["coins"] = coins
         return {"ok": True, "running": False, "found": 0}
 
     monkeypatch.setattr(web.Runtime, "start_harvest", fake)
@@ -474,3 +479,106 @@ def test_dashboard_carries_the_liquidity_panel(client):
     html = client.get("/").text
     for marker in ("loadLiquidity", "startWatch", "liqSize", "wLevel"):
         assert marker in html
+
+
+# --------------------------------------------------------------------------
+# multi-coin: one wallet read must populate every coin they hold
+# --------------------------------------------------------------------------
+
+def _pos(wallet, coin, long=True, entry=100.0, pnl=1_000.0, notional=1_000_000.0):
+    from liqmap.bucket import Position
+    return Position(
+        wallet=wallet, coin=coin, szi=1.0 if long else -1.0, entry_px=entry,
+        liquidation_px=entry * (0.9 if long else 1.1),
+        position_value=notional, leverage=10.0, leverage_type="cross",
+        unrealized_pnl=pnl, margin_used=notional / 10, account_value=5_000_000.0)
+
+
+@pytest.fixture
+def multi_coin(client, monkeypatch):
+    """Wallets holding four coins between them."""
+    rt = web.runtime()
+    rt.wallets = [f"0x{i:040x}" for i in range(5)]
+
+    mids = {"BTC": 100_000.0, "ETH": 3_000.0, "SOL": 150.0,
+            "DOGE": 0.20, "HYPE": 25.0}
+    positions = []
+    for i in range(5):                       # everyone holds BTC
+        positions.append(_pos(f"0x{i:040x}", "BTC", entry=99_000.0))
+    for i in range(4):                       # four hold ETH
+        positions.append(_pos(f"0x{i:040x}", "ETH", entry=2_900.0))
+    for i in range(3):                       # three hold SOL
+        positions.append(_pos(f"0x{i:040x}", "SOL", entry=140.0))
+    positions.append(_pos("0x" + "0" * 40, "DOGE", entry=0.19))   # only one
+
+    class FakeClient:
+        def all_mids(self):
+            return dict(mids)
+
+    rt._client = FakeClient()
+    monkeypatch.setattr(web, "startup_report", lambda _rt: [])
+    import liqmap.hl as hl
+    monkeypatch.setattr(hl, "sweep_positions",
+                        lambda client, wallets, on_progress=None: (positions, 0))
+    return rt
+
+
+def test_one_sweep_records_every_coin_the_wallets_hold(multi_coin, client):
+    """THE BUG: clearinghouseState returns a wallet's whole portfolio, but the
+    sweep threw away every coin except the one it was asked about. Getting a
+    second coin meant re-reading all the wallets for data already in hand —
+    so in practice only the coin you asked for ever had anything."""
+    r = client.post(f"/api/sweep?coin=BTC&token={TOKEN}").json()
+    assert r["ok"]
+    assert set(r["coins_recorded"]) >= {"BTC", "ETH", "SOL"}
+    assert r["coin"] == "BTC"               # headline is still what you asked
+
+
+def test_a_coin_nobody_holds_is_not_given_its_own_row(multi_coin, client):
+    """One stray position is not a market. DOGE has a single holder and is
+    not configured, so it should not get a sweep row of its own."""
+    r = client.post(f"/api/sweep?token={TOKEN}").json()
+    assert "DOGE" not in r["coins_recorded"]
+
+
+def test_asking_for_a_coin_records_it_even_if_barely_held(multi_coin, client):
+    r = client.post(f"/api/sweep?coin=DOGE&token={TOKEN}").json()
+    assert "DOGE" in r["coins_recorded"]
+
+
+def test_asking_for_a_symbol_the_exchange_does_not_list_says_so(multi_coin, client):
+    r = client.post(f"/api/sweep?coin=NOTACOIN&token={TOKEN}").json()
+    assert "NOTACOIN" not in r["coins_recorded"]
+    assert "no mid price" in r["warning"]
+    assert r["coins_recorded"], "the other coins must still be recorded"
+
+
+def test_a_held_but_unrecorded_coin_warns_about_the_universe(multi_coin, client):
+    """HYPE is listed on the exchange but none of these wallets hold it. The
+    fix is the wallet universe, so the message has to say that."""
+    r = client.post(f"/api/sweep?coin=HYPE&token={TOKEN}").json()
+    assert "HYPE" in r["coins_recorded"]     # it is a real market, so recorded
+    assert "hold" in r["warning"]
+
+
+def test_other_coins_are_readable_after_one_sweep(multi_coin, client):
+    client.post(f"/api/sweep?coin=BTC&token={TOKEN}")
+    for c in ("ETH", "SOL"):
+        d = client.get(f"/api/consensus?coin={c}&token={TOKEN}").json()
+        assert "error" not in d, f"{c} should have data after a single sweep"
+        assert d["n_traders"] > 0
+
+
+def test_coins_endpoint_separates_having_data_from_being_configured(multi_coin, client):
+    client.post(f"/api/sweep?token={TOKEN}")
+    d = client.get(f"/api/coins?token={TOKEN}").json()
+    names = [r["coin"] for r in d["with_data"]]
+    assert "SOL" in names
+    assert "BTC" in d["configured"]
+
+
+def test_empty_coin_message_names_what_does_have_data(multi_coin, client):
+    client.post(f"/api/sweep?token={TOKEN}")
+    d = client.get(f"/api/map?coin=XRP&token={TOKEN}").json()
+    assert "No data for XRP" in d["error"]
+    assert "BTC" in d["error"]              # tells you where to look instead

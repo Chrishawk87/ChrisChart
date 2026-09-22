@@ -133,7 +133,8 @@ class Runtime:
 
     # -- bootstrapping a wallet universe -----------------------------------
 
-    def start_harvest(self, minutes: float, then_sweep: bool = True) -> dict[str, Any]:
+    def start_harvest(self, minutes: float, then_sweep: bool = True,
+                      coins: list[str] | None = None) -> dict[str, Any]:
         """Listen to the public trade feed and collect addresses.
 
         Without this the first deploy is a dead end: no wallets means no
@@ -152,14 +153,21 @@ class Runtime:
                     "error": "a harvest is already running"}
 
         cfg = self.settings()
+        # Which tapes to listen to. Discovery is per-coin: a wallet only turns
+        # up if it trades a coin you subscribed to. Listening only to BTC
+        # finds BTC traders, which is why a universe built that way looks
+        # empty on everything else — their other positions do come back in the
+        # sweep, but a trader who only trades SOL is never found at all.
+        listen = [c.strip().upper() for c in (coins or cfg.coins) if c.strip()]
         self.harvest.update({"running": True, "found": 0, "error": None,
                              "finished": None, "minutes": minutes,
+                             "coins": listen,
                              "started": datetime.now(timezone.utc).isoformat()})
 
         def run() -> None:
             try:
                 from .hl import TradeHarvester
-                h = TradeHarvester(cfg.coins, min_notional=cfg.min_wallet_notional)
+                h = TradeHarvester(listen, min_notional=cfg.min_wallet_notional)
                 h.run(seconds=minutes * 60,
                       on_progress=lambda n: self.harvest.update({"found": n}))
 
@@ -168,11 +176,12 @@ class Runtime:
                 self.harvest.update({"found": len(wallets)})
 
                 if then_sweep and wallets:
-                    for coin in cfg.coins:
-                        try:
-                            self.sweep(coin)
-                        except Exception as exc:
-                            self.last_error = f"post-harvest sweep {coin}: {exc}"
+                    # One sweep now covers every coin these wallets hold, so
+                    # the old per-coin loop would just re-read all of them.
+                    try:
+                        self.sweep()
+                    except Exception as exc:
+                        self.last_error = f"post-harvest sweep: {exc}"
             except Exception as exc:
                 self.harvest["error"] = str(exc)
                 self.last_error = f"harvest: {exc}"
@@ -236,8 +245,27 @@ class Runtime:
 
     # -- the actual work ---------------------------------------------------
 
-    def sweep(self, coin: str) -> dict[str, Any]:
-        """One sweep: prices, positions, map, change detection.
+    # Below this many positions a coin is not worth its own sweep row. The
+    # requested and configured coins are recorded regardless of this.
+    MIN_POSITIONS_FOR_COIN = 3
+    # Bound on how many coins one sweep records, so a single read cannot write
+    # a hundred sweep rows into the volume.
+    MAX_COINS_PER_SWEEP = 25
+
+    def sweep(self, coin: str | None = None) -> dict[str, Any]:
+        """One sweep: prices, positions, maps, change detection — for EVERY
+        coin the wallets are holding, not just one.
+
+        `clearinghouseState` returns a wallet's entire portfolio in a single
+        weight-2 call. The original version threw away everything except the
+        one coin it was asked about, so getting a second coin meant reading
+        all 600 wallets a second time for data already in hand. That is why
+        only BTC ever had anything in it: whichever coin you asked for got
+        recorded and the rest of the response was discarded.
+
+        Now one read populates all of them. Same API cost as before, and
+        asking for a coin nobody holds tells you that instead of silently
+        recording nothing.
 
         Serialised behind a lock. Two concurrent sweeps would both consume the
         same rate-limit budget and each end up with a partial picture.
@@ -254,36 +282,144 @@ class Runtime:
             from .hl import sweep_positions
 
             client = self.client()
-            mids = client.all_mids()
-            spot = mids.get(coin)
-            if not spot:
-                raise RuntimeError(f"no mid price for {coin}")
-
-            self.store().log_price(coin, spot)
-
+            # Mids from every perp DEX, not just the canonical crypto one.
+            # Without this, gold, oil, FX and the stock perps have no price,
+            # get skipped as unlisted, and look like markets nobody trades.
+            try:
+                mids = client.all_mids_everywhere()
+            except Exception as exc:
+                self.last_error = f"multi-dex mids failed, using canonical: {exc}"
+                mids = client.all_mids()
             positions, failed = sweep_positions(client, wallets[:cfg.wallet_limit])
-            sweep_id, changes = self.history.record_sweep(coin, spot, positions)
-            self.last_sweep[coin] = datetime.now(timezone.utc).isoformat()
 
-            notable = [c for c in changes if c.kind != "HELD"]
-            return {
-                "coin": coin,
-                "spot": spot,
-                "sweep_id": sweep_id,
+            held: dict[str, int] = {}
+            for p in positions:
+                if p.szi:
+                    held[p.coin] = held.get(p.coin, 0) + 1
+
+            asked = coin.upper() if coin else None
+            # Order matters: what you asked for first, then what you configured,
+            # then whatever else the wallets actually hold, busiest first.
+            wanted: list[str] = []
+            for c in ([asked] if asked else []) + list(cfg.coins) + \
+                    sorted(held, key=lambda c: -held[c]):
+                if c and c not in wanted:
+                    if (c == asked or c in cfg.coins
+                            or held.get(c, 0) >= self.MIN_POSITIONS_FOR_COIN):
+                        wanted.append(c)
+                if len(wanted) >= self.MAX_COINS_PER_SWEEP:
+                    break
+
+            recorded: list[dict[str, Any]] = []
+            skipped: list[dict[str, str]] = []
+            stamp = datetime.now(timezone.utc).isoformat()
+
+            for c in wanted:
+                spot = mids.get(c)
+                if not spot:
+                    skipped.append({"coin": c, "why": "no mid price on the exchange"})
+                    continue
+                self.store().log_price(c, spot)
+                sweep_id, changes = self.history.record_sweep(c, spot, positions)
+                self.last_sweep[c] = stamp
+                notable = [ch for ch in changes if ch.kind != "HELD"]
+                recorded.append({
+                    "coin": c, "spot": spot, "sweep_id": sweep_id,
+                    "positions": held.get(c, 0),
+                    "changes": len(notable),
+                    "defended": len([ch for ch in notable if ch.kind == "DEFENDED"]),
+                    "liquidated": len([ch for ch in notable if ch.kind == "LIQUIDATED"]),
+                })
+
+            primary = next((r for r in recorded if r["coin"] == asked),
+                           recorded[0] if recorded else {})
+            out = {
                 "wallets_swept": len(wallets[:cfg.wallet_limit]),
                 "wallets_failed": failed,
-                "positions": len([p for p in positions if p.coin == coin]),
-                "changes": len(notable),
-                "defended": len([c for c in notable if c.kind == "DEFENDED"]),
-                "liquidated": len([c for c in notable if c.kind == "LIQUIDATED"]),
+                "coins_recorded": [r["coin"] for r in recorded],
+                "per_coin": recorded,
+                "skipped": skipped,
+                **primary,
             }
+            if asked and asked not in [r["coin"] for r in recorded]:
+                out["warning"] = (
+                    f"{asked} was swept but nothing was recorded for it — "
+                    f"{'the exchange has no mid price for that symbol' if asked not in mids else 'none of your wallets hold it'}. "
+                    f"Coins with data: {', '.join(r['coin'] for r in recorded) or 'none'}.")
+            elif asked and not held.get(asked):
+                out["warning"] = (
+                    f"None of your {len(wallets[:cfg.wallet_limit])} wallets hold "
+                    f"{asked} right now. Harvest for longer, or lower the minimum "
+                    f"wallet size in Settings so smaller {asked} traders get picked up.")
+            return out
+
+    def resolve_symbol(self, typed: str) -> tuple[str, list[str]]:
+        """Turn what someone typed into a symbol that exists.
+
+        HIP-3 markets are namespaced `dex:COIN`, so the gold perp is something
+        like `vntl:GOLD`, not `GOLD`. Nobody is going to type that, and typing
+        `GOLD` finding nothing is the single most confusing thing this app can
+        do — it looks like an empty market rather than a near miss.
+
+        Returns (best match, all candidates). Several builders can list the
+        same ticker, so an ambiguous match returns every one rather than
+        silently picking.
+        """
+        typed = typed.strip()
+        if not typed:
+            return "", []
+
+        known = [r["coin"] for r in self.history.coins_with_data()]
+        upper = typed.upper()
+
+        for k in known:                                   # exact, case-aware
+            if k.upper() == upper:
+                return k, [k]
+
+        from .hl import split_symbol
+        matches = [k for k in known if split_symbol(k)[1].upper() == upper]
+        if matches:
+            return matches[0], matches
+        return typed.upper(), []
+
+    def no_data_reason(self, coin: str) -> str:
+        """Why this coin is empty, and what to do about it.
+
+        "No sweep recorded yet" is true for a coin you never configured, a
+        coin nobody holds, and a service that has never swept at all — three
+        different problems with three different fixes, and the bare message
+        sends you looking in the wrong place for two of them.
+        """
+        have = [r["coin"] for r in self.history.coins_with_data()]
+        if not have:
+            return ("Nothing has been swept yet. Click Harvest wallets to "
+                    "collect a universe, then Sweep now.")
+
+        # A near miss is far more likely than a missing market: the HIP-3
+        # perps are namespaced, so "GOLD" is really "vntl:GOLD" or similar.
+        _, candidates = self.resolve_symbol(coin)
+        if candidates:
+            return (f"{coin} is listed as {', '.join(candidates)} — those are "
+                    f"builder-deployed markets, so the venue is part of the "
+                    f"symbol. Use the full name.")
+
+        cfg = self.settings()
+        others = ", ".join(have[:8])
+        if coin in cfg.coins:
+            return (f"{coin} is configured but has no positions recorded. None "
+                    f"of your wallets are holding it, or the last sweep missed "
+                    f"it. Coins with data right now: {others}.")
+        return (f"No data for {coin}. Your wallets are holding {others}. "
+                f"Run a sweep — one read records every coin they hold — or add "
+                f"{coin} to the coin list in Settings so it is always included.")
 
     def maps(self, coin: str) -> dict[str, Any]:
         """Both maps from the most recent stored sweep."""
         cfg = self.settings()
+        coin = self.resolve_symbol(coin)[0] or coin
         latest = self.history.latest_sweep_positions(coin)
         if not latest:
-            return {"coin": coin, "error": "no sweep recorded yet"}
+            return {"coin": coin, "error": self.no_data_reason(coin)}
 
         sweep_id, positions = latest
         meta = next((s for s in self.history.sweeps(coin, limit=1)), {})
@@ -390,11 +526,10 @@ def _worker_loop(rt: Runtime) -> None:
 
             if now - last_sweep >= cfg.sweep_interval_minutes * 60:
                 last_sweep = now
-                for coin in cfg.coins:
-                    try:
-                        rt.sweep(coin)
-                    except Exception as exc:
-                        rt.last_error = f"sweep {coin}: {exc}"
+                try:
+                    rt.sweep()          # one read, every coin
+                except Exception as exc:
+                    rt.last_error = f"sweep: {exc}"
 
             time.sleep(5)
         except Exception:
@@ -496,10 +631,10 @@ def create_app() -> FastAPI:
     @app.get("/api/positions", dependencies=[Depends(require_token)])
     def api_positions(coin: str = "BTC", top: int = 50) -> dict[str, Any]:
         cfg = rt.settings()
-        coin = coin.upper()
+        coin = rt.resolve_symbol(coin)[0] or coin.upper()
         latest = rt.history.latest_sweep_positions(coin)
         if not latest:
-            return {"coin": coin, "error": "no sweep recorded yet"}
+            return {"coin": coin, "error": rt.no_data_reason(coin)}
 
         _, positions = latest
         meta = next((s for s in rt.history.sweeps(coin, limit=1)), {})
@@ -536,10 +671,10 @@ def create_app() -> FastAPI:
                       min_account: float = 0.0) -> dict[str, Any]:
         """Who is positioned which way, among traders currently in profit."""
         cfg = rt.settings()
-        coin = coin.upper()
+        coin = rt.resolve_symbol(coin)[0] or coin.upper()
         latest = rt.history.latest_sweep_positions(coin)
         if not latest:
-            return {"coin": coin, "error": "no sweep recorded yet"}
+            return {"coin": coin, "error": rt.no_data_reason(coin)}
 
         _, positions = latest
         meta = next((s for s in rt.history.sweeps(coin, limit=1)), {})
@@ -704,24 +839,68 @@ def create_app() -> FastAPI:
         return out
 
     @app.post("/api/harvest", dependencies=[Depends(require_token)])
-    def post_harvest(minutes: float = 5.0,
-                     then_sweep: bool = True) -> JSONResponse:
+    def post_harvest(minutes: float = 5.0, then_sweep: bool = True,
+                     coins: str = "") -> JSONResponse:
         """Collect a wallet universe off the trade feed.
 
         Five minutes is enough to see the thing work. A real universe wants
         an hour or more -- the longer it listens, the more of the large
         participants it catches, and those are the ones whose liquidations
         matter.
+
+        `coins` is a comma-separated list of tapes to listen to, defaulting to
+        the configured coins. Discovery only sees wallets that trade a coin you
+        subscribed to, so this is what decides which markets your universe can
+        ever cover.
         """
-        result = rt.start_harvest(min(max(minutes, 0.5), 180.0), then_sweep)
+        want = [c for c in (coins or "").upper().split(",") if c.strip()]
+        result = rt.start_harvest(min(max(minutes, 0.5), 180.0), then_sweep,
+                                  coins=want or None)
         return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
     @app.post("/api/sweep", dependencies=[Depends(require_token)])
-    def post_sweep(coin: str = "BTC") -> JSONResponse:
+    def post_sweep(coin: str = "") -> JSONResponse:
+        """Sweep. One wallet read records every coin they hold; passing a coin
+        only decides which one comes back as the headline."""
         try:
-            return JSONResponse({"ok": True, **rt.sweep(coin.upper())})
+            return JSONResponse({"ok": True, **rt.sweep(coin.upper() or None)})
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    @app.get("/api/coins", dependencies=[Depends(require_token)])
+    def api_coins() -> dict[str, Any]:
+        """Which markets actually have data, and which are merely configured."""
+        from .hl import split_symbol
+
+        cfg = rt.settings()
+        have = rt.history.coins_with_data()
+        names = [r["coin"] for r in have]
+        for r in have:
+            dex, base = split_symbol(r["coin"])
+            r["dex"] = dex
+            r["base"] = base
+            # HIP-3 markets are oracle-priced synthetics on a builder's own
+            # book. They are NOT the underlying futures market, and their
+            # liquidity is a fraction of it.
+            r["hip3"] = bool(dex)
+        return {
+            "configured": cfg.coins,
+            "with_data": have,
+            "never_swept": [c for c in cfg.coins if c not in names],
+        }
+
+    @app.get("/api/dexes", dependencies=[Depends(require_token)])
+    def api_dexes() -> dict[str, Any]:
+        """Which perp DEXes this service can see.
+
+        If this returns only the canonical DEX, every non-crypto market is
+        invisible to the sweep and that is why they look empty.
+        """
+        try:
+            return {"dexes": rt.client().perp_dexs(),
+                    "check": rt.client().check_dexes()}
+        except Exception as exc:
+            return {"dexes": [], "error": str(exc)}
 
     @app.post("/api/resolve", dependencies=[Depends(require_token)])
     def post_resolve(horizon: float | None = None,
@@ -837,16 +1016,23 @@ DASHBOARD = """<!doctype html>
 
   <div class="bar">
     <input type="password" id="tok" placeholder="access token">
-    <input id="coin" value="BTC" size="6">
+    <input id="coin" value="BTC" size="12" list="coinList" onchange="showVenueNote()"
+           title="any perp symbol — crypto, or a HIP-3 market like vntl:GOLD">
+    <datalist id="coinList"></datalist>
     <button class="go" onclick="loadAll()">Load</button>
     <button onclick="doHarvest()">Harvest wallets</button>
     <input id="hmin" type="number" value="5" min="1" max="180" step="1"
            title="minutes to listen to the trade feed" style="width:62px">
     <span class="msg" style="margin-right:6px">min</span>
+    <input id="hcoins" size="18" placeholder="tapes: BTC,ETH,SOL"
+           title="which markets to listen to for wallet discovery — blank uses your configured coins">
+
     <button onclick="doSweep()">Sweep now</button>
     <button onclick="doResolve()">Resolve</button>
     <span id="msg" class="msg"></span>
   </div>
+
+  <div id="venueNote" class="say" style="display:none;margin-bottom:14px"></div>
 
   <div class="grid">
     <div class="panel full" id="conPanel"><h2>Who is winning, and which way</h2>
@@ -934,8 +1120,8 @@ function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (
 async function loadAll() {
   note('loading…');
   try {
-    await Promise.all([loadStatus(), loadConsensus(), loadLiquidity(), loadMap(),
-                       loadChanges(), loadPositions(), loadReport()]);
+    await Promise.all([loadStatus(), loadCoins(), loadConsensus(), loadLiquidity(),
+                       loadMap(), loadChanges(), loadPositions(), loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
   } catch (e) { note(e.message, true); }
 }
@@ -952,7 +1138,10 @@ async function doHarvest() {
 
   note('starting harvest…');
   try {
-    const r = await api('/api/harvest?minutes=' + encodeURIComponent(mins) + '&then_sweep=true',
+    const tapes = (($('hcoins') && $('hcoins').value) || '').trim();
+    const r = await api('/api/harvest?minutes=' + encodeURIComponent(mins)
+                        + '&then_sweep=true'
+                        + (tapes ? '&coins=' + encodeURIComponent(tapes) : ''),
                         {method: 'POST'});
     if (!r || r.ok === false) { note('could not start: ' + ((r && r.error) || 'unknown'), true); return; }
     note(`harvesting for ${mins} min — watching the trade feed…`);
@@ -1263,10 +1452,47 @@ async function doSweep() {
   note('sweeping — this takes a while at the rate limit…');
   try {
     const r = await api('/api/sweep?coin=' + coin(), {method: 'POST'});
-    note(r.ok ? `swept ${r.positions} positions, ${r.changes} changes (${r.defended} defended, ${r.liquidated} liquidated)`
-              : r.error, !r.ok);
-    if (r.ok) loadAll();
+    if (!r.ok) { note(r.error, true); return; }
+    const coins = r.coins_recorded || [];
+    note(`${coin()}: ${r.positions || 0} positions, ${r.changes || 0} changes `
+         + `(${r.defended || 0} defended, ${r.liquidated || 0} liquidated) · `
+         + `also recorded ${coins.length} coin${coins.length === 1 ? '' : 's'}: `
+         + coins.slice(0, 12).join(' '));
+    if (r.warning) note(r.warning, true);
+    loadCoins();
+    loadAll();
   } catch (e) { note(e.message, true); }
+}
+
+let hip3Markets = {};
+
+async function loadCoins() {
+  try {
+    const d = await api('/api/coins');
+    const rows = d.with_data || [];
+    hip3Markets = {};
+    rows.forEach(r => { if (r.hip3) hip3Markets[r.coin] = r.dex; });
+    const have = rows.map(r => r.coin);
+    $('coinList').innerHTML = rows.map(r =>
+        `<option value="${r.coin}">${r.hip3 ? r.base + ' · ' + r.dex : r.base}</option>`)
+      .concat((d.configured || []).filter(c => have.indexOf(c) === -1)
+              .map(c => `<option value="${c}">`)).join('');
+    showVenueNote();
+  } catch (e) { /* the coin box still works as free text */ }
+}
+
+function showVenueNote() {
+  const el = $('venueNote');
+  if (!el) return;
+  const dex = hip3Markets[coin()];
+  if (!dex) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  el.innerHTML = `<b>${coin()}</b> is a builder-deployed market on <b>${dex}</b>, `
+    + 'priced against an oracle rather than matched on the underlying exchange. '
+    + 'The book here is this venue’s own and is far thinner than the futures '
+    + 'market it tracks — depth, slippage and absorption describe THIS venue, '
+    + 'not COMEX or CME. Oracle dislocations and flash moves have happened on '
+    + 'these markets.';
 }
 
 async function doResolve() {

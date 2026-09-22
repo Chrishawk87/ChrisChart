@@ -265,6 +265,19 @@ class History:
         params.append(limit)
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
+    def coins_with_data(self) -> list[dict[str, Any]]:
+        """Every coin that has at least one recorded sweep, newest first.
+
+        The dashboard needs this to tell the difference between "that coin is
+        quiet" and "that coin has never been swept", which look identical from
+        an empty panel and have completely different fixes.
+        """
+        rows = self._conn.execute(
+            """SELECT coin, COUNT(*) AS sweeps, MAX(ts) AS last_ts,
+                      SUM(n_positions) AS positions
+               FROM sweeps GROUP BY coin ORDER BY last_ts DESC""").fetchall()
+        return [dict(r) for r in rows]
+
     def counts(self) -> dict[str, int]:
         def one(sql: str) -> int:
             return int(self._conn.execute(sql).fetchone()[0])

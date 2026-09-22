@@ -33,7 +33,7 @@ import json
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, Sequence
 
 import requests
@@ -130,8 +130,11 @@ class InfoClient:
 
     # -- endpoints --------------------------------------------------------
 
-    def all_mids(self) -> dict[str, float]:
-        raw = self.post({"type": "allMids"})
+    def all_mids(self, dex: str = "") -> dict[str, float]:
+        body: dict[str, Any] = {"type": "allMids"}
+        if dex:
+            body["dex"] = dex
+        raw = self.post(body)
         out = {}
         for k, v in (raw or {}).items():
             try:
@@ -140,8 +143,75 @@ class InfoClient:
                 continue
         return out
 
-    def clearinghouse_state(self, wallet: str) -> dict:
-        return self.post({"type": "clearinghouseState", "user": wallet})
+    def all_mids_everywhere(self, dexes: Sequence[str] | None = None
+                            ) -> dict[str, float]:
+        """Mids for the canonical perps AND every HIP-3 DEX.
+
+        HIP-3 symbols come back namespaced as `dex:COIN` so two builders can
+        both list GOLD without colliding. A plain `allMids` returns only the
+        canonical crypto markets, which is why gold, oil, FX and the stock
+        perps look like they do not exist: the sweep asks for a mid, gets
+        nothing, and skips the market as unlisted.
+
+        One DEX failing does not stop the others.
+        """
+        out = dict(self.all_mids())
+        if dexes is None:
+            try:
+                dexes = [d["name"] for d in self.perp_dexs() if d["name"]]
+            except HyperliquidError:
+                return out
+
+        for name in dexes:
+            try:
+                for coin, px in self.all_mids(name).items():
+                    out[coin if ":" in coin else join_symbol(name, coin)] = px
+            except HyperliquidError:
+                continue
+        return out
+
+    def clearinghouse_state(self, wallet: str, dex: str = "") -> dict:
+        """One wallet's perp state.
+
+        `dex` selects which perp DEX. Empty string is the canonical Hyperliquid
+        perps -- the crypto majors. HIP-3 builder-deployed DEXes, which is
+        where gold, oil, FX, the index and single-stock perps live, each have
+        their own name. "ALL_DEXES" asks for every one of them at once.
+        """
+        body = {"type": "clearinghouseState", "user": wallet}
+        if dex:
+            body["dex"] = dex
+        return self.post(body)
+
+    def perp_dexs(self) -> list[dict]:
+        """Every perp DEX on the exchange.
+
+        The canonical crypto DEX usually comes back as a null entry or under
+        the name "native"; HIP-3 DEXes are named. Shapes differ between
+        documentation sources, so this normalises to a list of dicts with at
+        least a `name`.
+        """
+        raw = self.post({"type": "perpDexs"})
+        out: list[dict] = []
+        for entry in raw or []:
+            if entry is None:
+                out.append({"name": "", "full_name": "Hyperliquid perps",
+                            "native": True})
+                continue
+            if isinstance(entry, str):
+                out.append({"name": entry, "full_name": entry, "native": False})
+                continue
+            if isinstance(entry, dict):
+                name = str(entry.get("name") or entry.get("dex") or "")
+                out.append({
+                    "name": name,
+                    "full_name": str(entry.get("fullName")
+                                     or entry.get("full_name") or name),
+                    "deployer": entry.get("deployer"),
+                    "oracle_updater": entry.get("oracleUpdater"),
+                    "native": not name,
+                })
+        return out
 
     def l2_book(self, coin: str) -> dict:
         return self.post({"type": "l2Book", "coin": coin})
@@ -158,6 +228,29 @@ class InfoClient:
             return "allMids returned nothing -- endpoint or shape has changed"
         sample = ", ".join(f"{k}={v:,.4f}" for k, v in list(mids.items())[:3])
         return f"ok -- {len(mids)} markets. {sample}"
+
+    def check_dexes(self) -> str:
+        """Third smoke test: what markets can this account actually see.
+
+        The canonical perp DEX carries the crypto majors and nothing else.
+        Gold, oil, FX, the index perps and the single stocks are HIP-3
+        builder-deployed markets on SEPARATE perp DEXes, and a
+        `clearinghouseState` call without a `dex` never returns any of them.
+        That is not an empty market, it is a query pointed at the wrong venue,
+        and the two are indistinguishable from the dashboard.
+        """
+        try:
+            dexes = self.perp_dexs()
+        except HyperliquidError as exc:
+            return (f"perpDexs failed ({exc}). This build can still read the "
+                    f"canonical crypto perps; HIP-3 markets will be invisible.")
+        if not dexes:
+            return "perpDexs returned nothing -- only canonical perps available"
+
+        named = [d["name"] for d in dexes if d["name"]]
+        return (f"ok -- {len(dexes)} perp DEXes. canonical + "
+                f"{len(named)} HIP-3: {', '.join(named[:12])}"
+                + (" …" if len(named) > 12 else ""))
 
     def check_book(self, coin: str = "BTC") -> str:
         """Second smoke test, for the liquidity side.
@@ -299,33 +392,108 @@ class TradeHarvester:
 # position sweeping
 # --------------------------------------------------------------------------
 
+def split_symbol(coin: str) -> tuple[str, str]:
+    """`"para:CRDO"` -> `("para", "CRDO")`; `"BTC"` -> `("", "BTC")`.
+
+    HIP-3 namespaces every asset as `{dex}:{coin}` so two builders can list
+    the same ticker without colliding. Two deployers can both list GOLD.
+    """
+    if ":" in coin:
+        dex, _, base = coin.partition(":")
+        return dex, base
+    return "", coin
+
+
+def join_symbol(dex: str, coin: str) -> str:
+    return f"{dex}:{coin}" if dex else coin
+
+
+def positions_from_state(wallet: str, payload: Any) -> list:
+    """Parse a `clearinghouseState` response in either shape.
+
+    A single-DEX call returns the flat object with `assetPositions` and
+    `marginSummary`. An ALL_DEXES call returns a mapping of DEX name to that
+    object, with the canonical perps under "native".
+
+    Which shape you get back is not something this code can know in advance,
+    and guessing wrong loses every position silently rather than raising. So
+    it detects instead: if the payload has `assetPositions` it is flat, and
+    otherwise anything that looks like a state object is parsed and its
+    symbols namespaced by the key it arrived under.
+    """
+    from .bucket import Position, parse_clearinghouse_state
+
+    if not isinstance(payload, dict):
+        return []
+
+    if "assetPositions" in payload or "marginSummary" in payload:
+        return parse_clearinghouse_state(wallet, payload)
+
+    out: list[Position] = []
+    for key, sub in payload.items():
+        if not isinstance(sub, dict):
+            continue
+        if "assetPositions" not in sub and "marginSummary" not in sub:
+            continue
+        dex = "" if key in ("native", "", None) else str(key)
+        for p in parse_clearinghouse_state(wallet, sub):
+            # Namespace the symbol unless the venue already did it, so a GOLD
+            # on one builder's DEX never merges with a GOLD on another's.
+            if dex and ":" not in p.coin:
+                p = replace(p, coin=join_symbol(dex, p.coin))
+            out.append(p)
+    return out
+
+
 def sweep_positions(client: InfoClient, wallets: Iterable[str],
-                    on_progress: Callable[[int, int], None] | None = None
-                    ) -> tuple[list, int]:
-    """Pull open positions for each wallet.
+                    on_progress: Callable[[int, int], None] | None = None,
+                    dex: str = "ALL_DEXES") -> tuple[list, int]:
+    """Pull open positions for each wallet, across every perp DEX.
 
     Returns (positions, wallets_failed). A failed wallet is skipped rather
     than aborting the sweep -- a map missing one address is fine, a map that
     never completes is not.
 
+    `dex` defaults to ALL_DEXES so gold, oil, FX, index and stock perps come
+    back alongside the crypto majors. If the exchange rejects that (older
+    node, or the parameter is not supported on this endpoint), it falls back
+    to the canonical DEX once and stays there rather than failing every
+    wallet in turn.
+
     At weight 2 per call against a 1200/minute budget this runs at roughly 600
     wallets per minute, so a 5,000-wallet universe takes about eight minutes.
+    A wildcard call may cost more than a single-DEX one; if sweeps start
+    getting throttled, that is the first thing to suspect.
     """
-    from .bucket import parse_clearinghouse_state
-
     wallets = list(wallets)
     positions = []
     failed = 0
+    use_dex = dex
 
     for i, w in enumerate(wallets):
         try:
-            positions.extend(parse_clearinghouse_state(w, client.clearinghouse_state(w)))
-        except HyperliquidError:
+            positions.extend(
+                positions_from_state(w, client.clearinghouse_state(w, use_dex)))
+        except HyperliquidError as exc:
+            if use_dex and _looks_like_bad_dex(exc):
+                # One retry, then give up on the wildcard for the whole sweep.
+                use_dex = ""
+                try:
+                    positions.extend(
+                        positions_from_state(w, client.clearinghouse_state(w, "")))
+                    continue
+                except HyperliquidError:
+                    pass
             failed += 1
         if on_progress and (i + 1) % 100 == 0:
             on_progress(i + 1, len(wallets))
 
     return positions, failed
+
+
+def _looks_like_bad_dex(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(s in text for s in ("dex", "unknown field", "invalid", "400"))
 
 
 # --------------------------------------------------------------------------
