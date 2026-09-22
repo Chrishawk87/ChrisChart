@@ -37,6 +37,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
+from . import consensus as consensus_mod
 from .bucket import build_map, render
 from .history import History, render_changes
 from .settings import Settings, SettingsStore, default_db_path
@@ -471,6 +472,59 @@ def create_app() -> FastAPI:
                     "fragility": s.fragility(),
                 } for s in scored]}
 
+    @app.get("/api/consensus", dependencies=[Depends(require_token)])
+    def api_consensus(coin: str = "BTC", winners_only: bool = True,
+                      min_notional: float = 0.0,
+                      min_account: float = 0.0) -> dict[str, Any]:
+        """Who is positioned which way, among traders currently in profit."""
+        cfg = rt.settings()
+        coin = coin.upper()
+        latest = rt.history.latest_sweep_positions(coin)
+        if not latest:
+            return {"coin": coin, "error": "no sweep recorded yet"}
+
+        _, positions = latest
+        meta = next((s for s in rt.history.sweeps(coin, limit=1)), {})
+        spot = float(meta.get("spot") or 0)
+        if spot <= 0:
+            return {"coin": coin, "error": "sweep has no spot price"}
+
+        v = consensus_mod.build(
+            positions, coin, spot, cfg.sigma_per_min, cfg.horizon_minutes,
+            min_notional=min_notional, min_account=min_account,
+            winners_only=winners_only)
+
+        return {
+            "coin": coin, "spot": spot, "as_of": meta.get("ts"),
+            "direction": v.direction,
+            "strength": v.strength,
+            "agreement": v.agreement,
+            "n_traders": v.n_traders,
+            "n_winning": v.n_winning,
+            "n_losing": v.n_losing,
+            "long_notional": v.long_notional,
+            "short_notional": v.short_notional,
+            "winning_long_notional": v.winning_long_notional,
+            "winning_short_notional": v.winning_short_notional,
+            "avg_entry": v.avg_entry,
+            "entry_gap_pct": v.entry_gap_pct,
+            "room_sigmas": v.room_sigmas,
+            "median_leverage": v.median_leverage,
+            "crowded": v.crowded,
+            "late": v.late,
+            "verdict": v.verdict(),
+            "traders": [{
+                "wallet": r.wallet, "side": r.side, "notional": r.notional,
+                "entry": r.entry_px, "unrealized_pnl": r.unrealized_pnl,
+                "return_on_position": r.return_on_position,
+                "account_value": r.account_value, "leverage": r.leverage,
+                "liq_distance_sigmas": r.liq_distance_sigmas,
+                "survivability": r.survivability,
+                "entry_gap_pct": r.entry_gap_pct,
+                "winning": r.winning,
+            } for r in v.rows[:60]],
+        }
+
     @app.get("/api/changes", dependencies=[Depends(require_token)])
     def api_changes(coin: str | None = None, kind: str | None = None,
                     hours: float = 24.0, limit: int = 200) -> dict[str, Any]:
@@ -631,11 +685,33 @@ DASHBOARD = """<!doctype html>
   .kv span:nth-child(odd){color:var(--dim)}
   .kv span:nth-child(even){font-family:var(--mono)}
   .full{grid-column:1/-1}
+  .conbar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:12px;
+          font-size:12px;color:var(--dim)}
+  .conbar label{display:flex;align-items:center;gap:5px}
+  .verdict-big{font-size:26px;font-weight:700;letter-spacing:-.02em;margin-bottom:2px}
+  .verdict-big.long{color:var(--up)}.verdict-big.short{color:var(--down)}
+  .verdict-big.split{color:var(--dim)}
+  .conrow{display:flex;flex-wrap:wrap;gap:8px 26px;align-items:baseline;margin:10px 0}
+  .stat{display:flex;flex-direction:column}
+  .stat b{font-family:var(--mono);font-size:15px;font-weight:700}
+  .stat span{font-size:11px;color:var(--dim)}
+  .gap-bad b{color:var(--down)}
+  .gap-ok b{color:var(--up)}
+  .flag{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;
+        font-weight:700;letter-spacing:.05em;margin-right:6px}
+  .flag.crowded{background:#45241f;color:var(--down)}
+  .flag.late{background:#3e3318;color:var(--accent)}
+  .say{font-size:13px;color:var(--ink);line-height:1.6;margin-top:10px;
+       padding:10px 12px;background:var(--bg);border-radius:4px;
+       border-left:3px solid var(--accent)}
   label{font-size:12px;color:var(--dim);display:block;margin:8px 0 2px}
 </style></head><body>
 <div class="wrap">
   <h1>liqmap</h1>
-  <div class="sub">Liquidation pressure, position strength, and what changed since the last sweep.</div>
+  <div class="sub">Live Hyperliquid positions, read straight from the exchange API.
+    Nothing to paste in — <b>Harvest wallets</b> listens to the public trade feed to find
+    who is active, <b>Sweep now</b> reads every one of their open positions, and the
+    background worker re-sweeps on its own every 30 minutes.</div>
 
   <div class="bar">
     <input type="password" id="tok" placeholder="access token">
@@ -651,6 +727,22 @@ DASHBOARD = """<!doctype html>
   </div>
 
   <div class="grid">
+    <div class="panel full" id="conPanel"><h2>Who is winning, and which way</h2>
+      <div class="msg" style="margin-bottom:8px">Of the wallets holding this coin right now,
+        how much winning money is on each side — and how much worse you would enter than
+        they did.</div>
+      <div class="conbar">
+        <label><input type="checkbox" id="winOnly" checked onchange="loadConsensus()">
+          winners only</label>
+        <label>min position $<input id="minNot" type="number" value="0" step="10000"
+          style="width:96px" onchange="loadConsensus()"></label>
+        <label>min account $<input id="minAcct" type="number" value="0" step="100000"
+          style="width:110px" onchange="loadConsensus()"></label>
+      </div>
+      <div id="consensus" class="msg">—</div>
+      <div id="conTraders"></div>
+    </div>
+
     <div class="panel"><h2>Status</h2><div id="status" class="msg">—</div>
       <div id="firstrun" class="msg"></div></div>
     <div class="panel"><h2>Conviction flow · 24h</h2><div id="flow" class="msg">—</div></div>
@@ -697,7 +789,8 @@ function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (
 async function loadAll() {
   note('loading…');
   try {
-    await Promise.all([loadStatus(), loadMap(), loadChanges(), loadPositions(), loadReport()]);
+    await Promise.all([loadStatus(), loadConsensus(), loadMap(), loadChanges(),
+                       loadPositions(), loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
   } catch (e) { note(e.message, true); }
 }
@@ -807,6 +900,58 @@ async function saveSettings() {
     note(r.ok ? 'settings saved' : 'rejected: ' + (r.problems || []).join('; '), !r.ok);
     if (r.ok) loadStatus();
   } catch (e) { note(e.message, true); }
+}
+
+async function loadConsensus() {
+  const wo = $('winOnly').checked;
+  const mn = parseFloat($('minNot').value || '0') || 0;
+  const ma = parseFloat($('minAcct').value || '0') || 0;
+  let d;
+  try {
+    d = await api('/api/consensus?coin=' + coin() + '&winners_only=' + wo
+                  + '&min_notional=' + mn + '&min_account=' + ma);
+  } catch (e) { $('consensus').textContent = e.message; return; }
+
+  if (d.error) { $('consensus').textContent = d.error; $('conTraders').innerHTML = ''; return; }
+
+  const gapBad = d.entry_gap_pct > 0.005;
+  const flags = (d.crowded ? '<span class="flag crowded">CROWDED</span>' : '')
+              + (d.late ? '<span class="flag late">LATE ENTRY</span>' : '');
+
+  $('consensus').innerHTML =
+      `<div class="verdict-big ${d.direction}">${d.direction.toUpperCase()}`
+    + `<span style="font-size:15px;color:var(--dim);font-weight:400"> `
+    + `&nbsp;${(d.strength*100).toFixed(0)}% of winning size</span></div>`
+    + `<div style="font-size:12px;color:var(--dim)">${flags}`
+    + `${d.n_winning} winning · ${d.n_losing} losing · ${d.n_traders} tracked</div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${money(d.winning_long_notional)}</b><span>winning long</span></div>`
+    + `<div class="stat"><b>${money(d.winning_short_notional)}</b><span>winning short</span></div>`
+    + `<div class="stat"><b>${Number(d.avg_entry).toLocaleString(undefined,{maximumFractionDigits:2})}</b><span>their avg entry</span></div>`
+    + `<div class="stat ${gapBad ? 'gap-bad' : 'gap-ok'}"><b>${(d.entry_gap_pct*100).toFixed(2)}%</b>`
+    + `<span>${gapBad ? 'WORSE than their entry' : 'your entry gap'}</span></div>`
+    + `<div class="stat"><b>${Number(d.room_sigmas).toFixed(1)}sd</b><span>room before liq</span></div>`
+    + `<div class="stat"><b>${Number(d.median_leverage).toFixed(0)}x</b><span>median leverage</span></div>`
+    + '</div>'
+    + `<div class="say">${d.verdict}</div>`;
+
+  const rows = (d.traders || []).filter(t => !wo || t.winning);
+  $('conTraders').innerHTML = !rows.length ? '' :
+    '<table style="margin-top:14px"><tr><th>wallet</th><th>side</th>'
+    + '<th class="r">size</th><th class="r">entry</th><th class="r">your gap</th>'
+    + '<th class="r">uPnL</th><th class="r">return</th><th class="r">room</th>'
+    + '<th class="r">lev</th></tr>'
+    + rows.slice(0,25).map(t => `<tr>
+        <td>${t.wallet.slice(0,10)}…</td>
+        <td class="${t.side}">${t.side}</td>
+        <td class="r">${money(t.notional)}</td>
+        <td class="r">${Number(t.entry).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+        <td class="r ${t.entry_gap_pct > 0.005 ? 'short' : 'long'}">${(t.entry_gap_pct*100).toFixed(2)}%</td>
+        <td class="r ${t.unrealized_pnl >= 0 ? 'long' : 'short'}">${money(t.unrealized_pnl)}</td>
+        <td class="r">${(t.return_on_position*100).toFixed(1)}%</td>
+        <td class="r">${t.liq_distance_sigmas.toFixed(1)}sd</td>
+        <td class="r">${Number(t.leverage).toFixed(0)}x</td></tr>`).join('')
+    + '</table>';
 }
 
 async function loadMap() {
