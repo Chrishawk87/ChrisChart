@@ -635,6 +635,7 @@ class LevelWatcher:
         self.ws_url = ws_url
 
         self.last_book = None
+        self.last_book_ts = 0.0
         self.trades_seen = 0
         self.books_seen = 0
         self.errors: list[str] = []
@@ -676,6 +677,7 @@ class LevelWatcher:
         with self._lock:
             self.watch.on_book(b)
             self.last_book = b
+            self.last_book_ts = time.time()
             self.books_seen += 1
 
     def _note(self, msg: str) -> None:
@@ -750,9 +752,13 @@ class LevelWatcher:
             div = self.watch.tape.divergence(self.watch.window_s)
             cvd = self.watch.tape.cvd
 
+        now = time.time()
         out: dict[str, Any] = {
             "coin": self.coin,
             "level": self.watch.level,
+            "book_age_s": (now - self.last_book_ts) if self.last_book_ts else None,
+            "last_trade_age_s": ((now - self.watch.tape.last_ts)
+                                 if self.watch.tape.last_ts else None),
             "trades_seen": self.trades_seen,
             "books_seen": self.books_seen,
             "side_report": self.side_report,

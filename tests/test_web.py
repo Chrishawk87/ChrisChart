@@ -696,3 +696,120 @@ def test_dashboard_carries_the_read_panel(client):
     html = client.get("/").text
     for marker in ("loadRead", "doCalibrate", "Candle read", "toggleReadAuto"):
         assert marker in html
+
+
+# --------------------------------------------------------------------------
+# live price and staleness
+# --------------------------------------------------------------------------
+
+class _NowClient(_CandleClient):
+    def __init__(self, mids=None, mids_fail=False, **kw):
+        super().__init__(**kw)
+        self._mids = mids if mids is not None else {"BTC": 101_234.5}
+        self.mids_fail = mids_fail
+
+    def all_mids_everywhere(self, dexes=None):
+        if self.mids_fail:
+            raise RuntimeError("exchange unreachable")
+        return dict(self._mids)
+
+    def all_mids(self, dex=""):
+        return self.all_mids_everywhere()
+
+
+def test_now_requires_a_token(client):
+    assert client.get("/api/now").status_code == 401
+
+
+def test_now_returns_a_live_price_and_its_age(client):
+    web.runtime()._client = _NowClient()
+    d = client.get(f"/api/now?coin=BTC&token={TOKEN}").json()
+    assert d["spot"] == 101_234.5
+    assert d["spot_age_s"] == 0.0
+    assert d["server_epoch"] > 0
+
+
+def test_now_serves_the_last_known_price_with_its_real_age_when_the_feed_dies(client):
+    """A price that silently stops updating is worse than no price. When the
+    fetch fails the last known value comes back WITH its age attached."""
+    rt = web.runtime()
+    rt._client = _NowClient()
+    client.get(f"/api/now?coin=BTC&token={TOKEN}")          # prime the cache
+
+    rt._client = _NowClient(mids_fail=True)
+    d = client.get(f"/api/now?coin=BTC&token={TOKEN}").json()
+    assert d["spot"] == 101_234.5
+    assert d["spot_age_s"] is not None and d["spot_age_s"] >= 0
+    assert "price fetch failed" in d["spot_error"]
+
+
+def test_now_says_when_a_symbol_has_no_price(client):
+    web.runtime()._client = _NowClient(mids={"ETH": 3000.0})
+    d = client.get(f"/api/now?coin=BTC&token={TOKEN}").json()
+    assert d["spot"] is None
+    assert "no mid price" in d["spot_error"]
+
+
+def test_now_reports_the_age_of_each_panel_source(client):
+    web.runtime()._client = _NowClient()
+    d = client.get(f"/api/now?coin=BTC&token={TOKEN}").json()
+    src = d["sources"]
+    assert set(src) == {"sweep", "book", "watch"}
+    assert src["sweep"]["age_s"] is None          # nothing swept yet
+    assert src["book"]["age_s"] is None
+    assert src["watch"]["running"] is False
+
+
+def test_sweep_age_is_reported_once_something_has_been_swept(multi_coin, client):
+    client.post(f"/api/sweep?coin=BTC&token={TOKEN}")
+    rt = web.runtime()
+    rt._client = _NowClient()
+    d = client.get(f"/api/now?coin=BTC&token={TOKEN}").json()
+    age = d["sources"]["sweep"]["age_s"]
+    assert age is not None and 0 <= age < 60
+
+
+def test_reading_the_book_makes_its_age_real(client):
+    web.runtime()._client = _NowClient()
+    assert client.get(f"/api/now?token={TOKEN}").json()["sources"]["book"]["age_s"] is None
+    client.get(f"/api/liquidity?coin=BTC&size=1000&token={TOKEN}")
+    age = client.get(f"/api/now?token={TOKEN}").json()["sources"]["book"]["age_s"]
+    assert age is not None and age < 60
+
+
+def test_liquidity_stamps_a_freshly_fetched_book_as_current(client):
+    web.runtime()._client = _NowClient()
+    d = client.get(f"/api/liquidity?coin=BTC&size=1000&token={TOKEN}").json()
+    assert d["book_age_s"] == 0.0
+
+
+def test_read_carries_the_live_mid_beside_the_candle_close(client):
+    web.runtime()._client = _NowClient()
+    d = client.get(f"/api/read?coin=BTC&token={TOKEN}").json()
+    assert d["spot"] == 101_234.5
+    assert d["spot_vs_candle_bps"] is not None
+
+
+def test_read_flags_a_candle_that_disagrees_with_the_live_price(client):
+    """Two endpoints, two clocks. If they diverge, one is stale and every
+    signal built on the candle is suspect."""
+    candles = _synthetic_candles()
+    web.runtime()._client = _NowClient(candles=candles,
+                                       mids={"BTC": candles[-1].close * 1.05})
+    d = client.get(f"/api/read?coin=BTC&token={TOKEN}").json()
+    assert d["stale"] is True
+    assert abs(d["spot_vs_candle_bps"]) > 25
+
+
+def test_read_is_not_flagged_stale_when_the_prices_agree(client):
+    candles = _synthetic_candles()
+    web.runtime()._client = _NowClient(candles=candles,
+                                       mids={"BTC": candles[-1].close})
+    d = client.get(f"/api/read?coin=BTC&token={TOKEN}").json()
+    assert d["stale"] is False
+
+
+def test_dashboard_carries_the_ticker(client):
+    html = client.get("/").text
+    for marker in ("loadNow", "paintTicker", "startTicker", "tickPx", "ageText"):
+        assert marker in html

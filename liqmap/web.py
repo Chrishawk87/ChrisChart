@@ -73,6 +73,13 @@ class Runtime:
                                            "level": None, "started": None,
                                            "finished": None, "error": None}
         self._calibrations: dict[tuple[str, str], Any] = {}
+        # Wall-clock stamps for freshness reporting. Every reading on the
+        # dashboard is a snapshot from a poll, not a stream, and a number with
+        # no age on it is indistinguishable from a number that stopped
+        # updating half an hour ago.
+        self.last_price_ts: float = 0.0
+        self.last_price: dict[str, float] = {}
+        self.last_book_ts: float = 0.0
         self._lock = threading.Lock()
         self._client = None
         self._store = None
@@ -354,6 +361,70 @@ class Runtime:
                     f"wallet size in Settings so smaller {asked} traders get picked up.")
             return out
 
+    def now(self, coin: str) -> dict[str, Any]:
+        """Spot price plus how old everything else on the dashboard is.
+
+        This exists because a reading with no price beside it cannot be
+        checked against anything. If the number here does not match the chart
+        you are looking at, nothing else on the page is worth reading, and
+        that should take one glance to establish rather than an investigation.
+
+        Ages are computed HERE, on the server, and the client counts up from
+        when it received them. Computing them in the browser from timestamps
+        means a machine whose clock is a few minutes off reports everything as
+        fresh, or everything as stale, and both are worse than no age at all.
+        """
+        coin = self.resolve_symbol(coin)[0] or coin.upper()
+        now = time.time()
+        out: dict[str, Any] = {
+            "coin": coin,
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "server_epoch": now,
+        }
+
+        try:
+            mids = self.client().all_mids_everywhere()
+            self.last_price.update(mids)
+            self.last_price_ts = now
+            spot = mids.get(coin)
+            out["spot"] = spot
+            out["spot_age_s"] = 0.0
+            if spot is None:
+                out["spot_error"] = (
+                    f"{coin} has no mid price on the exchange right now")
+        except Exception as exc:
+            spot = self.last_price.get(coin)
+            out["spot"] = spot
+            out["spot_age_s"] = (now - self.last_price_ts
+                                 if self.last_price_ts else None)
+            out["spot_error"] = f"price fetch failed: {exc}"
+
+        # How stale is each panel's underlying data.
+        sweeps = self.history.sweeps(coin, limit=1)
+        sweep_age = None
+        if sweeps:
+            try:
+                ts = datetime.fromisoformat(sweeps[0]["ts"])
+                sweep_age = now - ts.timestamp()
+            except (ValueError, KeyError, TypeError):
+                sweep_age = None
+
+        watching = bool(self.watch_info.get("running"))
+        out["sources"] = {
+            # consensus, positions and the liquidation map all come from here
+            "sweep": {"age_s": sweep_age,
+                      "interval_s": self.settings().sweep_interval_minutes * 60,
+                      "note": "positions, consensus and the liquidation map"},
+            "book": {"age_s": (now - self.last_book_ts
+                               if self.last_book_ts else None),
+                     "note": "depth, slippage and shelves"},
+            "watch": {"running": watching,
+                      "coin": self.watch_info.get("coin"),
+                      "level": self.watch_info.get("level"),
+                      "note": "flow and absorption — only live while watching"},
+        }
+        return out
+
     def calibration(self, coin: str, interval: str):
         """Measured hit rate per market and timeframe.
 
@@ -429,11 +500,17 @@ class Runtime:
             if k.upper() == upper:
                 return k, [k]
 
-        from .hl import split_symbol
+        from .hl import join_symbol, split_symbol
         matches = [k for k in known if split_symbol(k)[1].upper() == upper]
         if matches:
             return matches[0], matches
-        return typed.upper(), []
+
+        # No match on record. Normalise case WITHOUT touching the DEX prefix:
+        # HIP-3 DEX names are lowercase and case-sensitive, so upper-casing
+        # the whole thing turns `vntl:GOLD` into `VNTL:GOLD`, which matches
+        # nothing on the exchange and looks exactly like a missing market.
+        dex, base = split_symbol(typed)
+        return join_symbol(dex, base.upper()), []
 
     def no_data_reason(self, coin: str) -> str:
         """Why this coin is empty, and what to do about it.
@@ -684,7 +761,7 @@ def create_app() -> FastAPI:
     @app.get("/api/positions", dependencies=[Depends(require_token)])
     def api_positions(coin: str = "BTC", top: int = 50) -> dict[str, Any]:
         cfg = rt.settings()
-        coin = rt.resolve_symbol(coin)[0] or coin.upper()
+        coin = rt.resolve_symbol(coin)[0] or coin
         latest = rt.history.latest_sweep_positions(coin)
         if not latest:
             return {"coin": coin, "error": rt.no_data_reason(coin)}
@@ -724,7 +801,7 @@ def create_app() -> FastAPI:
                       min_account: float = 0.0) -> dict[str, Any]:
         """Who is positioned which way, among traders currently in profit."""
         cfg = rt.settings()
-        coin = rt.resolve_symbol(coin)[0] or coin.upper()
+        coin = rt.resolve_symbol(coin)[0] or coin
         latest = rt.history.latest_sweep_positions(coin)
         if not latest:
             return {"coin": coin, "error": rt.no_data_reason(coin)}
@@ -859,6 +936,7 @@ def create_app() -> FastAPI:
 
         try:
             b = rt.client().book(coin.upper())
+            rt.last_book_ts = time.time()
         except Exception as exc:
             return {"coin": coin.upper(), "error": str(exc)}
         if b.empty:
@@ -867,6 +945,7 @@ def create_app() -> FastAPI:
         out: dict[str, Any] = {
             "coin": coin.upper(),
             "watch": dict(rt.watch_info),
+            "book_age_s": 0.0,          # fetched in this request
             "book": {
                 "bid": b.best_bid, "ask": b.best_ask, "mid": b.mid,
                 "spread_bps": b.spread_bps,
@@ -942,6 +1021,11 @@ def create_app() -> FastAPI:
             "never_swept": [c for c in cfg.coins if c not in names],
         }
 
+    @app.get("/api/now", dependencies=[Depends(require_token)])
+    def api_now(coin: str = "BTC") -> dict[str, Any]:
+        """Live price and how stale everything else is. Cheap enough to poll."""
+        return rt.now(coin)
+
     @app.get("/api/read", dependencies=[Depends(require_token)])
     def api_read(coin: str = "BTC", interval: str = "15m",
                  higher: str = "4h", size: float = 0.0) -> dict[str, Any]:
@@ -959,7 +1043,7 @@ def create_app() -> FastAPI:
         from .structure import (atr, session_anchor, structure as read_structure,
                                 vwap as make_vwap, zones)
 
-        coin = rt.resolve_symbol(coin)[0] or coin.upper()
+        coin = rt.resolve_symbol(coin)[0] or coin
         client = rt.client()
         out: dict[str, Any] = {"coin": coin, "interval": interval}
 
@@ -995,6 +1079,7 @@ def create_app() -> FastAPI:
         book = None
         try:
             book = client.book(coin)
+            rt.last_book_ts = time.time()
         except Exception as exc:
             out["book_error"] = str(exc)
 
@@ -1033,9 +1118,26 @@ def create_app() -> FastAPI:
             magnet_bps=magnet_bps, magnet_notional=magnet_notional,
             calibration=rt.calibration(coin, interval))
 
+        # The candle's close and the live mid come from different endpoints.
+        # If they disagree materially, one of them is stale and every signal
+        # built on the candle is suspect -- so it is surfaced rather than
+        # quietly averaged over.
+        live_spot = None
+        try:
+            live_spot = rt.client().all_mids_everywhere().get(coin)
+            rt.last_price_ts = time.time()
+        except Exception:
+            pass
+        drift_bps = None
+        if live_spot and current.close > 0:
+            drift_bps = (live_spot - current.close) / current.close * 10_000.0
+
         out.update({
             "open": current.open, "high": current.high, "low": current.low,
             "last": current.close,
+            "spot": live_spot,
+            "spot_vs_candle_bps": drift_bps,
+            "stale": bool(drift_bps is not None and abs(drift_bps) > 25),
             "elapsed_fraction": r.elapsed_fraction,
             "seconds_left": r.seconds_left,
             "change_bps": r.change_bps,
@@ -1073,7 +1175,7 @@ def create_app() -> FastAPI:
         cannot be reconstructed. So the replayed hit rate is a floor: the
         live read has strictly more information than this.
         """
-        coin = rt.resolve_symbol(coin)[0] or coin.upper()
+        coin = rt.resolve_symbol(coin)[0] or coin
         try:
             n = rt.replay_calibration(coin, interval)
         except Exception as exc:
@@ -1198,6 +1300,28 @@ DASHBOARD = """<!doctype html>
        padding:10px 12px;background:var(--bg);border-radius:4px;
        border-left:3px solid var(--accent)}
   label{font-size:12px;color:var(--dim);display:block;margin:8px 0 2px}
+
+  /* Live price and staleness. Every reading on this page is a snapshot from
+     a poll; without an age beside it there is no way to tell a quiet market
+     from a feed that stopped. */
+  .ticker{display:flex;flex-wrap:wrap;align-items:center;gap:18px;
+    padding:12px 16px;margin-bottom:14px;background:var(--panel);
+    border:1px solid var(--line);border-radius:6px}
+  .tick-px{display:flex;align-items:baseline;gap:10px;font-size:13px;
+    color:var(--dim)}
+  .tick-px b{font-size:28px;color:var(--fg);font-variant-numeric:tabular-nums}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--long);
+    display:inline-block;align-self:center}
+  .dot.warn{background:#d6a14a} .dot.bad{background:var(--short)}
+  .dot.live{animation:pulse 2s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .tick-age{font-size:12px;font-variant-numeric:tabular-nums}
+  .tick-age.warn{color:#d6a14a} .tick-age.bad{color:var(--short)}
+  .tick-src{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--dim)}
+  .tick-src span b{color:var(--fg);font-weight:600}
+  .tick-src span.warn b{color:#d6a14a} .tick-src span.bad b{color:var(--short)}
+  .stamp{font-size:11px;color:var(--dim);font-weight:400;margin-left:8px}
+  .stamp.warn{color:#d6a14a} .stamp.bad{color:var(--short)}
 </style></head><body>
 <div class="wrap">
   <h1>liqmap</h1>
@@ -1208,7 +1332,7 @@ DASHBOARD = """<!doctype html>
 
   <div class="bar">
     <input type="password" id="tok" placeholder="access token">
-    <input id="coin" value="BTC" size="12" list="coinList" onchange="showVenueNote()"
+    <input id="coin" value="BTC" size="12" list="coinList" onchange="showVenueNote(); loadNow()"
            title="any perp symbol — crypto, or a HIP-3 market like vntl:GOLD">
     <datalist id="coinList"></datalist>
     <button class="go" onclick="loadAll()">Load</button>
@@ -1224,10 +1348,18 @@ DASHBOARD = """<!doctype html>
     <span id="msg" class="msg"></span>
   </div>
 
+  <div id="ticker" class="ticker">
+    <div class="tick-px"><span id="tickSym">—</span>
+      <b id="tickPx">—</b>
+      <span id="tickDot" class="dot"></span>
+      <span id="tickAge" class="tick-age">connecting…</span></div>
+    <div id="tickSources" class="tick-src"></div>
+  </div>
+
   <div id="venueNote" class="say" style="display:none;margin-bottom:14px"></div>
 
   <div class="grid">
-    <div class="panel full" id="readPanel"><h2>Candle read — live</h2>
+    <div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Everything this service knows,
         assembled into one direction on the candle still forming. Absorption
         <b>inverts</b> flow: heavy buying that is not moving price is a bearish
@@ -1249,7 +1381,7 @@ DASHBOARD = """<!doctype html>
       <div id="readSay" class="say" style="display:none"></div>
     </div>
 
-    <div class="panel full" id="conPanel"><h2>Who is winning, and which way</h2>
+    <div class="panel full" id="conPanel"><h2>Who is winning, and which way<span class="stamp" id="conStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Of the wallets holding this coin right now,
         how much winning money is on each side — and how much worse you would enter than
         they did.</div>
@@ -1265,7 +1397,7 @@ DASHBOARD = """<!doctype html>
       <div id="conTraders"></div>
     </div>
 
-    <div class="panel full" id="liqPanel"><h2>Liquidity — what it costs and who is winning the level</h2>
+    <div class="panel full" id="liqPanel"><h2>Liquidity — what it costs and who is winning the level<span class="stamp" id="liqStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Slippage works immediately off a
         single book read. Absorption needs a running watch, because it has to learn
         how far price normally moves per dollar before it can say whether this is
@@ -1333,6 +1465,7 @@ function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (
 
 async function loadAll() {
   note('loading…');
+  if (!nowPoll) startTicker();
   try {
     await Promise.all([loadStatus(), loadCoins(), loadRead(), loadConsensus(),
                        loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
@@ -1451,6 +1584,95 @@ async function saveSettings() {
   } catch (e) { note(e.message, true); }
 }
 
+/* ---- live price and staleness -------------------------------------------
+   Ages arrive computed by the server and we count up from the moment we
+   received them. Deriving them in the browser from timestamps means a clock
+   a few minutes out reports everything as fresh, or everything as stale.  */
+
+let nowData = null, nowFetchedAt = 0, nowPoll = null, lastPx = null;
+
+function ageClass(sec, warn, bad) {
+  if (sec == null) return 'bad';
+  return sec >= bad ? 'bad' : sec >= warn ? 'warn' : '';
+}
+
+function ageText(sec) {
+  if (sec == null) return 'never';
+  if (sec < 60) return Math.floor(sec) + 's ago';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+  return (sec / 3600).toFixed(1) + 'h ago';
+}
+
+async function loadNow() {
+  try {
+    nowData = await api('/api/now?coin=' + coin());
+    nowFetchedAt = Date.now();
+  } catch (e) {
+    $('tickAge').textContent = e.message;
+    $('tickDot').className = 'dot bad';
+    return;
+  }
+  paintTicker();
+}
+
+function paintTicker() {
+  const d = nowData;
+  if (!d) return;
+  const since = (Date.now() - nowFetchedAt) / 1000;
+
+  $('tickSym').textContent = d.coin;
+  if (d.spot != null) {
+    const px = Number(d.spot);
+    const dir = lastPx == null ? '' : px > lastPx ? 'long' : px < lastPx ? 'short' : '';
+    $('tickPx').className = dir;
+    $('tickPx').textContent = px.toLocaleString(undefined,
+      {minimumFractionDigits: 2, maximumFractionDigits: 6});
+    lastPx = px;
+  } else {
+    $('tickPx').textContent = '—';
+  }
+
+  const age = (d.spot_age_s == null ? null : d.spot_age_s + since);
+  const cls = ageClass(age, 20, 60);
+  $('tickDot').className = 'dot ' + (cls || 'live');
+  $('tickAge').className = 'tick-age ' + cls;
+  $('tickAge').textContent = (d.spot_error ? d.spot_error + ' · ' : '')
+    + 'price ' + ageText(age);
+
+  const s = d.sources || {};
+  const bits = [];
+  const sweepWarn = (s.sweep && s.sweep.interval_s) ? s.sweep.interval_s * 1.5 : 2700;
+  if (s.sweep) {
+    const a = s.sweep.age_s == null ? null : s.sweep.age_s + since;
+    bits.push(`<span class="${ageClass(a, sweepWarn, sweepWarn * 2)}">`
+      + `positions &amp; consensus <b>${ageText(a)}</b></span>`);
+  }
+  if (s.book) {
+    const a = s.book.age_s == null ? null : s.book.age_s + since;
+    bits.push(`<span class="${ageClass(a, 30, 120)}">book <b>${ageText(a)}</b></span>`);
+  }
+  if (s.watch) {
+    bits.push(s.watch.running
+      ? `<span>flow &amp; absorption <b>live on ${s.watch.coin} @ ${s.watch.level}</b></span>`
+      : '<span class="bad">flow &amp; absorption <b>not running</b></span>');
+  }
+  $('tickSources').innerHTML = bits.join('');
+}
+
+function startTicker() {
+  if (nowPoll) clearInterval(nowPoll);
+  loadNow();
+  nowPoll = setInterval(loadNow, 5000);
+  setInterval(paintTicker, 1000);       // keep the age counting between polls
+}
+
+function stamp(id, seconds, warn, bad, label) {
+  const el = $(id);
+  if (!el) return;
+  el.className = 'stamp ' + ageClass(seconds, warn, bad);
+  el.textContent = (label || '') + ageText(seconds);
+}
+
 let readPoll = null;
 
 function toggleReadAuto() {
@@ -1473,6 +1695,7 @@ async function loadRead() {
 
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
   const flags = (d.early ? '<span class="flag late">EARLY</span>' : '')
+              + (d.stale ? '<span class="flag crowded">STALE — candle and live price disagree</span>' : '')
               + (d.has_watch ? '' : '<span class="flag">NO LEVEL WATCH — flow and absorption missing</span>');
 
   $('readHead').innerHTML =
@@ -1488,6 +1711,12 @@ async function loadRead() {
     + `<div class="stat"><b class="${d.change_bps >= 0 ? 'long' : 'short'}">`
     + `${d.change_bps >= 0 ? '+' : ''}${d.change_bps.toFixed(1)}bps</b><span>on the candle</span></div>`
     + `<div class="stat"><b>${(d.position_in_range*100).toFixed(0)}%</b><span>of candle range</span></div>`
+    + `<div class="stat"><b>${Number(d.last).toLocaleString(undefined,{maximumFractionDigits:6})}</b><span>candle price</span></div>`
+    + (d.spot != null
+       ? `<div class="stat ${d.stale ? 'gap-bad' : 'gap-ok'}">`
+         + `<b>${Number(d.spot).toLocaleString(undefined,{maximumFractionDigits:6})}</b>`
+         + `<span>live mid${d.spot_vs_candle_bps != null ? ' (' + (d.spot_vs_candle_bps >= 0 ? '+' : '') + d.spot_vs_candle_bps.toFixed(1) + 'bps)' : ''}</span></div>`
+       : '')
     + (d.round_trip_bps != null
        ? `<div class="stat"><b>${d.round_trip_bps.toFixed(1)}bps</b><span>round trip cost</span></div>` : '')
     + '</div>';
@@ -1503,6 +1732,7 @@ async function loadRead() {
         <td style="color:var(--dim)">${s.note}</td></tr>`).join('')
     + '</table>';
 
+  stamp('readStamp', 0, 30, 120, 'read ');
   $('readSay').style.display = '';
   $('readSay').innerHTML = d.verdict
     + (d.higher_timeframe ? `<div style="margin-top:6px;color:var(--dim)">Higher timeframe: ${d.higher_timeframe}</div>` : '')
@@ -1559,6 +1789,8 @@ async function loadLiquidity() {
     $('liqBook').innerHTML = ''; $('liqAbs').style.display = 'none';
     $('liqShelves').innerHTML = ''; return;
   }
+
+  stamp('liqStamp', d.book_age_s != null ? d.book_age_s : 0, 30, 120, 'book ');
 
   const c = d.cost, b = d.book;
   if (c) {
@@ -1630,6 +1862,16 @@ async function loadConsensus() {
   } catch (e) { $('consensus').textContent = e.message; return; }
 
   if (d.error) { $('consensus').textContent = d.error; $('conTraders').innerHTML = ''; return; }
+
+  // The stamp here is the SWEEP's age, not this fetch's. Consensus is built
+  // from stored positions, so a fresh HTTP call can still serve half-hour-old
+  // data and stamping the request time would say it was current.
+  let sweepAge = null;
+  if (d.as_of) {
+    const t = Date.parse(d.as_of);
+    if (!isNaN(t)) sweepAge = (Date.now() - t) / 1000;
+  }
+  stamp('conStamp', sweepAge, 2700, 5400, 'swept ');
 
   const gapBad = d.entry_gap_pct > 0.005;
   const flags = (d.crowded ? '<span class="flag crowded">CROWDED</span>' : '')

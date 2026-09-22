@@ -256,3 +256,26 @@ def test_perp_dexs_handles_a_bare_list_of_names():
             return ["vntl", "para"]
 
     assert [d["name"] for d in InfoClient.perp_dexs(C())] == ["vntl", "para"]
+
+
+# --------------------------------------------------------------------------
+# case handling on namespaced symbols
+# --------------------------------------------------------------------------
+
+def test_dex_prefix_case_is_preserved_when_normalising():
+    """HIP-3 DEX names are lowercase and case-sensitive. Upper-casing the
+    whole symbol turns `vntl:GOLD` into `VNTL:GOLD`, which matches nothing on
+    the exchange and is indistinguishable from a market that does not exist."""
+    import liqmap.web as web
+
+    class FakeHistory:
+        def coins_with_data(self):
+            return []
+
+    rt = object.__new__(web.Runtime)
+    rt.history = FakeHistory()
+
+    assert web.Runtime.resolve_symbol(rt, "vntl:GOLD")[0] == "vntl:GOLD"
+    assert web.Runtime.resolve_symbol(rt, "vntl:gold")[0] == "vntl:GOLD"
+    assert web.Runtime.resolve_symbol(rt, "btc")[0] == "BTC"
+    assert web.Runtime.resolve_symbol(rt, "")[0] == ""

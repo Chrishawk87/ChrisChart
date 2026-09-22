@@ -415,6 +415,16 @@ class FlowTape:
     def last_px(self) -> float:
         return self._last_px
 
+    @property
+    def last_ts(self) -> float:
+        """Timestamp of the most recent trade, 0 if the tape is empty.
+
+        Used for staleness reporting: a tape that stopped receiving five
+        minutes ago still answers every query, just with old data, and that is
+        indistinguishable from a quiet market unless the age is shown.
+        """
+        return self._trades[-1].ts if self._trades else 0.0
+
     def __len__(self) -> int:
         return len(self._trades)
 
