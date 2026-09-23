@@ -813,3 +813,135 @@ def test_dashboard_carries_the_ticker(client):
     html = client.get("/").text
     for marker in ("loadNow", "paintTicker", "startTicker", "tickPx", "ageText"):
         assert marker in html
+
+
+# --------------------------------------------------------------------------
+# market picker, backtest and weights
+# --------------------------------------------------------------------------
+
+def test_markets_lists_the_whole_tradeable_universe(client):
+    """THE BUG: the picker was built from swept history, so it listed BTC and
+    nothing else. What you can trade and what has been swept are different
+    questions."""
+    web.runtime()._client = _NowClient(mids={
+        "BTC": 100_000.0, "ETH": 3_000.0,
+        "vntl:GOLD": 4_100.0, "vntl:CL": 74.0, "para:NVDA": 190.0})
+    d = client.get(f"/api/markets?token={TOKEN}").json()
+
+    syms = {m["symbol"] for m in d["markets"]}
+    assert syms == {"BTC", "ETH", "vntl:GOLD", "vntl:CL", "para:NVDA"}
+    assert d["count"] == 5
+    assert set(d["venues"]) == {"", "vntl", "para"}
+
+
+def test_markets_are_grouped_by_venue_and_sorted(client):
+    web.runtime()._client = _NowClient(mids={
+        "ETH": 3_000.0, "BTC": 100_000.0, "vntl:GOLD": 4_100.0,
+        "vntl:CL": 74.0})
+    rows = client.get(f"/api/markets?token={TOKEN}").json()["markets"]
+    assert [r["symbol"] for r in rows] == ["BTC", "ETH", "vntl:CL", "vntl:GOLD"]
+
+
+def test_markets_mark_which_ones_have_swept_data(multi_coin, client):
+    client.post(f"/api/sweep?token={TOKEN}")
+    web.runtime()._client = _NowClient(mids={"BTC": 100_000.0, "XRP": 2.0})
+    rows = client.get(f"/api/markets?refresh=true&token={TOKEN}").json()["markets"]
+    by = {r["symbol"]: r for r in rows}
+    assert by["BTC"]["has_data"] is True
+    assert by["XRP"]["has_data"] is False
+
+
+def test_markets_are_cached_rather_than_refetched_every_poll(client):
+    calls = {"n": 0}
+
+    class Counting(_NowClient):
+        def all_mids_everywhere(self, dexes=None):
+            calls["n"] += 1
+            return {"BTC": 100_000.0}
+
+    web.runtime()._client = Counting()
+    for _ in range(4):
+        client.get(f"/api/markets?token={TOKEN}")
+    assert calls["n"] == 1
+    client.get(f"/api/markets?refresh=true&token={TOKEN}")
+    assert calls["n"] == 2
+
+
+def test_markets_serve_the_cache_when_the_exchange_is_unreachable(client):
+    rt = web.runtime()
+    rt._client = _NowClient(mids={"BTC": 100_000.0})
+    client.get(f"/api/markets?token={TOKEN}")
+    rt._client = _NowClient(mids_fail=True)
+    d = client.get(f"/api/markets?refresh=true&token={TOKEN}").json()
+    assert d["stale"] is True
+    assert any(m["symbol"] == "BTC" for m in d["markets"])
+
+
+def test_backtest_reports_train_and_held_out_separately(client):
+    web.runtime()._client = _CandleClient(candles=_synthetic_candles(n=600))
+    d = client.post(f"/api/backtest?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["ok"]
+    assert "held out" in d["test"]["label"]
+    assert d["baseline_test"] is not None
+    assert "overfit_gap_pts" in d
+
+
+def test_backtest_names_what_it_cannot_see(client):
+    """The replay is blind to the three strongest live signals. Saying so is
+    the difference between a floor and a false promise."""
+    web.runtime()._client = _CandleClient(candles=_synthetic_candles(n=600))
+    d = client.post(f"/api/backtest?token={TOKEN}").json()
+    assert set(d["blind_to"]) >= {"flow", "absorption"}
+
+
+def test_backtest_reports_missing_candles(client):
+    web.runtime()._client = _CandleClient(fail=True)
+    d = client.post(f"/api/backtest?token={TOKEN}").json()
+    assert not d["ok"] and "candles unavailable" in d["error"]
+
+
+def test_weights_can_be_read_applied_and_reset(client):
+    from liqmap import candleread
+
+    base = dict(candleread.DEFAULT_WEIGHTS)
+    try:
+        d = client.post(f"/api/weights?token={TOKEN}", json={"flow": 2.5}).json()
+        assert d["ok"] and d["weights"]["flow"] == 2.5
+
+        r = client.post(f"/api/weights?reset=true&token={TOKEN}").json()
+        assert r["weights"] == base
+    finally:
+        candleread.WEIGHTS.clear()
+        candleread.WEIGHTS.update(base)
+
+
+def test_weights_are_clamped_and_unknown_names_rejected(client):
+    from liqmap import candleread
+
+    base = dict(candleread.DEFAULT_WEIGHTS)
+    try:
+        d = client.post(f"/api/weights?token={TOKEN}",
+                        json={"flow": 999.0, "nonsense": 1.0}).json()
+        assert d["weights"]["flow"] == 5.0
+        assert "nonsense" not in d["weights"]
+
+        bad = client.post(f"/api/weights?token={TOKEN}",
+                          json={"nonsense": 1.0}).json()
+        assert not bad["ok"]
+    finally:
+        candleread.WEIGHTS.clear()
+        candleread.WEIGHTS.update(base)
+
+
+def test_dashboard_carries_the_alert_and_backtest_controls(client):
+    html = client.get("/").text
+    for marker in ("checkAlert", "runBacktest", "alertBar", "rAlert",
+                   "applyWeights", "optgroup"):
+        assert marker in html
+
+
+def test_higher_timeframe_offers_the_shorter_options(client):
+    html = client.get("/").text
+    sel = html.split('id="rHigh"')[1].split("</select>")[0]
+    for tf in ("15m", "30m", "1h", "4h"):
+        assert f">{tf}<" in sel

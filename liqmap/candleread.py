@@ -56,7 +56,9 @@ Lean = Literal["up", "down", "flat"]
 
 # Unvalidated priors. Each is argued in `read()` where it is applied. They are
 # module-level so a calibration run can adjust them without touching logic.
-WEIGHTS = {
+# DEFAULT_WEIGHTS is the frozen original; WEIGHTS is the live, mutable copy
+# that tuning writes to, so there is always something to reset back to.
+DEFAULT_WEIGHTS = {
     "flow": 1.0,          # net aggression inside this candle
     "position": 0.8,      # where price sits in the candle's own range
     "imbalance": 0.5,     # resting depth, the weakest of the group
@@ -66,6 +68,8 @@ WEIGHTS = {
     "zone": 0.9,          # sitting in a fresh supply or demand zone
     "magnet": 0.7,        # liquidation fuel pulling one way
 }
+
+WEIGHTS = dict(DEFAULT_WEIGHTS)
 
 MIN_CALIBRATION_SAMPLES = 40
 

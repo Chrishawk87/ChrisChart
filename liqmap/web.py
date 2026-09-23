@@ -80,6 +80,8 @@ class Runtime:
         self.last_price_ts: float = 0.0
         self.last_price: dict[str, float] = {}
         self.last_book_ts: float = 0.0
+        self._markets_cache: dict[str, Any] | None = None
+        self._markets_ts: float = 0.0
         self._lock = threading.Lock()
         self._client = None
         self._store = None
@@ -361,6 +363,53 @@ class Runtime:
                     f"wallet size in Settings so smaller {asked} traders get picked up.")
             return out
 
+    # The listed universe changes when a builder deploys a market, not by the
+    # second. Refetching it on every dashboard poll would spend rate-limit
+    # budget the sweep needs.
+    MARKETS_TTL_S = 300.0
+
+    def markets(self, force: bool = False) -> dict[str, Any]:
+        """Every market you can actually trade, across every perp DEX.
+
+        The picker used to be built from swept history, which meant it listed
+        only markets the wallet universe happened to hold -- in practice BTC
+        and nothing else. What you can trade and what has been swept are
+        different questions, and the picker was answering the wrong one.
+        """
+        now = time.time()
+        if (not force and self._markets_cache
+                and now - self._markets_ts < self.MARKETS_TTL_S):
+            return self._markets_cache
+
+        from .hl import split_symbol
+
+        try:
+            mids = self.client().all_mids_everywhere()
+        except Exception as exc:
+            if self._markets_cache:
+                return {**self._markets_cache, "stale": True, "error": str(exc)}
+            return {"markets": [], "error": str(exc), "venues": []}
+
+        have = {r["coin"] for r in self.history.coins_with_data()}
+        rows = []
+        for sym, px in mids.items():
+            dex, base = split_symbol(sym)
+            rows.append({"symbol": sym, "base": base, "dex": dex,
+                         "hip3": bool(dex), "price": px,
+                         "has_data": sym in have})
+
+        # Canonical crypto first, then each builder's markets, alphabetical
+        # within a venue so the list is scannable rather than hash-ordered.
+        rows.sort(key=lambda r: (r["dex"], r["base"]))
+        venues = sorted({r["dex"] for r in rows})
+
+        self._markets_cache = {
+            "markets": rows, "venues": venues, "count": len(rows),
+            "fetched": datetime.now(timezone.utc).isoformat(),
+        }
+        self._markets_ts = now
+        return self._markets_cache
+
     def now(self, coin: str) -> dict[str, Any]:
         """Spot price plus how old everything else on the dashboard is.
 
@@ -493,7 +542,13 @@ class Runtime:
         if not typed:
             return "", []
 
+        # Both what has been swept AND what is listed. Resolving only against
+        # swept history means a market you can trade but have not swept fails
+        # to resolve, which is the same near-miss confusion in a new place.
         known = [r["coin"] for r in self.history.coins_with_data()]
+        if self._markets_cache:
+            known += [m["symbol"] for m in self._markets_cache.get("markets", [])
+                      if m["symbol"] not in known]
         upper = typed.upper()
 
         for k in known:                                   # exact, case-aware
@@ -1021,6 +1076,11 @@ def create_app() -> FastAPI:
             "never_swept": [c for c in cfg.coins if c not in names],
         }
 
+    @app.get("/api/markets", dependencies=[Depends(require_token)])
+    def api_markets(refresh: bool = False) -> dict[str, Any]:
+        """Everything listed and tradeable, across every perp DEX."""
+        return rt.markets(force=refresh)
+
     @app.get("/api/now", dependencies=[Depends(require_token)])
     def api_now(coin: str = "BTC") -> dict[str, Any]:
         """Live price and how stale everything else is. Cheap enough to poll."""
@@ -1164,6 +1224,78 @@ def create_app() -> FastAPI:
         if size > 0 and book is not None and not book.empty:
             out["round_trip_bps"] = book.round_trip_bps(size)
         return out
+
+    @app.post("/api/backtest", dependencies=[Depends(require_token)])
+    def api_backtest(coin: str = "BTC", interval: str = "15m",
+                     bars: int = 1000, train_fraction: float = 0.6,
+                     tune: bool = True) -> dict[str, Any]:
+        """Walk-forward backtest with a held-out half.
+
+        The number to act on is the held-out one. Weights are searched on the
+        earlier portion only and the later portion is never seen by the
+        search, so the gap between the two is a direct measure of how much of
+        any apparent edge is fitted noise.
+        """
+        from . import backtest as bt_mod
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        try:
+            candles = rt.client().candles(coin, interval,
+                                          bars=max(200, min(bars, 5000)))
+        except Exception as exc:
+            return {"ok": False, "error": f"candles unavailable: {exc}"}
+
+        bt = bt_mod.run(candles, coin, interval,
+                        train_fraction=max(0.3, min(train_fraction, 0.85)),
+                        do_tune=tune)
+
+        def rep(r) -> dict[str, Any]:
+            return {"label": r.label, "n": r.n, "calls": r.calls,
+                    "accuracy": r.accuracy, "coverage": r.coverage,
+                    "edge_pts": r.edge, "describe": r.describe(),
+                    "bands": [{"band": b.band, "n": b.n, "up_rate": b.up_rate}
+                              for b in r.bands],
+                    "curve": r.curve}
+
+        return {
+            "ok": True, "coin": coin, "interval": interval,
+            "candles": len(candles), "samples": len(bt.samples),
+            "train": rep(bt.train), "test": rep(bt.test),
+            "baseline_test": rep(bt.baseline_test) if bt.baseline_test else None,
+            "tuned_weights": bt.tuned_weights,
+            "overfit_gap_pts": bt.overfit_gap,
+            "verdict": bt.verdict(),
+            "blind_to": ["flow", "absorption", "imbalance", "magnet"],
+        }
+
+    @app.post("/api/weights", dependencies=[Depends(require_token)])
+    def api_weights(payload: dict[str, float] | None = None,
+                    reset: bool = False) -> dict[str, Any]:
+        """Apply tuned weights to the live read, or put the defaults back.
+
+        Separate from the backtest on purpose: seeing a tuned result and
+        adopting it should be two decisions, not one. A tuned set that only
+        improved the training half is exactly the thing you do not want
+        silently applied to live readings.
+        """
+        from . import candleread
+
+        if reset:
+            candleread.WEIGHTS.clear()
+            candleread.WEIGHTS.update(candleread.DEFAULT_WEIGHTS)
+            return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                    "note": "defaults restored"}
+        if not payload:
+            return {"ok": True, "weights": dict(candleread.WEIGHTS)}
+
+        clean = {k: max(0.0, min(float(v), 5.0)) for k, v in payload.items()
+                 if k in candleread.DEFAULT_WEIGHTS}
+        if not clean:
+            return {"ok": False, "error": "no recognised weight names",
+                    "known": sorted(candleread.DEFAULT_WEIGHTS)}
+        candleread.WEIGHTS.update(clean)
+        return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                "applied": clean}
 
     @app.post("/api/calibrate", dependencies=[Depends(require_token)])
     def api_calibrate(coin: str = "BTC", interval: str = "15m") -> dict[str, Any]:
@@ -1322,6 +1454,22 @@ DASHBOARD = """<!doctype html>
   .tick-src span.warn b{color:#d6a14a} .tick-src span.bad b{color:var(--short)}
   .stamp{font-size:11px;color:var(--dim);font-weight:400;margin-left:8px}
   .stamp.warn{color:#d6a14a} .stamp.bad{color:var(--short)}
+
+  .alertbar{padding:12px 14px;margin:10px 0;border-radius:5px;font-size:14px;
+    font-weight:600;border-left:4px solid}
+  .alertbar.up{background:rgba(74,168,116,.14);border-color:var(--long);
+    color:var(--long)}
+  .alertbar.down{background:rgba(201,90,90,.14);border-color:var(--short);
+    color:var(--short)}
+  .alertbar small{display:block;font-weight:400;color:var(--dim);margin-top:4px}
+  .bt-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+    gap:14px;margin-top:10px}
+  .bt-col{padding:10px 12px;background:var(--bg);border-radius:5px;
+    border:1px solid var(--line)}
+  .bt-col h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;
+    letter-spacing:.06em;color:var(--dim)}
+  .bt-col.held{border-color:var(--accent)}
+  .bt-big{font-size:26px;font-variant-numeric:tabular-nums}
 </style></head><body>
 <div class="wrap">
   <h1>liqmap</h1>
@@ -1332,9 +1480,10 @@ DASHBOARD = """<!doctype html>
 
   <div class="bar">
     <input type="password" id="tok" placeholder="access token">
-    <input id="coin" value="BTC" size="12" list="coinList" onchange="showVenueNote(); loadNow()"
-           title="any perp symbol — crypto, or a HIP-3 market like vntl:GOLD">
-    <datalist id="coinList"></datalist>
+    <select id="coin" onchange="onCoinChange()" style="min-width:150px"
+            title="every market listed on the exchange — a dot marks ones with swept position data">
+      <option value="BTC">BTC</option></select>
+    <span id="mktCount" class="msg" style="margin-right:6px">—</span>
     <button class="go" onclick="loadAll()">Load</button>
     <button onclick="doHarvest()">Harvest wallets</button>
     <input id="hmin" type="number" value="5" min="1" max="180" step="1"
@@ -1369,16 +1518,44 @@ DASHBOARD = """<!doctype html>
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></select></label>
         <label>higher TF <select id="rHigh" onchange="loadRead()">
-          <option>1h</option><option selected>4h</option><option>12h</option>
+          <option>15m</option><option>30m</option><option>1h</option>
+          <option selected>4h</option><option>12h</option>
           <option>1d</option></select></label>
+        <label>alert at <select id="rAlert" onchange="saveAlert()">
+          <option value="0">off</option><option value="0.6">60%</option>
+          <option value="0.7">70%</option><option value="0.8" selected>80%</option>
+          <option value="0.9">90%</option></select> confidence</label>
         <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
           auto-refresh 10s</label>
         <button onclick="loadRead()">Read now</button>
         <button onclick="doCalibrate()">Calibrate</button>
       </div>
+      <div id="alertBar" class="alertbar" style="display:none"></div>
       <div id="readHead" class="msg">—</div>
       <div id="readSignals"></div>
       <div id="readSay" class="say" style="display:none"></div>
+    </div>
+
+    <div class="panel full" id="btPanel"><h2>Backtest — measured, not asserted</h2>
+      <div class="msg" style="margin-bottom:8px">History is split in two by date.
+        Weights are tuned on the <b>earlier</b> half only; the <b>later</b> half is
+        never seen by the search. Act on the held-out number. The replay is blind to
+        flow, absorption, book depth and the liquidation magnet — none of those were
+        recorded historically — so it is a floor, not a forecast.</div>
+      <div class="conbar">
+        <label>bars <input id="btBars" type="number" value="1000" min="200" max="5000"
+          step="100" style="width:88px"></label>
+        <label>train split <select id="btSplit">
+          <option value="0.5">50/50</option><option value="0.6" selected>60/40</option>
+          <option value="0.7">70/30</option></select></label>
+        <label><input type="checkbox" id="btTune" checked> search weights</label>
+        <button onclick="runBacktest()">Run backtest</button>
+        <button onclick="applyWeights()" id="btApply" disabled>Apply tuned weights</button>
+        <button onclick="resetWeights()">Reset weights</button>
+      </div>
+      <div id="btHead" class="msg">—</div>
+      <div id="btCurve"></div>
+      <div id="btSay" class="say" style="display:none"></div>
     </div>
 
     <div class="panel full" id="conPanel"><h2>Who is winning, and which way<span class="stamp" id="conStamp"></span></h2>
@@ -1666,11 +1843,103 @@ function startTicker() {
   setInterval(paintTicker, 1000);       // keep the age counting between polls
 }
 
+let lastCoin = 'BTC';
+try { const c = localStorage.getItem('liqmap_coin'); if (c) lastCoin = c; } catch (e) {}
+window.addEventListener('DOMContentLoaded', () => {
+  try {
+    const a = localStorage.getItem('liqmap_alert');
+    if (a && $('rAlert')) $('rAlert').value = a;
+  } catch (e) {}
+});
+
+function onCoinChange() {
+  lastCoin = coin();
+  try { localStorage.setItem('liqmap_coin', lastCoin); } catch (e) {}
+  alertedFor = null;            // a new market starts its own alert history
+  showVenueNote();
+  loadNow();
+  loadRead();
+}
+
 function stamp(id, seconds, warn, bad, label) {
   const el = $(id);
   if (!el) return;
   el.className = 'stamp ' + ageClass(seconds, warn, bad);
   el.textContent = (label || '') + ageText(seconds);
+}
+
+/* ---- the confidence alert ------------------------------------------------
+   Fires once per candle per direction. Three suppressions matter more than
+   the alert itself: it will not fire on stale data, it will not fire early
+   in a candle, and it will not re-fire for a state it already announced.
+   An alert that cries wolf gets ignored, and then the one that matters does
+   too.                                                                     */
+
+let alertedFor = null, audioCtx = null;
+
+function alertThreshold() {
+  const v = parseFloat(($('rAlert') && $('rAlert').value) || '0.8');
+  return isFinite(v) ? v : 0.8;
+}
+
+function saveAlert() {
+  try { localStorage.setItem('liqmap_alert', $('rAlert').value); } catch (e) {}
+  alertedFor = null;
+}
+
+function ping() {
+  // Synthesised rather than a file: an artifact page cannot load external
+  // media, and a two-tone chirp cuts through better than a single beep.
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    [880, 1320].forEach((f, i) => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = f; o.type = 'sine';
+      g.gain.setValueAtTime(0.0001, audioCtx.currentTime + i * 0.14);
+      g.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + i * 0.14 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + i * 0.14 + 0.13);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(audioCtx.currentTime + i * 0.14);
+      o.stop(audioCtx.currentTime + i * 0.14 + 0.14);
+    });
+  } catch (e) {}
+}
+
+function checkAlert(d) {
+  const bar = $('alertBar');
+  const thr = alertThreshold();
+
+  if (!thr || d.lean === 'flat' || d.confidence < thr) {
+    bar.style.display = 'none';
+    if (d.lean === 'flat' || d.confidence < thr * 0.8) alertedFor = null;
+    return;
+  }
+  if (d.early || d.stale) { bar.style.display = 'none'; return; }
+
+  const key = coin() + '|' + $('rInt').value + '|' + d.lean
+            + '|' + Math.floor(d.seconds_left / 60);
+  const candleKey = coin() + '|' + $('rInt').value + '|' + d.lean;
+
+  bar.className = 'alertbar ' + d.lean;
+  bar.style.display = '';
+  bar.innerHTML = `${d.lean.toUpperCase()} — ${(d.confidence*100).toFixed(0)}% confidence, `
+    + `${(d.agreement*100).toFixed(0)}% of signals agree, `
+    + `${(d.seconds_left/60).toFixed(1)} min left`
+    + `<small>${d.verdict}</small>`;
+
+  if (alertedFor === candleKey) return;      // already announced this one
+  alertedFor = candleKey;
+  ping();
+
+  try {
+    if (window.Notification && Notification.permission === 'granted') {
+      new Notification(`${coin()} ${d.lean.toUpperCase()} ${(d.confidence*100).toFixed(0)}%`,
+        {body: `${(d.seconds_left/60).toFixed(1)} min left · `
+               + `${(d.agreement*100).toFixed(0)}% agree · score ${d.score.toFixed(2)}`});
+    } else if (window.Notification && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  } catch (e) {}
 }
 
 let readPoll = null;
@@ -1733,6 +2002,7 @@ async function loadRead() {
     + '</table>';
 
   stamp('readStamp', 0, 30, 120, 'read ');
+  checkAlert(d);
   $('readSay').style.display = '';
   $('readSay').innerHTML = d.verdict
     + (d.higher_timeframe ? `<div style="margin-top:6px;color:var(--dim)">Higher timeframe: ${d.higher_timeframe}</div>` : '')
@@ -1748,6 +2018,86 @@ async function doCalibrate() {
     const rows = (r.table || []).filter(t => t.n > 0)
       .map(t => `${t.band}: ${(t.up_rate*100).toFixed(0)}% up (n=${t.n})`);
     note(`scored ${r.scored} past candles — ` + (rows.join(' · ') || 'no bands populated'));
+    loadRead();
+  } catch (e) { note(e.message, true); }
+}
+
+let tunedWeights = null;
+
+async function runBacktest() {
+  $('btHead').textContent = 'replaying…';
+  $('btSay').style.display = 'none';
+  $('btCurve').innerHTML = '';
+  let d;
+  try {
+    d = await api('/api/backtest?coin=' + coin() + '&interval=' + $('rInt').value
+                  + '&bars=' + (parseInt($('btBars').value, 10) || 1000)
+                  + '&train_fraction=' + $('btSplit').value
+                  + '&tune=' + ($('btTune').checked ? 'true' : 'false'),
+                  {method: 'POST'});
+  } catch (e) { $('btHead').textContent = e.message; return; }
+  if (!d.ok) { $('btHead').textContent = d.error; return; }
+
+  tunedWeights = d.tuned_weights || null;
+  $('btApply').disabled = !tunedWeights;
+
+  const col = (r, held) => {
+    if (!r) return '';
+    const acc = r.calls >= 20 ? (r.accuracy * 100).toFixed(1) + '%' : '—';
+    const edgeCls = r.calls < 20 ? '' : r.edge_pts > 0 ? 'long' : 'short';
+    return `<div class="bt-col${held ? ' held' : ''}"><h3>${r.label}</h3>`
+      + `<div class="bt-big ${edgeCls}">${acc}</div>`
+      + `<div style="font-size:12px;color:var(--dim)">`
+      + `${r.calls} calls from ${r.n} bars (${(r.coverage*100).toFixed(0)}% coverage)<br>`
+      + `${r.calls >= 20 ? (r.edge_pts >= 0 ? '+' : '') + r.edge_pts.toFixed(1) + 'pts vs coin flip'
+                          : 'too few calls to judge'}</div></div>`;
+  };
+
+  $('btHead').innerHTML =
+      `<div style="font-size:12px;color:var(--dim);margin-bottom:6px">`
+    + `${d.candles} candles · ${d.samples} scored bars · blind to `
+    + `${(d.blind_to || []).join(', ')}</div>`
+    + '<div class="bt-grid">'
+    + col(d.train, false) + col(d.baseline_test, false) + col(d.test, true)
+    + '</div>'
+    + `<div style="margin-top:8px;font-size:12px;color:var(--dim)">`
+    + `Train minus held-out: <b class="${d.overfit_gap_pts > 8 ? 'short' : ''}">`
+    + `${d.overfit_gap_pts >= 0 ? '+' : ''}${d.overfit_gap_pts.toFixed(1)}pts</b>`
+    + ` — anything large here is fitted noise.</div>`;
+
+  const curve = (d.test && d.test.curve) || [];
+  $('btCurve').innerHTML = !curve.length ? '' :
+    '<table style="margin-top:14px"><tr><th>selectivity (held out)</th>'
+    + '<th class="r">calls</th><th class="r">accuracy</th><th class="r">coverage</th></tr>'
+    + curve.map(r => `<tr>
+        <td>score at or above ${r.threshold.toFixed(2)}</td>
+        <td class="r">${r.n}</td>
+        <td class="r ${r.accuracy == null ? '' : r.accuracy > 0.55 ? 'long' : r.accuracy < 0.45 ? 'short' : ''}">
+          ${r.accuracy == null ? '—' : (r.accuracy*100).toFixed(1) + '%'}</td>
+        <td class="r">${(r.coverage*100).toFixed(0)}%</td></tr>`).join('')
+    + '</table>'
+    + '<div style="margin-top:6px;font-size:12px;color:var(--dim)">'
+    + 'Being more selective trades trades for accuracy. The row you can live '
+    + 'with is the one that decides whether this is worth trading.</div>';
+
+  $('btSay').style.display = '';
+  $('btSay').textContent = d.verdict;
+}
+
+async function applyWeights() {
+  if (!tunedWeights) return;
+  try {
+    const r = await api('/api/weights', {method: 'POST',
+      body: JSON.stringify(tunedWeights)});
+    note(r.ok ? 'tuned weights applied to live reads' : r.error, !r.ok);
+    loadRead();
+  } catch (e) { note(e.message, true); }
+}
+
+async function resetWeights() {
+  try {
+    const r = await api('/api/weights?reset=true', {method: 'POST'});
+    note('weights reset to defaults');
     loadRead();
   } catch (e) { note(e.message, true); }
 }
@@ -1995,18 +2345,36 @@ async function doSweep() {
 let hip3Markets = {};
 
 async function loadCoins() {
+  // The picker lists what you can TRADE, not what happens to have been swept.
+  // Built from swept history it showed BTC and nothing else, which is a
+  // different question answered wrongly.
   try {
-    const d = await api('/api/coins');
-    const rows = d.with_data || [];
+    const d = await api('/api/markets');
+    const rows = d.markets || [];
+    if (!rows.length) { $('mktCount').textContent = d.error || 'no markets'; return; }
+
     hip3Markets = {};
-    rows.forEach(r => { if (r.hip3) hip3Markets[r.coin] = r.dex; });
-    const have = rows.map(r => r.coin);
-    $('coinList').innerHTML = rows.map(r =>
-        `<option value="${r.coin}">${r.hip3 ? r.base + ' · ' + r.dex : r.base}</option>`)
-      .concat((d.configured || []).filter(c => have.indexOf(c) === -1)
-              .map(c => `<option value="${c}">`)).join('');
+    rows.forEach(r => { if (r.hip3) hip3Markets[r.symbol] = r.dex; });
+
+    const byVenue = {};
+    rows.forEach(r => { (byVenue[r.dex] || (byVenue[r.dex] = [])).push(r); });
+
+    const label = v => v ? v + ' (builder market)' : 'Hyperliquid perps';
+    const groups = Object.keys(byVenue).sort().map(v =>
+      `<optgroup label="${label(v)}">`
+      + byVenue[v].map(r =>
+          `<option value="${r.symbol}"${r.symbol === coin() ? ' selected' : ''}>`
+          + `${r.base}${r.has_data ? ' •' : ''}</option>`).join('')
+      + '</optgroup>').join('');
+
+    $('coin').innerHTML = groups;
+    if (coin() !== lastCoin && rows.some(r => r.symbol === lastCoin)) {
+      $('coin').value = lastCoin;
+    }
+    $('mktCount').textContent = `${d.count} markets`
+      + (d.stale ? ' (cached — exchange unreachable)' : '');
     showVenueNote();
-  } catch (e) { /* the coin box still works as free text */ }
+  } catch (e) { $('mktCount').textContent = e.message; }
 }
 
 function showVenueNote() {

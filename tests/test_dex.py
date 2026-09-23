@@ -274,6 +274,7 @@ def test_dex_prefix_case_is_preserved_when_normalising():
 
     rt = object.__new__(web.Runtime)
     rt.history = FakeHistory()
+    rt._markets_cache = None       # resolution also consults the listed universe
 
     assert web.Runtime.resolve_symbol(rt, "vntl:GOLD")[0] == "vntl:GOLD"
     assert web.Runtime.resolve_symbol(rt, "vntl:gold")[0] == "vntl:GOLD"
