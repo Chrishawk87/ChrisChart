@@ -834,12 +834,15 @@ def test_markets_lists_the_whole_tradeable_universe(client):
     assert set(d["venues"]) == {"", "vntl", "para"}
 
 
-def test_markets_are_grouped_by_venue_and_sorted(client):
+def test_markets_are_ordered_by_asset_class_then_ticker(client):
+    """Venue order is not useful for finding a market. Class order is: with
+    1,393 symbols, crypto, metals, energy and so on is how you navigate."""
     web.runtime()._client = _NowClient(mids={
         "ETH": 3_000.0, "BTC": 100_000.0, "vntl:GOLD": 4_100.0,
         "vntl:CL": 74.0})
     rows = client.get(f"/api/markets?token={TOKEN}").json()["markets"]
-    assert [r["symbol"] for r in rows] == ["BTC", "ETH", "vntl:CL", "vntl:GOLD"]
+    assert [r["symbol"] for r in rows] == ["BTC", "ETH", "vntl:GOLD", "vntl:CL"]
+    assert [r["klass"] for r in rows] == ["crypto", "crypto", "metals", "energy"]
 
 
 def test_markets_mark_which_ones_have_swept_data(multi_coin, client):
@@ -945,3 +948,233 @@ def test_higher_timeframe_offers_the_shorter_options(client):
     sel = html.split('id="rHigh"')[1].split("</select>")[0]
     for tf in ("15m", "30m", "1h", "4h"):
         assert f">{tf}<" in sel
+
+
+# --------------------------------------------------------------------------
+# the 401, and the stale-candle direction bug
+# --------------------------------------------------------------------------
+
+def test_a_symbol_with_a_fragment_character_strips_the_query_token(client):
+    """Reproduces the reported 401. `#` in an unencoded URL turns everything
+    after it into a fragment, so `&token=` is never sent."""
+    web.runtime()._client = _NowClient()
+    assert client.get(f"/api/now?coin=A#B&token={TOKEN}").status_code == 401
+
+
+def test_the_header_keeps_auth_working_when_the_query_is_mangled(client):
+    """The client now sends the token in the Authorization header as well,
+    so a mangled query string cannot take authentication down with it."""
+    web.runtime()._client = _NowClient()
+    r = client.get("/api/now?coin=A#B",
+                   headers={"Authorization": f"Bearer {TOKEN}"})
+    assert r.status_code == 200
+
+
+def test_every_dashboard_request_encodes_its_parameters():
+    """No hand-concatenated symbols left in the page."""
+    import liqmap.web as w
+    html = w.DASHBOARD if hasattr(w, "DASHBOARD") else None
+    assert html is None or "+ coin()" not in html
+
+
+def test_dashboard_builds_urls_through_the_encoder(client):
+    html = client.get("/").text
+    assert "function q(params)" in html
+    assert "+ coin()" not in html, "unencoded symbol concatenated into a URL"
+    assert "'Authorization': 'Bearer '" in html
+
+
+def _stale_series(n=200, step=900, close_age_s=2400, start=4000.0, rise=3.0):
+    """A rally whose last candle closed a while ago."""
+    import time as _t
+    from liqmap.structure import Candle
+    now = _t.time()
+    out, px = [], start
+    for i in range(n):
+        o, c = px, px + rise
+        out.append(Candle(ts=now - (n - i) * step - close_age_s, open=o,
+                          high=c + 1, low=o - 1, close=c, volume=500.0))
+        px = c
+    return out
+
+
+class _StaleClient(_NowClient):
+    def __init__(self, candles, spot):
+        super().__init__(candles=candles, mids={"BTC": spot})
+
+
+def test_a_closed_last_candle_is_detected_not_treated_as_forming(client):
+    bars = _stale_series()
+    web.runtime()._client = _StaleClient(bars, bars[-1].close)
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["candle_was_forming"] is False
+    assert d.get("synthesised_candle") is True
+    assert d["candle_age_s"] > 900
+
+
+def test_a_stale_green_candle_does_not_read_up_when_price_has_fallen(client):
+    """THE REPORTED BUG. The feed's last bar is green and closed. Price has
+    since dropped. Reading the stale bar gives position 100% and an UP lean
+    on a market that is falling."""
+    bars = _stale_series()
+    web.runtime()._client = _StaleClient(bars, bars[-1].close * 0.985)
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+
+    assert d["last"] < d["open"], "the read must reflect the live price"
+    assert d["change_bps"] < 0
+    assert d["position_in_range"] < 0.2
+    assert d["lean"] != "up"
+
+
+def test_a_stale_red_candle_does_not_read_down_when_price_has_risen(client):
+    bars = _stale_series(rise=-3.0, start=4600.0)
+    web.runtime()._client = _StaleClient(bars, bars[-1].close * 1.015)
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["change_bps"] > 0
+    assert d["lean"] != "down"
+
+
+def test_the_live_mid_is_overlaid_onto_a_genuinely_forming_candle(client):
+    """Even when the last bar IS the forming one, candleSnapshot lags the
+    tape, so its close must not be used as the current price."""
+    import time as _t
+    from liqmap.structure import Candle
+    now = _t.time()
+    bars = _stale_series(close_age_s=0)
+    bars[-1] = Candle(ts=now - 300, open=4000.0, high=4010.0, low=3995.0,
+                      close=4005.0, volume=100.0)
+    web.runtime()._client = _StaleClient(bars, 3990.0)      # price below the bar's low
+
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["candle_was_forming"] is True
+    assert d["last"] == 3990.0
+    assert d["low"] == 3990.0, "the live price must extend the candle's range"
+    assert d["position_in_range"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_read_states_what_it_predicts(client):
+    web.runtime()._client = _NowClient()
+    d = client.get(f"/api/read?token={TOKEN}").json()
+    assert "predicts" in d and "close of this" in d["predicts"]
+
+
+# --------------------------------------------------------------------------
+# weights, asset classes and the forward test
+# --------------------------------------------------------------------------
+
+def test_weights_endpoint_reports_defaults_alongside_live(client):
+    d = client.post(f"/api/weights?token={TOKEN}").json()
+    assert "weights" in d and "defaults" in d
+
+
+def test_markets_carry_an_asset_class(client):
+    web.runtime()._client = _NowClient(mids={
+        "BTC": 100_000.0, "vntl:GOLD": 4_100.0, "vntl:EUR": 1.08,
+        "para:NVDA": 190.0, "para:SPY": 600.0, "vntl:JP225": 39_000.0})
+    d = client.get(f"/api/markets?token={TOKEN}").json()
+    by = {m["symbol"]: m["klass"] for m in d["markets"]}
+    assert by["BTC"] == "crypto"
+    assert by["vntl:GOLD"] == "metals"
+    assert by["vntl:EUR"] == "fx"
+    assert by["para:NVDA"] == "equity"
+    assert by["para:SPY"] == "etf"
+    assert by["vntl:JP225"] == "index"
+
+
+def test_markets_report_class_counts_for_the_picker(client):
+    web.runtime()._client = _NowClient(mids={
+        "BTC": 1.0, "ETH": 2.0, "vntl:GOLD": 3.0})
+    d = client.get(f"/api/markets?token={TOKEN}").json()
+    counts = {c["klass"]: c["n"] for c in d["classes"]}
+    assert counts["crypto"] == 2 and counts["metals"] == 1
+
+
+def test_a_read_is_recorded_once_per_candle(client):
+    """Polling every ten seconds must not write ninety rows for one candle
+    and let a single lucky fifteen minutes dominate the hit rate."""
+    web.runtime()._client = _NowClient()
+    first = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    second = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert first["recorded"] is True
+    assert second["recorded"] is False
+
+
+def test_resolution_refuses_to_invent_an_outcome(client):
+    """A read whose candle is no longer in the window stays unresolved. A
+    fabricated outcome poisons the measurement permanently."""
+    rt = web.runtime()
+    rt._client = _NowClient()
+    client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}")
+    rt.history._conn.execute(
+        "UPDATE reads SET candle_end = 1, candle_ts = 1")
+    rt.history._conn.commit()
+
+    d = client.post(f"/api/resolve-reads?token={TOKEN}").json()
+    assert d["resolved"] == 0
+    assert d["unresolvable"] >= 1
+
+
+def test_forward_stats_separate_reads_that_had_flow(client):
+    """The whole point: a historical replay cannot see flow or absorption, so
+    the forward test has to report those cases apart from the rest."""
+    rt = web.runtime()
+    rt._client = _NowClient()
+    d = client.get(f"/api/forward?token={TOKEN}").json()["stats"]
+    assert set(d) >= {"overall", "with_flow", "without_flow", "bands", "pending"}
+
+
+def test_a_correct_read_is_scored_from_the_price_at_the_time(client):
+    """Correct means price finished on the leaned side measured from the read
+    price — not from the candle's open. That is the question a scalper asks."""
+    rt = web.runtime()
+    h = rt.history
+    rid = h.record_read(coin="BTC", interval="15m", candle_ts=1000.0,
+                        candle_end=1900.0, score=0.6, lean="up",
+                        confidence=0.8, elapsed_frac=0.5, price=100.0,
+                        had_flow=True)
+    assert rid
+    assert h.resolve_read(rid, 101.0) is True
+
+    stats = h.read_stats("BTC", "15m")
+    assert stats["overall"]["n"] == 1
+    assert stats["overall"]["accuracy"] == 1.0
+    assert stats["with_flow"]["n"] == 1
+
+
+def test_a_wrong_read_scores_zero(client):
+    h = web.runtime().history
+    rid = h.record_read(coin="ETH", interval="5m", candle_ts=1.0,
+                        candle_end=2.0, score=-0.6, lean="down",
+                        confidence=0.8, elapsed_frac=0.9, price=100.0,
+                        had_flow=False)
+    h.resolve_read(rid, 105.0)
+    stats = h.read_stats("ETH", "5m")
+    assert stats["overall"]["accuracy"] == 0.0
+    assert stats["without_flow"]["n"] == 1
+
+
+def test_a_flat_read_makes_no_claim_and_is_not_scored(client):
+    h = web.runtime().history
+    rid = h.record_read(coin="SOL", interval="5m", candle_ts=1.0,
+                        candle_end=2.0, score=0.02, lean="flat",
+                        confidence=0.1, elapsed_frac=0.9, price=100.0,
+                        had_flow=False)
+    h.resolve_read(rid, 110.0)
+    assert h.read_stats("SOL", "5m")["overall"]["n"] == 0
+
+
+def test_backtest_states_the_real_history_it_used(client):
+    """'How can a backtest run with no history' deserves a concrete answer:
+    how many real candles, over what dates."""
+    web.runtime()._client = _CandleClient(candles=_synthetic_candles(n=600))
+    d = client.post(f"/api/backtest?token={TOKEN}").json()
+    assert d["candles"] >= 500
+    assert "to" in d["history_span"] and "UTC" in d["history_span"]
+    assert "candleSnapshot" in d["source"]
+
+
+def test_dashboard_carries_the_weight_editor_and_forward_panel(client):
+    html = client.get("/").text
+    for marker in ("paintWeights", "readWeightInputs", "loadForward",
+                   "renderCoins", "mktFind"):
+        assert marker in html

@@ -381,6 +381,7 @@ class Runtime:
                 and now - self._markets_ts < self.MARKETS_TTL_S):
             return self._markets_cache
 
+        from .assetclass import classify, label as class_label
         from .hl import split_symbol
 
         try:
@@ -394,21 +395,81 @@ class Runtime:
         rows = []
         for sym, px in mids.items():
             dex, base = split_symbol(sym)
+            klass = classify(sym, dex)
             rows.append({"symbol": sym, "base": base, "dex": dex,
                          "hip3": bool(dex), "price": px,
+                         "klass": klass, "klass_label": class_label(klass),
                          "has_data": sym in have})
 
         # Canonical crypto first, then each builder's markets, alphabetical
         # within a venue so the list is scannable rather than hash-ordered.
-        rows.sort(key=lambda r: (r["dex"], r["base"]))
+        from .assetclass import ORDER
+
+        order = {k: i for i, k in enumerate(ORDER)}
+        rows.sort(key=lambda r: (order.get(r["klass"], 99), r["base"]))
         venues = sorted({r["dex"] for r in rows})
+
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["klass"]] = counts.get(r["klass"], 0) + 1
 
         self._markets_cache = {
             "markets": rows, "venues": venues, "count": len(rows),
+            "classes": [{"klass": k, "label": class_label(k), "n": counts[k]}
+                        for k in ORDER if k in counts],
             "fetched": datetime.now(timezone.utc).isoformat(),
         }
         self._markets_ts = now
         return self._markets_cache
+
+    def resolve_reads(self, limit: int = 300) -> dict[str, Any]:
+        """Settle recorded reads whose candle has closed.
+
+        Groups by (market, interval) so one candle fetch settles every read
+        waiting on it, rather than one request per row.
+        """
+        pending = self.history.pending_reads(time.time(), limit=limit)
+        if not pending:
+            return {"ok": True, "resolved": 0, "pending": 0}
+
+        by_market: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in pending:
+            by_market.setdefault((row["coin"], row["interval"]), []).append(row)
+
+        resolved = failed = 0
+        errors: list[str] = []
+        client = self.client()
+
+        for (coin, interval), rows in by_market.items():
+            try:
+                bars = client.candles(coin, interval, bars=200)
+            except Exception as exc:
+                errors.append(f"{coin} {interval}: {exc}")
+                failed += len(rows)
+                continue
+
+            step = client.INTERVALS.get(interval, 900)
+            for row in rows:
+                # Match within half a bar rather than exactly. A read taken
+                # against a synthesised boundary carries a grid timestamp that
+                # can sit a fraction off the feed's own, and an exact match
+                # would leave those permanently unresolved.
+                want = float(row["candle_ts"])
+                best = min(bars, key=lambda b: abs(b.ts - want), default=None)
+                px = (best.close if best is not None
+                      and abs(best.ts - want) <= step / 2 else None)
+                if px is None:
+                    # Candle rolled out of the window before it was resolved.
+                    # Leave it unresolved rather than guessing a price; a
+                    # fabricated outcome poisons the measurement permanently.
+                    failed += 1
+                    continue
+                if self.history.resolve_read(row["id"], px):
+                    resolved += 1
+
+        return {"ok": True, "resolved": resolved, "unresolvable": failed,
+                "pending": len(self.history.pending_reads(time.time())),
+                "errors": errors[:5]}
 
     def now(self, coin: str) -> dict[str, Any]:
         """Spot price plus how old everything else on the dashboard is.
@@ -689,6 +750,7 @@ def require_token(authorization: str = Header(default=""),
 def _worker_loop(rt: Runtime) -> None:
     last_sweep = 0.0
     last_price = 0.0
+    last_resolve = 0.0
 
     while True:
         try:
@@ -708,6 +770,13 @@ def _worker_loop(rt: Runtime) -> None:
                             rt.store().log_price(coin, mids[coin])
                 except Exception as exc:
                     rt.last_error = f"price poll: {exc}"
+
+            if now - last_resolve >= 120:
+                last_resolve = now
+                try:
+                    rt.resolve_reads(limit=200)
+                except Exception as exc:
+                    rt.last_error = f"resolve reads: {exc}"
 
             if now - last_sweep >= cfg.sweep_interval_minutes * 60:
                 last_sweep = now
@@ -1115,10 +1184,56 @@ def create_app() -> FastAPI:
             return {**out, "error": f"only {len(bars)} candles came back — "
                                     f"not enough to read structure"}
 
+        from .structure import Candle
+
         step = client.INTERVALS.get(interval, 900)
-        current = bars[-1]
-        closed = bars[:-1]
-        elapsed = max(0.0, min(float(step), time.time() - current.ts))
+        now_s = time.time()
+
+        # Is the last bar actually the one still forming?
+        #
+        # This is the bug behind "it says up on a candle that is clearly going
+        # down". If the feed's last bar has already closed, every signal built
+        # from it describes the PREVIOUS candle while the panel presents it as
+        # the current one -- and a finished green bar sitting under a market
+        # that has since turned is exactly how you get an UP read on a falling
+        # candle. So it is detected and corrected rather than assumed.
+        last = bars[-1]
+        candle_age = now_s - last.ts
+        last_is_forming = candle_age < step
+
+        # Live mid, fetched BEFORE assembling anything that depends on price.
+        live_spot = None
+        try:
+            live_spot = rt.client().all_mids_everywhere().get(coin)
+            rt.last_price.update({coin: live_spot} if live_spot else {})
+            rt.last_price_ts = now_s
+        except Exception as exc:
+            out["price_error"] = str(exc)
+
+        if last_is_forming:
+            current, closed = last, bars[:-1]
+            elapsed = max(0.0, min(float(step), candle_age))
+        else:
+            # No forming bar in the data. Build one from the live price so the
+            # read describes NOW rather than a closed candle.
+            boundary = last.ts + step * (int(candle_age // step))
+            px = live_spot if live_spot else last.close
+            current = Candle(ts=boundary, open=last.close, high=max(last.close, px),
+                             low=min(last.close, px), close=px, volume=0.0)
+            closed = bars
+            elapsed = max(0.0, min(float(step), now_s - boundary))
+            out["synthesised_candle"] = True
+
+        # Overlay the live mid onto the forming candle. `candleSnapshot` lags
+        # the tape, so its close, high and low for the in-progress bar are
+        # behind the market -- and `position_in_range` computed from a stale
+        # close is the single most misleading number on the panel.
+        if live_spot and live_spot > 0:
+            current = Candle(ts=current.ts, open=current.open,
+                             high=max(current.high, live_spot),
+                             low=min(current.low, live_spot),
+                             close=live_spot, volume=current.volume,
+                             trades=current.trades)
 
         # higher timeframe
         higher_struct = None
@@ -1178,19 +1293,12 @@ def create_app() -> FastAPI:
             magnet_bps=magnet_bps, magnet_notional=magnet_notional,
             calibration=rt.calibration(coin, interval))
 
-        # The candle's close and the live mid come from different endpoints.
-        # If they disagree materially, one of them is stale and every signal
-        # built on the candle is suspect -- so it is surfaced rather than
-        # quietly averaged over.
-        live_spot = None
-        try:
-            live_spot = rt.client().all_mids_everywhere().get(coin)
-            rt.last_price_ts = time.time()
-        except Exception:
-            pass
+        # The candle feed and the live mid come from different endpoints with
+        # different clocks. The overlay above keeps them in step; this reports
+        # how far apart they were, which is the honest staleness measure.
         drift_bps = None
-        if live_spot and current.close > 0:
-            drift_bps = (live_spot - current.close) / current.close * 10_000.0
+        if live_spot and last.close > 0:
+            drift_bps = (live_spot - last.close) / last.close * 10_000.0
 
         out.update({
             "open": current.open, "high": current.high, "low": current.low,
@@ -1198,6 +1306,10 @@ def create_app() -> FastAPI:
             "spot": live_spot,
             "spot_vs_candle_bps": drift_bps,
             "stale": bool(drift_bps is not None and abs(drift_bps) > 25),
+            "candle_age_s": candle_age,
+            "candle_was_forming": last_is_forming,
+            "predicts": ("direction of price from here to the close of this "
+                         f"{interval} candle"),
             "elapsed_fraction": r.elapsed_fraction,
             "seconds_left": r.seconds_left,
             "change_bps": r.change_bps,
@@ -1223,7 +1335,39 @@ def create_app() -> FastAPI:
         })
         if size > 0 and book is not None and not book.empty:
             out["round_trip_bps"] = book.round_trip_bps(size)
+
+        # Write the read down so it can be scored when the candle closes.
+        # This is the only way the flow and absorption signals ever get
+        # measured: no exchange serves historical order flow, so a backtest
+        # over past candles is permanently blind to them. This accumulates
+        # while you use the dashboard.
+        try:
+            import json as _json
+            rid = rt.history.record_read(
+                coin=coin, interval=interval, candle_ts=current.ts,
+                candle_end=current.ts + step, score=r.score, lean=r.lean,
+                confidence=r.confidence, elapsed_frac=r.elapsed_fraction,
+                price=current.close, had_flow=absorption is not None,
+                signals=_json.dumps({s.name: round(s.weighted(), 4)
+                                     for s in r.signals}))
+            out["recorded"] = rid is not None
+        except Exception as exc:
+            out["record_error"] = str(exc)
+
+        out["forward"] = rt.history.read_stats(coin, interval)
         return out
+
+    @app.post("/api/resolve-reads", dependencies=[Depends(require_token)])
+    def api_resolve_reads(limit: int = 300) -> dict[str, Any]:
+        """Score recorded reads whose candle has now closed."""
+        return rt.resolve_reads(limit=limit)
+
+    @app.get("/api/forward", dependencies=[Depends(require_token)])
+    def api_forward(coin: str = "", interval: str = "") -> dict[str, Any]:
+        """Measured performance of the live read, from recorded outcomes."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return {"coin": c, "interval": interval or None,
+                "stats": rt.history.read_stats(c, interval or None)}
 
     @app.post("/api/backtest", dependencies=[Depends(require_token)])
     def api_backtest(coin: str = "BTC", interval: str = "15m",
@@ -1257,9 +1401,18 @@ def create_app() -> FastAPI:
                               for b in r.bands],
                     "curve": r.curve}
 
+        span = ""
+        if candles:
+            from datetime import datetime as _dt
+            a = _dt.utcfromtimestamp(candles[0].ts).strftime("%Y-%m-%d %H:%M")
+            b = _dt.utcfromtimestamp(candles[-1].ts).strftime("%Y-%m-%d %H:%M")
+            span = f"{a} to {b} UTC"
+
         return {
             "ok": True, "coin": coin, "interval": interval,
             "candles": len(candles), "samples": len(bt.samples),
+            "history_span": span,
+            "source": "real exchange candles via candleSnapshot",
             "train": rep(bt.train), "test": rep(bt.test),
             "baseline_test": rep(bt.baseline_test) if bt.baseline_test else None,
             "tuned_weights": bt.tuned_weights,
@@ -1284,9 +1437,11 @@ def create_app() -> FastAPI:
             candleread.WEIGHTS.clear()
             candleread.WEIGHTS.update(candleread.DEFAULT_WEIGHTS)
             return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                    "defaults": dict(candleread.DEFAULT_WEIGHTS),
                     "note": "defaults restored"}
         if not payload:
-            return {"ok": True, "weights": dict(candleread.WEIGHTS)}
+            return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                    "defaults": dict(candleread.DEFAULT_WEIGHTS)}
 
         clean = {k: max(0.0, min(float(v), 5.0)) for k, v in payload.items()
                  if k in candleread.DEFAULT_WEIGHTS}
@@ -1295,6 +1450,7 @@ def create_app() -> FastAPI:
                     "known": sorted(candleread.DEFAULT_WEIGHTS)}
         candleread.WEIGHTS.update(clean)
         return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                "defaults": dict(candleread.DEFAULT_WEIGHTS),
                 "applied": clean}
 
     @app.post("/api/calibrate", dependencies=[Depends(require_token)])
@@ -1470,6 +1626,13 @@ DASHBOARD = """<!doctype html>
     letter-spacing:.06em;color:var(--dim)}
   .bt-col.held{border-color:var(--accent)}
   .bt-big{font-size:26px;font-variant-numeric:tabular-nums}
+  .wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+    gap:8px}
+  .wgrid div{background:var(--bg);border:1px solid var(--line);border-radius:4px;
+    padding:6px 8px}
+  .wgrid label{margin:0 0 3px;font-size:11px}
+  .wgrid input{width:100%;padding:4px 6px;font-size:13px}
+  .wgrid div.changed{border-color:var(--accent)}
 </style></head><body>
 <div class="wrap">
   <h1>liqmap</h1>
@@ -1480,7 +1643,11 @@ DASHBOARD = """<!doctype html>
 
   <div class="bar">
     <input type="password" id="tok" placeholder="access token">
-    <select id="coin" onchange="onCoinChange()" style="min-width:150px"
+    <select id="klass" onchange="renderCoins()" style="min-width:110px"
+            title="asset class"><option value="">all classes</option></select>
+    <input id="mktFind" size="10" placeholder="find…" oninput="renderCoins()"
+           title="filter by ticker">
+    <select id="coin" onchange="onCoinChange()" style="min-width:160px"
             title="every market listed on the exchange — a dot marks ones with swept position data">
       <option value="BTC">BTC</option></select>
     <span id="mktCount" class="msg" style="margin-right:6px">—</span>
@@ -1537,11 +1704,15 @@ DASHBOARD = """<!doctype html>
     </div>
 
     <div class="panel full" id="btPanel"><h2>Backtest — measured, not asserted</h2>
-      <div class="msg" style="margin-bottom:8px">History is split in two by date.
-        Weights are tuned on the <b>earlier</b> half only; the <b>later</b> half is
-        never seen by the search. Act on the held-out number. The replay is blind to
-        flow, absorption, book depth and the liquidation magnet — none of those were
-        recorded historically — so it is a floor, not a forecast.</div>
+      <div class="msg" style="margin-bottom:8px">Two separate measurements.
+        <b>Historical replay</b> uses real candles pulled from the exchange — the
+        count and date range are shown with the result — split in two by date, with
+        weights tuned on the earlier half only. No exchange serves historical order
+        flow or book depth, so that replay can only measure the candle-structure
+        signals. <b>Forward test</b> is the answer to that: every live read is written
+        down and scored when its candle closes, so flow and absorption get measured
+        too. It fills up as you use the dashboard.</div>
+      <div id="fwd" class="msg" style="margin-bottom:10px">—</div>
       <div class="conbar">
         <label>bars <input id="btBars" type="number" value="1000" min="200" max="5000"
           step="100" style="width:88px"></label>
@@ -1550,12 +1721,23 @@ DASHBOARD = """<!doctype html>
           <option value="0.7">70/30</option></select></label>
         <label><input type="checkbox" id="btTune" checked> search weights</label>
         <button onclick="runBacktest()">Run backtest</button>
-        <button onclick="applyWeights()" id="btApply" disabled>Apply tuned weights</button>
-        <button onclick="resetWeights()">Reset weights</button>
       </div>
       <div id="btHead" class="msg">—</div>
       <div id="btCurve"></div>
       <div id="btSay" class="say" style="display:none"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Signal weights — edit and apply</h3>
+      <div class="msg" style="margin-bottom:8px">These are the multipliers the
+        live read uses. Running a backtest fills in a tuned set; you can also
+        type your own. Nothing is applied until you press Apply.</div>
+      <div id="wGrid" class="wgrid"></div>
+      <div style="margin-top:8px">
+        <button onclick="applyWeights()">Apply weights</button>
+        <button onclick="resetWeights()">Reset to defaults</button>
+        <button onclick="useTuned()" id="btUseTuned" disabled>Load tuned values</button>
+        <span id="wMsg" class="msg"></span>
+      </div>
     </div>
 
     <div class="panel full" id="conPanel"><h2>Who is winning, and which way<span class="stamp" id="conStamp"></span></h2>
@@ -1620,7 +1802,28 @@ DASHBOARD = """<!doctype html>
 <script>
 const $ = id => document.getElementById(id);
 const tok = () => $('tok').value.trim();
-const coin = () => $('coin').value.trim().toUpperCase() || 'BTC';
+
+// Do NOT upper-case the whole symbol. HIP-3 DEX prefixes are lowercase and
+// case-sensitive, so `vntl:GOLD` upper-cased is a symbol that does not exist.
+const coin = () => {
+  const raw = $('coin').value.trim();
+  if (!raw) return 'BTC';
+  const i = raw.indexOf(':');
+  return i < 0 ? raw.toUpperCase()
+               : raw.slice(0, i) + ':' + raw.slice(i + 1).toUpperCase();
+};
+
+/* Build a query string with every value encoded.
+   Concatenating a raw symbol into a URL is what caused "bad or missing
+   token": a symbol containing `#` turns everything after it into a fragment,
+   the browser never sends `&token=`, and the server correctly rejects the
+   request. The symptom looked like an auth bug and was a URL bug.           */
+function q(params) {
+  return Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+    .join('&');
+}
 const money = n => n == null ? '—' :
   (Math.abs(n) >= 1e6 ? '$' + (n/1e6).toFixed(2) + 'M'
    : Math.abs(n) >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'k' : '$' + Number(n).toFixed(0));
@@ -1631,8 +1834,14 @@ try { const s = localStorage.getItem('liqmap_tok'); if (s) $('tok').value = s; }
 async function api(path, opts) {
   if (!tok()) throw new Error('enter your access token first');
   try { localStorage.setItem('liqmap_tok', tok()); } catch (e) {}
-  const r = await fetch(path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(tok()),
-    Object.assign({headers: {'Content-Type': 'application/json'}}, opts || {}));
+  // Token goes in BOTH the header and the query. The header survives any
+  // mangling of the query string; the query keeps plain links working.
+  const o = Object.assign({}, opts || {});
+  o.headers = Object.assign({'Content-Type': 'application/json',
+                             'Authorization': 'Bearer ' + tok()},
+                            o.headers || {});
+  const r = await fetch(path + (path.includes('?') ? '&' : '?')
+                        + 'token=' + encodeURIComponent(tok()), o);
   const txt = await r.text();
   if (!r.ok) throw new Error(txt.slice(0, 300));
   try { return JSON.parse(txt); } catch (e) { return txt; }
@@ -1644,7 +1853,8 @@ async function loadAll() {
   note('loading…');
   if (!nowPoll) startTicker();
   try {
-    await Promise.all([loadStatus(), loadCoins(), loadRead(), loadConsensus(),
+    await Promise.all([loadStatus(), loadCoins(), loadWeights(), loadRead(),
+                       loadForward(), loadConsensus(),
                        loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
                        loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
@@ -1664,10 +1874,8 @@ async function doHarvest() {
   note('starting harvest…');
   try {
     const tapes = (($('hcoins') && $('hcoins').value) || '').trim();
-    const r = await api('/api/harvest?minutes=' + encodeURIComponent(mins)
-                        + '&then_sweep=true'
-                        + (tapes ? '&coins=' + encodeURIComponent(tapes) : ''),
-                        {method: 'POST'});
+    const r = await api('/api/harvest?' + q({minutes: mins, then_sweep: 'true',
+                        coins: tapes}), {method: 'POST'});
     if (!r || r.ok === false) { note('could not start: ' + ((r && r.error) || 'unknown'), true); return; }
     note(`harvesting for ${mins} min — watching the trade feed…`);
 
@@ -1782,7 +1990,7 @@ function ageText(sec) {
 
 async function loadNow() {
   try {
-    nowData = await api('/api/now?coin=' + coin());
+    nowData = await api('/api/now?' + q({coin: coin()}));
     nowFetchedAt = Date.now();
   } catch (e) {
     $('tickAge').textContent = e.message;
@@ -1952,9 +2160,9 @@ function toggleReadAuto() {
 async function loadRead() {
   let d;
   try {
-    d = await api('/api/read?coin=' + coin() + '&interval=' + $('rInt').value
-                  + '&higher=' + $('rHigh').value
-                  + '&size=' + (parseFloat($('liqSize').value || '0') || 0));
+    d = await api('/api/read?' + q({coin: coin(), interval: $('rInt').value,
+                  higher: $('rHigh').value,
+                  size: parseFloat($('liqSize').value || '0') || 0}));
   } catch (e) { $('readHead').textContent = e.message; return; }
 
   if (d.error) {
@@ -2012,8 +2220,8 @@ async function loadRead() {
 async function doCalibrate() {
   note('replaying history — this measures the lean instead of asserting it…');
   try {
-    const r = await api('/api/calibrate?coin=' + coin() + '&interval=' + $('rInt').value,
-                        {method: 'POST'});
+    const r = await api('/api/calibrate?' + q({coin: coin(),
+                        interval: $('rInt').value}), {method: 'POST'});
     if (!r.ok) { note(r.error, true); return; }
     const rows = (r.table || []).filter(t => t.n > 0)
       .map(t => `${t.band}: ${(t.up_rate*100).toFixed(0)}% up (n=${t.n})`);
@@ -2030,16 +2238,19 @@ async function runBacktest() {
   $('btCurve').innerHTML = '';
   let d;
   try {
-    d = await api('/api/backtest?coin=' + coin() + '&interval=' + $('rInt').value
-                  + '&bars=' + (parseInt($('btBars').value, 10) || 1000)
-                  + '&train_fraction=' + $('btSplit').value
-                  + '&tune=' + ($('btTune').checked ? 'true' : 'false'),
+    d = await api('/api/backtest?' + q({coin: coin(),
+                  interval: $('rInt').value,
+                  bars: parseInt($('btBars').value, 10) || 1000,
+                  train_fraction: $('btSplit').value,
+                  tune: $('btTune').checked ? 'true' : 'false'}),
                   {method: 'POST'});
   } catch (e) { $('btHead').textContent = e.message; return; }
   if (!d.ok) { $('btHead').textContent = d.error; return; }
 
   tunedWeights = d.tuned_weights || null;
-  $('btApply').disabled = !tunedWeights;
+  const bu = $('btUseTuned');
+  if (bu) bu.disabled = !tunedWeights;
+  if (tunedWeights) paintWeights(liveWeights, tunedWeights);
 
   const col = (r, held) => {
     if (!r) return '';
@@ -2055,7 +2266,8 @@ async function runBacktest() {
 
   $('btHead').innerHTML =
       `<div style="font-size:12px;color:var(--dim);margin-bottom:6px">`
-    + `${d.candles} candles · ${d.samples} scored bars · blind to `
+    + `${d.candles} real candles (${d.history_span || 'span unknown'}) · `
+    + `${d.samples} scored bars · replay is blind to `
     + `${(d.blind_to || []).join(', ')}</div>`
     + '<div class="bt-grid">'
     + col(d.train, false) + col(d.baseline_test, false) + col(d.test, true)
@@ -2082,24 +2294,108 @@ async function runBacktest() {
 
   $('btSay').style.display = '';
   $('btSay').textContent = d.verdict;
+  loadForward();
+}
+
+async function loadForward() {
+  let d;
+  try {
+    d = await api('/api/forward?' + q({coin: coin(), interval: $('rInt').value}));
+  } catch (e) { $('fwd').textContent = e.message; return; }
+
+  const s = d.stats || {};
+  const o = s.overall || {n: 0};
+  const cell = (label, v) => {
+    if (!v || !v.n) return `<div class="stat"><b>—</b><span>${label} (0)</span></div>`;
+    return `<div class="stat"><b class="${v.accuracy > 0.55 ? 'long' : v.accuracy < 0.45 ? 'short' : ''}">`
+      + `${(v.accuracy*100).toFixed(0)}%</b><span>${label} (${v.n})</span></div>`;
+  };
+
+  if (!o.n) {
+    $('fwd').innerHTML = '<b>Forward test:</b> nothing scored yet'
+      + (s.pending ? ` — ${s.pending} read${s.pending === 1 ? '' : 's'} waiting for their candle to close.`
+                   : '. Leave the read running and it will fill up.');
+    return;
+  }
+
+  $('fwd').innerHTML = '<b>Forward test — measured on live reads</b>'
+    + '<div class="conrow" style="margin-top:6px">'
+    + cell('overall', o)
+    + cell('with flow &amp; absorption', s.with_flow)
+    + cell('candles only', s.without_flow)
+    + (s.bands || []).map(b => cell(b.band + ' signals', b)).join('')
+    + '</div>'
+    + (s.pending ? `<div style="color:var(--dim);font-size:12px">${s.pending} awaiting resolution</div>` : '');
+}
+
+let liveWeights = {}, defaultWeights = {};
+
+function wmsg(m, bad) {
+  const el = $('wMsg');
+  el.textContent = m;
+  el.className = 'msg' + (bad ? ' err' : '');
+}
+
+function paintWeights(w, tuned) {
+  liveWeights = Object.assign({}, w);
+  $('wGrid').innerHTML = Object.keys(w).sort().map(k => {
+    const t = tuned && tuned[k] != null ? tuned[k] : null;
+    const diff = t != null && Math.abs(t - w[k]) > 1e-9;
+    return `<div class="${diff ? 'changed' : ''}">`
+      + `<label>${k}${t != null ? ` <span style="color:var(--accent)">tuned ${t.toFixed(2)}</span>` : ''}</label>`
+      + `<input id="w_${k}" type="number" step="0.05" min="0" max="5" value="${w[k]}"></div>`;
+  }).join('');
+}
+
+function readWeightInputs() {
+  const out = {};
+  Object.keys(liveWeights).forEach(k => {
+    const el = $('w_' + k);
+    if (!el) return;
+    const v = parseFloat(el.value);
+    if (isFinite(v)) out[k] = Math.max(0, Math.min(v, 5));
+  });
+  return out;
+}
+
+async function loadWeights() {
+  try {
+    const r = await api('/api/weights', {method: 'POST'});
+    defaultWeights = r.defaults || r.weights;
+    paintWeights(r.weights, tunedWeights);
+  } catch (e) { wmsg(e.message, true); }
 }
 
 async function applyWeights() {
-  if (!tunedWeights) return;
+  const w = readWeightInputs();
+  if (!Object.keys(w).length) { wmsg('nothing to apply', true); return; }
+  wmsg('applying…');
   try {
-    const r = await api('/api/weights', {method: 'POST',
-      body: JSON.stringify(tunedWeights)});
-    note(r.ok ? 'tuned weights applied to live reads' : r.error, !r.ok);
+    const r = await api('/api/weights', {method: 'POST', body: JSON.stringify(w)});
+    if (!r.ok) { wmsg(r.error || 'rejected', true); return; }
+    paintWeights(r.weights, tunedWeights);
+    wmsg('applied — live reads now use these');
     loadRead();
-  } catch (e) { note(e.message, true); }
+  } catch (e) { wmsg(e.message, true); }
 }
 
 async function resetWeights() {
+  wmsg('resetting…');
   try {
     const r = await api('/api/weights?reset=true', {method: 'POST'});
-    note('weights reset to defaults');
+    paintWeights(r.weights, tunedWeights);
+    wmsg('back to defaults');
     loadRead();
-  } catch (e) { note(e.message, true); }
+  } catch (e) { wmsg(e.message, true); }
+}
+
+function useTuned() {
+  if (!tunedWeights) return;
+  Object.keys(tunedWeights).forEach(k => {
+    const el = $('w_' + k);
+    if (el) el.value = tunedWeights[k];
+  });
+  wmsg('tuned values loaded into the boxes — press Apply to use them');
 }
 
 let watchPoll = null;
@@ -2110,8 +2406,8 @@ async function startWatch() {
   const mins = parseFloat($('wMins').value || '15');
   const band = parseFloat($('wBand').value || '10');
   try {
-    const r = await api(`/api/watch?coin=${coin()}&level=${lvl}&minutes=${mins}&band_bps=${band}`,
-                        {method: 'POST'});
+    const r = await api('/api/watch?' + q({coin: coin(), level: lvl,
+                        minutes: mins, band_bps: band}), {method: 'POST'});
     if (!r || r.ok === false) { note('could not start watch: ' + ((r && r.error) || 'unknown'), true); return; }
     note(`watching ${coin()} at ${lvl} for ${mins} min`);
     if (watchPoll) clearInterval(watchPoll);
@@ -2131,7 +2427,7 @@ async function loadLiquidity() {
   const size = parseFloat($('liqSize').value || '0') || 0;
   let d;
   try {
-    d = await api('/api/liquidity?coin=' + coin() + '&size=' + size);
+    d = await api('/api/liquidity?' + q({coin: coin(), size: size}));
   } catch (e) { $('liqCost').textContent = e.message; return; }
 
   if (d.error) {
@@ -2207,8 +2503,8 @@ async function loadConsensus() {
   const ma = parseFloat($('minAcct').value || '0') || 0;
   let d;
   try {
-    d = await api('/api/consensus?coin=' + coin() + '&winners_only=' + wo
-                  + '&min_notional=' + mn + '&min_account=' + ma);
+    d = await api('/api/consensus?' + q({coin: coin(), winners_only: wo,
+                  min_notional: mn, min_account: ma}));
   } catch (e) { $('consensus').textContent = e.message; return; }
 
   if (d.error) { $('consensus').textContent = d.error; $('conTraders').innerHTML = ''; return; }
@@ -2264,7 +2560,7 @@ async function loadConsensus() {
 }
 
 async function loadMap() {
-  const d = await api('/api/map?coin=' + coin());
+  const d = await api('/api/map?' + q({coin: coin()}));
   if (d.error) { $('mapRaw').textContent = d.error; $('mapW').textContent = d.error; return; }
   $('mapRaw').textContent = d.text.raw;
   $('mapW').textContent = d.text.weighted;
@@ -2281,7 +2577,7 @@ async function loadMap() {
 }
 
 async function loadChanges() {
-  const d = await api('/api/changes?hours=24&coin=' + coin());
+  const d = await api('/api/changes?' + q({hours: 24, coin: coin()}));
   const rows = d.changes || [];
   if (!rows.length) {
     $('changes').textContent = 'no changes in the last 24h — needs at least two sweeps';
@@ -2303,7 +2599,7 @@ async function loadChanges() {
 }
 
 async function loadPositions() {
-  const d = await api('/api/positions?coin=' + coin() + '&top=40');
+  const d = await api('/api/positions?' + q({coin: coin(), top: 40}));
   if (d.error) { $('pos').textContent = d.error; return; }
   $('pos').innerHTML = '<table><tr><th>wallet</th><th>side</th><th class="r">notional</th>'
     + '<th class="r">entry</th><th class="r">liq</th><th class="r">liq dist</th>'
@@ -2329,7 +2625,7 @@ async function loadReport() { $('report').textContent = await api('/api/report')
 async function doSweep() {
   note('sweeping — this takes a while at the rate limit…');
   try {
-    const r = await api('/api/sweep?coin=' + coin(), {method: 'POST'});
+    const r = await api('/api/sweep?' + q({coin: coin()}), {method: 'POST'});
     if (!r.ok) { note(r.error, true); return; }
     const coins = r.coins_recorded || [];
     note(`${coin()}: ${r.positions || 0} positions, ${r.changes || 0} changes `
@@ -2344,37 +2640,62 @@ async function doSweep() {
 
 let hip3Markets = {};
 
+let allMarkets = [];
+
 async function loadCoins() {
   // The picker lists what you can TRADE, not what happens to have been swept.
-  // Built from swept history it showed BTC and nothing else, which is a
-  // different question answered wrongly.
+  // With well over a thousand markets, a flat alphabetical list is a haystack,
+  // so they are grouped by asset class and filterable by ticker.
   try {
     const d = await api('/api/markets');
     const rows = d.markets || [];
     if (!rows.length) { $('mktCount').textContent = d.error || 'no markets'; return; }
 
+    allMarkets = rows;
     hip3Markets = {};
     rows.forEach(r => { if (r.hip3) hip3Markets[r.symbol] = r.dex; });
 
-    const byVenue = {};
-    rows.forEach(r => { (byVenue[r.dex] || (byVenue[r.dex] = [])).push(r); });
+    const cls = d.classes || [];
+    $('klass').innerHTML = `<option value="">all (${d.count})</option>`
+      + cls.map(c => `<option value="${c.klass}">${c.label} (${c.n})</option>`).join('');
 
-    const label = v => v ? v + ' (builder market)' : 'Hyperliquid perps';
-    const groups = Object.keys(byVenue).sort().map(v =>
-      `<optgroup label="${label(v)}">`
-      + byVenue[v].map(r =>
-          `<option value="${r.symbol}"${r.symbol === coin() ? ' selected' : ''}>`
-          + `${r.base}${r.has_data ? ' •' : ''}</option>`).join('')
-      + '</optgroup>').join('');
-
-    $('coin').innerHTML = groups;
-    if (coin() !== lastCoin && rows.some(r => r.symbol === lastCoin)) {
-      $('coin').value = lastCoin;
-    }
-    $('mktCount').textContent = `${d.count} markets`
-      + (d.stale ? ' (cached — exchange unreachable)' : '');
-    showVenueNote();
+    renderCoins();
+    $('mktCount').textContent = (d.stale ? 'cached — exchange unreachable' : '');
   } catch (e) { $('mktCount').textContent = e.message; }
+}
+
+function renderCoins() {
+  const want = $('klass').value;
+  const find = ($('mktFind').value || '').trim().toUpperCase();
+  const keep = allMarkets.filter(r =>
+    (!want || r.klass === want) && (!find || r.base.toUpperCase().includes(find)));
+
+  if (!keep.length) {
+    $('coin').innerHTML = '<option value="">no match</option>';
+    $('mktCount').textContent = '0 of ' + allMarkets.length;
+    return;
+  }
+
+  // Group by class, then by venue inside it, so a builder's gold and the
+  // canonical crypto never sit in the same undifferentiated list.
+  const groups = {};
+  keep.forEach(r => {
+    const g = r.klass_label + (r.dex ? ' · ' + r.dex : '');
+    (groups[g] || (groups[g] = [])).push(r);
+  });
+
+  $('coin').innerHTML = Object.keys(groups).map(g =>
+    `<optgroup label="${g}">`
+    + groups[g].map(r =>
+        `<option value="${r.symbol}">${r.base}${r.has_data ? ' •' : ''}</option>`).join('')
+    + '</optgroup>').join('');
+
+  const still = keep.some(r => r.symbol === lastCoin);
+  if (still) $('coin').value = lastCoin;
+  $('mktCount').textContent = keep.length === allMarkets.length
+    ? allMarkets.length + ' markets'
+    : keep.length + ' of ' + allMarkets.length;
+  showVenueNote();
 }
 
 function showVenueNote() {

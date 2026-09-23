@@ -41,6 +41,38 @@ from .bucket import Position
 from .strength import PositionChange, diff_positions
 
 SCHEMA = """
+-- Live candle reads, and how they turned out.
+--
+-- The historical replay in backtest.py can only see what candles provide.
+-- Flow, absorption, book depth and the liquidation magnet were never recorded
+-- by the exchange, so a backtest over past candles is permanently blind to
+-- the four strongest live signals. The only way to measure those is to write
+-- down what the read said at the time and come back when the candle closes.
+--
+-- That is what this table is: a forward test that accumulates while you use
+-- the thing. It answers the question a historical replay cannot.
+CREATE TABLE IF NOT EXISTS reads (
+    id            TEXT PRIMARY KEY,
+    ts            TEXT NOT NULL,
+    coin          TEXT NOT NULL,
+    interval      TEXT NOT NULL,
+    candle_ts     REAL NOT NULL,
+    candle_end    REAL NOT NULL,
+    score         REAL NOT NULL,
+    lean          TEXT NOT NULL,
+    confidence    REAL NOT NULL,
+    elapsed_frac  REAL NOT NULL,
+    price         REAL NOT NULL,
+    had_flow      INTEGER NOT NULL DEFAULT 0,
+    signals       TEXT,
+    resolved      INTEGER NOT NULL DEFAULT 0,
+    outcome_px    REAL,
+    correct       INTEGER,
+    move_bps      REAL
+);
+CREATE INDEX IF NOT EXISTS idx_reads_open ON reads(resolved, candle_end);
+CREATE INDEX IF NOT EXISTS idx_reads_market ON reads(coin, interval, ts);
+
 CREATE TABLE IF NOT EXISTS sweeps (
     id          TEXT PRIMARY KEY,
     ts          TEXT NOT NULL,
@@ -264,6 +296,128 @@ class History:
         sql += " ORDER BY ts DESC LIMIT ?"
         params.append(limit)
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    # -- forward testing ---------------------------------------------------
+
+    # One read per candle per market. Polling every ten seconds would
+    # otherwise write ninety rows for a single candle and let one lucky
+    # fifteen minutes dominate the measured hit rate.
+    def record_read(self, coin: str, interval: str, candle_ts: float,
+                    candle_end: float, score: float, lean: str,
+                    confidence: float, elapsed_frac: float, price: float,
+                    had_flow: bool, signals: str = "") -> str | None:
+        """Write down what the read said, unless this candle already has one.
+
+        Returns the row id, or None when a read for this candle exists. Later
+        reads in the same candle are deliberately dropped rather than
+        updating: the honest question is what it said at a given point, not
+        what it settled on once the answer was nearly known.
+        """
+        existing = self._conn.execute(
+            "SELECT id FROM reads WHERE coin=? AND interval=? AND candle_ts=?",
+            (coin, interval, candle_ts)).fetchone()
+        if existing:
+            return None
+
+        rid = uuid.uuid4().hex[:16]
+        with self._tx() as c:
+            c.execute(
+                """INSERT INTO reads (id, ts, coin, interval, candle_ts,
+                       candle_end, score, lean, confidence, elapsed_frac,
+                       price, had_flow, signals)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (rid, datetime.now(timezone.utc).isoformat(), coin, interval,
+                 candle_ts, candle_end, score, lean, confidence, elapsed_frac,
+                 price, 1 if had_flow else 0, signals))
+        return rid
+
+    def pending_reads(self, now: float, limit: int = 500) -> list[dict[str, Any]]:
+        """Reads whose candle has closed but which have no outcome yet."""
+        rows = self._conn.execute(
+            """SELECT * FROM reads WHERE resolved = 0 AND candle_end <= ?
+               ORDER BY candle_end LIMIT ?""", (now, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_read(self, read_id: str, outcome_px: float) -> bool:
+        """Settle one read against the price at its candle's close.
+
+        Correct means price finished on the side the read leaned, measured
+        FROM THE PRICE AT THE TIME OF THE READ -- not from the candle's open.
+        That is the question a scalper is actually asking: if I had acted on
+        this, would I be up when the candle ended?
+        """
+        row = self._conn.execute(
+            "SELECT lean, price FROM reads WHERE id = ?", (read_id,)).fetchone()
+        if row is None:
+            return False
+
+        entry = float(row["price"] or 0)
+        if entry <= 0 or outcome_px <= 0:
+            return False
+        move = (outcome_px - entry) / entry * 10_000.0
+
+        lean = row["lean"]
+        if lean == "up":
+            correct = 1 if move > 0 else 0
+        elif lean == "down":
+            correct = 1 if move < 0 else 0
+        else:
+            correct = None          # a flat read makes no claim to score
+
+        with self._tx() as c:
+            c.execute(
+                """UPDATE reads SET resolved = 1, outcome_px = ?, correct = ?,
+                       move_bps = ? WHERE id = ?""",
+                (outcome_px, correct, move, read_id))
+        return True
+
+    def read_stats(self, coin: str | None = None, interval: str | None = None
+                   ) -> dict[str, Any]:
+        """Measured performance of the live read, by score band.
+
+        Splits on whether flow and absorption were available, because those
+        are exactly the signals a historical backtest cannot see -- and the
+        difference between the two is the value of having a level watch
+        running.
+        """
+        where = ["resolved = 1", "correct IS NOT NULL"]
+        params: list[Any] = []
+        if coin:
+            where.append("coin = ?")
+            params.append(coin)
+        if interval:
+            where.append("interval = ?")
+            params.append(interval)
+        clause = " AND ".join(where)
+
+        rows = [dict(r) for r in self._conn.execute(
+            f"SELECT score, correct, move_bps, had_flow FROM reads "
+            f"WHERE {clause}", params).fetchall()]
+
+        def summarise(subset: list[dict[str, Any]]) -> dict[str, Any]:
+            if not subset:
+                return {"n": 0, "accuracy": None, "avg_move_bps": None}
+            right = sum(1 for r in subset if r["correct"])
+            moves = [abs(float(r["move_bps"] or 0)) for r in subset]
+            return {"n": len(subset), "accuracy": right / len(subset),
+                    "avg_move_bps": sum(moves) / len(moves)}
+
+        bands = []
+        for lo, hi, name in ((0.15, 0.30, "weak"), (0.30, 0.50, "moderate"),
+                             (0.50, 1.01, "strong")):
+            sub = [r for r in rows if lo <= abs(float(r["score"])) < hi]
+            bands.append({"band": name, **summarise(sub)})
+
+        pending = int(self._conn.execute(
+            "SELECT COUNT(*) FROM reads WHERE resolved = 0").fetchone()[0])
+
+        return {
+            "overall": summarise(rows),
+            "with_flow": summarise([r for r in rows if r["had_flow"]]),
+            "without_flow": summarise([r for r in rows if not r["had_flow"]]),
+            "bands": bands,
+            "pending": pending,
+        }
 
     def coins_with_data(self) -> list[dict[str, Any]]:
         """Every coin that has at least one recorded sweep, newest first.
