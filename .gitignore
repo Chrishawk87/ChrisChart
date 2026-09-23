@@ -10,3 +10,4 @@ venv/
 *.db
 wallets.json
 *.npy
+.DS_Store

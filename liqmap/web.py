@@ -35,7 +35,8 @@ from typing import Any, Sequence
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import (Depends, FastAPI, File, Header, HTTPException, Query,
+                     UploadFile)
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 
 from . import consensus as consensus_mod
@@ -45,6 +46,22 @@ from .settings import Settings, SettingsStore, default_db_path
 from .strength import fragility_weighter, score_all, summarise
 
 APP_TITLE = "liqmap"
+
+# Trade size assumed when none is given, in dollars. It is a stated default
+# rather than a borrowed one: size determines the round-trip cost, which
+# determines whether a suggestion is offered at all, so it must not be tied
+# to an unrelated setting that someone might reasonably change.
+DEFAULT_TRADE_NOTIONAL = 10_000.0
+
+# Largest chart-history upload accepted, in bytes. Enforced against the
+# declared length BEFORE the body is read, because a cap checked after
+# `await file.read()` has already allocated the whole thing.
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+
+# Most bars kept from one upload. A 14MB CSV parses to roughly 400k bars and
+# half a gigabyte of resident memory; this bounds that regardless of what the
+# file claims to be.
+MAX_UPLOAD_BARS = 250_000
 
 
 # --------------------------------------------------------------------------
@@ -526,6 +543,186 @@ class Runtime:
                 "pending": len(self.history.pending_reads(time.time())),
                 "errors": errors[:5]}
 
+    def suggest_for(self, coin: str, interval: str = "15m",
+                    notional: float = 0.0, fee_bps: float = 0.0,
+                    record: bool = True) -> dict[str, Any]:
+        """A trade to take or ignore on this market, or why there isn't one.
+
+        Everything the suggestion needs comes from the live feed: the book
+        read, the book itself, how much of the candle is left and what recent
+        bars on this timeframe actually travel. If the feed is not running
+        there is no suggestion, and saying so is the correct answer -- the
+        alternative is a target sized from a stale snapshot.
+        """
+        from .live import INTERVALS
+        from .suggest import suggest as make_suggestion
+
+        coin = self.resolve_symbol(coin)[0] or coin
+
+        # An unknown interval must not silently become 900 seconds. The
+        # candle grid, the recorded `candle_ts` and the resolver's own
+        # lookup would each use a different length, and the row could never
+        # be settled -- it would simply sit pending forever.
+        if interval not in INTERVALS:
+            return {"ok": False, "coin": coin, "take": False,
+                    "gate": "bad interval",
+                    "detail": f"{interval!r} is not a timeframe this feed "
+                              f"builds ({', '.join(sorted(INTERVALS))})",
+                    "sentence": f"No trade — {interval!r} is not a known "
+                                f"timeframe."}
+
+        feed = self.feed_for(coin)
+        if feed is None:
+            return {"ok": False, "coin": coin, "take": False,
+                    "gate": "no feed",
+                    "detail": "no live feed on this market — press Go live",
+                    "sentence": "No trade — the feed is not running on this "
+                                "market, so there is no book to read."}
+
+        interval_s = float(INTERVALS[interval])
+        read = feed.book_call()
+        with feed._lock:
+            book = feed.book
+
+        live = feed.candle(interval)
+        if live is None:
+            feed.ensure_interval(interval)
+            live = feed.candle(interval)
+
+        now = time.time()
+        if live is not None:
+            seconds_left = max(0.0, live.end_ts - now)
+            candle_ts, candle_end = live.start_ts, live.end_ts
+        else:
+            from .live import grid_start
+            start = grid_start(now, interval_s)
+            seconds_left = max(0.0, start + interval_s - now)
+            candle_ts, candle_end = start, start + interval_s
+
+        # Closed bars for the range estimate. The feed's own history is
+        # preferred -- it is what this candle is actually following -- and
+        # the exchange fills in when the feed has not been up long.
+        recent = feed.history(interval)
+        if len(recent) < 10:
+            try:
+                recent = self.client().candles(coin, interval, bars=60)[:-1]
+            except Exception:
+                pass
+
+        # A fixed, stated default rather than `min_wallet_notional`, which is
+        # the "smallest whale position worth harvesting" knob and has nothing
+        # to do with trade size. Size drives the round trip, which drives the
+        # main gate, so an operator lowering an unrelated setting would have
+        # silently made every suggestion look cheaper.
+        if notional <= 0:
+            notional = DEFAULT_TRADE_NOTIONAL
+
+        out = make_suggestion(
+            read, book, coin=coin, interval=interval, interval_s=interval_s,
+            seconds_left=seconds_left, recent=recent, notional=notional,
+            fee_bps=fee_bps)
+
+        payload = out.to_dict()
+        payload["ok"] = True
+        payload["coin"] = coin
+        payload["interval"] = interval
+        payload["candle_ts"] = candle_ts
+        payload["notional"] = notional
+        payload["feed_age_s"] = feed.age
+        payload["book_updates"] = feed.book_updates
+
+        # Record it so it can be settled later. Only real suggestions are
+        # stored: a refusal is not a trade and counting refusals would let
+        # the tool improve its own hit rate by declining more often.
+        if record and out.take:
+            sid = self.history.record_suggestion(
+                coin=coin, interval=interval, candle_ts=candle_ts,
+                candle_end=candle_end, side=out.side, entry=out.entry,
+                target_px=out.target_px, stop_px=out.stop_px,
+                target_bps=out.target_bps, risk_bps=out.risk_bps,
+                rr=out.rr, cost_bps=out.cost_bps,
+                conviction=out.conviction, score=out.score,
+                reason="; ".join(out.reasons), made_at=now)
+            if sid is None:
+                existing = self.history.open_suggestion(coin, interval,
+                                                        candle_ts)
+                sid = existing["id"] if existing else None
+                if existing:
+                    payload["decision"] = existing["decision"]
+            payload["id"] = sid
+        return payload
+
+    def resolve_suggestions(self, limit: int = 300) -> dict[str, Any]:
+        """Settle suggestions whose candle has closed.
+
+        Two things make this harder than settling a read, and both of them
+        flatter the result if they are got wrong.
+
+        THE WINDOW STARTS WHEN THE SUGGESTION DID. A suggestion made ten
+        minutes into a fifteen-minute bar must not be settled against that
+        bar's full high and low. A bar that spiked 300bps in its first two
+        minutes and came back would record a target hit that happened eight
+        minutes before the trade existed. So the settling window runs from
+        `made_at` to the candle's close, and it is built from ONE-MINUTE bars
+        covering that span.
+
+        A TRADE IS DECIDED BY WHICH LEVEL WAS REACHED, not by the close. A
+        close-only resolution records a winner as a loser every time price
+        touched the target and came back.
+        """
+        pending = self.history.pending_suggestions(time.time(), limit=limit)
+        if not pending:
+            return {"ok": True, "resolved": 0, "pending": 0}
+
+        by_coin: dict[str, list[dict[str, Any]]] = {}
+        for row in pending:
+            by_coin.setdefault(row["coin"], []).append(row)
+
+        resolved = failed = 0
+        errors: list[str] = []
+        client = self.client()
+
+        for coin, rows in by_coin.items():
+            try:
+                # One-minute bars are the finest the exchange serves, and
+                # they are what makes a sub-candle window measurable at all.
+                fine = client.candles(coin, "1m", bars=1500)
+            except Exception as exc:
+                errors.append(f"{coin}: {exc}")
+                failed += len(rows)
+                continue
+
+            for row in rows:
+                start = float(row["made_at"] or 0) or float(row["candle_ts"])
+                end = float(row["candle_end"])
+                window = [b for b in fine if start - 60 <= b.ts < end]
+                if not window:
+                    # The span rolled out of the 1m history before it could
+                    # be settled. Never settle against the wrong bars: a
+                    # fabricated outcome poisons the measurement
+                    # permanently, while a missing one is merely missing.
+                    #
+                    # Rows too old to ever come back are abandoned rather
+                    # than left pending, because `pending_suggestions` is
+                    # ordered oldest-first: one permanently unresolvable row
+                    # would otherwise sit at the head of the queue and block
+                    # every newer row behind it.
+                    if end < time.time() - 86_400:
+                        self.history.abandon_suggestion(row["id"])
+                    failed += 1
+                    continue
+
+                if self.history.resolve_suggestion(
+                        row["id"],
+                        high=max(b.high for b in window),
+                        low=min(b.low for b in window),
+                        close=window[-1].close):
+                    resolved += 1
+
+        return {"ok": True, "resolved": resolved, "unresolvable": failed,
+                "pending": len(self.history.pending_suggestions(time.time())),
+                "errors": errors[:5]}
+
     def now(self, coin: str) -> dict[str, Any]:
         """Spot price plus how old everything else on the dashboard is.
 
@@ -835,6 +1032,15 @@ def _worker_loop(rt: Runtime) -> None:
                     rt.resolve_reads(limit=200)
                 except Exception as exc:
                     rt.last_error = f"resolve reads: {exc}"
+                # Suggestions settle on the same tick. Without this the
+                # table fills up and nothing in it is ever scored, so
+                # `suggestion_stats` reports "nothing settled yet" forever
+                # while the backlog grows -- and the decision freeze, which
+                # keys off the candle clock, has nothing to compare against.
+                try:
+                    rt.resolve_suggestions(limit=200)
+                except Exception as exc:
+                    rt.last_error = f"resolve suggestions: {exc}"
 
             if now - last_sweep >= cfg.sweep_interval_minutes * 60:
                 last_sweep = now
@@ -1466,6 +1672,136 @@ def create_app() -> FastAPI:
             "age_s": feed.age,
         }
 
+    @app.get("/api/suggest", dependencies=[Depends(require_token)])
+    def api_suggest(coin: str = "BTC", interval: str = "15m",
+                    size: float = 0.0, fee_bps: float = 0.0,
+                    record: bool = True) -> dict[str, Any]:
+        """A trade to take or ignore, in one sentence, or why there isn't one.
+
+        `size` is what you would actually trade, because the round trip
+        depends on how far into the book you have to reach. `fee_bps` is your
+        own round-trip fee; leaving it at zero makes every suggestion look
+        cheaper than it is, and the output says so when it is unset.
+
+        This SUGGESTS. It does not place anything.
+        """
+        return rt.suggest_for(coin, interval, notional=max(size, 0.0),
+                              fee_bps=max(fee_bps, 0.0), record=record)
+
+    @app.post("/api/decide", dependencies=[Depends(require_token)])
+    def api_decide(id: str, taken: bool) -> dict[str, Any]:
+        """Record that a suggestion was taken or ignored.
+
+        Ignored ones matter as much as taken ones: without them there is no
+        way to find out whether the filtering being applied is worth
+        anything.
+        """
+        ok = rt.history.decide(id, taken)
+        # `decision` reports what was STORED, not what was asked for. The
+        # first cut echoed the request either way, so a refused write came
+        # back reading "taken" and the page showed a decision that is not in
+        # the table.
+        return {"ok": ok, "id": id,
+                "decision": ("taken" if taken else "ignored") if ok else None,
+                "note": "" if ok else
+                        "unknown id, or that candle has already closed — a "
+                        "decision cannot be recorded or changed once the "
+                        "result is visible"}
+
+    @app.post("/api/resolve-suggestions", dependencies=[Depends(require_token)])
+    def api_resolve_suggestions(limit: int = 300) -> dict[str, Any]:
+        return rt.resolve_suggestions(limit=limit)
+
+    @app.get("/api/decisions", dependencies=[Depends(require_token)])
+    def api_decisions(coin: str = "", interval: str = "", recent: int = 25
+                      ) -> dict[str, Any]:
+        """How the suggestions did, and how the decisions about them did."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return {
+            "ok": True, "coin": c, "interval": interval or None,
+            "stats": rt.history.suggestion_stats(c, interval or None),
+            "recent": rt.history.recent_suggestions(c, limit=max(1, min(recent, 200))),
+        }
+
+    @app.post("/api/upload-history", dependencies=[Depends(require_token)])
+    async def api_upload_history(file: UploadFile = File(...),
+                                 coin: str = "BTC",
+                                 merge_into: str = "") -> dict[str, Any]:
+        """Take an OHLCV export and store it for replaying.
+
+        The report that comes back always states what candle-only history can
+        and cannot train. It cannot train the book signals, which are most of
+        the weight in the book call, because an OHLCV file does not contain a
+        book and no exchange serves historical depth at this resolution.
+        """
+        from .ingest import parse as parse_history
+
+        too_big = {"ok": False,
+                   "error": f"file is over "
+                            f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB — split "
+                            f"it or upload a shorter span"}
+
+        # Checked against the declared size first: reading a two-gigabyte
+        # body and THEN rejecting it means the allocation already happened.
+        declared = getattr(file, "size", None)
+        if declared is not None and declared > MAX_UPLOAD_BYTES:
+            return too_big
+
+        # Read in bounded chunks so a request that lies about its length
+        # cannot get further than one chunk past the cap.
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                return too_big
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        del chunks
+
+        ing = parse_history(raw, source=file.filename or "upload")
+        if len(ing.candles) > MAX_UPLOAD_BARS:
+            return {"ok": False,
+                    "error": f"{len(ing.candles):,} bars is more than this "
+                             f"service will hold in one dataset "
+                             f"({MAX_UPLOAD_BARS:,}) — upload a shorter span "
+                             f"or a higher timeframe"}
+        out = ing.to_dict()
+        if not ing.ok:
+            out["ok"] = False
+            return out
+
+        try:
+            did = rt.history.save_dataset(
+                name=file.filename or "upload",
+                coin=rt.resolve_symbol(coin)[0] or coin,
+                interval=ing.interval_name, interval_s=ing.interval_s,
+                candles=ing.candles, report=ing.describe(),
+                merge_into=merge_into or None)
+        except ValueError as exc:
+            return {**out, "ok": False, "error": str(exc)}
+
+        out["ok"] = True
+        out["dataset_id"] = did
+        # Read the count back from the listing, which does not carry the
+        # bars. Reloading and re-parsing the whole blob just to count it
+        # doubles the memory cost of every upload.
+        meta = next((d for d in rt.history.datasets() if d["id"] == did), None)
+        out["stored_bars"] = meta["bars"] if meta else len(ing.candles)
+        return out
+
+    @app.get("/api/datasets", dependencies=[Depends(require_token)])
+    def api_datasets(coin: str = "") -> dict[str, Any]:
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return {"ok": True, "datasets": rt.history.datasets(c)}
+
+    @app.post("/api/datasets/delete", dependencies=[Depends(require_token)])
+    def api_delete_dataset(id: str) -> dict[str, Any]:
+        return {"ok": rt.history.delete_dataset(id), "id": id}
+
     @app.get("/api/read", dependencies=[Depends(require_token)])
     def api_read(coin: str = "BTC", interval: str = "15m",
                  higher: str = "4h", size: float = 0.0,
@@ -1832,22 +2168,38 @@ def create_app() -> FastAPI:
     @app.post("/api/backtest", dependencies=[Depends(require_token)])
     def api_backtest(coin: str = "BTC", interval: str = "15m",
                      bars: int = 1000, train_fraction: float = 0.6,
-                     tune: bool = True) -> dict[str, Any]:
+                     tune: bool = True, dataset: str = "") -> dict[str, Any]:
         """Walk-forward backtest with a held-out half.
 
         The number to act on is the held-out one. Weights are searched on the
         earlier portion only and the later portion is never seen by the
         search, so the gap between the two is a direct measure of how much of
         any apparent edge is fitted noise.
+
+        With `dataset`, the replay runs over uploaded chart history instead
+        of the exchange's own candles. That buys length -- years rather than
+        the few thousand bars the API serves -- and buys nothing at all for
+        the book signals, which are not in an OHLCV file. `blind_to` in the
+        response says so on every run, uploaded or not.
         """
         from . import backtest as bt_mod
 
-        coin = rt.resolve_symbol(coin)[0] or coin
-        try:
-            candles = rt.client().candles(coin, interval,
-                                          bars=max(200, min(bars, 5000)))
-        except Exception as exc:
-            return {"ok": False, "error": f"candles unavailable: {exc}"}
+        source = "real exchange candles via candleSnapshot"
+        if dataset:
+            stored = rt.history.dataset(dataset)
+            if stored is None:
+                return {"ok": False, "error": f"no dataset {dataset!r}"}
+            candles = stored["candles"]
+            coin, interval = stored["coin"], stored["interval"]
+            source = (f"uploaded history: {stored['name']} "
+                      f"({len(candles):,} bars)")
+        else:
+            coin = rt.resolve_symbol(coin)[0] or coin
+            try:
+                candles = rt.client().candles(coin, interval,
+                                              bars=max(200, min(bars, 5000)))
+            except Exception as exc:
+                return {"ok": False, "error": f"candles unavailable: {exc}"}
 
         bt = bt_mod.run(candles, coin, interval,
                         train_fraction=max(0.3, min(train_fraction, 0.85)),
@@ -1872,13 +2224,21 @@ def create_app() -> FastAPI:
             "ok": True, "coin": coin, "interval": interval,
             "candles": len(candles), "samples": len(bt.samples),
             "history_span": span,
-            "source": "real exchange candles via candleSnapshot",
+            "source": source,
+            "dataset": dataset or None,
             "train": rep(bt.train), "test": rep(bt.test),
             "baseline_test": rep(bt.baseline_test) if bt.baseline_test else None,
             "tuned_weights": bt.tuned_weights,
             "overfit_gap_pts": bt.overfit_gap,
             "verdict": bt.verdict(),
             "blind_to": ["flow", "absorption", "imbalance", "magnet"],
+            "caveat": (
+                "A replay over bars can only train what a bar contains. "
+                "Microprice tilt, replenishment, depletion and absorption "
+                "are not in an OHLCV series at any length, so uploading more "
+                "history improves the candle-geometry half and leaves the "
+                "book half exactly where it was. That half is measured "
+                "forward, live, in the suggestions table."),
         }
 
     @app.post("/api/weights", dependencies=[Depends(require_token)])
@@ -2159,6 +2519,33 @@ DASHBOARD = """<!doctype html>
   <div id="venueNote" class="say" style="display:none;margin-bottom:14px"></div>
 
   <div class="grid">
+    <div class="panel full" id="agentPanel"><h2>The call — take it or leave it
+      <span class="stamp" id="sugStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">A trade or a reason there
+        isn't one. The target comes from what bars on this timeframe actually
+        travel; the invalidation comes from the resting level the trade leans
+        on. <b>Nothing here places an order.</b></div>
+      <div class="conbar">
+        <label>candle <select id="sInt" onchange="loadSuggest()">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label>size $<input id="sSize" value="10000" size="8"
+          onchange="loadSuggest()"></label>
+        <label>round-trip fee <input id="sFee" value="0" size="4"
+          onchange="loadSuggest()">bps</label>
+        <label><input type="checkbox" id="sAuto" onchange="toggleSuggestAuto()">
+          poll 5s</label>
+        <button onclick="loadSuggest()">Ask</button>
+      </div>
+      <div id="sugCard" class="msg">Press <b>Go live</b>, then <b>Ask</b>.</div>
+      <div id="sugActions" style="display:none;margin-top:10px">
+        <button class="go" onclick="decide(true)">Take it</button>
+        <button onclick="decide(false)">Ignore</button>
+        <span id="sugDecided" class="msg" style="margin-left:10px"></span>
+      </div>
+      <div id="sugScore" class="say" style="display:none;margin-top:12px"></div>
+    </div>
+
     <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
       <span class="stamp" id="bookStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">The order book is the structure.
@@ -2216,7 +2603,30 @@ DASHBOARD = """<!doctype html>
         down and scored when its candle closes, so flow and absorption get measured
         too. It fills up as you use the dashboard.</div>
       <div id="fwd" class="msg" style="margin-bottom:10px">—</div>
+
+      <h3 style="margin:14px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Upload chart history</h3>
+      <div class="msg" style="margin-bottom:8px">A CSV or JSON OHLCV export —
+        TradingView, an exchange, anything with time, open, high, low and
+        close. Column names and order are detected. This extends the
+        historical replay past what the exchange API serves, and it trains
+        the candle-geometry signals only: <b>microprice tilt, replenishment,
+        depletion and absorption are not in an OHLCV file at any length</b>,
+        so that half stays where it is and is measured forward instead.</div>
       <div class="conbar">
+        <input type="file" id="histFile" accept=".csv,.txt,.json,.tsv">
+        <label>merge into <select id="histMerge">
+          <option value="">— new dataset —</option></select></label>
+        <button onclick="uploadHistory()">Upload</button>
+      </div>
+      <div id="histSay" class="msg" style="margin-bottom:6px">—</div>
+      <div id="histList"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Run a replay</h3>
+      <div class="conbar">
+        <label>source <select id="btSource">
+          <option value="">exchange candles</option></select></label>
         <label>bars <input id="btBars" type="number" value="1000" min="200" max="5000"
           step="100" style="width:88px"></label>
         <label>train split <select id="btSplit">
@@ -2327,6 +2737,15 @@ function q(params) {
     .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
     .join('&');
 }
+/* Escape before putting any server string into innerHTML. Coin names,
+   uploaded filenames and error text all reach the page this way, and a
+   symbol or filename containing a bracket would otherwise break the markup
+   around it -- or worse. */
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 const money = n => n == null ? '—' :
   (Math.abs(n) >= 1e6 ? '$' + (n/1e6).toFixed(2) + 'M'
    : Math.abs(n) >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'k' : '$' + Number(n).toFixed(0));
@@ -2340,9 +2759,13 @@ async function api(path, opts) {
   // Token goes in BOTH the header and the query. The header survives any
   // mangling of the query string; the query keeps plain links working.
   const o = Object.assign({}, opts || {});
-  o.headers = Object.assign({'Content-Type': 'application/json',
-                             'Authorization': 'Bearer ' + tok()},
-                            o.headers || {});
+  // A FormData body must set its own Content-Type, because only the browser
+  // knows the multipart boundary it generated. Forcing application/json onto
+  // it makes the server unable to find any of the parts, and the failure
+  // looks like an empty upload rather than a header problem.
+  const base = {'Authorization': 'Bearer ' + tok()};
+  if (!(o.body instanceof FormData)) base['Content-Type'] = 'application/json';
+  o.headers = Object.assign(base, o.headers || {});
   const r = await fetch(path + (path.includes('?') ? '&' : '?')
                         + 'token=' + encodeURIComponent(tok()), o);
   const txt = await r.text();
@@ -2357,7 +2780,8 @@ async function loadAll() {
   if (!nowPoll) startTicker();
   try {
     await Promise.all([loadStatus(), loadCoins(), loadBookCall(), loadWeights(), loadRead(),
-                       loadForward(), loadConsensus(),
+                       loadForward(), loadConsensus(), loadDecisions(),
+                       loadDatasets(),
                        loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
                        loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
@@ -2655,6 +3079,119 @@ function paintBookCall(d) {
   $('bookSay').style.display = '';
   $('bookSay').textContent = d.verdict;
   stamp('bookStamp', d.age_s == null ? 0 : d.age_s, 5, 30, 'book ');
+}
+
+/* ---- the call: take it or leave it ---------------------------------- */
+
+let sugPoll = null;
+let sugId = null;
+
+async function loadSuggest() {
+  let d;
+  try {
+    d = await api('/api/suggest?' + q({
+      coin: coin(), interval: $('sInt').value,
+      size: parseFloat($('sSize').value || '10000'),
+      fee_bps: parseFloat($('sFee').value || '0')}));
+  } catch (e) { $('sugCard').textContent = e.message; return; }
+  paintSuggest(d);
+  loadDecisions();
+}
+
+function paintSuggest(d) {
+  if (!d) return;
+  sugId = d.id || null;
+  const act = $('sugActions');
+
+  if (!d.take) {
+    // A refusal is an answer, not an error. It gets the same prominence as
+    // a trade, because "the spread eats this" is the most useful thing the
+    // tool says on most polls.
+    $('sugCard').innerHTML =
+        `<div class="call"><b>NO TRADE</b></div>`
+      + `<div class="msg" style="margin-top:6px">${esc(d.detail || d.sentence || '')}</div>`;
+    act.style.display = 'none';
+    stamp('sugStamp', d.feed_age_s == null ? 0 : d.feed_age_s, 5, 30, 'book ');
+    return;
+  }
+
+  const cls = d.side === 'long' ? 'long' : 'short';
+  const sign = d.side === 'long' ? '+' : '-';
+  const px = v => Number(v).toLocaleString(undefined, {maximumFractionDigits: 6});
+
+  $('sugCard').innerHTML =
+      `<div class="call"><b class="${cls}">${d.side.toUpperCase()}</b>`
+    + `<span class="sub">${d.target_ticks} ticks · ${sign}${d.target_bps.toFixed(0)}bps`
+    + ` · ${d.rr}R · conviction ${(d.conviction*100).toFixed(0)}%</span></div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${px(d.entry)}</b><span>entry</span></div>`
+    + `<div class="stat"><b class="${cls}">${px(d.target_px)}</b><span>target</span></div>`
+    + `<div class="stat"><b class="${d.side === 'long' ? 'short' : 'long'}">${px(d.stop_px)}</b><span>invalid</span></div>`
+    + `<div class="stat"><b>${d.cost_bps.toFixed(1)}bps</b><span>round trip</span></div>`
+    + `<div class="stat"><b>${d.cost_multiple}x</b><span>target vs cost</span></div>`
+    + '</div>'
+    + (d.reasons && d.reasons.length
+        ? `<div class="msg" style="margin-top:8px"><b>Why:</b> ${esc(d.reasons.join('; '))}.</div>` : '')
+    + (d.cautions && d.cautions.length
+        ? `<div class="msg" style="margin-top:4px;color:var(--down)"><b>Against:</b> ${esc(d.cautions.join('; '))}.</div>` : '')
+    + (d.fees_included ? ''
+        : `<div class="msg" style="margin-top:4px">Cost excludes fees — put your
+           round-trip fee in the box above or every suggestion looks cheaper
+           than it is.</div>`);
+
+  act.style.display = '';
+  $('sugDecided').textContent = d.decision && d.decision !== 'pending'
+      ? 'already ' + d.decision + ' for this candle' : '';
+  stamp('sugStamp', d.feed_age_s == null ? 0 : d.feed_age_s, 5, 30, 'book ');
+}
+
+async function decide(taken) {
+  if (!sugId) { $('sugDecided').textContent = 'nothing to decide on'; return; }
+  try {
+    const r = await api('/api/decide?' + q({id: sugId, taken: taken}),
+                        {method: 'POST'});
+    // Only claim a decision was stored when the server says it was. It
+    // refuses once the candle has closed, and reporting it anyway would
+    // show a decision that is not in the table.
+    $('sugDecided').textContent = r.ok && r.decision
+        ? 'recorded: ' + r.decision : (r.note || 'could not record');
+  } catch (e) { $('sugDecided').textContent = e.message; }
+  loadDecisions();
+}
+
+async function loadDecisions() {
+  let d;
+  try {
+    d = await api('/api/decisions?' + q({coin: coin(),
+                                         interval: $('sInt').value}));
+  } catch (e) { return; }
+  const s = d.stats || {};
+  const box = $('sugScore');
+  const pct = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
+  const o = s.overall || {}, t = s.taken || {}, i = s.ignored || {};
+  box.style.display = '';
+  const bps = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + 'bps';
+  box.innerHTML =
+      `<b>${esc(s.verdict || '')}</b>`
+    + `<div class="msg" style="margin-top:6px">`
+    + `all ${o.n || 0} settled · hit ${pct(o.hit_rate)} · `
+    + `taken ${t.n || 0} (${pct(t.hit_rate)}) · `
+    + `ignored ${i.n || 0} (${pct(i.hit_rate)}) · `
+    + `${s.pending || 0} waiting on a close</div>`
+    // Gross and net side by side. They answer different questions: gross
+    // says whether the book read was right, net says whether the trade made
+    // money, and only one of those pays for anything.
+    + (o.n ? `<div class="msg" style="margin-top:4px">`
+        + `avg per trade ${bps(o.avg_gross_bps)} gross, `
+        + `<b class="${(o.avg_pnl_bps || 0) >= 0 ? 'long' : 'short'}">`
+        + `${bps(o.avg_pnl_bps)} after cost</b> · `
+        + `total ${bps(o.total_pnl_bps)} · `
+        + `cost has taken ${bps(-(o.cost_drag_bps || 0))}</div>` : '');
+}
+
+function toggleSuggestAuto() {
+  if (sugPoll) { clearInterval(sugPoll); sugPoll = null; }
+  if ($('sAuto').checked) { loadSuggest(); sugPoll = setInterval(loadSuggest, 5000); }
 }
 
 function inputFlags(d) {
@@ -2959,6 +3496,62 @@ async function doCalibrate() {
   } catch (e) { note(e.message, true); }
 }
 
+/* ---- uploaded chart history ------------------------------------------ */
+
+async function uploadHistory() {
+  const f = $('histFile').files[0];
+  if (!f) { $('histSay').textContent = 'pick a file first'; return; }
+  $('histSay').textContent = 'reading ' + f.name + '…';
+
+  const body = new FormData();
+  body.append('file', f);
+  try {
+    const d = await api('/api/upload-history?' + q({
+                          coin: coin(), merge_into: $('histMerge').value}),
+                        {method: 'POST', body: body});
+    $('histSay').innerHTML = (d.ok ? '' : '<b>Rejected.</b> ')
+      + esc(d.describe || d.error || '');
+  } catch (e) { $('histSay').textContent = e.message; return; }
+  loadDatasets();
+}
+
+async function loadDatasets() {
+  let d;
+  try { d = await api('/api/datasets?' + q({coin: coin()})); }
+  catch (e) { return; }
+
+  const rows = d.datasets || [];
+  const when = ts => new Date(ts * 1000).toISOString().slice(0, 10);
+
+  $('histList').innerHTML = !rows.length ? ''
+    : '<table><tr><th>file</th><th>market</th><th>tf</th><th>bars</th>'
+      + '<th>span</th><th></th></tr>'
+      + rows.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.coin)}</td>`
+          + `<td>${esc(r.interval)}</td><td>${r.bars.toLocaleString()}</td>`
+          + `<td>${when(r.start_ts)} → ${when(r.end_ts)}</td>`
+          + `<td><button onclick="dropDataset('${esc(r.id)}')">delete</button></td>`
+          + '</tr>').join('') + '</table>';
+
+  // Both selectors are rebuilt from the same list, keeping whatever was
+  // chosen if it still exists.
+  for (const [id, head] of [['histMerge', '— new dataset —'],
+                            ['btSource', 'exchange candles']]) {
+    const sel = $(id);
+    if (!sel) continue;
+    const keep = sel.value;
+    sel.innerHTML = `<option value="">${head}</option>`
+      + rows.map(r => `<option value="${esc(r.id)}">${esc(r.name)} · `
+          + `${esc(r.interval)} · ${r.bars.toLocaleString()} bars</option>`).join('');
+    if (keep && rows.some(r => r.id === keep)) sel.value = keep;
+  }
+}
+
+async function dropDataset(id) {
+  try { await api('/api/datasets/delete?' + q({id: id}), {method: 'POST'}); }
+  catch (e) { $('histSay').textContent = e.message; return; }
+  loadDatasets();
+}
+
 let tunedWeights = null;
 
 async function runBacktest() {
@@ -2971,6 +3564,7 @@ async function runBacktest() {
                   interval: $('rInt').value,
                   bars: parseInt($('btBars').value, 10) || 1000,
                   train_fraction: $('btSplit').value,
+                  dataset: $('btSource') ? $('btSource').value : '',
                   tune: $('btTune').checked ? 'true' : 'false'}),
                   {method: 'POST'});
   } catch (e) { $('btHead').textContent = e.message; return; }

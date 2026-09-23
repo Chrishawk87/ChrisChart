@@ -293,6 +293,75 @@ distances are handled in sigma throughout.
 reads 1.23x purely by chance. Any real effect should be strongest near price
 and fade with distance; a "signal" that peaks three sigma out is an artifact.
 
+## The call — a trade to take or leave
+
+`suggest.py` turns the book read into a sentence you can act on or ignore:
+
+```
+LONG ETH 84 ticks (+11bps) from 7,736.3 — target 7,744.7,
+  invalid below 7,731.8. 1.87R.
+Why: leaning to the offer — thinner above; the offer is being eaten;
+  57% bid heavy.
+Cost: round trip 4.9bps — the target pays 2.2x.
+Conviction 64% from 21 book updates, spread 0.26bps. 4m41s left on the 15m.
+```
+
+**It suggests. It never places anything.** There is no order-placement code in
+this repository and there is not meant to be.
+
+Every number traces to something observed:
+
+| number | where it comes from |
+|---|---|
+| direction | microprice tilt, replenishment, depletion, absorption |
+| target | median high-low range of recent bars on this timeframe, scaled by `sqrt(time left)` and halved |
+| invalidation | the largest resting level behind the touch, floored at 15% of a typical bar's range |
+| cost | walking the actual book both ways at your size, plus your fee |
+
+**Refusing is the main output.** Most polls return `No trade` naming the gate
+that stopped it — flat book, thin conviction, a target that does not clear the
+round trip twice over, a stop in the wrong place, one-sided or locked book, a
+size bigger than the displayed depth. A tool that finds a trade every time it
+is asked is generating sentences, not reading a book.
+
+### Take it or ignore it, and find out which of you is right
+
+Every suggestion is stored, taken or ignored. That second column is the point:
+
+- **The tool's edge** — how all the suggestions did.
+- **Your edge** — how the ones you *took* did against the ones you *passed on*.
+
+If the ignored ones win more often, the filter you are applying is costing you,
+and there is no way to discover that without writing down the trades you
+skipped. The comparison refuses to draw a conclusion under 20 of each, because
+twelve trades is an impression and replacing an impression with a measurement
+was the whole point.
+
+P&L is reported **net of the round trip**, alongside gross. Gross says whether
+the read was right; net says whether the trade made money. Only one of those
+pays for anything.
+
+## Uploading chart history
+
+`POST /api/upload-history` takes a CSV or JSON OHLCV export — TradingView, an
+exchange, anything with time/open/high/low/close. Columns are matched by name
+in any order, delimiters and timestamp units are detected, and malformed rows
+are **dropped and counted, never repaired**.
+
+This extends the historical replay well past the few thousand bars the exchange
+API serves. What it does **not** do is train the book:
+
+> A bar records four prices and a volume. It does not record what was resting
+> at the touch, which side kept replacing size, or whether aggression moved the
+> mid. Microprice tilt, replenishment, depletion and absorption are about 70%
+> of the weight in the book call, and no exchange serves historical L2 depth at
+> this resolution — so that half cannot be uploaded at any length. It is
+> measured forward, live, in the suggestions table.
+
+Every upload report and every replay result says this. Uploading three months
+of bars and being told the model is now trained on three months would be a lie
+by omission, and it is exactly the lie that would get acted on.
+
 ## Honest limitations
 
 **Coverage is partial.** You see your harvested wallets, on one venue. Most
@@ -323,6 +392,10 @@ Everything else is tested. Run `check` first and expect to fix something.
 
 ```
 liqmap/
+  suggest.py       book read -> a trade to take or leave, or a named refusal
+  ingest.py        uploaded OHLCV -> candles, with what it can and cannot train
+  bookread.py      the order book calls the candle; nothing else consulted
+  live.py          websocket feed, live candles, absorption baseline
   firstpassage.py  barrier-hit probability — the baseline clusters must beat
   bucket.py        positions -> liquidation map (raw or fragility-weighted)
   strength.py      survivability, carry, commitment, fragility, change detection

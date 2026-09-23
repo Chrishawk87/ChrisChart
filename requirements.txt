@@ -6,6 +6,12 @@ requests>=2.31
 fastapi>=0.110
 uvicorn[standard]>=0.27
 
+# Required for the chart-history upload endpoint. FastAPI's UploadFile needs
+# it, and without it that one route fails at request time while everything
+# else keeps working -- which makes the failure look like a bug in the
+# parser rather than a missing dependency.
+python-multipart>=0.0.9
+
 # Required for the live feed and wallet harvesting (both use the
 # public trades websocket). Without it the service still runs, but the
 # current candle falls back to polling.
