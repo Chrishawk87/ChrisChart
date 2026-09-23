@@ -277,6 +277,9 @@ class LiveFeed:
 
         self.trades_seen = 0
         self.book_updates = 0
+        # Whether the venue honoured `fast: true`. Not assumed -- set only
+        # when a message actually arrives on the fast channel.
+        self.fast_book = False
         self.last_trade_ts = 0.0
         self.last_msg_ts = 0.0
         self.connected = False
@@ -377,8 +380,32 @@ class LiveFeed:
             self._stop.wait(min(2.0 * self.reconnects, 20.0))
 
     def _on_open(self, ws) -> None:
+        """Subscribe, asking for the FAST book.
+
+        This matters more than anything else in this file.
+
+        In June 2026 Hyperliquid slowed the public `l2Book` feed: 20 levels
+        every two seconds, moving later to five, and it is currently
+        observed arriving around every 5.4 seconds. Everything this service
+        reads from the book -- microprice tilt, replenishment, queue
+        depletion -- is a measurement of how the book CHANGES. At one update
+        every five seconds a twenty-second window holds four samples, the
+        dynamics are noise, and the call is being made from a photograph
+        taken before the last two candles of a one-minute chart.
+
+        `fast: true` asks for the five-level raw stream instead, which
+        arrives around every 500ms -- roughly ten times more often. Five
+        levels is not a loss here: `NEAR_LEVELS` is 5, so the near book was
+        all that was ever read.
+
+        Both are requested. If the venue ignores `fast` the plain feed still
+        arrives and the reader carries on at the slower rate; `updates_per_s`
+        in `status()` reports which one is actually being delivered, because
+        a silently degraded feed looks exactly like a quiet market.
+        """
         self.connected = True
         for sub in ({"type": "trades", "coin": self.coin},
+                    {"type": "l2Book", "coin": self.coin, "fast": True},
                     {"type": "l2Book", "coin": self.coin}):
             try:
                 ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
@@ -400,7 +427,12 @@ class LiveFeed:
 
         if channel == "trades":
             self._handle_trades(msg.get("data") or [])
-        elif channel == "l2Book":
+        elif channel in ("l2Book", "fastBook"):
+            # The fast stream comes back on its own channel name. Missing
+            # this would mean subscribing to the fast feed successfully and
+            # then discarding every message it sends.
+            if channel == "fastBook":
+                self.fast_book = True
             self._handle_book(msg.get("data") or {})
         else:
             return
@@ -597,6 +629,40 @@ class LiveFeed:
         return (time.time() - self.last_msg_ts) if self.last_msg_ts else None
 
     @property
+    def updates_per_s(self) -> float:
+        """Measured book pushes per second.
+
+        The single most diagnostic number this feed produces. Everything
+        read from the book is a measurement of change, so the rate at which
+        change arrives IS the resolution of the signal. Around 2/s means the
+        fast stream; around 0.2/s means the throttled public feed and a book
+        read that cannot see anything inside five seconds.
+
+        Measured rather than assumed, because a feed that quietly degrades
+        looks exactly like a quiet market.
+        """
+        if not self.started_at:
+            return 0.0
+        up = time.time() - self.started_at
+        return round(self.book_updates / up, 2) if up > 1.0 else 0.0
+
+    @property
+    def feed_quality(self) -> str:
+        """Plain words on whether the book is arriving fast enough."""
+        if not self.book_updates:
+            return "no book updates yet"
+        r = self.updates_per_s
+        if r >= 1.0:
+            return f"fast book — {r:.1f} updates/s"
+        if r >= 0.35:
+            return (f"{r:.2f} updates/s — the throttled public feed. The "
+                    f"dynamics are thin at this rate")
+        return (f"only {r:.2f} updates/s. The book read cannot see anything "
+                f"happening inside {1 / max(r, 0.01):.0f}s, so replenishment "
+                f"and depletion are close to meaningless — this is the "
+                f"slowed public feed, not a quiet market")
+
+    @property
     def stale(self) -> bool:
         a = self.age
         return a is None or a > STALE_AFTER_S
@@ -611,6 +677,9 @@ class LiveFeed:
             "age_s": a,
             "trades_seen": self.trades_seen,
             "book_updates": self.book_updates,
+            "fast_book": self.fast_book,
+            "updates_per_s": self.updates_per_s,
+            "feed_quality": self.feed_quality,
             "reconnects": self.reconnects,
             "baseline_samples": self.baseline.samples,
             "absorption_ready": self.baseline.ready,

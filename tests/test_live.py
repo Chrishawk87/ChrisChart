@@ -512,3 +512,79 @@ def test_the_spread_series_shows_what_the_book_is_doing_not_just_its_shape():
 
 def test_spread_trend_on_an_empty_book_history_is_safe():
     assert LiveFeed("BTC").spread_trend()["samples"] == 0
+
+
+# --------------------------------------------------------------------------
+# the fast book — the single highest-leverage setting in this file
+# --------------------------------------------------------------------------
+
+def test_the_feed_asks_for_the_fast_book():
+    """In June 2026 Hyperliquid slowed the public l2Book feed to roughly one
+    update every five seconds. Every book signal here measures CHANGE, so at
+    that rate a twenty-second window holds four samples and the dynamics are
+    noise. `fast: true` asks for the ~500ms stream instead."""
+    import json as _json
+
+    sent = []
+
+    class FakeWS:
+        def send(self, payload):
+            sent.append(_json.loads(payload))
+
+    f = LiveFeed("BTC", intervals=("15m",))
+    f._on_open(FakeWS())
+
+    subs = [m["subscription"] for m in sent]
+    assert any(s.get("type") == "l2Book" and s.get("fast") is True
+               for s in subs), "the fast book was never requested"
+    # The plain feed is still requested, so a venue that ignores `fast`
+    # leaves the service working rather than blind.
+    assert any(s.get("type") == "l2Book" and "fast" not in s for s in subs)
+    assert any(s.get("type") == "trades" for s in subs)
+
+
+def test_messages_on_the_fast_channel_are_not_discarded():
+    """Subscribing to the fast feed and then throwing away everything it
+    sends would look exactly like the subscription failing."""
+    import json as _json
+
+    f = LiveFeed("BTC", intervals=("15m",))
+    payload = _json.dumps({"channel": "fastBook", "data": {
+        "coin": "BTC", "time": 1_700_000_000_000,
+        "levels": [[{"px": "100.0", "sz": "5", "n": 2}],
+                   [{"px": "100.1", "sz": "3", "n": 1}]]}})
+    f._on_message(None, payload)
+
+    assert f.book_updates == 1
+    assert f.book is not None
+    assert f.fast_book is True
+
+
+def test_a_slow_feed_is_reported_as_slow_rather_than_as_a_quiet_market():
+    """A silently degraded feed and a quiet market look identical from an
+    empty panel and have completely different fixes."""
+    import time as _t
+
+    f = LiveFeed("BTC", intervals=("15m",))
+    f.started_at = _t.time() - 100.0
+
+    f.book_updates = 200                    # 2/s
+    assert f.updates_per_s >= 1.0
+    assert "fast book" in f.feed_quality
+
+    f.book_updates = 18                     # 0.18/s
+    assert "not a quiet market" in f.feed_quality
+    assert "meaningless" in f.feed_quality
+
+
+def test_update_rate_is_zero_before_the_feed_has_run():
+    f = LiveFeed("BTC", intervals=("15m",))
+    assert f.updates_per_s == 0.0
+    assert "no book updates yet" in f.feed_quality
+
+
+def test_status_carries_the_feed_quality():
+    f = LiveFeed("BTC", intervals=("15m",))
+    s = f.status()
+    for key in ("fast_book", "updates_per_s", "feed_quality"):
+        assert key in s

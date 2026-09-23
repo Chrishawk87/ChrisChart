@@ -655,6 +655,9 @@ class Runtime:
         payload["mode"] = mode
         payload["feed_age_s"] = feed.age
         payload["book_updates"] = feed.book_updates
+        payload["updates_per_s"] = feed.updates_per_s
+        payload["feed_quality"] = feed.feed_quality
+        payload["fast_book"] = feed.fast_book
         if out is not None:
             # Flatten the trade onto the top level too, so the panel and the
             # existing clients can read it without reaching into a nested
@@ -2805,6 +2808,7 @@ DASHBOARD = """<!doctype html>
         the pressure is winning. A trade only when they agree — if the book
         favours buyers and price is falling, somebody is absorbing them and
         we stand aside. <b>Nothing here places an order.</b></div>
+      <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
       <div id="sugCompare" style="display:none;margin-bottom:10px"></div>
       <div class="conbar">
         <label>candle <select id="sInt" onchange="loadSuggest()">
@@ -3452,6 +3456,20 @@ function paintSuggest(d) {
   sugId = d.id || null;
   const act = $('sugActions');
   paintCompare(d);
+
+  // The feed rate decides whether anything below it is worth reading. Every
+  // book signal measures CHANGE, so the rate change arrives at IS the
+  // resolution of the signal — and a throttled feed looks exactly like a
+  // quiet market from an empty panel.
+  const fq = $('sugFeed');
+  if (d.feed_quality) {
+    const slow = (d.updates_per_s || 0) < 0.35;
+    fq.style.display = '';
+    fq.className = 'msg';
+    fq.innerHTML = (slow ? '<b class="short">SLOW FEED</b> — ' : '')
+      + esc(d.feed_quality)
+      + (d.fast_book ? '' : ' (fast stream not confirmed)');
+  } else { fq.style.display = 'none'; }
 
   if (!d.take) {
     // A refusal is an answer, not an error, and it still carries a grade and
