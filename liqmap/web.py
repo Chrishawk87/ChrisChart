@@ -665,7 +665,70 @@ class Runtime:
         # Record it so it can be settled later. Only real suggestions are
         # stored: a refusal is not a trade and counting refusals would let
         # the tool improve its own hit rate by declining more often.
-        # Only tradeable calls are recorded. A graded look at a candle that
+        # EVERY candle's agreement state is recorded, tradeable or not, with
+        # the raw readings behind it. This is the only way to answer what the
+        # confirmation rule is actually worth: measuring only the candles
+        # that passed the filter and concluding the filter works is the
+        # oldest mistake there is.
+        if record and call.confirmation is not None:
+            feats: dict[str, Any] = {}
+            if read is not None:
+                feats.update({
+                    "tilt": round(read.tilt, 4),
+                    "imbalance": round(read.imbalance, 4),
+                    "replenish": round(read.replenish, 4),
+                    "depletion": round(read.depletion, 4),
+                    "aggression": round(read.aggression, 4),
+                    "absorbed": bool(read.absorbed),
+                    "spread_bps": round(read.spread_bps, 4),
+                    "book_score": round(read.score, 4),
+                    "book_samples": read.samples,
+                })
+            if action is not None:
+                feats.update({
+                    "slope_bps": round(action.slope_bps, 4),
+                    "thrust_bps": round(action.thrust_bps, 4),
+                    "position": round(action.position, 4),
+                    "extending": action.extending,
+                    "price_score": round(action.score, 4),
+                })
+
+            # The third source: forced flow. Stored rather than acted on,
+            # so the question "does a liquidation cluster in the called
+            # direction improve a confirmed candle" becomes something the
+            # feature slice can answer from data already collected, instead
+            # of a weight guessed at now and argued about later.
+            spot = book.mid if book is not None and not book.empty else 0.0
+            if spot > 0:
+                mag_bps, mag_notional = self.magnet_for(coin, spot)
+                feats["magnet_bps"] = round(mag_bps, 2)
+                feats["magnet_notional"] = round(mag_notional, 0)
+                # Signed FOR the book's call: +1 the fuel is where the book
+                # wants to go, -1 it is behind us.
+                if mag_notional > 0 and call.confirmation.book != "flat":
+                    want_up = call.confirmation.book == "up"
+                    feats["magnet_with_call"] = (
+                        1 if (mag_bps > 0) == want_up else -1)
+                else:
+                    feats["magnet_with_call"] = 0
+            try:
+                self.history.record_state(
+                    coin=coin, interval=interval, candle_ts=candle_ts,
+                    candle_end=candle_end,
+                    book_dir=call.confirmation.book,
+                    book_strength=call.confirmation.book_strength,
+                    price_dir=call.confirmation.candle,
+                    price_strength=call.confirmation.candle_strength,
+                    verdict=call.confirmation.verdict,
+                    price=(book.mid if book is not None and not book.empty
+                           else 0.0),
+                    elapsed_frac=(1.0 - seconds_left / interval_s
+                                  if interval_s > 0 else 0.0),
+                    made_at=now, features=feats)
+            except Exception as exc:
+                payload["state_error"] = str(exc)
+
+        # Only tradeable calls become trades. A graded look at a candle that
         # was never tradeable is not a trade, and scoring refusals would let
         # the tool raise its own hit rate by declining more often.
         if record and out is not None:
@@ -755,6 +818,90 @@ class Runtime:
 
         return {"ok": True, "resolved": resolved, "unresolvable": failed,
                 "pending": len(self.history.pending_suggestions(time.time())),
+                "errors": errors[:5]}
+
+    def magnet_for(self, coin: str, spot: float) -> tuple[float, float]:
+        """The nearest liquidation cluster, signed, and its size.
+
+        A THIRD kind of evidence, and qualitatively different from the other
+        two. The order book is resting orders, which are voluntary and can be
+        pulled in a microsecond. Price action is what has already traded.
+        A liquidation cluster is neither: it is flow that MUST happen if
+        price reaches the level, because margin runs out whether anyone
+        wants it to or not.
+
+        Returns (bps to the cluster, notional). Positive bps means the
+        cluster sits above spot -- shorts liquidating, forced buying, a pull
+        upward. Negative means longs below, forced selling, a pull down.
+        """
+        try:
+            m = self.maps(coin)
+        except Exception:
+            return 0.0, 0.0
+
+        clusters = (m.get("weighted") or {}).get("clusters") or []
+        at = float(m.get("spot") or spot)
+        if at <= 0:
+            return 0.0, 0.0
+
+        best = None
+        for cl in clusters:
+            px = float(cl.get("price") or 0)
+            notional = float(cl.get("notional") or 0)
+            if px <= 0 or notional <= 0:
+                continue
+            bps = (px - at) / at * 10_000.0
+            # Pull falls off with distance: a huge cluster 5% away is not
+            # acting on this candle, a modest one 10bps away is.
+            pull = notional / max(abs(bps), 1.0)
+            if best is None or pull > best[0]:
+                best = (pull, bps, notional)
+
+        return (best[1], best[2]) if best else (0.0, 0.0)
+
+    def resolve_states(self, limit: int = 300) -> dict[str, Any]:
+        """Settle recorded agreement states against their closed candles.
+
+        Settled from the read forward, not from the candle's open — a read
+        taken a third of the way in must not be credited with a move that
+        happened before it existed. So the window runs from `made_at` to the
+        close and is built from one-minute bars.
+        """
+        pending = self.history.pending_states(time.time(), limit=limit)
+        if not pending:
+            return {"ok": True, "resolved": 0, "pending": 0}
+
+        by_coin: dict[str, list[dict[str, Any]]] = {}
+        for row in pending:
+            by_coin.setdefault(row["coin"], []).append(row)
+
+        resolved = failed = 0
+        errors: list[str] = []
+        client = self.client()
+
+        for coin, rows in by_coin.items():
+            try:
+                fine = client.candles(coin, "1m", bars=1500)
+            except Exception as exc:
+                errors.append(f"{coin}: {exc}")
+                failed += len(rows)
+                continue
+
+            for row in rows:
+                start = float(row["made_at"] or 0) or float(row["candle_ts"])
+                end = float(row["candle_end"])
+                window = [b for b in fine if start - 60 <= b.ts < end]
+                if not window:
+                    failed += 1
+                    continue
+                if self.history.resolve_state(
+                        row["id"], close_px=window[-1].close,
+                        high_px=max(b.high for b in window),
+                        low_px=min(b.low for b in window)):
+                    resolved += 1
+
+        return {"ok": True, "resolved": resolved, "unresolvable": failed,
+                "pending": len(self.history.pending_states(time.time())),
                 "errors": errors[:5]}
 
     def now(self, coin: str) -> dict[str, Any]:
@@ -1075,6 +1222,10 @@ def _worker_loop(rt: Runtime) -> None:
                     rt.resolve_suggestions(limit=200)
                 except Exception as exc:
                     rt.last_error = f"resolve suggestions: {exc}"
+                try:
+                    rt.resolve_states(limit=300)
+                except Exception as exc:
+                    rt.last_error = f"resolve states: {exc}"
 
             if now - last_sweep >= cfg.sweep_interval_minutes * 60:
                 last_sweep = now
@@ -1767,6 +1918,89 @@ def create_app() -> FastAPI:
             "stats": rt.history.suggestion_stats(c, interval or None),
             "recent": rt.history.recent_suggestions(c, limit=max(1, min(recent, 200))),
         }
+
+    @app.get("/api/agreement", dependencies=[Depends(require_token)])
+    def api_agreement(coin: str = "", interval: str = "",
+                      min_strength: float = 0.0) -> dict[str, Any]:
+        """What actually happens in each agreement state.
+
+        Built from real order book readings recorded as they happened. It
+        starts empty and fills while the feed runs — there is no way to
+        backfill it, because historical L2 depth does not exist.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return rt.history.agreement_table(c, interval or None, min_strength)
+
+    @app.post("/api/resolve-states", dependencies=[Depends(require_token)])
+    def api_resolve_states(limit: int = 300) -> dict[str, Any]:
+        return rt.resolve_states(limit=limit)
+
+    @app.get("/api/feature-slice", dependencies=[Depends(require_token)])
+    def api_feature_slice(coin: str = "", interval: str = "",
+                          feature: str = "tilt", verdict: str = "confirmed"
+                          ) -> dict[str, Any]:
+        """How the outcome varies with one stored reading.
+
+        The tuning surface: ask what confirmed candles look like when tilt is
+        above 0.5 versus below, and get the answer from candles already
+        recorded rather than from three more weeks of collecting.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        out = rt.history.feature_slice(c, interval or None, feature=feature,
+                                       verdict=verdict)
+        out["available"] = rt.history.stored_features()
+        return out
+
+    @app.post("/api/agreement-replay", dependencies=[Depends(require_token)])
+    def api_agreement_replay(coin: str = "BTC", interval: str = "15m",
+                             bars: int = 500, at: float = 0.33,
+                             dataset: str = "") -> dict[str, Any]:
+        """The price-action base rate over history.
+
+        Deliberately measures ONE side. The order book half cannot be
+        replayed — no exchange serves historical depth — and a book proxy
+        built from candles would be price action agreeing with itself. This
+        is the number the full rule has to beat.
+        """
+        from . import replay as replay_mod
+        from .live import INTERVALS
+
+        if interval not in INTERVALS:
+            return {"ok": False, "error": f"{interval!r} is not a timeframe "
+                                          f"this service builds"}
+        interval_s = float(INTERVALS[interval])
+        if interval_s <= 60:
+            return {"ok": False,
+                    "error": "this replay stands inside a candle using "
+                             "one-minute sub-bars, so it needs a timeframe "
+                             "larger than 1m"}
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        try:
+            if dataset:
+                stored = rt.history.dataset(dataset)
+                if stored is None:
+                    return {"ok": False, "error": f"no dataset {dataset!r}"}
+                main = stored["candles"]
+                coin, interval = stored["coin"], stored["interval"]
+                interval_s = float(INTERVALS.get(interval, interval_s))
+                sub = rt.client().candles(coin, "1m", bars=5000)
+            else:
+                n = max(100, min(bars, 2000))
+                main = rt.client().candles(coin, interval, bars=n)
+                need = int(n * interval_s / 60.0)
+                sub = rt.client().candles(coin, "1m", bars=min(need, 5000))
+        except Exception as exc:
+            return {"ok": False, "error": f"candles unavailable: {exc}"}
+
+        rows = replay_mod.replay_price_action(
+            main, sub, interval_s=interval_s, sub_s=60.0,
+            at=max(0.1, min(at, 0.8)))
+        out = replay_mod.table(rows)
+        out.update({"ok": True, "coin": coin, "interval": interval,
+                    "bars": len(main), "sub_bars": len(sub),
+                    "read_at": f"{max(0.1, min(at, 0.8)):.0%} into the bar"})
+        return out
 
     @app.post("/api/upload-history", dependencies=[Depends(require_token)])
     async def api_upload_history(file: UploadFile = File(...),
@@ -2643,6 +2877,44 @@ DASHBOARD = """<!doctype html>
       <div id="readSay" class="say" style="display:none"></div>
     </div>
 
+    <div class="panel full" id="agreePanel"><h2>Book vs price — what actually
+      happens<span class="stamp" id="agreeStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Every candle is recorded,
+        tradeable or not, with the raw book and price readings behind it.
+        That is the only way to find out what the confirmation rule is worth:
+        measuring just the candles that passed the filter and concluding the
+        filter works answers a different question. <b>This cannot be
+        backfilled</b> — no exchange serves historical order book depth, so it
+        fills as the feed runs.</div>
+      <div class="conbar">
+        <label>market <select id="agInt" onchange="loadAgreement()">
+          <option value="">all timeframes</option>
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label><input type="checkbox" id="agThis" checked
+          onchange="loadAgreement()"> this coin only</label>
+        <button onclick="loadAgreement()">Refresh</button>
+        <button onclick="runReplay()">Historical base rate</button>
+      </div>
+      <div id="agSay" class="say" style="display:none;margin-bottom:10px"></div>
+      <div id="agTable"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Which reading matters</h3>
+      <div class="msg" style="margin-bottom:8px">The tuning surface. Pick a
+        stored reading and see how the outcome varies across its range — a
+        signal that matters shows a rising line, one that does not shows
+        noise. Answered from candles already recorded.</div>
+      <div class="conbar">
+        <label>reading <select id="agFeat" onchange="loadSlice()"></select></label>
+        <label>state <select id="agVerdict" onchange="loadSlice()">
+          <option value="confirmed" selected>confirmed</option>
+          <option value="conflict">conflict</option>
+          <option value="unconfirmed">unconfirmed</option></select></label>
+      </div>
+      <div id="agSlice"></div>
+    </div>
+
     <div class="panel full" id="btPanel"><h2>Backtest — measured, not asserted</h2>
       <div class="msg" style="margin-bottom:8px">Two separate measurements.
         <b>Historical replay</b> uses real candles pulled from the exchange — the
@@ -2831,7 +3103,7 @@ async function loadAll() {
   try {
     await Promise.all([loadStatus(), loadCoins(), loadBookCall(), loadWeights(), loadRead(),
                        loadForward(), loadConsensus(), loadDecisions(),
-                       loadDatasets(),
+                       loadDatasets(), loadAgreement(),
                        loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
                        loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
@@ -3591,6 +3863,111 @@ async function doCalibrate() {
     note(`scored ${r.scored} past candles — ` + (rows.join(' · ') || 'no bands populated'));
     loadRead();
   } catch (e) { note(e.message, true); }
+}
+
+/* ---- book vs price: the table ---------------------------------------- */
+
+const bpsCell = v => v == null ? '—'
+  : `<b class="${v > 0 ? 'long' : v < 0 ? 'short' : ''}">`
+    + `${v >= 0 ? '+' : ''}${v.toFixed(1)}</b>`;
+const pctCell = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
+
+function agreementRows(rows, withSides) {
+  return rows.map(r => {
+    // A row with nothing in it is greyed rather than hidden: "we have never
+    // seen this state" is itself worth knowing.
+    const dim = r.n ? '' : ' style="opacity:.35"';
+    return `<tr${dim}><td><b>${esc(r.state)}</b><br>`
+      + `<span style="color:var(--dim);font-size:11px">${esc(r.detail || '')}</span></td>`
+      + `<td>${r.n}</td>`
+      + `<td>${r.share == null ? '—' : (r.share * 100).toFixed(0) + '%'}</td>`
+      + `<td>${bpsCell(r.avg_called_bps)}</td>`
+      + `<td>${r.median_called_bps == null ? '—' : r.median_called_bps.toFixed(1)}</td>`
+      + `<td>${pctCell(r.hit_rate)}</td>`
+      + (withSides
+          ? `<td>${pctCell(r.book_right)}</td><td>${pctCell(r.price_right)}</td>`
+          : '')
+      + `<td>${r.avg_mfe_bps == null ? '—' : '+' + r.avg_mfe_bps.toFixed(1)}</td>`
+      + `<td>${r.avg_mae_bps == null ? '—' : r.avg_mae_bps.toFixed(1)}</td>`
+      + '</tr>';
+  }).join('');
+}
+
+async function loadAgreement() {
+  let d;
+  try {
+    d = await api('/api/agreement?' + q({
+      coin: $('agThis').checked ? coin() : '',
+      interval: $('agInt').value}));
+  } catch (e) { $('agSay').style.display = ''; $('agSay').textContent = e.message; return; }
+
+  $('agSay').style.display = '';
+  $('agSay').innerHTML = `<b>${esc(d.verdict || '')}</b>`
+    + `<div class="msg" style="margin-top:6px">${d.n} settled · `
+    + `${d.pending || 0} waiting on a close · ${esc(d.source || '')}</div>`;
+
+  $('agTable').innerHTML =
+      '<table><tr><th>state</th><th>n</th><th>share</th>'
+    + '<th>avg move<br>called (bps)</th><th>median</th><th>closed<br>that way</th>'
+    + '<th>book<br>right</th><th>price<br>right</th>'
+    + '<th>avg best</th><th>avg worst</th></tr>'
+    + agreementRows(d.table || [], true) + '</table>';
+
+  loadSlice();
+}
+
+async function runReplay() {
+  $('agSay').style.display = '';
+  $('agSay').textContent = 'replaying price action over history…';
+  let d;
+  try {
+    d = await api('/api/agreement-replay?' + q({
+      coin: coin(), interval: $('agInt').value || '15m', bars: 800}),
+      {method: 'POST'});
+  } catch (e) { $('agSay').textContent = e.message; return; }
+  if (!d.ok) { $('agSay').textContent = d.error; return; }
+
+  $('agSay').innerHTML = `<b>${esc(d.verdict || '')}</b>`
+    + `<div class="msg" style="margin-top:6px">${esc(d.caveat || '')}</div>`;
+  $('agTable').innerHTML =
+      `<div class="msg" style="margin-bottom:6px">${d.bars} bars, `
+    + `${d.sub_bars} one-minute sub-bars, read ${esc(d.read_at || '')}. `
+    + '<b>Price action only — the book half is not in this table.</b></div>'
+    + '<table><tr><th>state</th><th>n</th><th>share</th>'
+    + '<th>avg move<br>called (bps)</th><th>median</th><th>closed<br>that way</th>'
+    + '<th>avg best</th><th>avg worst</th></tr>'
+    + agreementRows(d.table || [], false) + '</table>';
+}
+
+async function loadSlice() {
+  let d;
+  try {
+    d = await api('/api/feature-slice?' + q({
+      coin: $('agThis').checked ? coin() : '',
+      interval: $('agInt').value,
+      feature: $('agFeat').value || 'tilt',
+      verdict: $('agVerdict').value}));
+  } catch (e) { return; }
+
+  const sel = $('agFeat');
+  const keep = sel.value;
+  const names = d.available && d.available.length ? d.available
+              : ['tilt', 'replenish', 'depletion', 'imbalance', 'slope_bps',
+                 'position', 'magnet_bps', 'magnet_with_call'];
+  sel.innerHTML = names.map(n =>
+    `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  if (keep && names.includes(keep)) sel.value = keep;
+
+  const rows = (d.buckets || []);
+  $('agSlice').innerHTML =
+      '<table><tr><th>range</th><th>n</th><th>avg move called (bps)</th>'
+    + '<th>closed that way</th></tr>'
+    + rows.map(b => `<tr${b.n ? '' : ' style="opacity:.35"'}>`
+        + `<td>${b.from.toFixed(2)} → ${b.to.toFixed(2)}</td>`
+        + `<td>${b.n}</td><td>${bpsCell(b.avg_called_bps)}</td>`
+        + `<td>${pctCell(b.hit_rate)}</td></tr>`).join('')
+    + '</table>'
+    + `<div class="msg" style="margin-top:6px">${esc(d.note || '')}</div>`;
 }
 
 /* ---- uploaded chart history ------------------------------------------ */

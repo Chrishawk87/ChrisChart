@@ -134,6 +134,61 @@ CREATE INDEX IF NOT EXISTS idx_sugg_decision ON suggestions(decision, resolved);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sugg_candle
     ON suggestions(coin, interval, candle_ts);
 
+-- Every candle's agreement state, tradeable or not.
+--
+-- The suggestions table only holds trades. This holds the READ on every
+-- candle, including all the ones that were refused, which is the only way to
+-- answer the questions that matter about the confirmation rule itself:
+--
+--     when book and price agree, how far does price actually go?
+--     when they disagree, which one turns out to be right?
+--     how often is each state even reached?
+--
+-- None of those can be answered from the trades alone, because the trades are
+-- exactly the cases that passed the filter. Measuring only what you took and
+-- concluding the filter works is the oldest mistake there is.
+--
+-- This is recorded LIVE and cannot be backfilled. No exchange serves
+-- historical order book depth, so `book_dir` has no historical equivalent --
+-- see `/api/agreement-replay` for what CAN be measured from bars, which is
+-- the price-action half on its own.
+CREATE TABLE IF NOT EXISTS agreement_states (
+    id            TEXT PRIMARY KEY,
+    ts            TEXT NOT NULL,
+    coin          TEXT NOT NULL,
+    interval      TEXT NOT NULL,
+    candle_ts     REAL NOT NULL,
+    candle_end    REAL NOT NULL,
+    made_at       REAL NOT NULL DEFAULT 0,
+    elapsed_frac  REAL NOT NULL DEFAULT 0,
+    book_dir      TEXT NOT NULL,
+    book_strength REAL NOT NULL DEFAULT 0,
+    price_dir     TEXT NOT NULL,
+    price_strength REAL NOT NULL DEFAULT 0,
+    verdict       TEXT NOT NULL,
+    price         REAL NOT NULL,
+    -- The RAW readings behind the verdict, as JSON: microprice tilt, near
+    -- imbalance, replenishment, depletion, aggression, spread, and the
+    -- price-action components.
+    --
+    -- Storing only the verdict would mean every change to a threshold or a
+    -- weight starts the measurement over from zero. Storing what the book
+    -- and the tape actually SAID lets any new rule be re-scored against
+    -- history that has already been collected — which is the difference
+    -- between tuning in an afternoon and tuning in a quarter.
+    features      TEXT,
+    resolved      INTEGER NOT NULL DEFAULT 0,
+    close_px      REAL,
+    move_bps      REAL,     -- signed: + is up, from `price` to the close
+    mfe_bps       REAL,     -- furthest it went UP after the read
+    mae_bps       REAL      -- furthest it went DOWN after the read
+);
+CREATE INDEX IF NOT EXISTS idx_state_open ON agreement_states(resolved, candle_end);
+CREATE INDEX IF NOT EXISTS idx_state_market
+    ON agreement_states(coin, interval, verdict);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_state_candle
+    ON agreement_states(coin, interval, candle_ts);
+
 -- Uploaded chart history.
 --
 -- Kept in the database rather than on the filesystem so it lands on the same
@@ -776,6 +831,283 @@ class History(ThreadedDB):
         params.append(limit)
         return [dict(r) for r in self._conn.execute(sql, params).fetchall()]
 
+    # -- agreement states, on every candle ---------------------------------
+
+    def record_state(self, coin: str, interval: str, candle_ts: float,
+                     candle_end: float, book_dir: str, book_strength: float,
+                     price_dir: str, price_strength: float, verdict: str,
+                     price: float, elapsed_frac: float = 0.0,
+                     made_at: float | None = None,
+                     features: dict[str, Any] | None = None) -> str | None:
+        """One row per candle per market, tradeable or not."""
+        import json as _json
+        import time as _time
+
+        if price <= 0:
+            return None
+        sid = uuid.uuid4().hex[:16]
+        try:
+            with self._tx() as c:
+                c.execute(
+                    """INSERT INTO agreement_states (
+                           id, ts, coin, interval, candle_ts, candle_end,
+                           made_at, elapsed_frac, book_dir, book_strength,
+                           price_dir, price_strength, verdict, price,
+                           features)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (sid, _now(), coin, interval, candle_ts, candle_end,
+                     made_at if made_at is not None else _time.time(),
+                     elapsed_frac, book_dir, book_strength, price_dir,
+                     price_strength, verdict, price,
+                     _json.dumps(features) if features else None))
+        except sqlite3.IntegrityError:
+            return None            # this candle already has its read
+        return sid
+
+    def pending_states(self, now: float, limit: int = 500
+                       ) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            """SELECT * FROM agreement_states
+               WHERE resolved = 0 AND candle_end <= ?
+               ORDER BY candle_end LIMIT ?""", (now, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_state(self, state_id: str, close_px: float, high_px: float,
+                      low_px: float) -> bool:
+        """Settle one read against what the candle actually did.
+
+        Three numbers, because the average move alone hides the shape of it.
+        A state that drifts to +5bps having first gone to +40 and back is a
+        different animal from one that walks quietly to +5, and only the
+        excursions tell them apart.
+        """
+        row = self._conn.execute(
+            "SELECT price FROM agreement_states WHERE id = ?",
+            (state_id,)).fetchone()
+        if row is None:
+            return False
+        entry = float(row["price"] or 0)
+        if entry <= 0 or close_px <= 0 or high_px < low_px:
+            return False
+
+        move = (close_px - entry) / entry * 10_000.0
+        mfe = (high_px - entry) / entry * 10_000.0
+        mae = (low_px - entry) / entry * 10_000.0
+
+        with self._tx() as c:
+            c.execute(
+                """UPDATE agreement_states SET resolved = 1, close_px = ?,
+                       move_bps = ?, mfe_bps = ?, mae_bps = ?
+                   WHERE id = ? AND resolved = 0""",
+                (close_px, move, mfe, mae, state_id))
+        return True
+
+    def feature_slice(self, coin: str | None = None,
+                      interval: str | None = None,
+                      feature: str = "tilt", edges: Sequence[float] = (),
+                      verdict: str = "confirmed") -> dict[str, Any]:
+        """How the outcome varies with one stored reading.
+
+        This is the tuning surface. Ask "what does the confirmed state look
+        like when microprice tilt is above 0.5 versus below it" and the
+        answer comes from candles already recorded, rather than from three
+        more weeks of waiting.
+
+        Buckets are half-open [lo, hi), so a value never lands in two.
+        """
+        import json as _json
+
+        where = ["resolved = 1", "move_bps IS NOT NULL", "features IS NOT NULL"]
+        params: list[Any] = []
+        if coin:
+            where.append("coin = ?")
+            params.append(coin)
+        if interval:
+            where.append("interval = ?")
+            params.append(interval)
+        if verdict:
+            where.append("verdict = ?")
+            params.append(verdict)
+
+        rows = [dict(r) for r in self._conn.execute(
+            f"SELECT * FROM agreement_states WHERE {' AND '.join(where)}",
+            params).fetchall()]
+
+        cuts = list(edges) or [-1.0, -0.5, -0.2, 0.2, 0.5, 1.01]
+        buckets: list[dict[str, Any]] = []
+
+        for lo, hi in zip(cuts, cuts[1:]):
+            called, hits = [], 0
+            for r in rows:
+                try:
+                    feats = _json.loads(r["features"] or "{}")
+                except (ValueError, TypeError):
+                    continue
+                v = feats.get(feature)
+                if v is None or not (lo <= float(v) < hi):
+                    continue
+                s = 1 if r["book_dir"] == "up" else -1 if r["book_dir"] == "down" else 0
+                if not s:
+                    continue
+                m = float(r["move_bps"] or 0.0) * s
+                called.append(m)
+                if m > 0:
+                    hits += 1
+
+            buckets.append({
+                "from": lo, "to": hi, "n": len(called),
+                "avg_called_bps": (sum(called) / len(called)) if called else None,
+                "hit_rate": (hits / len(called)) if called else None,
+            })
+
+        return {"feature": feature, "verdict": verdict, "n": len(rows),
+                "buckets": buckets,
+                "note": ("Each bucket is the average move in the direction "
+                         "the book called, for candles whose "
+                         f"{feature} fell in that range. A feature that "
+                         "matters shows a rising line; one that does not "
+                         "shows noise.")}
+
+    def stored_features(self, limit: int = 200) -> list[str]:
+        """Which readings are available to slice on."""
+        import json as _json
+
+        rows = self._conn.execute(
+            "SELECT features FROM agreement_states "
+            "WHERE features IS NOT NULL LIMIT ?", (limit,)).fetchall()
+        names: set[str] = set()
+        for r in rows:
+            try:
+                names.update(_json.loads(r["features"] or "{}").keys())
+            except (ValueError, TypeError):
+                continue
+        return sorted(names)
+
+    def agreement_table(self, coin: str | None = None,
+                        interval: str | None = None,
+                        min_strength: float = 0.0) -> dict[str, Any]:
+        """What actually happens in each state.
+
+        The headline is `avg_called_bps`: the average move IN THE DIRECTION
+        THE STATE CALLED. Averaging raw signed moves across up-calls and
+        down-calls would cancel a perfectly good signal to zero, which is
+        the easiest way to conclude a working rule does nothing.
+
+        On conflicts the two sides are scored separately, because "which one
+        is right when they disagree" is the question that decides whether
+        standing aside is correct or whether one side should simply be
+        followed.
+        """
+        where = ["resolved = 1", "move_bps IS NOT NULL"]
+        params: list[Any] = []
+        if coin:
+            where.append("coin = ?")
+            params.append(coin)
+        if interval:
+            where.append("interval = ?")
+            params.append(interval)
+        if min_strength > 0:
+            where.append("(book_strength >= ? OR price_strength >= ?)")
+            params.extend([min_strength, min_strength])
+
+        rows = [dict(r) for r in self._conn.execute(
+            f"SELECT * FROM agreement_states WHERE {' AND '.join(where)}",
+            params).fetchall()]
+
+        total = len(rows)
+
+        def sign(d: str) -> int:
+            return 1 if d == "up" else -1 if d == "down" else 0
+
+        def summarise(subset: list[dict[str, Any]], called: str) -> dict[str, Any]:
+            """`called` picks which direction counts as 'the call'."""
+            if not subset:
+                return {"n": 0, "share": 0.0, "avg_called_bps": None,
+                        "median_called_bps": None, "hit_rate": None,
+                        "book_right": None, "price_right": None,
+                        "avg_mfe_bps": None, "avg_mae_bps": None}
+
+            called_moves, favourable, adverse = [], [], []
+            book_hits = price_hits = scored = 0
+
+            for r in subset:
+                s = sign(r.get(called) or "flat")
+                move = float(r["move_bps"] or 0.0)
+                if s:
+                    called_moves.append(move * s)
+                    # Excursions flip with the call, so a short's favourable
+                    # excursion is the low, not the high.
+                    up, down = float(r["mfe_bps"] or 0.0), float(r["mae_bps"] or 0.0)
+                    favourable.append(up if s > 0 else -down)
+                    adverse.append(down if s > 0 else -up)
+
+                bs, ps = sign(r["book_dir"]), sign(r["price_dir"])
+                if move != 0 and (bs or ps):
+                    scored += 1
+                    if bs and (move > 0) == (bs > 0):
+                        book_hits += 1
+                    if ps and (move > 0) == (ps > 0):
+                        price_hits += 1
+
+            def mid(xs):
+                if not xs:
+                    return None
+                ys = sorted(xs)
+                n = len(ys)
+                return ys[n // 2] if n % 2 else (ys[n // 2 - 1] + ys[n // 2]) / 2
+
+            return {
+                "n": len(subset),
+                "share": len(subset) / total if total else 0.0,
+                "avg_called_bps": (sum(called_moves) / len(called_moves)
+                                   if called_moves else None),
+                "median_called_bps": mid(called_moves),
+                "hit_rate": (sum(1 for m in called_moves if m > 0)
+                             / len(called_moves)) if called_moves else None,
+                "book_right": book_hits / scored if scored else None,
+                "price_right": price_hits / scored if scored else None,
+                "avg_mfe_bps": (sum(favourable) / len(favourable)
+                                if favourable else None),
+                "avg_mae_bps": (sum(adverse) / len(adverse)
+                                if adverse else None),
+            }
+
+        def pick(**kw) -> list[dict[str, Any]]:
+            return [r for r in rows
+                    if all(r.get(k) == v for k, v in kw.items())]
+
+        confirmed = pick(verdict="confirmed")
+        conflict = pick(verdict="conflict")
+
+        table = [
+            {"state": "CONFIRMED up", "detail": "book up, price up",
+             **summarise(pick(verdict="confirmed", book_dir="up"), "book_dir")},
+            {"state": "CONFIRMED down", "detail": "book down, price down",
+             **summarise(pick(verdict="confirmed", book_dir="down"), "book_dir")},
+            {"state": "CONFIRMED (both)", "detail": "either direction",
+             **summarise(confirmed, "book_dir")},
+            {"state": "CONFLICT, book up", "detail": "book up, price down",
+             **summarise(pick(verdict="conflict", book_dir="up"), "book_dir")},
+            {"state": "CONFLICT, book down", "detail": "book down, price up",
+             **summarise(pick(verdict="conflict", book_dir="down"), "book_dir")},
+            {"state": "CONFLICT (both)", "detail": "they disagree",
+             **summarise(conflict, "book_dir")},
+            {"state": "UNCONFIRMED", "detail": "book leans, price flat",
+             **summarise(pick(verdict="unconfirmed"), "book_dir")},
+            {"state": "NO SIGNAL", "detail": "book balanced",
+             **summarise(pick(verdict="no signal"), "price_dir")},
+        ]
+
+        pending = int(self._conn.execute(
+            "SELECT COUNT(*) FROM agreement_states WHERE resolved = 0"
+        ).fetchone()[0])
+
+        return {
+            "n": total, "pending": pending, "table": table,
+            "verdict": _agreement_verdict(table, conflict),
+            "source": "live order book plus live tape — recorded as it happened",
+        }
+
     # -- uploaded chart history --------------------------------------------
 
     def save_dataset(self, name: str, coin: str, interval: str,
@@ -918,6 +1250,59 @@ class History(ThreadedDB):
 # anything. Below this the gap is sampling noise, and reporting it as a
 # finding is how someone talks themselves out of a filter that works.
 MIN_FOR_COMPARISON = 20
+
+
+def _agreement_verdict(table: Sequence[dict[str, Any]],
+                       conflicts: Sequence[dict[str, Any]]) -> str:
+    """Plain words on what the table is saying, or that it is too early.
+
+    Refuses to draw a conclusion under `MIN_FOR_COMPARISON` in a row. The
+    whole point of the table is to replace an impression with a measurement,
+    and a measurement of twelve candles is another impression.
+    """
+    by_state = {r["state"]: r for r in table}
+    both = by_state.get("CONFIRMED (both)", {})
+    clash = by_state.get("CONFLICT (both)", {})
+
+    lines = []
+    n = both.get("n") or 0
+    if n < MIN_FOR_COMPARISON:
+        lines.append(f"Only {n} confirmed candles settled — too few to "
+                     f"conclude anything. Needs {MIN_FOR_COMPARISON}+.")
+    else:
+        avg = both.get("avg_called_bps")
+        hit = both.get("hit_rate")
+        lines.append(
+            f"When book and price agree, price goes {avg:+.1f}bps their way "
+            f"on average and closes that way {hit:.0%} of the time "
+            f"({n} candles).")
+
+    cn = clash.get("n") or 0
+    if cn < MIN_FOR_COMPARISON:
+        lines.append(f"{cn} conflicts settled — not enough to say which side "
+                     f"wins yet.")
+    else:
+        br, pr = clash.get("book_right"), clash.get("price_right")
+        if br is not None and pr is not None:
+            gap = (br - pr) * 100
+            if gap > 5:
+                lines.append(
+                    f"When they disagree the BOOK is right more often "
+                    f"({br:.0%} vs {pr:.0%} on {cn}) — worth testing whether "
+                    f"following the book through a conflict beats standing "
+                    f"aside.")
+            elif gap < -5:
+                lines.append(
+                    f"When they disagree PRICE ACTION is right more often "
+                    f"({pr:.0%} vs {br:.0%} on {cn}) — the book is being "
+                    f"absorbed and price is telling the truth, which is the "
+                    f"case the confirmation rule was built for.")
+            else:
+                lines.append(
+                    f"When they disagree neither side wins ({br:.0%} book "
+                    f"vs {pr:.0%} price on {cn}) — a coin flip, so standing "
+                    f"aside is the right call.")
+    return " ".join(lines)
 
 
 def _decision_verdict(taken: dict[str, Any], ignored: dict[str, Any],
