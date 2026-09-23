@@ -24,6 +24,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
+from .db import ThreadedDB
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS snapshots (
     id              TEXT PRIMARY KEY,
@@ -81,13 +83,11 @@ def _parse(ts: str) -> datetime:
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
-class Store:
+class Store(ThreadedDB):
+    """Snapshots, prices and outcomes. One connection per thread — see db.py."""
+
     def __init__(self, path: str | Path = "liqmap.db"):
-        self.path = str(path)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        super().__init__(path, SCHEMA)
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -251,8 +251,6 @@ class Store:
             "prices": one("SELECT COUNT(*) FROM prices"),
         }
 
-    def close(self) -> None:
-        self._conn.close()
 
 
 # --------------------------------------------------------------------------

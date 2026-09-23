@@ -545,7 +545,8 @@ class Runtime:
 
     def suggest_for(self, coin: str, interval: str = "15m",
                     notional: float = 0.0, fee_bps: float = 0.0,
-                    record: bool = True) -> dict[str, Any]:
+                    record: bool = True, mode: str = "scalp"
+                    ) -> dict[str, Any]:
         """A trade to take or ignore on this market, or why there isn't one.
 
         Everything the suggestion needs comes from the live feed: the book
@@ -555,7 +556,7 @@ class Runtime:
         alternative is a target sized from a stale snapshot.
         """
         from .live import INTERVALS
-        from .suggest import suggest as make_suggestion
+        from .suggest import assess as make_call
 
         coin = self.resolve_symbol(coin)[0] or coin
 
@@ -617,24 +618,46 @@ class Runtime:
         if notional <= 0:
             notional = DEFAULT_TRADE_NOTIONAL
 
-        out = make_suggestion(
+        # What this market and timeframe is actually achieving, so the
+        # suggestion can put the rate it NEEDS next to the rate you GET.
+        # That pair is the whole decision, and neither half means much
+        # alone.
+        measured_rate, measured_n = None, 0
+        try:
+            stats = self.history.suggestion_stats(coin, interval)["overall"]
+            measured_rate, measured_n = stats["hit_rate"], stats["n"]
+        except Exception:
+            pass
+
+        call = make_call(
             read, book, coin=coin, interval=interval, interval_s=interval_s,
             seconds_left=seconds_left, recent=recent, notional=notional,
-            fee_bps=fee_bps)
+            fee_bps=fee_bps, mode=("scalp" if mode == "scalp" else "range"),
+            measured_rate=measured_rate, measured_n=measured_n)
+        out = call.suggestion
 
-        payload = out.to_dict()
+        payload = call.to_dict()
         payload["ok"] = True
-        payload["coin"] = coin
-        payload["interval"] = interval
+        payload["take"] = call.tradeable
         payload["candle_ts"] = candle_ts
         payload["notional"] = notional
+        payload["mode"] = mode
         payload["feed_age_s"] = feed.age
         payload["book_updates"] = feed.book_updates
+        if out is not None:
+            # Flatten the trade onto the top level too, so the panel and the
+            # existing clients can read it without reaching into a nested
+            # object.
+            payload.update({k: v for k, v in out.to_dict().items()
+                            if k not in ("coin", "interval")})
 
         # Record it so it can be settled later. Only real suggestions are
         # stored: a refusal is not a trade and counting refusals would let
         # the tool improve its own hit rate by declining more often.
-        if record and out.take:
+        # Only tradeable calls are recorded. A graded look at a candle that
+        # was never tradeable is not a trade, and scoring refusals would let
+        # the tool raise its own hit rate by declining more often.
+        if record and out is not None:
             sid = self.history.record_suggestion(
                 coin=coin, interval=interval, candle_ts=candle_ts,
                 candle_end=candle_end, side=out.side, entry=out.entry,
@@ -1675,8 +1698,18 @@ def create_app() -> FastAPI:
     @app.get("/api/suggest", dependencies=[Depends(require_token)])
     def api_suggest(coin: str = "BTC", interval: str = "15m",
                     size: float = 0.0, fee_bps: float = 0.0,
-                    record: bool = True) -> dict[str, Any]:
-        """A trade to take or ignore, in one sentence, or why there isn't one.
+                    record: bool = True, mode: str = "scalp"
+                    ) -> dict[str, Any]:
+        """A graded call on this candle, tradeable or not.
+
+        Always answers. `tradeable` is the honest flag and only tradeable
+        calls are recorded; the rest are graded D or unlettered and name the
+        gate that stopped them, so the panel shows the state of the book
+        rather than going blank.
+
+        `mode` is `scalp` or `range`. Scalp aims for the smallest target
+        that still pays — the highest hit rate available on a trade worth
+        taking. Range aims for half of what a bar typically travels.
 
         `size` is what you would actually trade, because the round trip
         depends on how far into the book you have to reach. `fee_bps` is your
@@ -1686,7 +1719,8 @@ def create_app() -> FastAPI:
         This SUGGESTS. It does not place anything.
         """
         return rt.suggest_for(coin, interval, notional=max(size, 0.0),
-                              fee_bps=max(fee_bps, 0.0), record=record)
+                              fee_bps=max(fee_bps, 0.0), record=record,
+                              mode=mode)
 
     @app.post("/api/decide", dependencies=[Depends(require_token)])
     def api_decide(id: str, taken: bool) -> dict[str, Any]:
@@ -2529,6 +2563,9 @@ DASHBOARD = """<!doctype html>
         <label>candle <select id="sInt" onchange="loadSuggest()">
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></select></label>
+        <label>aim <select id="sMode" onchange="loadSuggest()">
+          <option value="scalp" selected>scalp — nearest that pays</option>
+          <option value="range">range — half the bar</option></select></label>
         <label>size $<input id="sSize" value="10000" size="8"
           onchange="loadSuggest()"></label>
         <label>round-trip fee <input id="sFee" value="0" size="4"
@@ -3091,6 +3128,7 @@ async function loadSuggest() {
   try {
     d = await api('/api/suggest?' + q({
       coin: coin(), interval: $('sInt').value,
+      mode: $('sMode').value,
       size: parseFloat($('sSize').value || '10000'),
       fee_bps: parseFloat($('sFee').value || '0')}));
   } catch (e) { $('sugCard').textContent = e.message; return; }
@@ -3104,11 +3142,15 @@ function paintSuggest(d) {
   const act = $('sugActions');
 
   if (!d.take) {
-    // A refusal is an answer, not an error. It gets the same prominence as
-    // a trade, because "the spread eats this" is the most useful thing the
-    // tool says on most polls.
+    // A refusal is an answer, not an error, and it still carries a grade and
+    // a lean. "No trade but leaning long" and "no trade, book balanced" are
+    // different states and only one of them is worth watching.
+    const lean = d.side ? `${d.side.toUpperCase()} lean` : 'no lean';
+    const cls = d.side === 'long' ? 'long' : d.side === 'short' ? 'short' : '';
     $('sugCard').innerHTML =
-        `<div class="call"><b>NO TRADE</b></div>`
+        `<div class="call"><b class="${cls}">${esc(d.grade || '—')}</b>`
+      + `<span class="sub">${esc(lean)} · not tradeable`
+      + (d.blocked_by ? ` · ${esc(d.blocked_by)}` : '') + '</span></div>'
       + `<div class="msg" style="margin-top:6px">${esc(d.detail || d.sentence || '')}</div>`;
     act.style.display = 'none';
     stamp('sugStamp', d.feed_age_s == null ? 0 : d.feed_age_s, 5, 30, 'book ');
@@ -3119,17 +3161,32 @@ function paintSuggest(d) {
   const sign = d.side === 'long' ? '+' : '-';
   const px = v => Number(v).toLocaleString(undefined, {maximumFractionDigits: 6});
 
+  // The pair that decides it: what this trade NEEDS against what you GET.
+  const need = d.breakeven == null ? null : (d.breakeven * 100);
+  const got = d.measured_rate == null ? null : (d.measured_rate * 100);
+  const edgeCls = d.edge_pts == null ? '' : d.edge_pts >= 0 ? 'long' : 'short';
+
   $('sugCard').innerHTML =
       `<div class="call"><b class="${cls}">${d.side.toUpperCase()}</b>`
-    + `<span class="sub">${d.target_ticks} ticks · ${sign}${d.target_bps.toFixed(0)}bps`
-    + ` · ${d.rr}R · conviction ${(d.conviction*100).toFixed(0)}%</span></div>`
+    + `<span class="sub">grade ${esc(d.grade || '')} · ${d.target_ticks} ticks`
+    + ` · ${sign}${d.target_bps.toFixed(1)}bps · ${d.rr}R`
+    + ` · conviction ${(d.conviction*100).toFixed(0)}%</span></div>`
     + '<div class="conrow">'
     + `<div class="stat"><b>${px(d.entry)}</b><span>entry</span></div>`
     + `<div class="stat"><b class="${cls}">${px(d.target_px)}</b><span>target</span></div>`
     + `<div class="stat"><b class="${d.side === 'long' ? 'short' : 'long'}">${px(d.stop_px)}</b><span>invalid</span></div>`
     + `<div class="stat"><b>${d.cost_bps.toFixed(1)}bps</b><span>round trip</span></div>`
-    + `<div class="stat"><b>${d.cost_multiple}x</b><span>target vs cost</span></div>`
+    + (need == null ? ''
+       : `<div class="stat"><b>${need.toFixed(0)}%</b><span>needs to win</span></div>`)
+    + (got == null ? ''
+       : `<div class="stat"><b class="${edgeCls}">${got.toFixed(0)}%</b>`
+         + `<span>you win (${d.measured_n})</span></div>`)
     + '</div>'
+    + (d.edge_pts == null ? ''
+       : `<div class="msg" style="margin-top:6px"><b class="${edgeCls}">`
+         + `${d.edge_pts >= 0 ? '+' : ''}${d.edge_pts} points `
+         + `${d.edge_pts >= 0 ? 'clear of' : 'short of'} breakeven</b>`
+         + ` on ${d.measured_n} settled trades.</div>`)
     + (d.reasons && d.reasons.length
         ? `<div class="msg" style="margin-top:8px"><b>Why:</b> ${esc(d.reasons.join('; '))}.</div>` : '')
     + (d.cautions && d.cautions.length

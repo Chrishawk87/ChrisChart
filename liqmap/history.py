@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 from .bucket import Position
+from .db import ThreadedDB
 from .strength import PositionChange, diff_positions
 
 SCHEMA = """
@@ -216,16 +217,22 @@ def _parse(ts: str) -> datetime:
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
-class History:
-    def __init__(self, path: str | Path = "liqmap.db"):
-        self.path = str(path)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._migrate()
-        self._conn.commit()
+class History(ThreadedDB):
+    """Sweep, read and suggestion history.
 
-    def _migrate(self) -> None:
+    One connection per thread -- see `db.py`. The background worker writes
+    while the dashboard reads, and a shared connection corrupts both.
+    """
+
+    def __init__(self, path: str | Path = "liqmap.db"):
+        super().__init__(path, SCHEMA)
+
+    def _bootstrap(self, conn: sqlite3.Connection) -> None:
+        super()._bootstrap(conn)
+        self._migrate(conn)
+        conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
         """Add columns that later versions introduced.
 
         `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
@@ -239,7 +246,7 @@ class History:
         }
         for table, columns in wanted.items():
             try:
-                have = {r["name"] for r in self._conn.execute(
+                have = {r["name"] for r in conn.execute(
                     f"PRAGMA table_info({table})").fetchall()}
             except sqlite3.Error:
                 continue
@@ -247,7 +254,7 @@ class History:
                 continue
             for name, decl in columns:
                 if name not in have:
-                    self._conn.execute(
+                    conn.execute(
                         f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
 
     @contextmanager
@@ -905,9 +912,6 @@ class History:
             c.execute(f"DELETE FROM sweep_positions WHERE sweep_id IN ({marks})", old)
             c.execute(f"DELETE FROM sweeps WHERE id IN ({marks})", old)
             return len(old)
-
-    def close(self) -> None:
-        self._conn.close()
 
 
 # How many settled trades before a difference between two hit rates means

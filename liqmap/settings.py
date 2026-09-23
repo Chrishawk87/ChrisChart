@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Iterator
 
+from .db import ThreadedDB
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS settings (
     key     TEXT PRIMARY KEY,
@@ -108,14 +110,11 @@ class Settings:
         return problems
 
 
-class SettingsStore:
+class SettingsStore(ThreadedDB):
+    """Runtime settings. One connection per thread — see db.py."""
+
     def __init__(self, path: str | None = None):
-        self.path = path or default_db_path()
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        super().__init__(path or default_db_path(), SCHEMA)
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -181,5 +180,3 @@ class SettingsStore:
             c.execute("DELETE FROM settings")
         return self.load()
 
-    def close(self) -> None:
-        self._conn.close()

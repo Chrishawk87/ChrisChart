@@ -50,6 +50,25 @@ from .flow import Book, Level
 from .structure import Candle
 
 Side = Literal["long", "short"]
+Mode = Literal["scalp", "range"]
+
+
+def breakeven_hit_rate(reward_bps: float, risk_bps: float,
+                       cost_bps: float = 0.0) -> float:
+    """The share of trades that must reach the target to break even.
+
+    Expected value is zero when
+
+        p * reward - (1 - p) * risk - cost = 0
+
+    so p = (risk + cost) / (reward + risk). This single number is what makes
+    a 0.6R scalp and a 3R swing comparable: it says what each one demands of
+    you, in the same units, with the cost of trading already counted.
+    """
+    denom = reward_bps + risk_bps
+    if denom <= 0:
+        return 1.0
+    return min(1.0, max(0.0, (risk_bps + cost_bps) / denom))
 
 # --- gates -----------------------------------------------------------------
 
@@ -66,9 +85,43 @@ MIN_CONVICTION = 0.45
 # for the broker. At 2.0 half of a correct call is still yours.
 MIN_COST_MULTIPLE = 2.0
 
-# Reward against risk. Below this the shape is wrong even when the direction
-# is right: you need a hit rate you have not measured to break even.
+# Reward against risk, in RANGE mode. Below this the shape is wrong even when
+# the direction is right: you need a hit rate you have not measured to break
+# even.
+#
+# Scalp mode does NOT use this, and it would refuse almost every scalp if it
+# did. That is the point of having two modes -- see MAX_BREAKEVEN.
 MIN_RR = 1.5
+
+# The gate that replaces R:R in scalp mode.
+#
+# A small target has a high hit rate and a bad reward-to-risk ratio, and
+# those are the same fact viewed twice. Judging a scalp by R:R refuses every
+# scalp; judging it by hit rate alone accepts trades that lose money slowly.
+# The honest number is the one that combines them -- the share of trades that
+# must reach the target for the whole thing to break even:
+#
+#     p = (risk + cost) / (reward + risk)
+#
+# At 3R that is 27%. At 0.67R it is 62%. Both can be good trades; they are
+# just different businesses. What is NOT a good trade is one needing a hit
+# rate no book read sustains, and this is where that line sits.
+MAX_BREAKEVEN = 0.70
+
+# In scalp mode the invalidation may be at most this multiple of the target.
+# Beyond it one loss erases too many wins, so the stop is pulled in to the
+# cap rather than the trade being refused -- a scalp leans on the book read,
+# not on a shelf thirty basis points away.
+MAX_RISK_MULTIPLE = 2.5
+
+# And at least this share of the target, so the stop is not inside the noise
+# of the very move it is waiting for. Below 1.0 because a scalp wants the
+# reward to beat the risk, and much below it the stop is flicker bait.
+SCALP_RISK_SHARE = 0.8
+
+# The most of the remaining expected range a target may ask for. Above this
+# the trade needs the candle to do more than a candle typically does.
+MAX_RANGE_SHARE = 0.8
 
 # Inside this many seconds of the close there is not enough candle left for
 # the move to happen, whatever the book says.
@@ -197,6 +250,9 @@ class Suggestion:
     seconds_left: float
     samples: int
     spread_bps: float
+    mode: Mode = "range"
+    measured_rate: float | None = None      # what you actually achieve
+    measured_n: int = 0
 
     reasons: list[str] = field(default_factory=list)
     cautions: list[str] = field(default_factory=list)
@@ -206,6 +262,25 @@ class Suggestion:
     @property
     def rr(self) -> float:
         return round(self.target_bps / self.risk_bps, 2) if self.risk_bps > 0 else 0.0
+
+    @property
+    def breakeven(self) -> float:
+        """Hit rate this trade needs to pay for itself, cost included."""
+        return round(breakeven_hit_rate(self.target_bps, self.risk_bps,
+                                        self.cost_bps), 4)
+
+    @property
+    def edge_pts(self) -> float | None:
+        """Measured hit rate minus the one required, in percentage points.
+
+        None until enough trades have settled. This is the only number that
+        says whether to take the trade rather than whether it is well shaped
+        -- and it cannot exist until the forward test has run for a while,
+        which is the honest answer to "is this any good".
+        """
+        if self.measured_rate is None or self.measured_n < 20:
+            return None
+        return round((self.measured_rate - self.breakeven) * 100, 1)
 
     @property
     def cost_multiple(self) -> float:
@@ -243,6 +318,22 @@ class Suggestion:
         lines.append(
             f"Cost: round trip {self.cost_bps:.1f}bps{fee_note} — the target "
             f"pays {self.cost_multiple}x.")
+
+        # The number that decides it. A 0.6R scalp and a 3R swing are not
+        # comparable by R; they are comparable by what each demands of you.
+        need = f"Needs {self.breakeven:.0%} to break even"
+        if self.measured_rate is not None and self.measured_n >= 20:
+            gap = self.edge_pts
+            verdict = ("clear" if gap > 5 else "short" if gap < -5 else "level")
+            need += (f"; you are running {self.measured_rate:.0%} on "
+                     f"{self.measured_n} settled — {abs(gap):.0f} points "
+                     f"{verdict}")
+        elif self.measured_n:
+            need += (f"; only {self.measured_n} settled so far, not enough "
+                     f"to compare")
+        else:
+            need += "; nothing settled yet to compare against"
+        lines.append(need + ".")
         lines.append(
             f"Conviction {self.conviction:.0%} from {self.samples} book "
             f"updates, spread {self.spread_bps:.2f}bps. "
@@ -271,6 +362,11 @@ class Suggestion:
             "seconds_left": round(self.seconds_left, 1),
             "samples": self.samples,
             "spread_bps": round(self.spread_bps, 3),
+            "mode": self.mode,
+            "breakeven": self.breakeven,
+            "measured_rate": self.measured_rate,
+            "measured_n": self.measured_n,
+            "edge_pts": self.edge_pts,
             "reasons": self.reasons, "cautions": self.cautions,
             "headline": self.headline(),
             "sentence": self.sentence(),
@@ -335,16 +431,32 @@ def suggest(read: BookRead | None, book: Book | None, *,
             notional: float = 10_000.0,
             fee_bps: float = 0.0,
             tick: float | None = None,
+            mode: Mode = "range",
             min_conviction: float = MIN_CONVICTION,
             min_rr: float = MIN_RR,
             min_cost_multiple: float = MIN_COST_MULTIPLE,
+            max_breakeven: float = MAX_BREAKEVEN,
+            measured_rate: float | None = None,
+            measured_n: int = 0,
             ) -> Suggestion | NoTrade:
     """A trade to take or ignore, or a named reason there isn't one.
 
-    `recent` is closed bars on the trading timeframe; they set the target.
+    `recent` is closed bars on the trading timeframe; they set the range.
     `notional` is the size you would actually trade, because the round trip
     depends on it -- a size that walks four levels costs more than one that
     lifts the touch.
+
+    TWO MODES, WHICH ARE TWO DIFFERENT BUSINESSES
+
+    `range` aims for half of what a bar typically travels. Fewer wins,
+    bigger ones, judged on reward against risk.
+
+    `scalp` aims for the SMALLEST move that still clears the round trip.
+    A nearer target is mechanically more likely to be touched, so this is
+    the highest hit rate available on a trade that still pays -- which is
+    the whole point of hyper-scalping. It also has worse reward-to-risk, and
+    those are the same fact seen twice, so scalp mode is judged on the hit
+    rate it REQUIRES rather than on R.
     """
     # -- the book has to be saying something ------------------------------
     if read is None or read.samples < MIN_SAMPLES:
@@ -412,7 +524,7 @@ def suggest(read: BookRead | None, book: Book | None, *,
     # Range grows with the square root of time, not linearly. Half an hour
     # left of a one-hour bar is about 70% of its range, not 50%.
     time_left = min(seconds_left / interval_s, 1.0)
-    target_bps = bar_bps * math.sqrt(time_left) * CAPTURE
+    available_bps = bar_bps * math.sqrt(time_left)
 
     # -- entry, at the side you would actually cross ----------------------
     entry = book.best_ask if side == "long" else book.best_bid
@@ -423,40 +535,14 @@ def suggest(read: BookRead | None, book: Book | None, *,
     if t <= 0:
         return NoTrade("no tick", "cannot read a tick size from this book")
 
-    # -- where it is wrong, from the book ---------------------------------
-    spread = max(book.best_ask - book.best_bid, 0.0)
-    shelf = _shelf(book.bids if side == "long" else book.asks)
-    if shelf is not None:
-        raw_stop = shelf.px - t if side == "long" else shelf.px + t
-    else:
-        raw_stop = (entry - 3 * spread) if side == "long" else (entry + 3 * spread)
-
-    # A stop inside the noise is not an invalidation, it is a donation. The
-    # binding constraint is usually the volatility floor, not the spread.
-    vol_floor = entry * (bar_bps * MIN_RISK_BAR_FRACTION) / 10_000.0
-    floor = max(3 * spread, 2 * t, vol_floor)
-    if abs(entry - raw_stop) < floor:
-        raw_stop = (entry - floor) if side == "long" else (entry + floor)
-
-    stop_px = raw_stop
-    risk_bps = abs(entry - stop_px) / entry * 10_000.0
-
-    # -- snap the target to ticks, then recompute from the snapped price --
-    raw_target = (entry * (1 + target_bps / 10_000.0) if side == "long"
-                  else entry * (1 - target_bps / 10_000.0))
-    steps = max(1, round(abs(raw_target - entry) / t))
-    target_px = entry + steps * t if side == "long" else entry - steps * t
-    if target_px <= 0:
-        return NoTrade("no target", "the target lands at or below zero")
-    target_bps = abs(target_px - entry) / entry * 10_000.0
-
-    # -- does it pay -------------------------------------------------------
+    # -- what the round trip costs ----------------------------------------
     #
-    # Walked explicitly rather than through `round_trip_bps`, because the
-    # fills carry `exhausted` and the summed number does not. A size larger
-    # than the displayed book prices the round trip on whatever fraction
-    # could fill, which makes the most expensive trades look like the
-    # cheapest ones.
+    # Priced BEFORE the target, because in scalp mode the target is derived
+    # from it. Walked explicitly rather than through `round_trip_bps`: the
+    # fills carry `exhausted` and the summed number does not, so a size
+    # larger than the displayed book would otherwise price on whatever
+    # fraction could fill and make the most expensive trade available look
+    # like one of the cheapest.
     buy, sell = book.walk(notional, "buy"), book.walk(notional, "sell")
     if buy.exhausted or sell.exhausted:
         return NoTrade(
@@ -474,17 +560,148 @@ def suggest(read: BookRead | None, book: Book | None, *,
                        "is free",
                        side=side, conviction=read.conviction)
 
+    # -- where it is wrong, before deciding how far to aim -----------------
+    #
+    # The invalidation is computed first because in scalp mode the target
+    # depends on it. A stop inside the noise is not an invalidation, it is a
+    # donation, and the floor it has to clear -- three spreads, two ticks --
+    # does not shrink just because the target is small.
+    spread = max(book.best_ask - book.best_bid, 0.0)
+    shelf = _shelf(book.bids if side == "long" else book.asks)
+    if shelf is not None:
+        shelf_dist = abs(entry - (shelf.px - t if side == "long"
+                                  else shelf.px + t))
+    else:
+        shelf_dist = 3 * spread
+    hard_floor = max(3 * spread, 2 * t)
+
+    def stop_for(target_px_bps: float) -> tuple[float, bool]:
+        """Invalidation distance in price for a given target, and whether it
+        had to be pulled in from the structural level."""
+        if mode != "scalp":
+            # Held for much of the bar, so the bar's own range is the noise
+            # it must survive.
+            floor = max(hard_floor,
+                        entry * (bar_bps * MIN_RISK_BAR_FRACTION) / 10_000.0)
+            return max(shelf_dist, floor), False
+
+        # A scalp is held for the time price takes to travel a few basis
+        # points -- seconds, not the candle -- so the noise it must survive
+        # scales with the TARGET, not with the bar. Using the bar's range
+        # here puts the invalidation thirty basis points from a nine basis
+        # point target, which is not a cautious scalp, it is a losing one
+        # wearing a cautious stop.
+        floor = max(hard_floor,
+                    entry * (target_px_bps * SCALP_RISK_SHARE) / 10_000.0)
+        cap = entry * (target_px_bps * MAX_RISK_MULTIPLE) / 10_000.0
+        # A structural level further away than the cap is not what a scalp
+        # leans on -- the book read is, and when that stops being true the
+        # reason is gone whether or not a shelf has broken. So it is pulled
+        # in rather than the trade refused, and the pull is disclosed.
+        if shelf_dist > max(cap, floor):
+            return max(cap, floor), True
+        return max(shelf_dist, floor), False
+
+    # -- how far to aim ----------------------------------------------------
+    scalp_stop_capped = False
+
+    if mode != "scalp":
+        steps = max(1, round(available_bps * CAPTURE / 10_000.0 * entry / t))
+        risk_dist, _ = stop_for(0.0)
+    else:
+        # The SMALLEST target that actually pays.
+        #
+        # "Clears the round trip" is necessary and not sufficient. The stop
+        # cannot go below three spreads however small the target is, so a
+        # target at twice the cost can still demand an 80% hit rate — which
+        # is not a trade, it is a donation with good manners. So the search
+        # walks outward one tick at a time and stops at the first target
+        # whose REQUIRED hit rate is achievable. That target is the nearest
+        # one worth taking, which is exactly what a scalper wants: the
+        # highest hit rate available on a trade that pays.
+        first = max(1, math.ceil(cost_bps * min_cost_multiple
+                                 / 10_000.0 * entry / t))
+        ceiling = max(first, int(available_bps * MAX_RANGE_SHARE
+                                 / 10_000.0 * entry / t))
+        steps = None
+        for candidate in range(first, ceiling + 1):
+            bps = candidate * t / entry * 10_000.0
+            dist, capped = stop_for(bps)
+            r_bps = dist / entry * 10_000.0
+            if breakeven_hit_rate(bps, r_bps, cost_bps) <= max_breakeven:
+                steps, risk_dist, scalp_stop_capped = candidate, dist, capped
+                break
+
+        if steps is None:
+            # Nothing inside this candle's range demands a rate a book read
+            # can reach. Almost always the spread: the trade has to pay for
+            # it before it pays you.
+            widest = ceiling * t / entry * 10_000.0
+            dist, _ = stop_for(widest)
+            need = breakeven_hit_rate(widest, dist / entry * 10_000.0, cost_bps)
+            return NoTrade(
+                "breakeven",
+                f"nothing this {interval} can offer pays for a "
+                f"{cost_bps:.1f}bps round trip against a "
+                f"{hard_floor / entry * 10_000.0:.1f}bps minimum stop — even "
+                f"the widest target it has room for ({widest:.1f}bps) would "
+                f"need to be right {need:.0%} of the time, above the "
+                f"{max_breakeven:.0%} ceiling. The read is {side}; the "
+                f"spread is the problem",
+                side=side, conviction=read.conviction)
+
+    target_px = entry + steps * t if side == "long" else entry - steps * t
+    if target_px <= 0:
+        return NoTrade("no target", "the target lands at or below zero")
+    target_bps = abs(target_px - entry) / entry * 10_000.0
+
+    if mode == "range":
+        risk_dist, _ = stop_for(target_bps)
+
+    stop_px = (entry - risk_dist) if side == "long" else (entry + risk_dist)
+    if stop_px <= 0:
+        return NoTrade("no target", "the invalidation lands at or below zero")
+    risk_bps = risk_dist / entry * 10_000.0
+    rr = target_bps / risk_bps if risk_bps > 0 else 0.0
+
+    # Does the candle have room for it?
+    if target_bps > available_bps * MAX_RANGE_SHARE:
+        return NoTrade(
+            "no room",
+            f"the smallest trade that pays for a {cost_bps:.1f}bps round trip "
+            f"needs {target_bps:.1f}bps, and this {interval} typically has "
+            f"about {available_bps:.0f}bps left in it. The read is {side}; "
+            f"there is not enough candle left to cover the spread"
+            if mode == "scalp" else
+            f"a {target_bps:.0f}bps target is more than this {interval} "
+            f"typically has left ({available_bps:.0f}bps)",
+            side=side, conviction=read.conviction)
+
     if target_bps < cost_bps * min_cost_multiple:
         return NoTrade(
             "cost",
-            f"the {interval} is only offering about {target_bps:.0f}bps from "
+            f"the {interval} is only offering about {target_bps:.1f}bps from "
             f"here and the round trip costs {cost_bps:.1f}bps — that is "
             f"{target_bps / cost_bps:.1f}x, under the {min_cost_multiple:.0f}x "
             f"floor. The read is {side}, the spread just eats it",
             side=side, conviction=read.conviction)
 
-    rr = target_bps / risk_bps if risk_bps > 0 else 0.0
-    if rr < min_rr:
+    # -- is the shape worth it --------------------------------------------
+    if mode == "scalp":
+        # R:R is deliberately NOT the gate here: a small target always has a
+        # poor one, and that is the same fact as its high hit rate counted
+        # twice. The search above already guaranteed the breakeven; this is
+        # the belt-and-braces check.
+        need = breakeven_hit_rate(target_bps, risk_bps, cost_bps)
+        if need > max_breakeven:
+            return NoTrade(
+                "breakeven",
+                f"this would need to be right {need:.0%} of the time to pay "
+                f"({target_bps:.1f}bps target, {risk_bps:.1f}bps risk, "
+                f"{cost_bps:.1f}bps cost) — above the {max_breakeven:.0%} "
+                f"ceiling, and no book read sustains that",
+                side=side, conviction=read.conviction)
+    elif rr < min_rr:
         return NoTrade(
             "shape",
             f"the read is {side} but the level it leans on is "
@@ -501,10 +718,142 @@ def suggest(read: BookRead | None, book: Book | None, *,
         cost_bps=cost_bps, fees_included=fee_bps > 0,
         conviction=read.conviction, score=read.score,
         seconds_left=seconds_left, samples=read.samples,
-        spread_bps=read.spread_bps,
+        spread_bps=read.spread_bps, mode=mode,
+        measured_rate=measured_rate, measured_n=measured_n,
         reasons=_reasons(read),
-        cautions=_cautions(read, read.spread_bps, target_bps),
+        cautions=_cautions(read, read.spread_bps, target_bps)
+        + (["the invalidation is a scalp stop, not a structural level — the "
+            "nearest shelf is further away than this trade can carry"]
+           if scalp_stop_capped else []),
     )
+
+
+# --------------------------------------------------------------------------
+# the call on every candle
+# --------------------------------------------------------------------------
+
+# Grades. These describe the SHAPE of a call, never a prediction: an A is a
+# trade that is cheap, well-supported and demands a hit rate a book read
+# plausibly reaches. It is not a promise that it wins.
+GRADES = (
+    ("A", "cheap, well supported, and asks little of you"),
+    ("B", "a fair trade — the numbers work with something to spare"),
+    ("C", "marginal: it works, but not by much"),
+    ("D", "readable but not tradeable"),
+    ("—", "the book is not saying anything"),
+)
+
+
+@dataclass(frozen=True)
+class Call:
+    """What the book says about this candle, tradeable or not.
+
+    `suggest` answers "is there a trade", and most of the time the answer is
+    no. That is correct and it is also unreadable: a panel that goes blank
+    cannot be told apart from a panel that is broken, and it hides the near
+    misses -- which are the ones worth watching, because they are where the
+    book is starting to lean.
+
+    So this always returns something. `tradeable` is the honest flag, and
+    only tradeable calls are ever recorded or scored. The rest are there to
+    be looked at.
+    """
+
+    coin: str
+    interval: str
+    side: Side | None
+    grade: str
+    tradeable: bool
+    detail: str
+    conviction: float = 0.0
+    score: float = 0.0
+    samples: int = 0
+    seconds_left: float = 0.0
+    spread_bps: float = 0.0
+    blocked_by: str | None = None
+    suggestion: Suggestion | None = None
+
+    @property
+    def grade_note(self) -> str:
+        return dict(GRADES).get(self.grade, "")
+
+    def sentence(self) -> str:
+        if self.suggestion is not None:
+            return self.suggestion.sentence()
+        lean = (f"{self.side} lean" if self.side else "no lean")
+        return (f"{self.grade} — {lean}, not tradeable. {self.detail}")
+
+    def to_dict(self) -> dict:
+        out = {
+            "coin": self.coin, "interval": self.interval,
+            "side": self.side, "grade": self.grade,
+            "grade_note": self.grade_note,
+            "tradeable": self.tradeable,
+            "blocked_by": self.blocked_by,
+            "detail": self.detail,
+            "conviction": round(self.conviction, 4),
+            "score": round(self.score, 4),
+            "samples": self.samples,
+            "seconds_left": round(self.seconds_left, 1),
+            "spread_bps": round(self.spread_bps, 3),
+            "sentence": self.sentence(),
+        }
+        out["suggestion"] = (self.suggestion.to_dict()
+                             if self.suggestion else None)
+        return out
+
+
+def _grade(s: Suggestion) -> str:
+    """How good the SHAPE is. Never how likely it is to win.
+
+    Three things, all measured: how far the target clears the cost, how much
+    room there is under the breakeven ceiling, and how convinced the book
+    is. A trade can be graded A and still lose; the grade says the numbers
+    are not working against you before you start.
+    """
+    need = s.breakeven
+    points = 0
+    points += 2 if s.cost_multiple >= 4 else 1 if s.cost_multiple >= 2.5 else 0
+    points += 2 if need <= 0.45 else 1 if need <= 0.58 else 0
+    points += 2 if s.conviction >= 0.75 else 1 if s.conviction >= 0.6 else 0
+    return "A" if points >= 5 else "B" if points >= 3 else "C"
+
+
+def assess(read: BookRead | None, book: Book | None, **kw) -> Call:
+    """A graded call on this candle, whether or not it is tradeable.
+
+    Takes and forwards everything `suggest` takes. The difference is that
+    this never declines to answer: a refusal comes back as an ungraded call
+    naming the gate, so the panel always shows the state of the book rather
+    than going blank and looking broken.
+    """
+    coin = kw.get("coin", "")
+    interval = kw.get("interval", "")
+    out = suggest(read, book, **kw)
+
+    conviction = read.conviction if read else 0.0
+    score = read.score if read else 0.0
+    samples = read.samples if read else 0
+    spread = read.spread_bps if read else 0.0
+
+    if isinstance(out, Suggestion):
+        return Call(coin=coin, interval=interval, side=out.side,
+                    grade=_grade(out), tradeable=True,
+                    detail=out.headline(), conviction=conviction,
+                    score=score, samples=samples,
+                    seconds_left=kw.get("seconds_left", 0.0),
+                    spread_bps=spread, suggestion=out)
+
+    # Not tradeable. Still report which way it leans, because "no trade but
+    # leaning long" and "no trade, book balanced" are different states and
+    # only one of them is worth watching.
+    side = out.side
+    grade = "D" if side else "—"
+    return Call(coin=coin, interval=interval, side=side, grade=grade,
+                tradeable=False, detail=out.detail, conviction=conviction,
+                score=score, samples=samples,
+                seconds_left=kw.get("seconds_left", 0.0),
+                spread_bps=spread, blocked_by=out.gate)
 
 
 # --------------------------------------------------------------------------

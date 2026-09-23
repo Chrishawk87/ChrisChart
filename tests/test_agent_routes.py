@@ -349,8 +349,12 @@ def test_a_running_feed_produces_a_real_suggestion_that_can_be_decided(client,
     assert d["take"] is True, d.get("detail")
     assert d["side"] == "long"
     assert d["target_px"] > d["entry"] > d["stop_px"]
-    assert d["rr"] >= 1.5
     assert d["cost_multiple"] >= 2.0
+    # The default is scalp, where R:R is deliberately not the gate — a near
+    # target always has a poor one. The breakeven ceiling is the gate.
+    assert d["mode"] == "scalp"
+    assert 0 < d["breakeven"] <= 0.70
+    assert d["grade"] in ("A", "B", "C")
     assert d["reasons"]
     assert d["id"]
 
@@ -418,3 +422,44 @@ def test_a_short_book_produces_a_short_suggestion(client, monkeypatch):
     assert d["take"] is True, d.get("detail")
     assert d["side"] == "short"
     assert d["target_px"] < d["entry"] < d["stop_px"]
+
+
+def test_the_route_always_returns_a_graded_call(client, monkeypatch):
+    """Tradeable or not, the panel must never go blank — a blank panel is
+    indistinguishable from a broken one."""
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    for mode in ("scalp", "range"):
+        d = client.get(f"/api/suggest?coin=BTC&interval=15m&mode={mode}",
+                       headers=AUTH).json()
+        assert d["grade"], mode
+        assert d["sentence"], mode
+        assert isinstance(d["tradeable"], bool)
+        if not d["tradeable"]:
+            assert d["blocked_by"]
+
+
+def test_scalp_aims_nearer_than_range_through_the_route(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    s = client.get("/api/suggest?coin=BTC&interval=15m&mode=scalp&record=false",
+                   headers=AUTH).json()
+    r = client.get("/api/suggest?coin=BTC&interval=15m&mode=range&record=false",
+                   headers=AUTH).json()
+    if s.get("take") and r.get("take"):
+        assert s["target_bps"] < r["target_bps"]
+
+
+def test_a_refusal_is_never_recorded_as_a_trade(client, monkeypatch):
+    """Scoring refusals would let the tool raise its own hit rate simply by
+    declining more often."""
+    rt = web.runtime()
+    d = client.get("/api/suggest?coin=BTC&interval=15m", headers=AUTH).json()
+    assert d["take"] is False
+    assert rt.history.recent_suggestions() == []

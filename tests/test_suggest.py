@@ -182,7 +182,9 @@ def test_fees_push_a_marginal_trade_over_the_line():
 def test_a_stop_too_far_for_the_target_refuses_on_shape():
     far = book_at(deep_bid_at=9, depth=10, tick=0.5)
     r = ask(book=far, recent=bars(rng=0.3))
-    assert isinstance(r, NoTrade) and r.gate in ("shape", "cost")
+    # A coarse tick on a quiet candle can trip "no room" before the shape is
+    # even reached — the smallest whole-tick target is bigger than the bar.
+    assert isinstance(r, NoTrade) and r.gate in ("shape", "cost", "no room")
 
 
 def test_every_refusal_carries_a_readable_sentence():
@@ -457,3 +459,221 @@ def test_a_one_sided_book_never_produces_a_negative_stop_price():
         out = ask(book=b, recent=bars(rng=50.0))
         if isinstance(out, Suggestion):
             assert out.stop_px > 0 and out.target_px > 0
+
+
+# --------------------------------------------------------------------------
+# scalp mode: the smallest target that still pays
+# --------------------------------------------------------------------------
+
+from liqmap.suggest import Call, assess, breakeven_hit_rate  # noqa: E402
+
+
+def tight_book(px=7736.2, tick=0.1, spread_ticks=2, deep_at=3):
+    """A realistic scalping book: ETH at 7736 with a 0.2 spread.
+
+    The `book_at` fixture above has a 2bps spread, which is enormous for
+    scalping — on it the stop floor alone (three spreads) is larger than any
+    sensible scalp target, so every scalp is correctly refused and nothing
+    about scalp mode gets exercised. Chris's own screenshot showed 0.003%.
+    """
+    bid = px - spread_ticks * tick / 2
+    ask_px = px + spread_ticks * tick / 2
+    return Book(
+        coin="ETH", ts=0.0,
+        bids=[Level(round(bid - i * tick, 4), 200.0 if i == deep_at else 30.0)
+              for i in range(10)],
+        asks=[Level(round(ask_px + i * tick, 4), 200.0 if i == deep_at else 30.0)
+              for i in range(10)])
+
+
+def wide_bars(n=40, px=7736.2, rng_bps=200.0):
+    half = px * rng_bps / 10_000.0 / 2
+    return [Candle(ts=i * 900.0, open=px, high=px + half, low=px - half,
+                   close=px, volume=10.0) for i in range(n)]
+
+
+def scalp(**kw):
+    kw.setdefault("mode", "scalp")
+    kw.setdefault("book", tight_book())
+    kw.setdefault("recent", wide_bars())
+    return ask(**kw)
+
+
+def test_breakeven_is_the_ev_zero_point():
+    # 2R with no cost: one win pays for two losses, so a third is enough.
+    assert breakeven_hit_rate(100.0, 50.0) == pytest.approx(1 / 3, abs=0.001)
+    # 1:1 is a coin flip.
+    assert breakeven_hit_rate(50.0, 50.0) == pytest.approx(0.5)
+    # Cost raises the bar, which is the entire point of tracking it.
+    assert breakeven_hit_rate(50.0, 50.0, cost_bps=10.0) == pytest.approx(0.6)
+
+
+def test_breakeven_never_divides_by_zero():
+    assert breakeven_hit_rate(0.0, 0.0) == 1.0
+
+
+def test_scalp_targets_are_much_nearer_than_range_targets():
+    """The whole point: a nearer target is touched more often."""
+    r = ask(mode="range", book=tight_book(), recent=wide_bars())
+    s = scalp()
+    assert isinstance(r, Suggestion) and isinstance(s, Suggestion)
+    assert s.target_bps < r.target_bps / 3
+
+
+def test_the_scalp_target_is_set_by_cost_not_by_range():
+    """Double the bar range and the scalp target must not move — it is
+    pinned to the round trip, not to volatility."""
+    a = scalp(recent=wide_bars(rng_bps=200.0))
+    b = scalp(recent=wide_bars(rng_bps=600.0))
+    assert isinstance(a, Suggestion) and isinstance(b, Suggestion)
+    assert a.target_bps == pytest.approx(b.target_bps, abs=0.01)
+
+    # But double the COST and it must move.
+    dearer = scalp(recent=wide_bars(rng_bps=200.0), fee_bps=20.0)
+    assert isinstance(dearer, Suggestion)
+    assert dearer.target_bps > a.target_bps
+
+
+def test_a_scalp_target_always_clears_the_round_trip():
+    for fee in (0.0, 1.0, 5.0, 15.0):
+        s = scalp(fee_bps=fee, recent=wide_bars(rng_bps=800.0))
+        if isinstance(s, Suggestion):
+            assert s.target_bps >= s.cost_bps * 2.0 - 0.01, f"fee={fee}"
+
+
+def test_the_scalp_stop_is_scaled_to_the_target_not_to_the_bar():
+    """A scalp is held for seconds. Using the bar's range for its stop puts
+    the invalidation thirty basis points from a nine basis point target,
+    which is a losing trade wearing a cautious stop."""
+    s = scalp(recent=wide_bars(rng_bps=800.0))
+    assert isinstance(s, Suggestion)
+    # Scaled to the target, not to the bar — the bar here is 800bps wide and
+    # the risk must be nowhere near that.
+    assert s.risk_bps <= s.target_bps * 2.5 + 0.05
+    assert s.risk_bps < 20.0
+
+
+def test_a_scalp_is_judged_on_required_hit_rate_not_on_r():
+    """R:R would refuse every scalp, because a small target always has a bad
+    one. That is the same fact as the high hit rate, counted twice."""
+    s = scalp(recent=wide_bars(rng_bps=800.0))
+    assert isinstance(s, Suggestion)
+    assert s.rr < 1.5, "this would be refused by the range-mode R floor"
+    assert s.breakeven <= 0.70
+
+
+def test_a_trade_needing_an_impossible_hit_rate_is_refused():
+    """Cost so high relative to what the book can give that no book read
+    could sustain the rate it demands."""
+    r = scalp(fee_bps=400.0, recent=wide_bars(rng_bps=200.0))
+    assert isinstance(r, NoTrade)
+    assert r.gate in ("breakeven", "no room", "cost")
+
+
+def test_a_spread_wider_than_the_candle_has_room_for_refuses_with_no_room():
+    r = scalp(recent=wide_bars(rng_bps=12.0), fee_bps=8.0)
+    assert isinstance(r, NoTrade) and r.gate in ("no room", "cost", "breakeven")
+    # Whichever gate catches it, the refusal must name the cause rather than
+    # leaving the user to guess at the market.
+    assert "spread" in r.detail or "round trip" in r.detail
+
+
+def test_range_mode_still_uses_the_r_floor():
+    assert ask(mode="range", book=tight_book(),
+               recent=wide_bars()).rr >= 1.5
+
+
+def test_every_suggestion_states_the_hit_rate_it_needs():
+    for mode in ("scalp", "range"):
+        s = ask(mode=mode, book=tight_book(), recent=wide_bars(rng_bps=400.0))
+        assert isinstance(s, Suggestion)
+        assert "break even" in s.sentence()
+        assert 0.0 < s.breakeven < 1.0
+
+
+def test_measured_performance_is_compared_against_what_is_needed():
+    s = ask(mode="scalp", book=tight_book(), recent=wide_bars(rng_bps=800.0),
+            measured_rate=0.80, measured_n=200)
+    assert isinstance(s, Suggestion)
+    assert s.edge_pts == pytest.approx((0.80 - s.breakeven) * 100, abs=0.2)
+    assert "you are running 80%" in s.sentence()
+
+
+def test_a_thin_sample_refuses_to_claim_an_edge():
+    """Nineteen trades is an impression."""
+    s = ask(mode="scalp", book=tight_book(), recent=wide_bars(rng_bps=800.0),
+            measured_rate=0.95, measured_n=19)
+    assert isinstance(s, Suggestion)
+    assert s.edge_pts is None
+    assert "not enough to compare" in s.sentence()
+
+
+# --------------------------------------------------------------------------
+# the call on every candle
+# --------------------------------------------------------------------------
+
+def _call(**kw):
+    kw.setdefault("coin", "BTC")
+    kw.setdefault("interval", "15m")
+    kw.setdefault("interval_s", 900.0)
+    kw.setdefault("seconds_left", 600.0)
+    kw.setdefault("notional", 10_000.0)
+    kw.setdefault("recent", bars(rng=2.0))
+    r = kw.pop("read", read_at())
+    b = kw.pop("book", book_at())
+    return assess(r, b, **kw)
+
+
+def test_a_call_comes_back_even_when_there_is_no_trade():
+    """A blank panel cannot be told apart from a broken one."""
+    for read in (read_at(0.0), read_at(0.2), read_at(samples=1)):
+        c = _call(read=read)
+        assert isinstance(c, Call)
+        assert c.tradeable is False
+        assert c.blocked_by
+        assert c.sentence()
+
+
+def test_a_flat_book_and_a_blocked_lean_are_different_states():
+    """Only one of them is worth watching."""
+    flat = _call(read=read_at(0.0))
+    leaning = _call(read=read_at(0.2))
+    assert flat.side is None and flat.grade == "—"
+    assert leaning.side == "long" and leaning.grade == "D"
+
+
+def test_a_tradeable_call_carries_the_suggestion_and_a_letter_grade():
+    c = _call(mode="range")
+    assert c.tradeable is True
+    assert c.grade in ("A", "B", "C")
+    assert c.suggestion is not None
+    assert c.sentence() == c.suggestion.sentence()
+
+
+def test_grade_falls_as_the_required_hit_rate_rises():
+    cheap = _call(mode="scalp", book=tight_book(),
+                  recent=wide_bars(rng_bps=1200.0), fee_bps=0.0)
+    dear = _call(mode="scalp", book=tight_book(),
+                 recent=wide_bars(rng_bps=1200.0), fee_bps=6.0)
+    assert cheap.tradeable and dear.tradeable
+    order = {"A": 3, "B": 2, "C": 1}
+    assert order[cheap.grade] >= order[dear.grade]
+    assert cheap.suggestion.breakeven <= dear.suggestion.breakeven
+
+
+def test_a_grade_is_about_shape_never_about_likelihood():
+    """Documented here because it is the easiest thing to misread on a
+    dashboard: an A says the numbers are not working against you, not that
+    the trade wins."""
+    c = _call(mode="range")
+    assert "not a forecast" in c.sentence()
+
+
+def test_the_call_dict_is_json_safe_and_complete():
+    import json
+    for read in (read_at(), read_at(0.0), read_at(0.2)):
+        d = _call(read=read).to_dict()
+        json.loads(json.dumps(d))
+        for k in ("grade", "tradeable", "side", "detail", "sentence",
+                  "blocked_by", "suggestion"):
+            assert k in d

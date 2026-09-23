@@ -18,3 +18,8 @@ liqmap = "liqmap.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["liqmap*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: sustained concurrency tests — a few seconds each, but a race that only shows up sometimes needs sustained contention to show up reliably",
+]
