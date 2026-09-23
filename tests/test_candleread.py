@@ -160,11 +160,35 @@ def test_stretched_above_vwap_reads_down():
     assert base(last_px=99.0, vw=v).by_name("vwap").direction == "up"
 
 
-def test_holding_just_above_vwap_reads_up_weakly():
+def test_being_merely_near_vwap_produces_no_signal_at_all():
+    """VWAP distance is a PRIOR — a claim about what price tends to do, not
+    a reading of who is winning. It now only speaks when price is genuinely
+    stretched, and at a weight that cannot drown a measurement."""
     v = VWAP(value=100.0, upper_1=101.0, lower_1=99.0, upper_2=102.0,
              lower_2=98.0, anchor_ts=0, bars=50)
-    s = base(last_px=100.5, vw=v).by_name("vwap")
-    assert s.direction == "up" and s.strength < 0.5
+    assert base(last_px=100.5, vw=v).by_name("vwap") is None
+
+
+def test_vwap_cannot_outweigh_an_observation():
+    from liqmap.candleread import WEIGHTS
+    assert WEIGHTS["vwap"] < WEIGHTS["flow"]
+    assert WEIGHTS["vwap"] < WEIGHTS["price_action"]
+    assert WEIGHTS["vwap"] < WEIGHTS["absorption"]
+
+
+def test_price_action_reaches_the_read():
+    from liqmap.pressure import price_action
+    from liqmap.structure import Candle as C
+
+    flat = [C(ts=i * 60.0, open=100.0, high=100.5, low=99.5, close=100.0,
+              volume=10.0) for i in range(10)]
+    swept = flat + [C(ts=999.0, open=100.0, high=105.0, low=99.8, close=100.2,
+                      volume=10.0)]
+    pa = price_action(swept)
+    s = base(pa=pa).by_name("price_action")
+    assert s is not None
+    assert s.direction == "down"            # failed break, buyers trapped
+    assert "failed break" in s.note
 
 
 def test_liquidation_magnet_pulls_toward_the_cluster():
@@ -188,16 +212,25 @@ def test_absorbed_buying_reads_DOWN_not_up():
     it. Reading that as bullish buys the top."""
     r = base(tape=tape_with(buy_notional=9e6, sell_notional=1e6),
              absorption=absorption_of(direction="buy"))
-    assert r.by_name("flow").direction == "up"
+
+    # Flow is SUPERSEDED, not left to vote against absorption. Letting both
+    # count made them cancel to roughly zero and the read came back "flat"
+    # on the most informative situation there is.
+    flow = r.by_name("flow")
+    assert flow.direction == "flat" and flow.strength == 0.0
+    assert "superseded" in flow.note
+
     assert r.by_name("absorption").direction == "down"
     assert "wrong way" in r.by_name("absorption").note
+    assert r.lean == "down", "absorbed buying must not read as flat"
 
 
 def test_absorbed_selling_reads_UP():
     r = base(tape=tape_with(buy_notional=1e6, sell_notional=9e6),
              absorption=absorption_of(direction="sell"))
-    assert r.by_name("flow").direction == "down"
+    assert r.by_name("flow").strength == 0.0      # superseded
     assert r.by_name("absorption").direction == "up"
+    assert r.lean == "up"
 
 
 def test_absorption_outweighs_flow_when_they_disagree():

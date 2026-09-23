@@ -407,3 +407,108 @@ def test_converted_history_lands_on_the_grid():
     c = Candle(ts=1234.0, open=1.0, high=2.0, low=0.5, close=1.5, volume=1.0)
     lc = LiveCandle.from_candle(c, 900)
     assert lc.start_ts == 900.0 and lc.seeded
+
+
+# --------------------------------------------------------------------------
+# absorption without a level watch, and candle-scoped reading
+# --------------------------------------------------------------------------
+
+def _train_feed(f, bps_per_million=10.0, buckets=45, start=4000.0):
+    """Teach the feed's baseline that $1m of aggression normally moves price
+    `bps_per_million`. Flow and its resulting move must land in the SAME
+    bucket or the baseline learns that a million dollars moves nothing."""
+    ts, px = 0.0, start
+    for _ in range(buckets):
+        target = px * (1 + bps_per_million / 10_000.0)
+        for k in range(5):
+            p = px + (target - px) * k / 4.0
+            f._handle_trades([{"px": str(p), "sz": str(200_000 / p),
+                               "side": "B", "time": int((ts + k) * 1000)}])
+        px = target
+        ts += f.bucket_s + 1
+    f._handle_trades([{"px": str(px), "sz": "0.000001", "side": "B",
+                       "time": int(ts * 1000)}])
+    return ts, px
+
+
+def test_absorption_needs_no_level_watch():
+    """It used to require pointing a LevelWatch at a price, so the panel said
+    'flow and absorption missing' while the tape was plainly running."""
+    f = LiveFeed("BTC", intervals=("15m",))
+    ts, px = _train_feed(f)
+    assert f.baseline.ready
+
+    base = ts + 5000
+    for i in range(12):
+        f._handle_trades([{"px": str(px), "sz": str(1_000_000 / px),
+                           "side": "B", "time": int((base + i) * 1000)}])
+
+    a = f.absorption(window_s=120.0)
+    assert a is not None
+    assert a.confident
+    assert a.direction == "buy"
+    assert a.absorbing, "heavy buying with no move is absorption"
+
+
+def test_an_untrained_feed_says_it_is_not_confident_rather_than_guessing():
+    f = LiveFeed("BTC", intervals=("15m",))
+    f._handle_trades([{"px": "100", "sz": "1", "side": "B", "time": 1000}])
+    a = f.absorption()
+    assert a is not None and not a.confident
+
+
+def test_status_reports_baseline_progress():
+    f = LiveFeed("BTC", intervals=("15m",))
+    s = f.status()
+    assert s["baseline_samples"] == 0
+    assert s["absorption_ready"] is False
+
+
+def test_an_interval_can_be_added_after_the_feed_started():
+    """The timeframe selector can name any interval. A feed opened on a
+    different set had nothing to offer, which looked like a dead socket."""
+    f = LiveFeed("BTC", intervals=("1m",))
+    assert f.candle("30m") is None
+
+    assert f.ensure_interval("30m") is True
+    assert f.ensure_interval("30m") is False      # already there
+    assert f.ensure_interval("7m") is False       # not a real interval
+
+    f._handle_trades([{"px": "100", "sz": "2", "side": "B",
+                       "time": int(time.time() * 1000)}])
+    assert f.candle("30m") is not None
+
+
+def test_a_new_interval_can_be_seeded_with_history():
+    f = LiveFeed("BTC", intervals=("1m",))
+    start = grid_start(time.time(), 1800)
+    bars = [Candle(ts=start - 1800 * i, open=10.0, high=11.0, low=9.0,
+                   close=10.5, volume=1.0) for i in range(4, 0, -1)]
+    bars.append(Candle(ts=start, open=20.0, high=21.0, low=19.0, close=20.5,
+                       volume=2.0))
+    f.ensure_interval("30m", bars)
+    c = f.candle("30m")
+    assert c is not None and c.open == 20.0 and c.seeded
+
+
+def test_the_spread_series_shows_what_the_book_is_doing_not_just_its_shape():
+    """A snapshot says what the book looks like. The series says what is
+    happening to it, which is the part you can trade."""
+    f = LiveFeed("BTC")
+    # Levels must sit inside the 25bps depth band or both sides read zero
+    # and the imbalance is 0 — correct, but it makes a wide fixture useless.
+    for i in range(10):
+        wide = 0.02 + i * 0.01
+        f._handle_book({"levels": [[{"px": str(100 - wide), "sz": "5"}],
+                                   [{"px": str(100 + wide), "sz": "1"}]],
+                        "time": 1000 + i})
+
+    t = f.spread_trend(window_s=3600.0)
+    assert t["samples"] == 10
+    assert t["spread_bps"] > t["spread_avg"]
+    assert t["spread_widening"] is True
+    assert t["imbalance"] > 0            # bid-heavy throughout
+
+
+def test_spread_trend_on_an_empty_book_history_is_safe():
+    assert LiveFeed("BTC").spread_trend()["samples"] == 0

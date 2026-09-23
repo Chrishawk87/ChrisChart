@@ -266,3 +266,112 @@ def test_by_timeframe_lookup():
     c = confront([p("4h", 14400), p("15m", 900)])
     assert c.by_timeframe("4h") is not None
     assert c.by_timeframe("nope") is None
+
+
+# --------------------------------------------------------------------------
+# price action — observations, not priors
+# --------------------------------------------------------------------------
+
+from liqmap.pressure import price_action    # noqa: E402
+
+
+def bar(o, h, l, c, ts=0.0, v=100.0):
+    return Candle(ts=ts, open=o, high=h, low=l, close=c, volume=v)
+
+
+def flat_bars(n=10, px=100.0, spread=0.5):
+    return [bar(px, px + spread, px - spread, px, ts=i * 60.0)
+            for i in range(n)]
+
+
+def test_a_long_upper_wick_reads_as_the_high_being_rejected():
+    bars = flat_bars() + [bar(100.0, 110.0, 99.5, 100.5, ts=999)]
+    pa = price_action(bars)
+    assert pa.rejection < 0
+    assert "rejected" in pa.describe()
+
+
+def test_a_long_lower_wick_reads_as_the_low_being_rejected():
+    bars = flat_bars() + [bar(100.0, 100.5, 90.0, 99.5, ts=999)]
+    pa = price_action(bars)
+    assert pa.rejection > 0
+
+
+def test_a_symmetric_bar_is_indecision_not_rejection():
+    """Equal wicks both ways is a doji. Reading every doji as a rejection
+    would fire this on almost every bar and make it worthless."""
+    bars = flat_bars() + [bar(100.0, 102.0, 98.0, 100.0, ts=999)]
+    assert price_action(bars).rejection == 0.0
+
+
+def test_a_swept_high_that_closes_back_inside_is_bearish():
+    """The failed break. Whoever bought the breakout is trapped and has to do
+    something about it — a mechanism, not a tendency."""
+    bars = flat_bars(px=100.0, spread=0.5)
+    bars.append(bar(100.0, 105.0, 99.8, 100.2, ts=999))   # through 100.5, back under
+    pa = price_action(bars)
+    assert pa.sweep < 0
+    assert "failed break" in pa.describe() and "buyers trapped" in pa.describe()
+    assert pa.signed < 0
+
+
+def test_a_swept_low_that_closes_back_inside_is_bullish():
+    bars = flat_bars(px=100.0, spread=0.5)
+    bars.append(bar(100.0, 100.2, 95.0, 99.8, ts=999))
+    pa = price_action(bars)
+    assert pa.sweep > 0
+    assert "sellers trapped" in pa.describe()
+    assert pa.signed > 0
+
+
+def test_closing_beyond_the_range_is_acceptance_not_a_sweep():
+    """The opposite of a sweep, and what makes a breakout real."""
+    bars = flat_bars(px=100.0, spread=0.5)
+    bars.append(bar(100.0, 106.0, 100.0, 105.5, ts=999))
+    pa = price_action(bars)
+    assert pa.acceptance > 0
+    assert pa.sweep == 0.0
+    assert "accepted" in pa.describe()
+
+
+def test_closing_below_the_range_is_downside_acceptance():
+    bars = flat_bars(px=100.0, spread=0.5)
+    bars.append(bar(100.0, 100.0, 94.0, 94.5, ts=999))
+    pa = price_action(bars)
+    assert pa.acceptance < 0
+
+
+def test_a_sweep_outweighs_a_rejection_in_the_combined_score():
+    """A wick says the level was defended. A failed break says somebody is
+    trapped and has to buy or sell their way out — a mechanism, so it counts
+    for more. The wicked bar here stays INSIDE the prior range so only the
+    rejection fires."""
+    swept = price_action(flat_bars() + [bar(100.0, 105.0, 99.8, 100.2, ts=9)])
+    wicked = price_action(flat_bars() + [bar(100.2, 100.45, 99.6, 100.35, ts=9)])
+
+    assert swept.sweep != 0.0 and wicked.sweep == 0.0
+    assert wicked.rejection != 0.0
+    assert abs(swept.signed) > abs(wicked.signed)
+
+
+def test_a_deeper_sweep_reads_stronger_than_a_shallow_one():
+    shallow = price_action(flat_bars() + [bar(100.0, 100.6, 99.8, 100.2, ts=9)])
+    deep = price_action(flat_bars() + [bar(100.0, 108.0, 99.8, 100.2, ts=9)])
+    assert abs(deep.sweep) > abs(shallow.sweep)
+
+
+def test_a_quiet_range_produces_nothing():
+    pa = price_action(flat_bars())
+    assert not pa.active
+    assert pa.signed == 0.0
+    assert "nothing notable" in pa.describe()
+
+
+def test_too_few_bars_is_safe():
+    assert price_action([]).signed == 0.0
+    assert price_action([bar(1, 2, 0.5, 1.5)]).signed == 0.0
+
+
+def test_the_combined_score_is_bounded():
+    bars = flat_bars() + [bar(100.0, 200.0, 99.9, 100.1, ts=9)]
+    assert -1.0 <= price_action(bars).signed <= 1.0

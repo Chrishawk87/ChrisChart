@@ -63,7 +63,8 @@ DEFAULT_WEIGHTS = {
     "position": 0.8,      # where price sits in the candle's own range
     "imbalance": 0.5,     # resting depth, the weakest of the group
     "absorption": 1.4,    # heaviest: it inverts flow and it is hard-won
-    "vwap": 0.6,
+    "price_action": 1.2,  # sweeps, rejections, acceptance — all observed
+    "vwap": 0.25,         # a PRIOR, not an observation. Kept as context only.
     "structure": 1.0,     # higher timeframe direction
     "zone": 0.9,          # sitting in a fresh supply or demand zone
     "magnet": 0.7,        # liquidation fuel pulling one way
@@ -164,7 +165,8 @@ class CandleRead:
         while everything else disagrees, and that is a materially different
         situation from six things quietly agreeing.
         """
-        directional = [s for s in self.signals if s.direction != "flat"]
+        directional = [s for s in self.signals
+                       if s.direction != "flat" and s.strength > 0]
         if not directional or self.lean == "flat":
             return 0.0
         same = sum(1 for s in directional if s.direction == self.lean)
@@ -302,6 +304,7 @@ def read(coin: str, interval_s: float, elapsed_s: float,
          higher: Structure | None = None,
          zone: Zone | None = None,
          vw: VWAP | None = None,
+         pa=None,
          magnet_bps: float = 0.0,
          magnet_notional: float = 0.0,
          calibration: Calibration | None = None) -> CandleRead:
@@ -317,17 +320,39 @@ def read(coin: str, interval_s: float, elapsed_s: float,
                      last_px=last_px, calibration=calibration)
     sig = out.signals
 
+    # Absorption is resolved FIRST, because it decides whether the flow
+    # signal is evidence or a trap.
+    absorbed = bool(absorption is not None and absorption.confident
+                    and absorption.absorbing
+                    and absorption.aggressive_notional > 0)
+
     # -- flow inside this candle -----------------------------------------
     if tape is not None and elapsed_s > 0:
         w = tape.window(elapsed_s)
         if w.total > 0:
             lean = w.lean                      # -1..+1
-            sig.append(Signal(
-                name="flow",
-                direction="up" if lean > 0.05 else "down" if lean < -0.05 else "flat",
-                strength=min(abs(lean), 1.0),
-                note=(f"${w.buy_notional:,.0f} bought vs "
-                      f"${w.sell_notional:,.0f} sold this candle")))
+            direction = ("up" if lean > 0.05
+                         else "down" if lean < -0.05 else "flat")
+            if absorbed:
+                # Flow is SUPERSEDED, not counted against absorption.
+                #
+                # Letting both vote made them cancel to roughly zero, and the
+                # read came back "flat" on the most informative situation
+                # there is: heavy aggression going nowhere. When absorption
+                # is confident, flow is known to be misleading -- so it is
+                # reported for context at zero strength rather than allowed
+                # to drag the score back toward neutral.
+                sig.append(Signal(
+                    name="flow", direction="flat", strength=0.0,
+                    note=(f"${w.buy_notional:,.0f} bought vs "
+                          f"${w.sell_notional:,.0f} sold — superseded by "
+                          f"absorption below")))
+            else:
+                sig.append(Signal(
+                    name="flow", direction=direction,
+                    strength=min(abs(lean), 1.0),
+                    note=(f"${w.buy_notional:,.0f} bought vs "
+                          f"${w.sell_notional:,.0f} sold this candle")))
 
     # -- where price sits in the candle's own range -----------------------
     rng = high_px - low_px
@@ -339,8 +364,10 @@ def read(coin: str, interval_s: float, elapsed_s: float,
         sig.append(Signal(
             name="position",
             direction="up" if off_centre > 0.1 else "down" if off_centre < -0.1 else "flat",
-            strength=min(abs(off_centre), 1.0),
-            note=f"trading at {pos:.0%} of the candle's range"))
+            strength=min(abs(off_centre), 1.0) * (0.4 if absorbed else 1.0),
+            note=(f"trading at {pos:.0%} of the candle's range"
+                  + (" (discounted — the move is being absorbed)"
+                     if absorbed else ""))))
 
     # -- resting depth ----------------------------------------------------
     if book is not None and not book.empty:
@@ -375,21 +402,28 @@ def read(coin: str, interval_s: float, elapsed_s: float,
                 note="book is thin — aggression is moving price more easily "
                      "than usual, so moves extend"))
 
-    # -- VWAP --------------------------------------------------------------
+    # -- price action: what price DID -------------------------------------
+    if pa is not None and pa.active:
+        sig.append(Signal(
+            name="price_action",
+            direction="up" if pa.signed > 0 else "down",
+            strength=min(abs(pa.signed), 1.0),
+            note=pa.describe()))
+
+    # -- VWAP, demoted to context -----------------------------------------
+    #
+    # This is a PRIOR: "price is stretched, so it tends to come back". That
+    # is a statement about tendencies, not about this market now, and it was
+    # sitting at the same weight as measurements of a fight you can watch.
+    # Kept because stretch is worth knowing, weighted low because it is not
+    # evidence of who is winning.
     if vw is not None and vw.value > 0 and last_px > 0:
-        dist = (last_px - vw.value) / vw.value * 10_000.0
-        # Near VWAP is not a signal. Far from it is mean reversion pressure,
-        # and the bands are how far is far.
         if last_px >= vw.upper_2 or last_px <= vw.lower_2:
+            dist = (last_px - vw.value) / vw.value * 10_000.0
             sig.append(Signal(
                 name="vwap", direction="down" if dist > 0 else "up",
-                strength=0.7,
-                note=f"{vw.band_of(last_px)} of VWAP — stretched"))
-        elif abs(dist) > 5:
-            sig.append(Signal(
-                name="vwap", direction="up" if dist > 0 else "down",
-                strength=0.35,
-                note=f"holding {'above' if dist > 0 else 'below'} VWAP"))
+                strength=0.5,
+                note=f"{vw.band_of(last_px)} of VWAP — stretched (context)"))
 
     # -- higher timeframe --------------------------------------------------
     if higher is not None and higher.direction != "range":

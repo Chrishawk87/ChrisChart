@@ -1459,6 +1459,14 @@ def create_app() -> FastAPI:
         # the tape rather than fetched. Nothing to poll, nothing to lag, and
         # no chance of being handed a closed bar and told it is the live one.
         feed = rt.feed_for(coin)
+        if feed is not None and interval not in feed.builders:
+            # The timeframe selector can name any interval. A feed opened on
+            # a different set has nothing for it, which looked exactly like
+            # the socket having stopped.
+            try:
+                feed.ensure_interval(interval, bars)
+            except Exception as exc:
+                out["feed_interval_error"] = str(exc)
         live_bar = feed.candle(interval) if feed else None
         use_feed = live_bar is not None and live_bar.seeded and not feed.stale
 
@@ -1556,8 +1564,21 @@ def create_app() -> FastAPI:
             tape = w.watch.tape
         elif use_feed:
             # Even without a level watch, the feed's tape gives the flow
-            # signal -- it is the same public fills either way.
+            # signal -- it is the same public fills either way. And the feed
+            # learns its own impact baseline, so absorption comes with it:
+            # absorption is a property of the tape, not of a level you
+            # happened to point at.
             tape = feed.tape
+            # Scope the absorption window to THIS candle. A fixed five
+            # minutes answers a different question on a 1-minute chart than
+            # on a 30-minute one, and the whole point is to read the bar in
+            # front of you. Floored at a quarter of the bar so a just-opened
+            # candle is not judged on three seconds of tape.
+            absorption = feed.absorption(
+                window_s=max(min(elapsed, float(step)), float(step) * 0.25))
+            # Impact buckets scale with the timeframe too: 15-second buckets
+            # are right for a 15-minute bar and far too coarse for a 1-minute.
+            feed.bucket_s = max(2.0, min(float(step) / 60.0, 60.0))
 
         # nearest liquidation cluster, signed by side
         magnet_bps = magnet_notional = 0.0
@@ -1580,13 +1601,19 @@ def create_app() -> FastAPI:
         except Exception:
             pass
 
+        try:
+            from .pressure import price_action
+            pa_read = price_action(closed + [current])
+        except Exception:
+            pa_read = None
+
         r = candleread.read(
             coin=coin, interval_s=float(step), elapsed_s=elapsed,
             open_px=current.open, high_px=current.high, low_px=current.low,
             last_px=current.close, tape=tape, book=book,
             absorption=absorption, higher=higher_struct, zone=in_zone, vw=vw,
             magnet_bps=magnet_bps, magnet_notional=magnet_notional,
-            calibration=rt.calibration(coin, interval))
+            pa=pa_read, calibration=rt.calibration(coin, interval))
 
         # The candle feed and the live mid come from different endpoints with
         # different clocks. The overlay above keeps them in step; this reports
@@ -1619,6 +1646,10 @@ def create_app() -> FastAPI:
             "higher_timeframe": (higher_struct.describe()
                                  if higher_struct else None),
             "atr": atr(closed),
+            "price_action": (None if pa_read is None else {
+                "rejection": pa_read.rejection, "sweep": pa_read.sweep,
+                "acceptance": pa_read.acceptance, "signed": pa_read.signed,
+                "notes": pa_read.notes}),
             "vwap": (None if vw is None else
                      {"value": vw.value, "band": vw.band_of(current.close)}),
             "zone": (None if in_zone is None else
@@ -1626,6 +1657,17 @@ def create_app() -> FastAPI:
                       "high": in_zone.high, "tested": in_zone.tested,
                       "fresh": in_zone.fresh}),
             "calibration": rt.calibration(coin, interval).table(),
+            "inputs": {
+                "flow": tape is not None,
+                "absorption": bool(absorption is not None
+                                   and absorption.confident),
+                "absorption_warming": bool(absorption is not None
+                                           and not absorption.confident),
+                "book": bool(book is not None and not book.empty),
+                "level_watch": bool(w is not None and w.coin == coin),
+                "baseline_samples": (feed.baseline.samples
+                                     if use_feed and feed else 0),
+            },
             "has_watch": absorption is not None,
         })
         # ---- who is winning, on every timeframe at once -----------------
@@ -1699,6 +1741,11 @@ def create_app() -> FastAPI:
                 "spread_bps": book.spread_bps,
                 "imbalance_25bps": book.imbalance(25.0),
                 "pushed": bool(use_feed and feed.book is not None),
+                # Scoped to the candle: what the book has been doing across
+                # this bar, not only what it looks like this instant.
+                "trend": (feed.spread_trend(
+                    window_s=max(min(elapsed, float(step)), 30.0))
+                    if use_feed and feed else None),
             }
         if size > 0 and book is not None and not book.empty:
             out["round_trip_bps"] = book.round_trip_bps(size)
@@ -2489,6 +2536,20 @@ function onCoinChange() {
   loadRead();
 }
 
+function inputFlags(d) {
+  // Report each input separately. One banner saying "flow and absorption
+  // missing" while flow was visibly working in the signal list was simply
+  // untrue, and an untrue status line costs more trust than a missing one.
+  const i = d.inputs || {};
+  let out = '';
+  if (!i.flow) out += '<span class="flag late">NO FLOW</span>';
+  if (i.absorption_warming)
+    out += `<span class="flag late">ABSORPTION WARMING (${i.baseline_samples||0}/20)</span>`;
+  else if (!i.absorption) out += '<span class="flag late">NO ABSORPTION</span>';
+  if (!i.book) out += '<span class="flag late">NO BOOK</span>';
+  return out;
+}
+
 function paintLadder(d) {
   const tfs = d.timeframes || [];
   const el = $('tfLadder'), say = $('tfSay');
@@ -2716,7 +2777,7 @@ function paintRead(d) {
                      : '<span class="flag late">POLLED</span>')
               + (d.early ? '<span class="flag late">EARLY</span>' : '')
               + (d.stale ? '<span class="flag crowded">STALE — candle and live price disagree</span>' : '')
-              + (d.has_watch ? '' : '<span class="flag">NO LEVEL WATCH — flow and absorption missing</span>');
+              + inputFlags(d);
 
   $('readHead').innerHTML =
       `<div class="verdict-big ${cls}">${d.lean.toUpperCase()}`

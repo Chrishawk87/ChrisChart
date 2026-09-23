@@ -50,7 +50,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Sequence
 
-from .flow import Book, FlowTape, Trade
+from .flow import Book, FlowTape, ImpactBaseline, Trade
 from .structure import Candle
 
 # Intervals the builder understands, in seconds. Mirrors the exchange's.
@@ -257,6 +257,17 @@ class LiveFeed:
             for name in intervals if name in INTERVALS}
         self.tape = FlowTape(max_age=tape_seconds)
         self.book: Book | None = None
+        self._book_hist: list[tuple[float, float, float, float]] = []
+
+        # Impact baseline, learned from this market's own tape. Without a
+        # scale, "ten million of buying" means nothing -- it is enormous at
+        # 3am and unremarkable at the open.
+        self.baseline = ImpactBaseline()
+        self.bucket_s = 15.0
+        self._bucket_start: float | None = None
+        self._bucket_delta = 0.0
+        self._bucket_open_px = 0.0
+        self._bucket_last_px = 0.0
 
         self.trades_seen = 0
         self.book_updates = 0
@@ -406,8 +417,80 @@ class LiveFeed:
                 self.tape.add(t)
                 for b in self.builders.values():
                     b.add(t)
+                self._accumulate(t)
                 self.trades_seen += 1
                 self.last_trade_ts = max(self.last_trade_ts, t.ts)
+
+    # -- absorption, continuously ------------------------------------------
+    #
+    # Absorption used to require pointing a LevelWatch at a specific price.
+    # That made it unavailable by default, so the panel said "flow and
+    # absorption missing" even while the tape was running and flow was
+    # plainly working. Absorption is not a property of a level -- it is a
+    # property of the tape -- so the feed learns it for itself.
+
+    def _accumulate(self, trade: Trade) -> None:
+        """Roll fills into fixed buckets and feed each finished one to the
+        impact baseline, so "is this a lot of volume" has a scale."""
+        if self._bucket_start is None:
+            self._bucket_start = trade.ts
+            self._bucket_open_px = trade.px
+
+        if trade.ts < self._bucket_start:        # clock went backwards
+            self._bucket_start = trade.ts
+            self._bucket_open_px = trade.px
+            self._bucket_delta = 0.0
+
+        if trade.ts - self._bucket_start >= self.bucket_s:
+            if self._bucket_open_px > 0 and self._bucket_last_px > 0:
+                move = ((self._bucket_last_px - self._bucket_open_px)
+                        / self._bucket_open_px * 10_000.0)
+                self.baseline.observe(self._bucket_delta, move)
+            self._bucket_start = trade.ts
+            self._bucket_open_px = trade.px
+            self._bucket_delta = 0.0
+
+        self._bucket_delta += trade.signed_notional
+        self._bucket_last_px = trade.px
+
+    def absorption(self, window_s: float = 300.0):
+        """What the tape says about who is being absorbed, right now.
+
+        Returns a `flow.Absorption` or None when the baseline has not seen
+        enough to have a scale yet -- it says so rather than guessing.
+        """
+        from .flow import Absorption, BandStat
+
+        with self._lock:
+            w = self.tape.window(window_s)
+            move = self.tape.price_change_bps(window_s)
+            px = self.tape.last_px
+            book = self.book
+
+        direction = "buy" if w.delta >= 0 else "sell"
+        net = abs(w.delta)
+        expected = self.baseline.expected_bps(net)
+        signed_move = move if direction == "buy" else -move
+        ratio = (signed_move / expected) if expected > 0 else 0.0
+
+        # Resting size around the current price, for the eaten/replaced line.
+        band = BandStat(low_px=px * 0.999, high_px=px * 1.001, observations=0,
+                        first_notional=0.0, last_notional=0.0,
+                        min_notional=0.0, max_notional=0.0,
+                        consumed=0.0, replenished=0.0, refill_events=0)
+        if book is not None and not book.empty:
+            resting = book.band_notional(px * 0.999, px * 1.001)
+            band = BandStat(low_px=px * 0.999, high_px=px * 1.001,
+                            observations=1, first_notional=resting,
+                            last_notional=resting, min_notional=resting,
+                            max_notional=resting, consumed=0.0,
+                            replenished=0.0, refill_events=0)
+
+        return Absorption(
+            level=px, window_s=window_s, direction=direction,
+            aggressive_notional=net, observed_bps=signed_move,
+            expected_bps=expected, impact_ratio=ratio, band=band,
+            confident=self.baseline.ready, trades=w.trades)
 
     def _handle_book(self, data: dict) -> None:
         from .hl import parse_book
@@ -422,12 +505,65 @@ class LiveFeed:
         with self._lock:
             self.book = b
             self.book_updates += 1
+            # Keep a short history of the spread and the imbalance. A single
+            # snapshot says what the book looks like; the series says what is
+            # happening to it, which is the part you can trade. A spread
+            # widening while one side thins is the book getting out of the
+            # way -- price action at the finest grain there is.
+            self._book_hist.append((time.time(), b.spread_bps,
+                                    b.imbalance(25.0), b.mid))
+            del self._book_hist[:-600]
+
+    def spread_trend(self, window_s: float = 60.0) -> dict:
+        """What the book has been doing over the window, not just now."""
+        with self._lock:
+            hist = list(self._book_hist)
+        if not hist:
+            return {"samples": 0}
+
+        cutoff = time.time() - window_s
+        inside = [h for h in hist if h[0] >= cutoff] or hist[-1:]
+        spreads = [h[1] for h in inside]
+        imbs = [h[2] for h in inside]
+
+        first_half = imbs[: max(1, len(imbs) // 2)]
+        second_half = imbs[max(1, len(imbs) // 2):] or first_half
+
+        return {
+            "samples": len(inside),
+            "spread_bps": spreads[-1],
+            "spread_avg": sum(spreads) / len(spreads),
+            "spread_widening": spreads[-1] > (sum(spreads) / len(spreads)) * 1.3,
+            "imbalance": imbs[-1],
+            "imbalance_avg": sum(imbs) / len(imbs),
+            # Which way the resting book is TILTING, not where it sits.
+            "imbalance_shift": (sum(second_half) / len(second_half)
+                                - sum(first_half) / len(first_half)),
+        }
 
     def _note(self, msg: str) -> None:
         self.errors.append(f"{time.strftime('%H:%M:%S')} {msg}")
         del self.errors[:-20]
 
     # -- read --------------------------------------------------------------
+
+    def ensure_interval(self, name: str,
+                        seed_bars: Sequence[Candle] | None = None) -> bool:
+        """Start building an interval the feed was not asked for at startup.
+
+        The dashboard's timeframe selector can name any interval, and a feed
+        opened on 1m/5m/15m has nothing to offer when you switch to 30m --
+        which looked like the socket had stopped working. Adding the builder
+        on demand costs nothing: the fills are already arriving.
+        """
+        if name in self.builders:
+            return False
+        if name not in INTERVALS:
+            return False
+        self.builders[name] = CandleBuilder(INTERVALS[name])
+        if seed_bars:
+            self.seed(name, seed_bars)
+        return True
 
     def candle(self, interval: str) -> LiveCandle | None:
         b = self.builders.get(interval)
@@ -458,6 +594,8 @@ class LiveFeed:
             "trades_seen": self.trades_seen,
             "book_updates": self.book_updates,
             "reconnects": self.reconnects,
+            "baseline_samples": self.baseline.samples,
+            "absorption_ready": self.baseline.ready,
             "intervals": sorted(self.builders),
             "uptime_s": (time.time() - self.started_at) if self.started_at else 0.0,
             "errors": self.errors[-3:],

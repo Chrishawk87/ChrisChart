@@ -362,3 +362,120 @@ def from_candles(timeframe: str, interval_s: float, bars: Sequence[Candle],
 
 def confront(readings: Sequence[Pressure]) -> Confrontation:
     return Confrontation(readings=[r for r in readings if r is not None])
+
+
+# --------------------------------------------------------------------------
+# price action: what price DID, not what it tends to do
+# --------------------------------------------------------------------------
+#
+# VWAP distance is a PRIOR. It says "price is stretched, so it tends to come
+# back" -- a statement about tendencies, not about this market right now. In a
+# read whose whole premise is observation over prediction, it does not belong
+# alongside measurements, and it was diluting them.
+#
+# These three are observations. Each one is a thing that visibly happened and
+# that you could point at on the chart:
+#
+#   REJECTION   a bar printed a high and closed far below it. Sellers took
+#               the level back. The wick is the evidence.
+#   SWEEP       price traded through a prior high or low and closed back
+#               inside. The breakout failed, and whoever bought it is trapped.
+#               This is the single most useful scalp signal there is.
+#   ACCEPTANCE  price closed beyond a prior range and stayed there. The
+#               opposite of a sweep, and the thing that makes a breakout real.
+#
+# All three read the same bars, and all three are signed the same way as
+# everything else: positive favours buyers.
+
+@dataclass
+class PriceAction:
+    """Observed behaviour over the last few bars."""
+
+    rejection: float = 0.0        # -1 top rejected ... +1 bottom rejected
+    sweep: float = 0.0            # -1 high swept and failed ... +1 low swept
+    acceptance: float = 0.0       # -1 accepted below ... +1 accepted above
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def signed(self) -> float:
+        """Combined, bounded to -1..+1.
+
+        A sweep is weighted hardest: a failed break leaves trapped
+        participants who have to do something about it, which is a mechanism
+        rather than a tendency.
+        """
+        raw = self.sweep * 0.5 + self.rejection * 0.3 + self.acceptance * 0.2
+        return max(-1.0, min(1.0, raw))
+
+    @property
+    def active(self) -> bool:
+        return abs(self.signed) > 0.05
+
+    def describe(self) -> str:
+        if not self.notes:
+            return "nothing notable in the price action"
+        return "; ".join(self.notes)
+
+
+def price_action(bars: Sequence[Candle], lookback: int = 12) -> PriceAction:
+    """Read rejection, sweeps and acceptance off the bars themselves."""
+    pa = PriceAction()
+    if len(bars) < 3:
+        return pa
+
+    window = list(bars[-max(3, lookback):])
+    last = window[-1]
+    prior = window[:-1]
+
+    # -- rejection: where did the last bar close inside its own range ------
+    rng = last.high - last.low
+    if rng > 0:
+        upper_wick = last.high - last.body_top
+        lower_wick = last.body_bottom - last.low
+        # Only the wick matters here. Comparing the close to `body_top` was
+        # wrong: on a bullish bar the body top IS the close, so that test
+        # could never pass and upper-wick rejection never fired at all.
+        # Giving back most of the range is the observation, whichever way the
+        # body happens to point.
+        # The wick must clearly DOMINATE the other side. A bar with equal
+        # wicks both ways is indecision, not rejection, and reading every
+        # doji as a rejection would fire this signal on almost every bar.
+        if upper_wick / rng > 0.45 and upper_wick > lower_wick * 1.5:
+            pa.rejection = -min(upper_wick / rng, 1.0)
+            pa.notes.append(
+                f"upper wick is {upper_wick / rng:.0%} of the bar — the high "
+                f"at {last.high:,.2f} was rejected")
+        elif lower_wick / rng > 0.45 and lower_wick > upper_wick * 1.5:
+            pa.rejection = min(lower_wick / rng, 1.0)
+            pa.notes.append(
+                f"lower wick is {lower_wick / rng:.0%} of the bar — the low "
+                f"at {last.low:,.2f} was rejected")
+
+    # -- sweep: took out a prior extreme and closed back inside ------------
+    prior_high = max(b.high for b in prior)
+    prior_low = min(b.low for b in prior)
+
+    if last.high > prior_high and last.close < prior_high:
+        depth = (last.high - prior_high) / prior_high * 10_000.0
+        pa.sweep = -min(1.0, 0.4 + depth / 25.0)
+        pa.notes.append(
+            f"swept the prior high at {prior_high:,.2f} by {depth:.1f}bps and "
+            f"closed back under it — failed break, buyers trapped")
+    elif last.low < prior_low and last.close > prior_low:
+        depth = (prior_low - last.low) / prior_low * 10_000.0
+        pa.sweep = min(1.0, 0.4 + depth / 25.0)
+        pa.notes.append(
+            f"swept the prior low at {prior_low:,.2f} by {depth:.1f}bps and "
+            f"closed back above it — failed break, sellers trapped")
+
+    # -- acceptance: closed beyond the range and held ----------------------
+    elif last.close > prior_high:
+        pa.acceptance = 1.0
+        pa.notes.append(f"closed above the prior high at {prior_high:,.2f} — "
+                        f"accepted, not rejected")
+    elif last.close < prior_low:
+        pa.acceptance = -1.0
+        pa.notes.append(f"closed below the prior low at {prior_low:,.2f} — "
+                        f"accepted, not rejected")
+
+    return pa
