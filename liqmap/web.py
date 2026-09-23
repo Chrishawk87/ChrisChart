@@ -555,6 +555,7 @@ class Runtime:
         there is no suggestion, and saying so is the correct answer -- the
         alternative is a target sized from a stale snapshot.
         """
+        from .confirm import from_feed as read_price_action
         from .live import INTERVALS
         from .suggest import assess as make_call
 
@@ -629,10 +630,20 @@ class Runtime:
         except Exception:
             pass
 
+        # What price is ACTUALLY doing, from fills only. This is the
+        # independent half of the comparison: it never touches the book, so
+        # agreement between the two means something.
+        #
+        # The window is scoped to the timeframe -- thirty seconds is the
+        # right question on a 15m bar and far too long on a 1m one.
+        action = read_price_action(
+            feed, interval, window_s=max(10.0, min(interval_s / 30.0, 120.0)))
+
         call = make_call(
             read, book, coin=coin, interval=interval, interval_s=interval_s,
             seconds_left=seconds_left, recent=recent, notional=notional,
             fee_bps=fee_bps, mode=("scalp" if mode == "scalp" else "range"),
+            action=action, require_confirmation=True,
             measured_rate=measured_rate, measured_n=measured_n)
         out = call.suggestion
 
@@ -2555,10 +2566,12 @@ DASHBOARD = """<!doctype html>
   <div class="grid">
     <div class="panel full" id="agentPanel"><h2>The call — take it or leave it
       <span class="stamp" id="sugStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">A trade or a reason there
-        isn't one. The target comes from what bars on this timeframe actually
-        travel; the invalidation comes from the resting level the trade leans
-        on. <b>Nothing here places an order.</b></div>
+      <div class="msg" style="margin-bottom:8px">Two independent readings.
+        The <b>book</b> says where the pressure is; <b>price</b> says whether
+        the pressure is winning. A trade only when they agree — if the book
+        favours buyers and price is falling, somebody is absorbing them and
+        we stand aside. <b>Nothing here places an order.</b></div>
+      <div id="sugCompare" style="display:none;margin-bottom:10px"></div>
       <div class="conbar">
         <label>candle <select id="sInt" onchange="loadSuggest()">
           <option>1m</option><option>5m</option><option selected>15m</option>
@@ -3136,10 +3149,37 @@ async function loadSuggest() {
   loadDecisions();
 }
 
+/* Book against price, always on show. This is the most useful thing on the
+   panel precisely when there is NO trade, so it is painted before and
+   independently of the call itself. */
+function paintCompare(d) {
+  const box = $('sugCompare');
+  const c = d.confirmation;
+  if (!c) { box.style.display = 'none'; return; }
+
+  const cls = v => v === 'up' ? 'long' : v === 'down' ? 'short' : '';
+  const arrow = v => v === 'up' ? '▲' : v === 'down' ? '▼' : '—';
+  const verdictCls = c.verdict === 'confirmed' ? 'long'
+                   : c.verdict === 'conflict' ? 'short' : '';
+
+  box.style.display = '';
+  box.innerHTML =
+      '<div class="conrow">'
+    + `<div class="stat"><b class="${cls(c.book)}">${arrow(c.book)} `
+    + `${esc((c.book || '').toUpperCase())}</b><span>order book</span></div>`
+    + `<div class="stat"><b class="${cls(c.candle)}">${arrow(c.candle)} `
+    + `${esc((c.candle || '').toUpperCase())}</b><span>price action</span></div>`
+    + `<div class="stat"><b class="${verdictCls}">`
+    + `${esc((c.verdict || '').toUpperCase())}</b><span>verdict</span></div>`
+    + '</div>'
+    + `<div class="msg" style="margin-top:6px">${esc(c.detail || '')}</div>`;
+}
+
 function paintSuggest(d) {
   if (!d) return;
   sugId = d.id || null;
   const act = $('sugActions');
+  paintCompare(d);
 
   if (!d.take) {
     // A refusal is an answer, not an error, and it still carries a grade and

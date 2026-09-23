@@ -46,6 +46,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Sequence
 
 from .bookread import BookRead
+from .confirm import CandleAction, Confirmation, confirm
 from .flow import Book, Level
 from .structure import Candle
 
@@ -253,6 +254,7 @@ class Suggestion:
     mode: Mode = "range"
     measured_rate: float | None = None      # what you actually achieve
     measured_n: int = 0
+    confirmation: Confirmation | None = None
 
     reasons: list[str] = field(default_factory=list)
     cautions: list[str] = field(default_factory=list)
@@ -309,6 +311,11 @@ class Suggestion:
             f"target {self.target_px:,.6g}, invalid {opposite} "
             f"{self.stop_px:,.6g}. {self.rr}R.",
         ]
+        if self.confirmation is not None:
+            c = self.confirmation
+            lines.append(
+                f"Book says {c.book.upper()}, price is going "
+                f"{c.candle.upper()} — confirmed.")
         if self.reasons:
             lines.append("Why: " + "; ".join(self.reasons) + ".")
         if self.cautions:
@@ -367,6 +374,8 @@ class Suggestion:
             "measured_rate": self.measured_rate,
             "measured_n": self.measured_n,
             "edge_pts": self.edge_pts,
+            "confirmation": (self.confirmation.to_dict()
+                             if self.confirmation else None),
             "reasons": self.reasons, "cautions": self.cautions,
             "headline": self.headline(),
             "sentence": self.sentence(),
@@ -431,6 +440,8 @@ def suggest(read: BookRead | None, book: Book | None, *,
             notional: float = 10_000.0,
             fee_bps: float = 0.0,
             tick: float | None = None,
+            action: CandleAction | None = None,
+            require_confirmation: bool = True,
             mode: Mode = "range",
             min_conviction: float = MIN_CONVICTION,
             min_rr: float = MIN_RR,
@@ -493,6 +504,25 @@ def suggest(read: BookRead | None, book: Book | None, *,
                        conviction=read.conviction)
 
     side: Side = "long" if read.direction == "up" else "short"
+
+    # -- does price agree with the book -----------------------------------
+    #
+    # The hard gate, and it comes before every other calculation because
+    # there is no point sizing a trade the price action is arguing against.
+    #
+    # A HARD gate, never a weight: blending a strong book with falling price
+    # averages a disagreement into a weak agreement, and a weak long is
+    # exactly the wrong thing to hold where a passive seller is filling
+    # every bid without moving the price.
+    agreement: Confirmation | None = None
+    if action is not None or require_confirmation:
+        agreement = confirm(read.direction, read.conviction, action)
+        if agreement.verdict == "conflict":
+            return NoTrade("conflict", agreement.detail,
+                           side=side, conviction=read.conviction)
+        if agreement.verdict == "unconfirmed":
+            return NoTrade("unconfirmed", agreement.detail,
+                           side=side, conviction=read.conviction)
 
     if read.conviction < min_conviction:
         return NoTrade("conviction",
@@ -720,6 +750,7 @@ def suggest(read: BookRead | None, book: Book | None, *,
         seconds_left=seconds_left, samples=read.samples,
         spread_bps=read.spread_bps, mode=mode,
         measured_rate=measured_rate, measured_n=measured_n,
+        confirmation=agreement,
         reasons=_reasons(read),
         cautions=_cautions(read, read.spread_bps, target_bps)
         + (["the invalidation is a scalp stop, not a structural level — the "
@@ -740,6 +771,7 @@ GRADES = (
     ("B", "a fair trade — the numbers work with something to spare"),
     ("C", "marginal: it works, but not by much"),
     ("D", "readable but not tradeable"),
+    ("X", "book and price disagree — somebody is absorbing"),
     ("—", "the book is not saying anything"),
 )
 
@@ -772,6 +804,11 @@ class Call:
     spread_bps: float = 0.0
     blocked_by: str | None = None
     suggestion: Suggestion | None = None
+    # Carried whether or not the trade happened: "book says UP, price says
+    # DOWN" is the most informative thing on the panel precisely on the
+    # candles where there is no trade.
+    confirmation: Confirmation | None = None
+    action: CandleAction | None = None
 
     @property
     def grade_note(self) -> str:
@@ -800,6 +837,22 @@ class Call:
         }
         out["suggestion"] = (self.suggestion.to_dict()
                              if self.suggestion else None)
+        out["confirmation"] = (self.confirmation.to_dict()
+                               if self.confirmation else None)
+        out["action"] = None
+        if self.action is not None:
+            out["action"] = {
+                "direction": self.action.direction,
+                "strength": self.action.strength,
+                "score": self.action.score,
+                "thrust_bps": round(self.action.thrust_bps, 3),
+                "position": round(self.action.position, 4),
+                "slope_bps": round(self.action.slope_bps, 3),
+                "extending": self.action.extending,
+                "window_s": self.action.window_s,
+                "components": self.action.components(),
+                "describe": self.action.describe(),
+            }
         return out
 
 
@@ -829,6 +882,7 @@ def assess(read: BookRead | None, book: Book | None, **kw) -> Call:
     """
     coin = kw.get("coin", "")
     interval = kw.get("interval", "")
+    action = kw.get("action")
     out = suggest(read, book, **kw)
 
     conviction = read.conviction if read else 0.0
@@ -842,18 +896,28 @@ def assess(read: BookRead | None, book: Book | None, **kw) -> Call:
                     detail=out.headline(), conviction=conviction,
                     score=score, samples=samples,
                     seconds_left=kw.get("seconds_left", 0.0),
-                    spread_bps=spread, suggestion=out)
+                    spread_bps=spread, suggestion=out,
+                    confirmation=out.confirmation, action=action)
 
-    # Not tradeable. Still report which way it leans, because "no trade but
-    # leaning long" and "no trade, book balanced" are different states and
-    # only one of them is worth watching.
+    # Not tradeable. Still report which way it leans and what price is
+    # doing, because "the book says buy and price is falling" is the most
+    # useful thing on the panel and it only ever appears on a candle with no
+    # trade on it.
     side = out.side
+    agreement = None
+    if read is not None and (action is not None
+                             or kw.get("require_confirmation", True)):
+        agreement = confirm(read.direction, read.conviction, action)
+
     grade = "D" if side else "—"
+    if out.gate == "conflict":
+        grade = "X"
     return Call(coin=coin, interval=interval, side=side, grade=grade,
                 tradeable=False, detail=out.detail, conviction=conviction,
                 score=score, samples=samples,
                 seconds_left=kw.get("seconds_left", 0.0),
-                spread_bps=spread, blocked_by=out.gate)
+                spread_bps=spread, blocked_by=out.gate,
+                confirmation=agreement, action=action)
 
 
 # --------------------------------------------------------------------------

@@ -305,25 +305,40 @@ def zigzag_csv(n=400, step=900, start=1_700_000_000):
 # unexercised, which is precisely where a wiring bug would live. So the feed
 # is built by hand and fed a book directly, with no socket involved.
 
-def _live_feed(coin="BTC", interval="15m", bias=0.95):
-    """A LiveFeed with a book pushed into it, no network."""
+def _live_feed(coin="BTC", interval="15m", rising=True):
+    """A LiveFeed with a book AND a tape pushed into it, no network.
+
+    Both halves are required. The book alone produces a lean; the trades are
+    what the confirmation gate checks it against, and without them every
+    suggestion is correctly refused as unconfirmed — which is the right
+    behaviour and makes the fixture useless for testing anything else.
+    """
     import time as _t
 
-    from liqmap.flow import Book, Level
+    from liqmap.flow import Book, Level, Trade
     from liqmap.live import LiveFeed
     from liqmap.structure import Candle
 
     f = LiveFeed(coin, intervals=(interval,))
-
     now = _t.time()
+    sign = 1.0 if rising else -1.0
+
     # Bids fat, offers thin and thinning: microprice pinned to the offer.
+    # Mirrored for a short.
     for i in range(40):
-        bids = [Level(round(99.99 - j * 0.01, 4), 800.0 if j == 3 else 120.0)
-                for j in range(8)]
-        asks = [Level(round(100.01 + j * 0.01, 4),
+        fat = [Level(round(99.99 - j * 0.01, 4), 800.0 if j == 3 else 120.0)
+               for j in range(8)]
+        thin = [Level(round(100.01 + j * 0.01, 4),
                       max(1.0, 40.0 - i) if j == 0 else 30.0)
                 for j in range(8)]
-        b = Book(coin=coin, ts=now - 40 + i, bids=bids, asks=asks)
+        b = (Book(coin=coin, ts=now - 40 + i, bids=fat, asks=thin) if rising
+             else Book(coin=coin, ts=now - 40 + i,
+                       bids=[Level(round(99.99 - j * 0.01, 4),
+                                   max(1.0, 40.0 - i) if j == 0 else 30.0)
+                             for j in range(8)],
+                       asks=[Level(round(100.01 + j * 0.01, 4),
+                                   800.0 if j == 3 else 120.0)
+                             for j in range(8)]))
         f.book = b
         f.book_updates += 1
         f.reader.add(b, now=now - 40 + i)
@@ -332,6 +347,17 @@ def _live_feed(coin="BTC", interval="15m", bias=0.95):
     f.seed(interval, [Candle(ts=now - (30 - i) * 900, open=100.0, high=100.9,
                              low=99.1, close=100.2, volume=50.0)
                       for i in range(30)])
+
+    # Fills that move price the same way the book leans, so the two agree.
+    builder = f.builders[interval]
+    px = 100.0
+    for i in range(60):
+        px += sign * 0.004
+        tr = Trade(px=round(px, 4), sz=0.5, aggressor="buy" if rising else "sell",
+                   ts=now - 60 + i)
+        f.tape.add(tr)
+        builder.add(tr)
+        f.trades_seen += 1
     return f
 
 
@@ -397,24 +423,8 @@ def test_record_false_asks_without_writing_anything(client, monkeypatch):
 
 def test_a_short_book_produces_a_short_suggestion(client, monkeypatch):
     """The sign error that would invert every trade the tool ever makes."""
-    import time as _t
-
-    from liqmap.flow import Book, Level
-
     rt = web.runtime()
-    feed = _live_feed()
-    now = _t.time()
-    feed.reader = type(feed.reader)()
-    for i in range(40):
-        # Mirrored: offers fat, bids thin and thinning.
-        bids = [Level(round(99.99 - j * 0.01, 4),
-                      max(1.0, 40.0 - i) if j == 0 else 30.0) for j in range(8)]
-        asks = [Level(round(100.01 + j * 0.01, 4),
-                      800.0 if j == 3 else 120.0) for j in range(8)]
-        b = Book(coin="BTC", ts=now - 40 + i, bids=bids, asks=asks)
-        feed.book = b
-        feed.reader.add(b, now=now - 40 + i)
-
+    feed = _live_feed(rising=False)      # book AND tape both bearish
     monkeypatch.setattr(rt, "feed", feed, raising=False)
     monkeypatch.setattr(type(feed), "running", property(lambda self: True))
 
@@ -422,6 +432,45 @@ def test_a_short_book_produces_a_short_suggestion(client, monkeypatch):
     assert d["take"] is True, d.get("detail")
     assert d["side"] == "short"
     assert d["target_px"] < d["entry"] < d["stop_px"]
+    assert d["confirmation"]["book"] == "down"
+    assert d["confirmation"]["candle"] == "down"
+
+
+def test_a_book_and_a_tape_that_disagree_refuse_the_trade(client, monkeypatch):
+    """The whole point. A bearish book with price rising is buyers absorbing
+    the sellers, and trading the book alone here is how money is lost."""
+    import time as _t
+
+    from liqmap.flow import Book, Level
+
+    rt = web.runtime()
+    feed = _live_feed(rising=True)       # rising tape from the helper
+    now = _t.time()
+    # ...against a book flipped bearish.
+    feed.reader = type(feed.reader)()
+    for i in range(40):
+        b = Book(coin="BTC", ts=now - 40 + i,
+                 bids=[Level(round(99.99 - j * 0.01, 4),
+                             max(1.0, 40.0 - i) if j == 0 else 30.0)
+                       for j in range(8)],
+                 asks=[Level(round(100.01 + j * 0.01, 4),
+                             800.0 if j == 3 else 120.0) for j in range(8)])
+        feed.book = b
+        feed.reader.add(b, now=now - 40 + i)
+
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    d = client.get("/api/suggest?coin=BTC&interval=15m", headers=AUTH).json()
+    assert d["take"] is False
+    assert d["blocked_by"] == "conflict"
+    assert d["grade"] == "X"
+    assert d["confirmation"]["book"] == "down"
+    assert d["confirmation"]["candle"] == "up"
+    assert "absorbing" in d["detail"]
+    # And nothing gets recorded, because there is no trade.
+    assert rt.history.recent_suggestions() == []
+
 
 
 def test_the_route_always_returns_a_graded_call(client, monkeypatch):

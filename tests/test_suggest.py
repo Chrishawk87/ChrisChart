@@ -61,14 +61,35 @@ def bars(n=40, rng=0.5, px=ENTRY):
             for i in range(n)]
 
 
+def acting(direction="up", strength=1.0, bar_range_bps=100.0):
+    """A CandleAction that clearly agrees with `direction`.
+
+    Most tests below are about sizing, cost and shape, not about
+    confirmation. They supply an agreeing action so the confirmation gate
+    passes and the rest of the logic is actually reached; the four-state
+    matrix is tested on its own further down.
+    """
+    from liqmap.confirm import CandleAction
+
+    sign = 1.0 if direction == "up" else -1.0 if direction == "down" else 0.0
+    move = sign * strength * bar_range_bps * 0.5
+    return CandleAction(
+        thrust_bps=move, position=0.5 + sign * strength * 0.45,
+        slope_bps=move, bar_range_bps=bar_range_bps,
+        extending=("up" if sign > 0 else "down" if sign < 0 else "flat"))
+
+
 def ask(read=None, book=None, recent=None, **kw):
     kw.setdefault("coin", "BTC")
     kw.setdefault("interval", "15m")
     kw.setdefault("interval_s", 900.0)
     kw.setdefault("seconds_left", 600.0)
     kw.setdefault("notional", 10_000.0)
-    return suggest(read if read is not None else read_at(),
-                   book if book is not None else book_at(),
+    r = read if read is not None else read_at()
+    # Default to price agreeing with the book, so tests of everything else
+    # reach everything else.
+    kw.setdefault("action", acting(r.direction if r else "up"))
+    return suggest(r, book if book is not None else book_at(),
                    recent=bars() if recent is None else recent, **kw)
 
 
@@ -621,6 +642,7 @@ def _call(**kw):
     kw.setdefault("recent", bars(rng=2.0))
     r = kw.pop("read", read_at())
     b = kw.pop("book", book_at())
+    kw.setdefault("action", acting(r.direction if r else "up"))
     return assess(r, b, **kw)
 
 
