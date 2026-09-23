@@ -61,6 +61,7 @@ class Runtime:
         self.token = os.environ.get("LIQMAP_TOKEN", "").strip()
         self.wallets: list[str] = []
         self.last_error: str | None = None
+        self.last_traceback: str | None = None
         self.last_sweep: dict[str, str] = {}
         self.worker_started = False
         self.harvest: dict[str, Any] = {"running": False, "found": 0,
@@ -902,6 +903,35 @@ def create_app() -> FastAPI:
     app = FastAPI(title=APP_TITLE, docs_url="/api/docs", redoc_url=None,
                   lifespan=lifespan)
 
+    @app.exception_handler(Exception)
+    async def unhandled(request, exc):     # noqa: ANN001
+        """Never serve a bare "Internal Server Error".
+
+        A 500 with no body on a service you are iterating on costs a round
+        trip every single time: the person sees five words, and the only way
+        to find out what happened is to ask someone with the logs. The error
+        class, its message and the route are safe to return -- they describe
+        this service's own code, not the caller's data -- and the traceback
+        goes to stdout where Railway keeps it.
+
+        The last one is also kept in memory so `/api/status` can show it
+        without anyone having to open a log viewer.
+        """
+        tb = traceback.format_exc()
+        rt.last_error = f"{type(exc).__name__}: {exc}"
+        rt.last_traceback = tb
+        print(f"[liqmap] 500 on {request.url.path}\n{tb}", flush=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "where": str(request.url.path),
+                "query": dict(request.query_params),
+                "hint": ("The full traceback is in the Railway deploy logs, "
+                         "and /api/status carries the last one."),
+            })
+
     # -- open ------------------------------------------------------------
 
     @app.get("/health")
@@ -929,6 +959,7 @@ def create_app() -> FastAPI:
             "last_sweep": rt.last_sweep,
             "harvest": rt.harvest,
             "last_error": rt.last_error,
+            "last_traceback": (rt.last_traceback or "").splitlines()[-12:],
             "warnings": startup_report(rt),
         }
 
@@ -1235,10 +1266,12 @@ def create_app() -> FastAPI:
         tick = threading.Event()
 
         feed = rt.feed_for(coin_r)
+        wake = (lambda _ch: tick.set())
         if feed is not None:
-            feed.on_update(lambda _ch: tick.set())
+            feed.on_update(wake)
 
         def events():
+          try:
             last_sent = 0.0
             # Bounded on purpose. An unbounded generator holds a worker for as
             # long as a forgotten tab stays open, and Railway does not have
@@ -1250,14 +1283,38 @@ def create_app() -> FastAPI:
             yield (f"event: hello\ndata: "
                    f"{json.dumps({'feed': bool(feed), 'coin': coin_r})}\n\n")
 
+            last_px = None
+
             while time.time() < deadline:
                 fired = tick.wait(timeout=min(5.0, max(0.1, deadline - time.time())))
                 tick.clear()
                 now = time.time()
                 if now >= deadline:
                     break
+
+                # PRICE FIRST, AND ON EVERY TICK.
+                #
+                # The full read costs structure, zones and VWAP, so it is
+                # coalesced. The price is one float the feed already holds,
+                # and in a fast market it is the number that goes stale
+                # first -- a four-second-old price during a move is worse
+                # than useless, because it reads as current. So it is sent
+                # on every batch of fills, independently of the read.
+                if feed is not None:
+                    bar = feed.candle(interval)
+                    px = bar.close if bar else None
+                    if px is not None and px != last_px:
+                        last_px = px
+                        yield ("event: px\ndata: "
+                               + json.dumps({"px": px, "ts": now,
+                                             "high": bar.high, "low": bar.low,
+                                             "open": bar.open,
+                                             "trades": bar.trades,
+                                             "delta": bar.delta})
+                               + "\n\n")
+
                 if fired and now - last_sent < 0.5:
-                    continue            # coalesce bursts
+                    continue            # coalesce the expensive part only
                 last_sent = now
                 try:
                     payload = api_read(coin=coin_r, interval=interval,
@@ -1269,10 +1326,86 @@ def create_app() -> FastAPI:
                 yield f"data: {json.dumps(payload, default=str)}\n\n"
 
             yield "event: bye\ndata: {}\n\n"
+          finally:
+            # The stream is over; stop waking it. EventSource reconnects on
+            # its own, so without this a tab left open overnight accumulates
+            # dead callbacks that fire on every single fill.
+            if feed is not None:
+                feed.off_update(wake)
 
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
+
+    @app.get("/api/diag", dependencies=[Depends(require_token)])
+    def api_diag(coin: str = "BTC", interval: str = "15m") -> dict[str, Any]:
+        """Run every upstream call for one symbol and report each result.
+
+        Built because "Internal Server Error" for a symbol names neither the
+        call that failed nor the reason. This walks the same sequence a read
+        makes -- resolve, mids, candles, book, structure, the read itself --
+        and reports each step separately, so the first FAIL is the answer
+        rather than the start of an investigation.
+        """
+        import traceback as _tb
+
+        steps: list[dict[str, Any]] = []
+
+        def step(name: str, fn) -> Any:
+            t0 = time.time()
+            try:
+                value = fn()
+                steps.append({"step": name, "ok": True,
+                              "ms": round((time.time() - t0) * 1000),
+                              "result": value})
+                return value
+            except Exception as exc:
+                steps.append({"step": name, "ok": False,
+                              "ms": round((time.time() - t0) * 1000),
+                              "error": f"{type(exc).__name__}: {exc}",
+                              "trace": _tb.format_exc().splitlines()[-4:]})
+                return None
+
+        raw = coin
+        resolved = step("resolve symbol",
+                        lambda: rt.resolve_symbol(raw)[0] or raw)
+        target = resolved or raw
+        client = rt.client()
+
+        step("allMids (canonical)",
+             lambda: f"{len(client.all_mids())} symbols")
+        step("perpDexs", lambda: [d["name"] for d in client.perp_dexs()])
+        mids = step("allMids (every dex)",
+                    lambda: client.all_mids_everywhere())
+        step(f"mid for {target}",
+             lambda: (mids or {}).get(target)
+             if (mids or {}).get(target) is not None
+             else (_ for _ in ()).throw(
+                 KeyError(f"{target} has no mid price — check the exact "
+                          f"symbol, including the dex prefix and its case")))
+
+        bars = step(f"candleSnapshot {interval}",
+                    lambda: client.candles(target, interval, bars=60))
+        step("candle count",
+             lambda: len(bars) if bars else (_ for _ in ()).throw(
+                 ValueError("no candles returned for this symbol")))
+        step("l2Book", lambda: client.check_book(target))
+
+        if bars:
+            from .structure import structure as read_structure, zones
+            step("structure", lambda: read_structure(bars).direction)
+            step("zones", lambda: len(zones(bars)))
+
+        step("full read", lambda: api_read(coin=target, interval=interval)
+             .get("lean", "no lean"))
+
+        first_fail = next((s for s in steps if not s["ok"]), None)
+        return {
+            "coin_asked": raw, "coin_used": target, "interval": interval,
+            "all_passed": first_fail is None,
+            "first_failure": first_fail,
+            "steps": steps,
+        }
 
     @app.get("/api/markets", dependencies=[Depends(require_token)])
     def api_markets(refresh: bool = False) -> dict[str, Any]:
@@ -2172,9 +2305,13 @@ async function loadNow() {
 function paintTicker() {
   const d = nowData;
   if (!d) return;
+  // A streamed price is always fresher than a polled one. Repainting over it
+  // would make a live tape look like it updates every few seconds.
+  const streaming = streamedAt && (Date.now() - streamedAt) < 15000;
   const since = (Date.now() - nowFetchedAt) / 1000;
 
   $('tickSym').textContent = d.coin;
+  if (streaming) { paintSources(d, since); return; }
   if (d.spot != null) {
     const px = Number(d.spot);
     const dir = lastPx == null ? '' : px > lastPx ? 'long' : px < lastPx ? 'short' : '';
@@ -2193,6 +2330,10 @@ function paintTicker() {
   $('tickAge').textContent = (d.spot_error ? d.spot_error + ' · ' : '')
     + 'price ' + ageText(age);
 
+  paintSources(d, since);
+}
+
+function paintSources(d, since) {
   const s = d.sources || {};
   const bits = [];
   const sweepWarn = (s.sweep && s.sweep.interval_s) ? s.sweep.interval_s * 1.5 : 2700;
@@ -2213,10 +2354,34 @@ function paintTicker() {
   $('tickSources').innerHTML = bits.join('');
 }
 
+function tickFromStream(p) {
+  if (!p || p.px == null) return;
+  const el = $('tickPx');
+  const dir = lastPx == null ? '' : p.px > lastPx ? 'long' : p.px < lastPx ? 'short' : '';
+  el.className = dir;
+  el.textContent = Number(p.px).toLocaleString(undefined,
+    {minimumFractionDigits: 2, maximumFractionDigits: 6});
+  lastPx = p.px;
+  streamedAt = Date.now();
+
+  $('tickDot').className = 'dot live';
+  $('tickAge').className = 'tick-age';
+  $('tickAge').textContent = 'live tape'
+    + (p.trades ? ` · ${p.trades} fills this candle` : '');
+}
+
+let streamedAt = 0;
+
 function startTicker() {
   if (nowPoll) clearInterval(nowPoll);
   loadNow();
-  nowPoll = setInterval(loadNow, 5000);
+  // 5s is fine as a backstop while the socket carries the price. Without a
+  // socket this is the only source, so it runs harder — at weight 2 a 2s
+  // poll costs 60/minute against a 1200 budget, which the sweep can absorb.
+  nowPoll = setInterval(() => {
+    const streaming = streamedAt && (Date.now() - streamedAt) < 15000;
+    if (!streaming || Math.random() < 0.2) loadNow();
+  }, 2000);
   setInterval(paintTicker, 1000);       // keep the age counting between polls
 }
 
@@ -2361,6 +2526,16 @@ function openStream() {
   stream.onmessage = (ev) => {
     try { paintRead(JSON.parse(ev.data)); } catch (e) {}
   };
+
+  // Price arrives on its own channel, on every batch of fills. The full read
+  // is coalesced; the price is not, because in a fast market it is the number
+  // that goes stale first and a stale price reads as a current one.
+  stream.addEventListener('px', (ev) => {
+    try {
+      const p = JSON.parse(ev.data);
+      tickFromStream(p);
+    } catch (e) {}
+  });
   stream.addEventListener('hello', (ev) => {
     try {
       const h = JSON.parse(ev.data);

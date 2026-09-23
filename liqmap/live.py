@@ -312,6 +312,22 @@ class LiveFeed:
         """Register a callback fired on each batch of messages."""
         self._listeners.append(fn)
 
+    def off_update(self, fn: Callable[[str], None]) -> None:
+        """Unregister a callback.
+
+        Every stream connection registers one, and EventSource reconnects on
+        its own -- so without this a tab left open overnight leaves hundreds
+        of dead callbacks being invoked on every fill.
+        """
+        try:
+            self._listeners.remove(fn)
+        except ValueError:
+            pass
+
+    @property
+    def listener_count(self) -> int:
+        return len(self._listeners)
+
     # -- the socket --------------------------------------------------------
 
     def _run(self) -> None:

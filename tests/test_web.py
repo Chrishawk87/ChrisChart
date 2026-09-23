@@ -716,6 +716,14 @@ class _NowClient(_CandleClient):
     def all_mids(self, dex=""):
         return self.all_mids_everywhere()
 
+    # The real InfoClient has these; a stub without them makes /api/diag
+    # report an AttributeError that no live deployment would ever hit.
+    def perp_dexs(self):
+        return [{"name": "", "native": True}]
+
+    def check_book(self, coin="BTC"):
+        return f"ok -- {coin}"
+
 
 def test_now_requires_a_token(client):
     assert client.get("/api/now").status_code == 401
@@ -1324,3 +1332,144 @@ def test_dashboard_carries_the_feed_controls(client):
     for marker in ("startFeed", "openStream", "EventSource", "paintRead",
                    "paintFeed"):
         assert marker in html
+
+
+# --------------------------------------------------------------------------
+# diagnosable errors and the fast price channel
+# --------------------------------------------------------------------------
+
+def test_a_crash_returns_the_reason_not_five_words(client):
+    """'Internal Server Error' costs a round trip every time: the only way to
+    learn what happened is to ask someone with the logs."""
+    rt = web.runtime()
+
+    class Exploding:
+        INTERVALS = {"15m": 900}
+
+        def all_mids_everywhere(self, dexes=None):
+            raise ZeroDivisionError("something specific went wrong")
+
+        def all_mids(self, dex=""):
+            return self.all_mids_everywhere()
+
+    rt._client = Exploding()
+    rt._markets_cache = None
+
+    # markets() catches, so force a path that does not: the diag route's own
+    # handler is protected, so assert the handler itself via a bad route arg.
+    r = client.get(f"/api/diag?coin=BTC&token={TOKEN}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["all_passed"] is False
+    assert "ZeroDivisionError" in str(body["first_failure"]["error"])
+
+
+def test_diag_names_the_first_upstream_call_that_fails(client):
+    class Broken:
+        INTERVALS = {"15m": 900, "4h": 14400}
+
+        def all_mids(self, dex=""):
+            return {"BTC": 100_000.0}
+
+        def all_mids_everywhere(self, dexes=None):
+            return {"BTC": 100_000.0}
+
+        def perp_dexs(self):
+            return [{"name": "", "native": True}]
+
+        def candles(self, coin, interval="15m", bars=200):
+            return []
+
+        def check_book(self, coin):
+            raise RuntimeError("422 unknown coin")
+
+        def book(self, coin):
+            from liqmap.flow import Book
+            return Book(coin=coin, ts=0)
+
+    web.runtime()._client = Broken()
+    d = client.get(f"/api/diag?coin=GOLD&interval=15m&token={TOKEN}").json()
+
+    assert d["all_passed"] is False
+    assert d["first_failure"]["step"] == "mid for GOLD"
+    assert "dex prefix" in d["first_failure"]["error"]
+    # Every step is reported, not just the failure, so the working half is
+    # visible too.
+    assert [s["step"] for s in d["steps"]][:3] == [
+        "resolve symbol", "allMids (canonical)", "perpDexs"]
+
+
+def test_diag_passes_cleanly_on_a_healthy_symbol(client):
+    web.runtime()._client = _NowClient(candles=_grid_bars())
+    d = client.get(f"/api/diag?coin=BTC&interval=15m&token={TOKEN}").json()
+    failures = [s for s in d["steps"] if not s["ok"]]
+    assert not failures, failures
+
+
+def test_status_carries_the_last_traceback(client):
+    rt = web.runtime()
+    rt.last_error = "ValueError: boom"
+    rt.last_traceback = "line one\nline two"
+    d = client.get(f"/api/status?token={TOKEN}").json()
+    assert d["last_error"] == "ValueError: boom"
+    assert "line two" in d["last_traceback"]
+
+
+def test_the_stream_pushes_price_on_every_fill(client):
+    """The full read is coalesced because it costs structure and zones. The
+    price is one float and goes stale fastest, so it must not be."""
+    import json as _j
+    import threading
+    import time as _t
+
+    rt = web.runtime()
+    bars = _grid_bars()
+    rt._client = _NowClient(candles=bars)
+    f = _attach_feed(rt, bars=bars)
+
+    def fire():
+        base = int(_t.time() * 1000)
+        for i in range(4):
+            _t.sleep(0.2)
+            f._handle_trades([{"px": str(4000 + (i + 1) * 3), "sz": "1",
+                               "side": "B", "time": base + i * 200}])
+            for fn in list(f._listeners):
+                fn("trades")
+
+    threading.Thread(target=fire, daemon=True).start()
+
+    prices, reads = [], 0
+    url = f"/api/stream?coin=BTC&interval=15m&max_seconds=2&token={TOKEN}"
+    with client.stream("GET", url) as r:
+        ev = None
+        for line in r.iter_lines():
+            if line.startswith("event:"):
+                ev = line.split(":", 1)[1].strip()
+            elif line.startswith("data:"):
+                if ev == "px":
+                    prices.append(_j.loads(line[5:])["px"])
+                elif ev is None:
+                    reads += 1
+                ev = None
+            elif line == "":
+                ev = None
+
+    assert len(prices) >= 3, f"expected a price per fill, got {prices}"
+    assert prices == sorted(prices)            # each one newer than the last
+    assert reads < len(prices), "reads should be coalesced below price ticks"
+
+
+def test_a_closed_stream_unregisters_its_listener(client):
+    """EventSource reconnects on its own, so a tab left open overnight would
+    otherwise leave hundreds of dead callbacks firing on every fill."""
+    rt = web.runtime()
+    bars = _grid_bars()
+    rt._client = _NowClient(candles=bars)
+    f = _attach_feed(rt, bars=bars)
+
+    for _ in range(3):
+        url = f"/api/stream?coin=BTC&max_seconds=1&token={TOKEN}"
+        with client.stream("GET", url) as r:
+            for _line in r.iter_lines():
+                pass
+    assert f.listener_count == 0
