@@ -104,6 +104,8 @@ class InfoClient:
         self.limiter = limiter or RateLimiter()
         self._session = requests.Session()
         self._session.headers.update({"Content-Type": "application/json"})
+        self._mids_cache: dict[str, tuple[float, dict[str, float]]] = {}
+        self._dexes_cache: tuple[float, list[dict]] | None = None
 
     def post(self, body: dict) -> Any:
         weight = WEIGHTS.get(body.get("type", ""), 20)
@@ -130,7 +132,21 @@ class InfoClient:
 
     # -- endpoints --------------------------------------------------------
 
-    def all_mids(self, dex: str = "") -> dict[str, float]:
+    # Mids move constantly but a price fetched a second ago is still a price.
+    # Without this, a dashboard polling every two seconds multiplies by the
+    # number of perp DEXes and spends the whole rate-limit budget on quotes.
+    MIDS_TTL_S = 2.0
+    # The set of deployed DEXes changes when a builder ships a market, which
+    # is not something to re-ask about every few seconds.
+    DEXES_TTL_S = 600.0
+
+    def all_mids(self, dex: str = "", max_age: float | None = None
+                 ) -> dict[str, float]:
+        ttl = self.MIDS_TTL_S if max_age is None else max_age
+        hit = self._mids_cache.get(dex)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+
         body: dict[str, Any] = {"type": "allMids"}
         if dex:
             body["dex"] = dex
@@ -141,7 +157,34 @@ class InfoClient:
                 out[k] = float(v)
             except (TypeError, ValueError):
                 continue
+        self._mids_cache[dex] = (time.time(), out)
         return out
+
+    def mid(self, coin: str) -> float | None:
+        """One symbol's price in ONE request.
+
+        `all_mids_everywhere` costs a request per perp DEX plus two, and it
+        was being called on every price poll and every read. On a venue with
+        a dozen builder DEXes that is fourteen requests for one number,
+        several times a second -- which does not fail loudly, it just queues
+        behind the rate limiter until the whole dashboard feels broken.
+
+        The symbol already says which DEX it lives on, so ask that one.
+        """
+        dex, _ = split_symbol(coin)
+        mids = self.all_mids(dex)
+        if coin in mids:
+            return mids[coin]
+
+        # HIP-3 responses may or may not carry the prefix. Try the bare form.
+        bare = coin.split(":", 1)[-1]
+        if bare in mids:
+            return mids[bare]
+
+        if dex:                       # namespaced but absent: try canonical
+            canon = self.all_mids()
+            return canon.get(coin) or canon.get(bare)
+        return None
 
     def all_mids_everywhere(self, dexes: Sequence[str] | None = None
                             ) -> dict[str, float]:
@@ -191,6 +234,10 @@ class InfoClient:
         documentation sources, so this normalises to a list of dicts with at
         least a `name`.
         """
+        if (self._dexes_cache
+                and time.time() - self._dexes_cache[0] < self.DEXES_TTL_S):
+            return self._dexes_cache[1]
+
         raw = self.post({"type": "perpDexs"})
         out: list[dict] = []
         for entry in raw or []:
@@ -211,6 +258,7 @@ class InfoClient:
                     "oracle_updater": entry.get("oracleUpdater"),
                     "native": not name,
                 })
+        self._dexes_cache = (time.time(), out)
         return out
 
     def l2_book(self, coin: str) -> dict:

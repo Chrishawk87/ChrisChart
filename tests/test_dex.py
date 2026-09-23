@@ -238,6 +238,9 @@ def test_perp_dexs_handles_the_null_native_entry():
     from liqmap.hl import InfoClient
 
     class C:
+        _dexes_cache = None          # perp_dexs caches; give the stub the slot
+        DEXES_TTL_S = 600.0
+
         def post(self, body):
             return [None, {"name": "vntl", "fullName": "Ventuals"},
                     {"name": "para", "fullName": "Paradex"}]
@@ -252,6 +255,9 @@ def test_perp_dexs_handles_a_bare_list_of_names():
     from liqmap.hl import InfoClient
 
     class C:
+        _dexes_cache = None
+        DEXES_TTL_S = 600.0
+
         def post(self, body):
             return ["vntl", "para"]
 

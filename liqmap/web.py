@@ -548,10 +548,13 @@ class Runtime:
         }
 
         try:
-            mids = self.client().all_mids_everywhere()
-            self.last_price.update(mids)
+            # ONE request. This runs every couple of seconds, so the
+            # every-dex sweep that used to live here was the single largest
+            # consumer of the rate-limit budget on the whole service.
+            spot = self.client().mid(coin)
+            if spot is not None:
+                self.last_price[coin] = spot
             self.last_price_ts = now
-            spot = mids.get(coin)
             out["spot"] = spot
             out["spot_age_s"] = 0.0
             if spot is None:
@@ -1419,7 +1422,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/read", dependencies=[Depends(require_token)])
     def api_read(coin: str = "BTC", interval: str = "15m",
-                 higher: str = "4h", size: float = 0.0) -> dict[str, Any]:
+                 higher: str = "4h", size: float = 0.0,
+                 timeframes: str = "") -> dict[str, Any]:
         """The live directional read on the candle still forming.
 
         Everything this service knows, assembled into one answer: flow inside
@@ -1473,7 +1477,7 @@ def create_app() -> FastAPI:
         # Live mid, fetched BEFORE assembling anything that depends on price.
         live_spot = None
         try:
-            live_spot = rt.client().all_mids_everywhere().get(coin)
+            live_spot = rt.client().mid(coin)
             rt.last_price.update({coin: live_spot} if live_spot else {})
             rt.last_price_ts = now_s
         except Exception as exc:
@@ -1624,6 +1628,71 @@ def create_app() -> FastAPI:
             "calibration": rt.calibration(coin, interval).table(),
             "has_watch": absorption is not None,
         })
+        # ---- who is winning, on every timeframe at once -----------------
+        #
+        # Not averaged into the score. A 4-hour that belongs to sellers and a
+        # 15-minute that belongs to buyers is a specific, tradeable shape;
+        # blending them to zero destroys the only thing worth knowing.
+        try:
+            from . import pressure as pr
+
+            tf_list = [t.strip() for t in (timeframes or "").split(",") if t.strip()]
+            if not tf_list:
+                tf_list = [higher, "1h", interval, "5m"]
+            seen, want = set(), []
+            for t in tf_list:
+                if t in client.INTERVALS and t not in seen:
+                    seen.add(t)
+                    want.append(t)
+
+            readings = []
+            for tf in want:
+                iv = float(client.INTERVALS[tf])
+                bar = feed.candle(tf) if (use_feed and feed) else None
+                if bar is not None and bar.seeded:
+                    cov = (min(1.0, (now_s - feed.started_at) / iv)
+                           if feed.started_at else 0.0)
+                    readings.append(pr.from_live(tf, iv, bar, book,
+                                                 coverage=max(cov, 0.05)))
+                    continue
+                try:
+                    tf_bars = (bars if tf == interval
+                               else client.candles(coin, tf, bars=6))
+                except Exception:
+                    continue
+                if not tf_bars:
+                    continue
+                # Aggregate the recent bars rather than reading only the one
+                # in progress: two minutes into a 4-hour candle there is
+                # nothing in it, and the higher timeframe would go silent
+                # exactly when it matters most.
+                r_ = pr.from_candles(
+                    tf, iv, tf_bars, lookback=3, book=book,
+                    elapsed_s=max(0.0, min(iv, now_s - tf_bars[-1].ts)))
+                if r_ is not None:
+                    readings.append(r_)
+
+            conf = pr.confront(readings)
+            out["timeframes"] = [{
+                "timeframe": r.timeframe, "winner": r.winner,
+                "aggressor": r.aggressor, "strength": r.strength,
+                "signed": r.signed, "absorbing": r.absorbing,
+                "move_bps": r.move_bps, "lean": r.lean,
+                "buy_notional": r.buy_notional,
+                "sell_notional": r.sell_notional,
+                "measured": r.measured, "trades": r.trades,
+                "position_in_range": r.position_in_range,
+                "describe": r.describe(),
+            } for r in conf.ordered]
+            out["confrontation"] = {
+                "aligned": conf.aligned, "conflicted": conf.conflicted,
+                "consensus": conf.consensus, "verdict": conf.verdict(),
+                "higher": conf.higher.timeframe if conf.higher else None,
+                "lower": conf.lower.timeframe if conf.lower else None,
+            }
+        except Exception as exc:
+            out["pressure_error"] = f"{type(exc).__name__}: {exc}"
+
         if book is not None and not book.empty:
             out["book"] = {
                 "bid": book.best_bid, "ask": book.best_ask, "mid": book.mid,
@@ -1924,6 +1993,18 @@ DASHBOARD = """<!doctype html>
     letter-spacing:.06em;color:var(--dim)}
   .bt-col.held{border-color:var(--accent)}
   .bt-big{font-size:26px;font-variant-numeric:tabular-nums}
+  .tf{display:grid;grid-template-columns:62px 92px 1fr 88px;gap:10px;
+    align-items:center;padding:7px 10px;border-radius:4px;margin-bottom:4px;
+    background:var(--bg);border-left:3px solid var(--line);font-size:13px}
+  .tf.buyers{border-left-color:var(--long)}
+  .tf.sellers{border-left-color:var(--short)}
+  .tf b{font-variant-numeric:tabular-nums}
+  .tf .who{font-weight:600;letter-spacing:.03em}
+  .tf .bar{height:6px;background:var(--line);border-radius:3px;position:relative}
+  .tf .bar i{position:absolute;top:0;bottom:0;border-radius:3px}
+  .tf .bar i.buyers{left:50%;background:var(--long)}
+  .tf .bar i.sellers{right:50%;background:var(--short)}
+  .tf .meta{font-size:11px;color:var(--dim);text-align:right}
   .wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
     gap:8px}
   .wgrid div{background:var(--bg);border:1px solid var(--line);border-radius:4px;
@@ -2000,6 +2081,8 @@ DASHBOARD = """<!doctype html>
       <div id="feedBar" class="msg" style="margin-bottom:8px">Feed off — the
         current candle is being polled. Go live to build it from the tape instead.</div>
       <div id="alertBar" class="alertbar" style="display:none"></div>
+      <div id="tfLadder"></div>
+      <div id="tfSay" class="say" style="display:none;margin-bottom:12px"></div>
       <div id="readHead" class="msg">—</div>
       <div id="readSignals"></div>
       <div id="readSay" class="say" style="display:none"></div>
@@ -2406,6 +2489,37 @@ function onCoinChange() {
   loadRead();
 }
 
+function paintLadder(d) {
+  const tfs = d.timeframes || [];
+  const el = $('tfLadder'), say = $('tfSay');
+  if (!tfs.length) {
+    el.innerHTML = '';
+    say.style.display = 'none';
+    if (d.pressure_error) el.innerHTML = '<div class="msg err">' + d.pressure_error + '</div>';
+    return;
+  }
+
+  el.innerHTML = tfs.map(t => {
+    const w = Math.round(Math.abs(t.signed) * 50);
+    return `<div class="tf ${t.winner}">
+      <b>${t.timeframe}</b>
+      <span class="who ${t.winner === 'buyers' ? 'long' : t.winner === 'sellers' ? 'short' : ''}">
+        ${t.winner.toUpperCase()}</span>
+      <span class="bar"><i class="${t.winner}" style="width:${w}%"></i></span>
+      <span class="meta">${t.move_bps >= 0 ? '+' : ''}${t.move_bps.toFixed(1)}bps
+        ${t.absorbing ? '· absorbed' : ''}
+        ${t.measured ? '' : '· inferred'}</span>
+    </div>`;
+  }).join('');
+
+  const c = d.confrontation;
+  if (!c) { say.style.display = 'none'; return; }
+  say.style.display = '';
+  say.innerHTML = (c.conflicted ? '<span class="flag crowded">CONFLICT</span>'
+                   : c.aligned ? '<span class="flag">ALIGNED</span>' : '')
+                + c.verdict;
+}
+
 function stamp(id, seconds, warn, bad, label) {
   const el = $(id);
   if (!el) return;
@@ -2596,6 +2710,7 @@ function paintRead(d) {
   }
 
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
+  paintLadder(d);
   const src = (d.source || '').indexOf('websocket') === 0;
   const flags = (src ? '<span class="flag">LIVE TAPE</span>'
                      : '<span class="flag late">POLLED</span>')

@@ -716,6 +716,10 @@ class _NowClient(_CandleClient):
     def all_mids(self, dex=""):
         return self.all_mids_everywhere()
 
+    def mid(self, coin):
+        """One symbol in one request — what the hot paths call now."""
+        return self.all_mids_everywhere().get(coin)
+
     # The real InfoClient has these; a stub without them makes /api/diag
     # report an AttributeError that no live deployment would ever hit.
     def perp_dexs(self):
@@ -1473,3 +1477,203 @@ def test_a_closed_stream_unregisters_its_listener(client):
             for _line in r.iter_lines():
                 pass
     assert f.listener_count == 0
+
+
+# --------------------------------------------------------------------------
+# multi-timeframe confrontation, and the fetch storm
+# --------------------------------------------------------------------------
+
+def _tf_series(step, n, start, drift, tail, now=None):
+    import time as _t
+    from liqmap.live import grid_start
+    from liqmap.structure import Candle
+    now = now or _t.time()
+    st = grid_start(now, step)
+    out, px = [], start
+    for i in range(n, 0, -1):
+        o = px
+        c = px + drift
+        out.append(Candle(ts=st - i * step, open=o,
+                          high=max(o, c) + abs(drift) * 0.2,
+                          low=min(o, c) - abs(drift) * 0.2,
+                          close=c, volume=300.0))
+        px = c
+    o, c = px, px + tail
+    out.append(Candle(ts=st, open=o, high=max(o, c) + 0.2,
+                      low=min(o, c) - 0.2, close=c, volume=20.0))
+    return out
+
+
+class _MultiTF:
+    """4h and 1h falling, 15m and 5m bouncing — the fade shape."""
+
+    INTERVALS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+
+    def __init__(self):
+        self.series = {
+            "4h": _tf_series(14400, 60, 5000.0, -25.0, -8.0),
+            "1h": _tf_series(3600, 60, 4200.0, -6.0, -2.0),
+            "15m": _tf_series(900, 60, 4020.0, 2.0, 3.0),
+            "5m": _tf_series(300, 60, 4040.0, 1.0, 2.0),
+        }
+        self.requests = 0
+
+    def mid(self, coin):
+        self.requests += 1
+        return self.series["15m"][-1].close
+
+    def all_mids(self, dex="", max_age=None):
+        self.requests += 1
+        return {"BTC": self.series["15m"][-1].close}
+
+    def all_mids_everywhere(self, dexes=None):
+        return self.all_mids()
+
+    def perp_dexs(self):
+        return [{"name": "", "native": True}]
+
+    def candles(self, coin, interval="15m", bars=200):
+        return list(self.series[interval])
+
+    def book(self, coin):
+        from liqmap.flow import Book, Level
+        p = self.series["15m"][-1].close
+        return Book(coin=coin, ts=0,
+                    bids=[Level(p - 0.1 * i, 4) for i in range(1, 12)],
+                    asks=[Level(p + 0.1 * i, 9) for i in range(1, 12)])
+
+
+def test_the_read_reports_every_timeframe_separately(client):
+    web.runtime()._client = _MultiTF()
+    d = client.get(f"/api/read?coin=BTC&interval=15m&higher=4h&token={TOKEN}").json()
+
+    assert "pressure_error" not in d, d.get("pressure_error")
+    tfs = {t["timeframe"]: t for t in d["timeframes"]}
+    assert set(tfs) >= {"4h", "1h", "15m", "5m"}
+    # slowest first: the context before the trigger
+    assert d["timeframes"][0]["timeframe"] == "4h"
+
+
+def test_a_falling_higher_timeframe_and_rising_lower_one_is_a_conflict(client):
+    """The shape a fade is built on. Averaging these to zero would throw away
+    the only thing worth knowing."""
+    web.runtime()._client = _MultiTF()
+    d = client.get(f"/api/read?coin=BTC&interval=15m&higher=4h&token={TOKEN}").json()
+
+    tfs = {t["timeframe"]: t for t in d["timeframes"]}
+    assert tfs["4h"]["winner"] == "sellers"
+    assert tfs["15m"]["winner"] == "buyers"
+
+    c = d["confrontation"]
+    assert c["conflicted"] is True and c["aligned"] is False
+    assert c["consensus"] == "sellers"      # the slow timeframe carries more
+    assert "CONFLICT" in c["verdict"]
+    assert "not a reason to follow" in c["verdict"]
+
+
+def test_a_higher_timeframe_is_read_from_recent_bars_not_the_partial_one(client):
+    """Two minutes into a 4-hour candle there is nothing in the current bar.
+    Reading only that would silence the higher timeframe exactly when it
+    matters."""
+    web.runtime()._client = _MultiTF()
+    d = client.get(f"/api/read?coin=BTC&interval=15m&higher=4h&token={TOKEN}").json()
+    four = next(t for t in d["timeframes"] if t["timeframe"] == "4h")
+    assert four["winner"] != "contested"
+    assert abs(four["move_bps"]) > 50
+
+
+def test_inferred_readings_are_flagged_as_such(client):
+    web.runtime()._client = _MultiTF()
+    d = client.get(f"/api/read?token={TOKEN}&coin=BTC&interval=15m").json()
+    assert all(t["measured"] is False for t in d["timeframes"])
+
+
+def test_timeframes_can_be_chosen_explicitly(client):
+    web.runtime()._client = _MultiTF()
+    d = client.get(f"/api/read?coin=BTC&timeframes=1h,5m&token={TOKEN}").json()
+    assert [t["timeframe"] for t in d["timeframes"]] == ["1h", "5m"]
+
+
+def test_an_unknown_timeframe_is_skipped_not_fatal(client):
+    web.runtime()._client = _MultiTF()
+    d = client.get(f"/api/read?coin=BTC&timeframes=1h,7m,5m&token={TOKEN}").json()
+    assert [t["timeframe"] for t in d["timeframes"]] == ["1h", "5m"]
+
+
+def test_price_polling_costs_one_request_not_one_per_dex(client):
+    """THE FETCH STORM. all_mids_everywhere costs a request per perp DEX plus
+    two, and it ran on every price poll and every read. On a venue with a
+    dozen builder DEXes that queued behind the rate limiter until the whole
+    dashboard felt broken."""
+    from liqmap.hl import InfoClient
+
+    seen = {"n": 0}
+
+    class Counting(InfoClient):
+        def post(self, body):
+            seen["n"] += 1
+            t = body.get("type")
+            if t == "perpDexs":
+                return [None] + [{"name": f"dex{i}"} for i in range(10)]
+            if t == "allMids":
+                dex = body.get("dex", "")
+                return {"BTC": "100000"} if not dex else {f"{dex}:GOLD": "4100"}
+            return {}
+
+    web.runtime()._client = Counting()
+    for _ in range(5):
+        client.get(f"/api/now?coin=BTC&token={TOKEN}")
+    assert seen["n"] == 1, f"5 polls made {seen['n']} upstream requests"
+
+
+def test_mids_are_cached_briefly_so_bursts_collapse(client):
+    from liqmap.hl import InfoClient
+
+    seen = {"n": 0}
+
+    class Counting(InfoClient):
+        def post(self, body):
+            seen["n"] += 1
+            return {"BTC": "100000"}
+
+    c = Counting()
+    for _ in range(10):
+        c.all_mids()
+    assert seen["n"] == 1
+
+
+def test_a_namespaced_symbol_asks_only_its_own_dex(client):
+    from liqmap.hl import InfoClient
+
+    asked = []
+
+    class Counting(InfoClient):
+        def post(self, body):
+            asked.append(body.get("dex", ""))
+            return {"vntl:GOLD": "4100"}
+
+    c = Counting()
+    assert c.mid("vntl:GOLD") == 4100.0
+    assert asked == ["vntl"], "should not sweep every dex for one price"
+
+
+def test_perp_dexes_are_cached_rather_than_re_asked(client):
+    from liqmap.hl import InfoClient
+
+    seen = {"n": 0}
+
+    class Counting(InfoClient):
+        def post(self, body):
+            seen["n"] += 1
+            return [None, {"name": "vntl"}]
+
+    c = Counting()
+    for _ in range(5):
+        c.perp_dexs()
+    assert seen["n"] == 1
+
+
+def test_dashboard_carries_the_timeframe_ladder(client):
+    html = client.get("/").text
+    for marker in ("paintLadder", "tfLadder", "CONFLICT"):
+        assert marker in html
