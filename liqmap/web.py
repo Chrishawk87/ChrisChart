@@ -25,12 +25,13 @@ public URL carrying your trading configuration should not be the default.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from contextlib import asynccontextmanager
 
@@ -80,6 +81,7 @@ class Runtime:
         self.last_price_ts: float = 0.0
         self.last_price: dict[str, float] = {}
         self.last_book_ts: float = 0.0
+        self.feed = None          # live.LiveFeed, when one is running
         self._markets_cache: dict[str, Any] | None = None
         self._markets_ts: float = 0.0
         self._lock = threading.Lock()
@@ -421,6 +423,58 @@ class Runtime:
         }
         self._markets_ts = now
         return self._markets_cache
+
+    # -- the live feed -----------------------------------------------------
+
+    def start_feed(self, coin: str,
+                   intervals: Sequence[str] = ("1m", "5m", "15m", "30m")
+                   ) -> dict[str, Any]:
+        """Open a persistent socket for one market and build its candles.
+
+        Replaces polling for the current bar entirely: open, high, low, last,
+        volume and the buy/sell split all come from fills as they print. The
+        builder is seeded once from `candleSnapshot` so the open of the bar
+        already in progress is real rather than whatever price happened to be
+        trading when the socket connected.
+
+        One market at a time. A second feed doubles the socket traffic for a
+        market you are not looking at.
+        """
+        from .live import LiveFeed
+
+        coin = self.resolve_symbol(coin)[0] or coin
+        if self.feed is not None and self.feed.coin == coin and self.feed.running:
+            return {"ok": True, **self.feed.status(), "already": True}
+
+        self.stop_feed()
+        feed = LiveFeed(coin, intervals=intervals)
+
+        seeded: list[str] = []
+        for iv in intervals:
+            try:
+                feed.seed(iv, self.client().candles(coin, iv, bars=200))
+                seeded.append(iv)
+            except Exception as exc:
+                feed.errors.append(f"seed {iv}: {exc}")
+
+        feed.start()
+        self.feed = feed
+        return {"ok": True, "seeded": seeded, **feed.status()}
+
+    def stop_feed(self) -> dict[str, Any]:
+        if self.feed is not None:
+            self.feed.stop()
+            out = {"ok": True, **self.feed.status()}
+            self.feed = None
+            return out
+        return {"ok": True, "running": False}
+
+    def feed_for(self, coin: str):
+        """The feed, only if it is live on this market and actually ticking."""
+        f = self.feed
+        if f is None or f.coin != coin or not f.running:
+            return None
+        return f
 
     def resolve_reads(self, limit: int = 300) -> dict[str, Any]:
         """Settle recorded reads whose candle has closed.
@@ -1145,6 +1199,81 @@ def create_app() -> FastAPI:
             "never_swept": [c for c in cfg.coins if c not in names],
         }
 
+    @app.post("/api/feed", dependencies=[Depends(require_token)])
+    def api_feed(coin: str = "BTC", stop: bool = False,
+                 intervals: str = "1m,5m,15m,30m") -> dict[str, Any]:
+        """Start or stop the WebSocket feed for one market."""
+        if stop:
+            return rt.stop_feed()
+        want = tuple(i.strip() for i in intervals.split(",") if i.strip())
+        return rt.start_feed(coin, want or ("1m", "5m", "15m"))
+
+    @app.get("/api/feed", dependencies=[Depends(require_token)])
+    def api_feed_status() -> dict[str, Any]:
+        return rt.feed.status() if rt.feed else {"running": False}
+
+    @app.get("/api/stream")
+    def api_stream(coin: str = "BTC", interval: str = "15m",
+                   higher: str = "4h", max_seconds: float = 3600.0,
+                   token: str = Query(default=""),
+                   authorization: str = Header(default="")) -> Any:
+        """Server-sent events: a read pushed on every tick.
+
+        EventSource cannot set headers, so the token comes through the query
+        string and is checked here rather than by the dependency.
+
+        The stream is driven by the feed's own updates with a short floor
+        between sends -- a busy market prints hundreds of fills a second and
+        re-running the read on each one would burn the container for no
+        additional information.
+        """
+        require_token(authorization=authorization, token=token)
+
+        from fastapi.responses import StreamingResponse
+
+        coin_r = rt.resolve_symbol(coin)[0] or coin
+        tick = threading.Event()
+
+        feed = rt.feed_for(coin_r)
+        if feed is not None:
+            feed.on_update(lambda _ch: tick.set())
+
+        def events():
+            last_sent = 0.0
+            # Bounded on purpose. An unbounded generator holds a worker for as
+            # long as a forgotten tab stays open, and Railway does not have
+            # many of them. EventSource reconnects by itself when it ends.
+            deadline = time.time() + max(1.0, max_seconds)
+            # Tell the client immediately whether this is a live socket or a
+            # polled fallback, so a silent stream is never mistaken for a
+            # quiet market.
+            yield (f"event: hello\ndata: "
+                   f"{json.dumps({'feed': bool(feed), 'coin': coin_r})}\n\n")
+
+            while time.time() < deadline:
+                fired = tick.wait(timeout=min(5.0, max(0.1, deadline - time.time())))
+                tick.clear()
+                now = time.time()
+                if now >= deadline:
+                    break
+                if fired and now - last_sent < 0.5:
+                    continue            # coalesce bursts
+                last_sent = now
+                try:
+                    payload = api_read(coin=coin_r, interval=interval,
+                                       higher=higher)
+                except Exception as exc:
+                    yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+                    time.sleep(2.0)
+                    continue
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
+
+            yield "event: bye\ndata: {}\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
     @app.get("/api/markets", dependencies=[Depends(require_token)])
     def api_markets(refresh: bool = False) -> dict[str, Any]:
         """Everything listed and tradeable, across every perp DEX."""
@@ -1189,6 +1318,13 @@ def create_app() -> FastAPI:
         step = client.INTERVALS.get(interval, 900)
         now_s = time.time()
 
+        # If a socket is feeding this market, the current bar is BUILT from
+        # the tape rather than fetched. Nothing to poll, nothing to lag, and
+        # no chance of being handed a closed bar and told it is the live one.
+        feed = rt.feed_for(coin)
+        live_bar = feed.candle(interval) if feed else None
+        use_feed = live_bar is not None and live_bar.seeded and not feed.stale
+
         # Is the last bar actually the one still forming?
         #
         # This is the bug behind "it says up on a candle that is clearly going
@@ -1210,9 +1346,20 @@ def create_app() -> FastAPI:
         except Exception as exc:
             out["price_error"] = str(exc)
 
-        if last_is_forming:
+        if use_feed:
+            # The socket's own candle wins over anything polled.
+            current = live_bar.to_candle()
+            closed = feed.history(interval) or bars[:-1]
+            elapsed = live_bar.elapsed(now_s)
+            live_spot = current.close
+            candle_age = now_s - current.ts
+            last_is_forming = True
+            out["source"] = "websocket"
+            out["feed"] = feed.status()
+        elif last_is_forming:
             current, closed = last, bars[:-1]
             elapsed = max(0.0, min(float(step), candle_age))
+            out["source"] = "polled"
         else:
             # No forming bar in the data. Build one from the live price so the
             # read describes NOW rather than a closed candle.
@@ -1223,12 +1370,15 @@ def create_app() -> FastAPI:
             closed = bars
             elapsed = max(0.0, min(float(step), now_s - boundary))
             out["synthesised_candle"] = True
+            out["source"] = "polled (last bar had already closed)"
 
         # Overlay the live mid onto the forming candle. `candleSnapshot` lags
         # the tape, so its close, high and low for the in-progress bar are
         # behind the market -- and `position_in_range` computed from a stale
         # close is the single most misleading number on the panel.
-        if live_spot and live_spot > 0:
+        # Skipped when the socket built the bar: it is already tick-current,
+        # and a polled mid would only drag it backwards.
+        if not use_feed and live_spot and live_spot > 0:
             current = Candle(ts=current.ts, open=current.open,
                              high=max(current.high, live_spot),
                              low=min(current.low, live_spot),
@@ -1252,17 +1402,25 @@ def create_app() -> FastAPI:
 
         # book, and absorption if a watch happens to be running on this coin
         book = None
-        try:
-            book = client.book(coin)
+        if use_feed and feed.book is not None:
+            book = feed.book           # pushed, not polled
             rt.last_book_ts = time.time()
-        except Exception as exc:
-            out["book_error"] = str(exc)
+        else:
+            try:
+                book = client.book(coin)
+                rt.last_book_ts = time.time()
+            except Exception as exc:
+                out["book_error"] = str(exc)
 
         absorption = tape = None
         w = rt.watcher
         if w is not None and w.coin == coin:
             absorption = w.watch.absorption()
             tape = w.watch.tape
+        elif use_feed:
+            # Even without a level watch, the feed's tape gives the flow
+            # signal -- it is the same public fills either way.
+            tape = feed.tape
 
         # nearest liquidation cluster, signed by side
         magnet_bps = magnet_notional = 0.0
@@ -1333,6 +1491,13 @@ def create_app() -> FastAPI:
             "calibration": rt.calibration(coin, interval).table(),
             "has_watch": absorption is not None,
         })
+        if book is not None and not book.empty:
+            out["book"] = {
+                "bid": book.best_bid, "ask": book.best_ask, "mid": book.mid,
+                "spread_bps": book.spread_bps,
+                "imbalance_25bps": book.imbalance(25.0),
+                "pushed": bool(use_feed and feed.book is not None),
+            }
         if size > 0 and book is not None and not book.empty:
             out["round_trip_bps"] = book.round_trip_bps(size)
 
@@ -1693,10 +1858,14 @@ DASHBOARD = """<!doctype html>
           <option value="0.7">70%</option><option value="0.8" selected>80%</option>
           <option value="0.9">90%</option></select> confidence</label>
         <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
-          auto-refresh 10s</label>
+          poll 10s</label>
+        <button onclick="startFeed()" id="feedBtn">Go live (websocket)</button>
+        <button onclick="stopFeed()">Stop feed</button>
         <button onclick="loadRead()">Read now</button>
         <button onclick="doCalibrate()">Calibrate</button>
       </div>
+      <div id="feedBar" class="msg" style="margin-bottom:8px">Feed off — the
+        current candle is being polled. Go live to build it from the tape instead.</div>
       <div id="alertBar" class="alertbar" style="display:none"></div>
       <div id="readHead" class="msg">—</div>
       <div id="readSignals"></div>
@@ -2061,6 +2230,9 @@ window.addEventListener('DOMContentLoaded', () => {
 });
 
 function onCoinChange() {
+  // A feed is bound to one market. Leaving it running on the old one would
+  // quietly serve its candles under the new symbol's name.
+  if (stream || feedTimer) stopFeed();
   lastCoin = coin();
   try { localStorage.setItem('liqmap_coin', lastCoin); } catch (e) {}
   alertedFor = null;            // a new market starts its own alert history
@@ -2150,6 +2322,79 @@ function checkAlert(d) {
   } catch (e) {}
 }
 
+/* ---- the live feed -------------------------------------------------------
+   Polling asks "what happened"; the stream is told. Once the socket is up,
+   every fill pushes a fresh read instead of waiting for the next poll, which
+   is the difference between seeing a move and reading about it.            */
+
+let stream = null, feedTimer = null;
+
+async function startFeed() {
+  $('feedBtn').disabled = true;
+  try {
+    const r = await api('/api/feed?' + q({coin: coin(),
+                        intervals: '1m,5m,15m,30m'}), {method: 'POST'});
+    if (!r.ok) { note(r.error || 'could not start feed', true); return; }
+    note(`feed starting on ${coin()} — seeding from history…`);
+    openStream();
+    if (!feedTimer) feedTimer = setInterval(paintFeed, 2000);
+  } catch (e) { note(e.message, true); }
+  finally { $('feedBtn').disabled = false; }
+}
+
+async function stopFeed() {
+  closeStream();
+  if (feedTimer) { clearInterval(feedTimer); feedTimer = null; }
+  try { await api('/api/feed?stop=true', {method: 'POST'}); } catch (e) {}
+  $('feedBar').textContent = 'Feed off — the current candle is being polled.';
+  note('feed stopped');
+}
+
+function openStream() {
+  closeStream();
+  // EventSource cannot set headers, so the token travels in the query. It is
+  // encoded like every other parameter.
+  const url = '/api/stream?' + q({coin: coin(), interval: $('rInt').value,
+                                  higher: $('rHigh').value, token: tok()});
+  stream = new EventSource(url);
+
+  stream.onmessage = (ev) => {
+    try { paintRead(JSON.parse(ev.data)); } catch (e) {}
+  };
+  stream.addEventListener('hello', (ev) => {
+    try {
+      const h = JSON.parse(ev.data);
+      note(h.feed ? 'streaming ' + h.coin + ' from the websocket'
+                  : 'streaming, but no socket feed — still polled');
+    } catch (e) {}
+  });
+  stream.addEventListener('error', () => {
+    // EventSource reconnects on its own; say so rather than looking dead.
+    $('feedBar').innerHTML = '<b>Stream interrupted</b> — reconnecting…';
+  });
+}
+
+function closeStream() {
+  if (stream) { stream.close(); stream = null; }
+}
+
+async function paintFeed() {
+  let f;
+  try { f = await api('/api/feed'); } catch (e) { return; }
+  const bar = $('feedBar');
+  if (!f.running) {
+    bar.textContent = 'Feed off — the current candle is being polled.';
+    return;
+  }
+  const age = f.age_s == null ? null : f.age_s;
+  const cls = f.stale ? 'short' : 'long';
+  bar.innerHTML = `<b class="${cls}">${f.stale ? 'FEED SILENT' : 'LIVE'}</b> `
+    + `${f.coin} · ${f.trades_seen} fills · ${f.book_updates} book updates · `
+    + `last message ${ageText(age)}`
+    + (f.reconnects ? ` · ${f.reconnects} reconnects` : '')
+    + (f.errors && f.errors.length ? `<br><span style="color:var(--short)">${f.errors[f.errors.length-1]}</span>` : '');
+}
+
 let readPoll = null;
 
 function toggleReadAuto() {
@@ -2164,14 +2409,22 @@ async function loadRead() {
                   higher: $('rHigh').value,
                   size: parseFloat($('liqSize').value || '0') || 0}));
   } catch (e) { $('readHead').textContent = e.message; return; }
+  paintRead(d);
+}
 
+// Split out so the websocket stream can paint without a fetch of its own.
+function paintRead(d) {
+  if (!d) return;
   if (d.error) {
     $('readHead').textContent = d.error;
     $('readSignals').innerHTML = ''; $('readSay').style.display = 'none'; return;
   }
 
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
-  const flags = (d.early ? '<span class="flag late">EARLY</span>' : '')
+  const src = (d.source || '').indexOf('websocket') === 0;
+  const flags = (src ? '<span class="flag">LIVE TAPE</span>'
+                     : '<span class="flag late">POLLED</span>')
+              + (d.early ? '<span class="flag late">EARLY</span>' : '')
               + (d.stale ? '<span class="flag crowded">STALE — candle and live price disagree</span>' : '')
               + (d.has_watch ? '' : '<span class="flag">NO LEVEL WATCH — flow and absorption missing</span>');
 

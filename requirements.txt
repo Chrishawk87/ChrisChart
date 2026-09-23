@@ -6,7 +6,9 @@ requests>=2.31
 fastapi>=0.110
 uvicorn[standard]>=0.27
 
-# Optional — only for `harvest` (wallet discovery over websocket)
+# Required for the live feed and wallet harvesting (both use the
+# public trades websocket). Without it the service still runs, but the
+# current candle falls back to polling.
 websocket-client>=1.7
 
 # Dev

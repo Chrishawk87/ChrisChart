@@ -970,16 +970,11 @@ def test_the_header_keeps_auth_working_when_the_query_is_mangled(client):
     assert r.status_code == 200
 
 
-def test_every_dashboard_request_encodes_its_parameters():
-    """No hand-concatenated symbols left in the page."""
-    import liqmap.web as w
-    html = w.DASHBOARD if hasattr(w, "DASHBOARD") else None
-    assert html is None or "+ coin()" not in html
-
-
 def test_dashboard_builds_urls_through_the_encoder(client):
     html = client.get("/").text
     assert "function q(params)" in html
+    # A blunt guard on purpose: string-concatenating the symbol anywhere is
+    # how the token got stripped, so the page must not do it at all.
     assert "+ coin()" not in html, "unencoded symbol concatenated into a URL"
     assert "'Authorization': 'Bearer '" in html
 
@@ -1177,4 +1172,155 @@ def test_dashboard_carries_the_weight_editor_and_forward_panel(client):
     html = client.get("/").text
     for marker in ("paintWeights", "readWeightInputs", "loadForward",
                    "renderCoins", "mktFind"):
+        assert marker in html
+
+
+# --------------------------------------------------------------------------
+# the websocket feed driving the read
+# --------------------------------------------------------------------------
+
+def _grid_bars(n=200, step=900, coin="BTC"):
+    import time as _t
+    from liqmap.live import grid_start
+    from liqmap.structure import Candle
+    start = grid_start(_t.time(), step)
+    out, px = [], 4000.0
+    for i in range(n, 0, -1):
+        o = px
+        c = px + (2.0 if i % 3 else -3.0)
+        out.append(Candle(ts=start - i * step, open=o, high=max(o, c) + 1,
+                          low=min(o, c) - 1, close=c, volume=400.0))
+        px = c
+    out.append(Candle(ts=start, open=px, high=px + 2, low=px - 2, close=px,
+                      volume=50.0))
+    return out
+
+
+def _attach_feed(rt, coin="BTC", interval="15m", bars=None):
+    """A LiveFeed with no socket, marked running, so the read path can be
+    exercised without a network."""
+    import time as _t
+    from liqmap.live import LiveFeed
+
+    bars = bars or _grid_bars()
+    f = LiveFeed(coin, intervals=(interval,))
+    f.seed(interval, bars)
+    f._thread = type("T", (), {"is_alive": lambda self: True})()
+    f.last_msg_ts = _t.time()
+    rt.feed = f
+    return f
+
+
+def test_read_falls_back_to_polling_with_no_feed(client):
+    web.runtime()._client = _NowClient(candles=_grid_bars())
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["source"].startswith("polled")
+    assert "feed" not in d
+
+
+def test_a_live_feed_builds_the_current_candle_from_fills(client):
+    import time as _t
+    rt = web.runtime()
+    bars = _grid_bars()
+    rt._client = _NowClient(candles=bars, mids={"BTC": 9999.0})
+    f = _attach_feed(rt, bars=bars)
+
+    base = int(_t.time() * 1000)
+    start_px = bars[-1].close
+    f._handle_trades([{"px": str(start_px - i * 4), "sz": "3", "side": "A",
+                       "time": base + i * 400} for i in range(12)])
+
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["source"] == "websocket"
+    assert d["feed"]["trades_seen"] == 12
+    # Built from the tape, NOT from the polled mid of 9999.
+    assert d["last"] == pytest.approx(start_px - 11 * 4)
+    assert d["change_bps"] < 0
+    assert d["lean"] != "up"
+
+
+def test_the_feeds_tape_supplies_flow_without_a_level_watch(client):
+    import time as _t
+    rt = web.runtime()
+    bars = _grid_bars()
+    rt._client = _NowClient(candles=bars)
+    f = _attach_feed(rt, bars=bars)
+
+    base = int(_t.time() * 1000)
+    f._handle_trades([{"px": str(bars[-1].close), "sz": "5", "side": "A",
+                       "time": base + i * 300} for i in range(10)])
+
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    flow = next((s for s in d["signals"] if s["name"] == "flow"), None)
+    assert flow is not None and flow["direction"] == "down"
+
+
+def test_a_pushed_book_is_used_instead_of_polling_one(client):
+    rt = web.runtime()
+    bars = _grid_bars()
+    rt._client = _NowClient(candles=bars)
+    f = _attach_feed(rt, bars=bars)
+    f._handle_book({"levels": [[{"px": "3950", "sz": "2"}],
+                               [{"px": "3951", "sz": "9"}]], "time": 1})
+
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["book"]["bid"] == 3950.0 and d["book"]["ask"] == 3951.0
+    assert d["book"]["pushed"] is True
+
+
+def test_a_stale_feed_is_not_trusted_over_polling(client):
+    """A socket that stopped delivering must not keep serving its last candle
+    as though it were current."""
+    rt = web.runtime()
+    bars = _grid_bars()
+    rt._client = _NowClient(candles=bars)
+    f = _attach_feed(rt, bars=bars)
+    f.last_msg_ts = 1.0                      # ancient
+
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["source"].startswith("polled")
+
+
+def test_a_feed_on_another_market_is_ignored(client):
+    rt = web.runtime()
+    rt._client = _NowClient(candles=_grid_bars())
+    _attach_feed(rt, coin="ETH")
+    d = client.get(f"/api/read?coin=BTC&interval=15m&token={TOKEN}").json()
+    assert d["source"].startswith("polled")
+
+
+def test_feed_status_endpoint_reports_off_when_nothing_runs(client):
+    assert client.get(f"/api/feed?token={TOKEN}").json()["running"] is False
+
+
+def test_stopping_a_feed_that_is_not_running_is_safe(client):
+    r = client.post(f"/api/feed?stop=true&token={TOKEN}").json()
+    assert r["ok"] is True and r["running"] is False
+
+
+def test_the_stream_requires_a_token(client):
+    with client.stream("GET", "/api/stream?coin=BTC&max_seconds=1") as r:
+        assert r.status_code == 401
+
+
+def test_the_stream_announces_whether_a_socket_is_behind_it(client):
+    """A silent stream must never be mistaken for a quiet market."""
+    web.runtime()._client = _NowClient(candles=_grid_bars())
+    url = f"/api/stream?coin=BTC&max_seconds=1&token={TOKEN}"
+    with client.stream("GET", url) as r:
+        assert r.status_code == 200
+        assert "text/event-stream" in r.headers["content-type"]
+        for line in r.iter_lines():
+            if line.startswith("data:"):
+                import json as _j
+                hello = _j.loads(line[5:])
+                assert hello["feed"] is False     # no socket attached
+                assert hello["coin"] == "BTC"
+                break
+
+
+def test_dashboard_carries_the_feed_controls(client):
+    html = client.get("/").text
+    for marker in ("startFeed", "openStream", "EventSource", "paintRead",
+                   "paintFeed"):
         assert marker in html
