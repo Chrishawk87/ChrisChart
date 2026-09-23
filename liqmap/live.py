@@ -259,6 +259,12 @@ class LiveFeed:
         self.book: Book | None = None
         self._book_hist: list[tuple[float, float, float, float]] = []
 
+        # The book read itself. Updated on EVERY book push rather than on a
+        # candle schedule -- the book is the structure, and it changes
+        # thousands of times a minute.
+        from .bookread import BookReader
+        self.reader = BookReader()
+
         # Impact baseline, learned from this market's own tape. Without a
         # scale, "ten million of buying" means nothing -- it is enormous at
         # 3am and unremarkable at the open.
@@ -505,6 +511,7 @@ class LiveFeed:
         with self._lock:
             self.book = b
             self.book_updates += 1
+            self.reader.add(b, now=time.time())
             # Keep a short history of the spread and the imbalance. A single
             # snapshot says what the book looks like; the series says what is
             # happening to it, which is the part you can trade. A spread
@@ -513,6 +520,17 @@ class LiveFeed:
             self._book_hist.append((time.time(), b.spread_bps,
                                     b.imbalance(25.0), b.mid))
             del self._book_hist[:-600]
+
+    def book_call(self, window_s: float | None = None):
+        """The book's call on the current candle. Cheap: the reader has
+        already done the work on each push."""
+        if window_s is not None:
+            self.reader.window_s = window_s
+        agg = 0.0
+        w = self.tape.window(min(self.reader.window_s * 3, 120.0))
+        if w.total > 0:
+            agg = w.lean
+        return self.reader.read(aggression=agg)
 
     def spread_trend(self, window_s: float = 60.0) -> dict:
         """What the book has been doing over the window, not just now."""
@@ -596,6 +614,7 @@ class LiveFeed:
             "reconnects": self.reconnects,
             "baseline_samples": self.baseline.samples,
             "absorption_ready": self.baseline.ready,
+            "book_reads": self.reader.updates,
             "intervals": sorted(self.builders),
             "uptime_s": (time.time() - self.started_at) if self.started_at else 0.0,
             "errors": self.errors[-3:],

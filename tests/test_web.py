@@ -1677,3 +1677,117 @@ def test_dashboard_carries_the_timeframe_ladder(client):
     html = client.get("/").text
     for marker in ("paintLadder", "tfLadder", "CONFLICT"):
         assert marker in html
+
+
+# --------------------------------------------------------------------------
+# the book call
+# --------------------------------------------------------------------------
+
+def _real_book():
+    """The book exactly as it appears on the venue: heavy bid at the touch,
+    thin offer. The offer gets consumed first, so this is UP."""
+    from liqmap.flow import Book, Level
+    asks = [(7737.3, 29216), (7737.2, 21803), (7737.1, 24418),
+            (7737.0, 19992), (7736.8, 9996), (7736.7, 99633),
+            (7736.6, 84368), (7736.5, 5052), (7736.3, 23209)]
+    bids = [(7736.1, 200009), (7736.0, 774), (7735.9, 67596),
+            (7735.8, 25899), (7735.7, 75222), (7735.6, 7921),
+            (7735.5, 15100), (7735.4, 403850), (7735.3, 91942)]
+    return Book(coin="X", ts=1.0,
+                bids=[Level(p, s) for p, s in bids],
+                asks=[Level(p, s) for p, s in asks])
+
+
+def test_bookcall_needs_a_live_feed(client):
+    d = client.get(f"/api/bookcall?coin=BTC&token={TOKEN}").json()
+    assert "no live feed" in d["error"]
+
+
+def test_bookcall_reads_a_real_book_as_up(client):
+    """200,009 bid against 23,209 offered at the touch. The thin side is
+    above, so the next print goes up — and the microprice says so."""
+    rt = web.runtime()
+    rt._client = _NowClient(candles=_grid_bars())
+    f = _attach_feed(rt, bars=_grid_bars())
+
+    b = _real_book()
+    for i in range(12):
+        f.reader.add(b, now=float(i))
+    f.book = b
+    f.book_updates = 12
+
+    d = client.get(f"/api/bookcall?coin=BTC&token={TOKEN}").json()
+    assert d["direction"] == "up"
+    assert d["tilt"] > 0.5, "microprice must lean toward the THIN side"
+    assert d["microprice"] > d["mid"]
+    assert d["spread_bps"] == pytest.approx(0.259, abs=0.01)
+
+
+def test_bookcall_inverts_when_the_book_inverts(client):
+    """The same shape mirrored must call down. If it does not, every call
+    this module makes is inverted."""
+    from liqmap.flow import Book, Level
+
+    rt = web.runtime()
+    rt._client = _NowClient(candles=_grid_bars())
+    f = _attach_feed(rt, bars=_grid_bars())
+
+    b = Book(coin="X", ts=1.0,
+             bids=[Level(100.0 - 0.01 * i, 1.0 if i == 0 else 3.0)
+                   for i in range(6)],
+             asks=[Level(100.02 + 0.01 * i, 200.0 if i == 0 else 3.0)
+                   for i in range(6)])
+    for i in range(12):
+        f.reader.add(b, now=float(i))
+    f.book = b
+
+    d = client.get(f"/api/bookcall?coin=BTC&token={TOKEN}").json()
+    assert d["direction"] == "down"
+    assert d["tilt"] < -0.5
+
+
+def test_bookcall_reports_every_component(client):
+    rt = web.runtime()
+    rt._client = _NowClient(candles=_grid_bars())
+    f = _attach_feed(rt, bars=_grid_bars())
+    for i in range(12):
+        f.reader.add(_real_book(), now=float(i))
+    f.book = _real_book()
+
+    d = client.get(f"/api/bookcall?coin=BTC&token={TOKEN}").json()
+    names = {c["name"] for c in d["components"]}
+    assert names == {"microprice tilt", "replenishment", "near imbalance",
+                     "queue depletion", "aggression", "mid drift"}
+
+
+def test_bookcall_window_is_adjustable(client):
+    rt = web.runtime()
+    rt._client = _NowClient(candles=_grid_bars())
+    f = _attach_feed(rt, bars=_grid_bars())
+    for i in range(30):
+        f.reader.add(_real_book(), now=float(i))
+    f.book = _real_book()
+
+    narrow = client.get(f"/api/bookcall?window_s=5&token={TOKEN}").json()
+    wide = client.get(f"/api/bookcall?window_s=60&token={TOKEN}").json()
+    assert narrow["samples"] < wide["samples"]
+
+
+def test_the_feed_updates_the_reader_on_every_book_push(client):
+    from liqmap.live import LiveFeed
+    f = LiveFeed("BTC")
+    assert f.reader.updates == 0
+    for i in range(5):
+        f._handle_book({"levels": [[{"px": "99.9", "sz": "5"}],
+                                   [{"px": "100.1", "sz": "1"}]],
+                        "time": 1000 + i})
+    assert f.reader.updates == 5
+    assert f.status()["book_reads"] == 5
+
+
+def test_dashboard_leads_with_the_book_call(client):
+    html = client.get("/").text
+    assert "Book call" in html
+    assert "paintBookCall" in html
+    # it must come BEFORE the older candle read panel
+    assert html.index("bookPanel") < html.index("readPanel")

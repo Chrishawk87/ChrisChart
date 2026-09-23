@@ -1316,6 +1316,16 @@ def create_app() -> FastAPI:
                                              "delta": bar.delta})
                                + "\n\n")
 
+                # The book call is cheap -- the reader already did the work
+                # on each push -- so it goes out at tape speed alongside the
+                # price, not on the read's slower cadence.
+                if feed is not None:
+                    try:
+                        bc = api_bookcall(coin=coin_r)
+                        yield f"event: book\ndata: {json.dumps(bc, default=str)}\n\n"
+                    except Exception:
+                        pass
+
                 if fired and now - last_sent < 0.5:
                     continue            # coalesce the expensive part only
                 last_sent = now
@@ -1419,6 +1429,42 @@ def create_app() -> FastAPI:
     def api_now(coin: str = "BTC") -> dict[str, Any]:
         """Live price and how stale everything else is. Cheap enough to poll."""
         return rt.now(coin)
+
+    @app.get("/api/bookcall", dependencies=[Depends(require_token)])
+    def api_bookcall(coin: str = "BTC", window_s: float = 20.0
+                     ) -> dict[str, Any]:
+        """The book's call on the current candle. Nothing else consulted.
+
+        No trend, no higher timeframe, no VWAP, no zones. Just: what is the
+        order book doing right now, and which way is this candle going.
+        """
+        coin = rt.resolve_symbol(coin)[0] or coin
+        feed = rt.feed_for(coin)
+        if feed is None:
+            return {"coin": coin,
+                    "error": "no live feed on this market — press Go live"}
+
+        r = feed.book_call(window_s=max(2.0, min(window_s, 120.0)))
+        if r is None:
+            return {"coin": coin, "error": "no book updates yet",
+                    "feed": feed.status()}
+
+        return {
+            "coin": coin,
+            "direction": r.direction, "score": r.score,
+            "conviction": r.conviction,
+            "mid": r.mid, "microprice": r.microprice,
+            "spread_bps": r.spread_bps,
+            "tilt": r.tilt, "imbalance": r.imbalance,
+            "depletion": r.depletion, "replenish": r.replenish,
+            "mid_drift_bps": r.mid_drift_bps,
+            "aggression": r.aggression, "absorbed": r.absorbed,
+            "samples": r.samples, "window_s": r.window_s,
+            "components": r.components(),
+            "verdict": r.verdict(),
+            "book_updates": feed.book_updates,
+            "age_s": feed.age,
+        }
 
     @app.get("/api/read", dependencies=[Depends(require_token)])
     def api_read(coin: str = "BTC", interval: str = "15m",
@@ -2052,6 +2098,18 @@ DASHBOARD = """<!doctype html>
   .tf .bar i.buyers{left:50%;background:var(--long)}
   .tf .bar i.sellers{right:50%;background:var(--short)}
   .tf .meta{font-size:11px;color:var(--dim);text-align:right}
+  .call{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+    padding:10px 0 4px}
+  .call b{font-size:44px;letter-spacing:.02em;line-height:1}
+  .call .sub{font-size:13px;color:var(--dim);font-variant-numeric:tabular-nums}
+  .comp{display:grid;grid-template-columns:132px 64px 1fr;gap:10px;
+    align-items:center;font-size:12px;padding:4px 0;
+    border-bottom:1px solid var(--line)}
+  .comp .v{font-variant-numeric:tabular-nums;text-align:right}
+  .comp .m{height:5px;background:var(--line);border-radius:3px;position:relative}
+  .comp .m i{position:absolute;top:0;bottom:0;border-radius:3px}
+  .comp .m i.pos{left:50%;background:var(--long)}
+  .comp .m i.neg{right:50%;background:var(--short)}
   .wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
     gap:8px}
   .wgrid div{background:var(--bg);border:1px solid var(--line);border-radius:4px;
@@ -2101,6 +2159,15 @@ DASHBOARD = """<!doctype html>
   <div id="venueNote" class="say" style="display:none;margin-bottom:14px"></div>
 
   <div class="grid">
+    <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
+      <span class="stamp" id="bookStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">The order book is the structure.
+        No trend, no higher timeframe, no VWAP. Updates on every book push.</div>
+      <div id="bookHead" class="msg">Press <b>Go live</b> to open the book feed.</div>
+      <div id="bookComps"></div>
+      <div id="bookSay" class="say" style="display:none"></div>
+    </div>
+
     <div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Everything this service knows,
         assembled into one direction on the candle still forming. Absorption
@@ -2120,6 +2187,10 @@ DASHBOARD = """<!doctype html>
           <option value="0.9">90%</option></select> confidence</label>
         <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
           poll 10s</label>
+        <label>book window <select id="bkWin" onchange="loadBookCall()">
+          <option value="5">5s</option><option value="10">10s</option>
+          <option value="20" selected>20s</option><option value="60">60s</option>
+        </select></label>
         <button onclick="startFeed()" id="feedBtn">Go live (websocket)</button>
         <button onclick="stopFeed()">Stop feed</button>
         <button onclick="loadRead()">Read now</button>
@@ -2285,7 +2356,7 @@ async function loadAll() {
   note('loading…');
   if (!nowPoll) startTicker();
   try {
-    await Promise.all([loadStatus(), loadCoins(), loadWeights(), loadRead(),
+    await Promise.all([loadStatus(), loadCoins(), loadBookCall(), loadWeights(), loadRead(),
                        loadForward(), loadConsensus(),
                        loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
                        loadReport()]);
@@ -2536,6 +2607,56 @@ function onCoinChange() {
   loadRead();
 }
 
+let bookPoll = null;
+
+async function loadBookCall() {
+  let d;
+  try {
+    d = await api('/api/bookcall?' + q({coin: coin(),
+                  window_s: parseFloat($('bkWin').value || '20')}));
+  } catch (e) { $('bookHead').textContent = e.message; return; }
+  paintBookCall(d);
+}
+
+function paintBookCall(d) {
+  if (!d) return;
+  if (d.error) {
+    $('bookHead').textContent = d.error;
+    $('bookComps').innerHTML = '';
+    $('bookSay').style.display = 'none';
+    return;
+  }
+
+  const cls = d.direction === 'up' ? 'long' : d.direction === 'down' ? 'short' : '';
+  $('bookHead').innerHTML =
+      `<div class="call"><b class="${cls}">${d.direction.toUpperCase()}</b>`
+    + `<span class="sub">score ${d.score >= 0 ? '+' : ''}${d.score.toFixed(3)}`
+    + ` · conviction ${(d.conviction*100).toFixed(0)}%`
+    + ` · ${d.samples} book updates / ${d.window_s.toFixed(0)}s</span></div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${Number(d.mid).toLocaleString(undefined,{maximumFractionDigits:6})}</b><span>mid</span></div>`
+    + `<div class="stat"><b class="${d.microprice > d.mid ? 'long' : d.microprice < d.mid ? 'short' : ''}">`
+    + `${Number(d.microprice).toLocaleString(undefined,{maximumFractionDigits:6})}</b><span>microprice</span></div>`
+    + `<div class="stat"><b>${d.spread_bps.toFixed(3)}bps</b><span>spread</span></div>`
+    + `<div class="stat"><b>${d.book_updates}</b><span>book pushes</span></div>`
+    + '</div>';
+
+  $('bookComps').innerHTML = (d.components || []).map(c => {
+    const w = Math.round(Math.abs(c.value) * 50);
+    return `<div class="comp">
+      <span>${c.name}</span>
+      <span class="v ${c.value > 0 ? 'long' : c.value < 0 ? 'short' : ''}">
+        ${c.value >= 0 ? '+' : ''}${c.value.toFixed(2)}</span>
+      <span class="m"><i class="${c.value >= 0 ? 'pos' : 'neg'}" style="width:${w}%"></i>
+        <span style="position:absolute;left:0;top:8px;color:var(--dim);font-size:11px">${c.note}</span></span>
+    </div>`;
+  }).join('') + '<div style="height:14px"></div>';
+
+  $('bookSay').style.display = '';
+  $('bookSay').textContent = d.verdict;
+  stamp('bookStamp', d.age_s == null ? 0 : d.age_s, 5, 30, 'book ');
+}
+
 function inputFlags(d) {
   // Report each input separately. One banner saying "flow and absorption
   // missing" while flow was visibly working in the signal list was simply
@@ -2705,6 +2826,10 @@ function openStream() {
   // Price arrives on its own channel, on every batch of fills. The full read
   // is coalesced; the price is not, because in a fast market it is the number
   // that goes stale first and a stale price reads as a current one.
+  stream.addEventListener('book', (ev) => {
+    try { paintBookCall(JSON.parse(ev.data)); } catch (e) {}
+  });
+
   stream.addEventListener('px', (ev) => {
     try {
       const p = JSON.parse(ev.data);
