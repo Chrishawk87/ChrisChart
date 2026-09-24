@@ -381,6 +381,11 @@ class Ledger(ThreadedDB):
         is not.
         """
         ts = now if now is not None else time.time()
+        if not (exit_px > 0) or pos.entry <= 0:
+            # Last line of defence. A caller that reaches here with a bad
+            # price has a bug, and writing the row anyway hides it inside
+            # an average where it is very hard to find again.
+            return None
         gross = pos.signed_bps(exit_px)
         net = gross - pos.cost_bps
         r = (gross / pos.risk_bps) if pos.risk_bps > 0 else 0.0
@@ -591,6 +596,46 @@ class Ledger(ThreadedDB):
             "pending_proposals": one("SELECT COUNT(*) FROM tuning_proposals "
                                      "WHERE status='pending'"),
         }
+
+    def clear(self, coin: str | None = None) -> dict[str, int]:
+        """Throw the book away and start clean.
+
+        Needed after a bug has written rows that cannot be right. A
+        corrupted trade does not average out -- it sits inside every slice
+        of the scorecard making the honest rows unreadable, and there is no
+        way to tell later which numbers were real.
+        """
+        with self._tx() as conn:
+            if coin:
+                a = conn.execute("DELETE FROM paper_positions WHERE coin=?",
+                                 (coin,)).rowcount
+                b = conn.execute("DELETE FROM paper_decisions WHERE coin=?",
+                                 (coin,)).rowcount
+            else:
+                a = conn.execute("DELETE FROM paper_positions").rowcount
+                b = conn.execute("DELETE FROM paper_decisions").rowcount
+        return {"positions": max(a, 0), "decisions": max(b, 0)}
+
+    def suspect(self, max_abs_bps: float = 1000.0) -> list[dict[str, Any]]:
+        """Closed trades whose result cannot be true.
+
+        A scalp does not move 100%. Anything past this is a bug wearing a
+        number, and it is worth being able to see them rather than only
+        their effect on an average.
+        """
+        rows = self._conn.execute(
+            "SELECT * FROM paper_positions WHERE status='closed' AND "
+            "(ABS(COALESCE(net_bps,0)) > ? OR exit_px <= 0)",
+            (max_abs_bps,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def drop_suspect(self, max_abs_bps: float = 1000.0) -> int:
+        with self._tx() as conn:
+            n = conn.execute(
+                "DELETE FROM paper_positions WHERE status='closed' AND "
+                "(ABS(COALESCE(net_bps,0)) > ? OR exit_px <= 0)",
+                (max_abs_bps,)).rowcount
+        return max(n, 0)
 
     def prune(self, keep_days: int = 60) -> int:
         cutoff = time.time() - keep_days * 86400

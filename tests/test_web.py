@@ -1237,7 +1237,8 @@ def test_a_live_feed_builds_the_current_candle_from_fills(client):
     rt._client = _NowClient(candles=bars, mids={"BTC": 9999.0})
     f = _attach_feed(rt, bars=bars)
 
-    base = int(_t.time() * 1000)
+    _settled_in_bar(need=6.0)
+    base = int(_t.time() * 1000) - 5000
     start_px = bars[-1].close
     f._handle_trades([{"px": str(start_px - i * 4), "sz": "3", "side": "A",
                        "time": base + i * 400} for i in range(12)])
@@ -1251,6 +1252,21 @@ def test_a_live_feed_builds_the_current_candle_from_fills(client):
     assert d["lean"] != "up"
 
 
+
+def _settled_in_bar(interval_s: float = 900.0, need: float = 5.0) -> None:
+    """Wait out the first instant of a candle, if we are standing in it.
+
+    At the exact boundary the current bar has no elapsed time, so there is
+    no moment that is both inside it and already past -- and a test asking
+    what the tape says is asking something undefined. It is a fraction of a
+    second per bar, which is rare enough to look like a mystery and common
+    enough to fail a suite now and then.
+    """
+    import time as _t
+    elapsed = _t.time() % interval_s
+    if elapsed < need:
+        _t.sleep(need - elapsed)
+
 def test_the_feeds_tape_supplies_flow_without_a_level_watch(client):
     import time as _t
     rt = web.runtime()
@@ -1258,7 +1274,13 @@ def test_the_feeds_tape_supplies_flow_without_a_level_watch(client):
     rt._client = _NowClient(candles=bars)
     f = _attach_feed(rt, bars=bars)
 
-    base = int(_t.time() * 1000)
+    # Stamped just BEHIND the clock, not ahead of it. Stamping them forward
+    # put the last few milliseconds into the next candle whenever the test
+    # ran within ~3 seconds of a bar boundary, and the current bar's tape
+    # came back empty. That is roughly one run in three hundred, which is
+    # exactly often enough to look like a real intermittent bug.
+    _settled_in_bar()
+    base = int(_t.time() * 1000) - 3000
     f._handle_trades([{"px": str(bars[-1].close), "sz": "5", "side": "A",
                        "time": base + i * 300} for i in range(10)])
 
@@ -1432,7 +1454,7 @@ def test_the_stream_pushes_price_on_every_fill(client):
     f = _attach_feed(rt, bars=bars)
 
     def fire():
-        base = int(_t.time() * 1000)
+        base = int(_t.time() * 1000) - 1000
         for i in range(4):
             _t.sleep(0.2)
             f._handle_trades([{"px": str(4000 + (i + 1) * 3), "sz": "1",
@@ -1789,9 +1811,38 @@ def test_the_feed_updates_the_reader_on_every_book_push(client):
     assert f.status()["book_reads"] == 5
 
 
-def test_dashboard_leads_with_the_book_call(client):
+def test_the_dashboard_holds_only_the_three_panels_you_watch(client):
+    """Seventeen panels in one column meant the three that matter were
+    separated by a screenful of things that did not."""
     html = client.get("/").text
-    assert "Book call" in html
-    assert "paintBookCall" in html
-    # it must come BEFORE the older candle read panel
-    assert html.index("bookPanel") < html.index("readPanel")
+    dash = html[html.index('id="tab-dash"'):html.index('id="tab-test"')]
+    for wanted in ("agentPanel", "pilotPanel", "readPanel"):
+        assert wanted in dash, f"{wanted} should be on the dashboard"
+    for elsewhere in ("sweepPanel", "btPanel", "liqPanel", "bookPanel"):
+        assert elsewhere not in dash, f"{elsewhere} should be behind a tab"
+
+
+def test_every_panel_lives_in_exactly_one_tab(client):
+    """A panel left out of the regrouping would silently vanish."""
+    html = client.get("/").text
+    for pid in ("agentPanel", "pilotPanel", "readPanel", "sweepPanel",
+                "bookPanel", "agreePanel", "btPanel", "conPanel",
+                "liqPanel"):
+        assert html.count(f'id="{pid}"') == 1, f"{pid} is duplicated or gone"
+    assert "Book call" in html and "paintBookCall" in html
+
+
+def test_hidden_tab_panes_are_actually_hidden(client):
+    """`.grid{display:grid}` is an author rule and beats the browser's own
+    `[hidden]{display:none}`, so every pane stayed on screen while
+    reporting itself hidden. It has to be stated explicitly."""
+    html = client.get("/").text
+    assert ".tabpane[hidden]{display:none}" in html.replace(" ", "")
+
+
+def test_the_chart_redraws_when_its_tab_is_shown(client):
+    """A canvas laid out while hidden measures zero and draws nothing."""
+    html = client.get("/").text
+    fn = html[html.index("function showTab"):]
+    fn = fn[:fn.index("function restoreTab")]
+    assert "drawChart()" in fn

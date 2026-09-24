@@ -714,6 +714,23 @@ class Runtime:
         payload["candle_ts"] = candle_ts
         payload["notional"] = notional
         payload["mode"] = mode
+        # The mark, ALWAYS. `suggest` only sets `entry` on candles it was
+        # willing to trade, so on every refused candle the payload carried
+        # no price at all -- and the agent, which no longer cares what
+        # `suggest` thinks, read that as zero. It stood aside on a third of
+        # its polls with a perfectly good vote, and an invalidation exit
+        # closed AT zero, which is a 10,000bps move. That one bad exit put
+        # +2494bps a trade on the scorecard.
+        mark = 0.0
+        if book is not None and not book.empty:
+            mark = book.mid
+        if mark <= 0:
+            bar_now = feed.candle(interval)
+            if bar_now is not None and bar_now.close > 0:
+                mark = bar_now.close
+        if mark <= 0 and recent:
+            mark = recent[-1].close
+        payload["price"] = mark
         payload["feed_age_s"] = feed.age
         payload["book_updates"] = feed.book_updates
         payload["three_way"] = three.to_dict()
@@ -1301,6 +1318,7 @@ class Runtime:
                                           limit=5000)
         card = score_mod.scorecard(positions, decisions)
         card["ok"] = True
+        card["suspect"] = len(self.ledger.suspect())
         card["counts"] = self.ledger.counts()
         card["open"] = [p.to_dict() for p in self.ledger.load_open(coin)]
         card["knobs"] = self.knobs().to_dict()
@@ -2462,8 +2480,8 @@ def create_app() -> FastAPI:
                 return {"ok": closed is not None, "closed": closed}
         return {"ok": False, "detail": "no open position with that id"}
 
-    @app.get("/api/sweep", dependencies=[Depends(require_token)])
-    def api_sweep(coin: str, interval: str = "15m",
+    @app.get("/api/grid", dependencies=[Depends(require_token)])
+    def api_grid(coin: str, interval: str = "15m",
                   tp_from: float = 5.0, tp_to: float = 40.0,
                   tp_step: float = 5.0, sl_from: float = 5.0,
                   sl_to: float = 40.0, sl_step: float = 5.0,
@@ -2496,6 +2514,27 @@ def create_app() -> FastAPI:
                 "n": len(sigs), "span": span,
                 "shapes": sorted(shapes.items(), key=lambda kv: -kv[1]),
                 "recent": [s2.to_dict() for s2 in sigs[-limit:]][::-1]}
+
+    @app.post("/api/ledger/clear", dependencies=[Depends(require_token)])
+    def api_ledger_clear(coin: str = "", suspect_only: bool = False
+                         ) -> dict[str, Any]:
+        """Throw away the agent's book, or just the impossible rows in it."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        if suspect_only:
+            n = rt.ledger.drop_suspect()
+            for pilot in rt._pilots.values():
+                pilot.position = None
+            return {"ok": True, "dropped": n,
+                    "note": f"removed {n} trades whose result cannot be true"}
+        out = rt.ledger.clear(c)
+        rt._pilots.clear()
+        return {"ok": True, **out,
+                "note": "book cleared — it starts counting again from now"}
+
+    @app.get("/api/ledger/suspect", dependencies=[Depends(require_token)])
+    def api_ledger_suspect() -> dict[str, Any]:
+        rows = rt.ledger.suspect()
+        return {"ok": True, "n": len(rows), "rows": rows[:50]}
 
     @app.get("/api/scorecard", dependencies=[Depends(require_token)])
     def api_scorecard(coin: str = "", interval: str = "") -> dict[str, Any]:
@@ -3491,6 +3530,26 @@ DASHBOARD = """<!doctype html>
   .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:12px}
   .kv span:nth-child(odd){color:var(--dim)}
   .kv span:nth-child(even){font-family:var(--mono)}
+  /* Tabs. Sticky, because the market selector and the tab you are on are
+     the two things you need while scrolling a long panel. */
+  .tabs{display:flex;gap:4px;flex-wrap:wrap;margin:0 0 14px;
+        position:sticky;top:0;z-index:20;background:var(--bg);
+        padding:8px 0 6px;border-bottom:1px solid var(--line)}
+  .tab-btn{background:transparent;border:1px solid transparent;
+           color:var(--dim);padding:6px 12px;border-radius:5px;
+           font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+  .tab-btn:hover{color:var(--ink);background:var(--panel)}
+  .tab-btn.on{color:var(--bg);background:var(--accent)}
+  .tab-btn .pip{display:inline-block;width:6px;height:6px;border-radius:50%;
+                background:var(--up);margin-left:6px;vertical-align:middle}
+  /* An author `display:grid` beats the browser's own [hidden] rule, so the
+     panes stayed on screen while reporting themselves hidden. This has to
+     be stated explicitly. */
+  .tabpane[hidden]{display:none}
+  @media (max-width:640px){
+    .tabs{gap:2px}
+    .tab-btn{padding:6px 9px;font-size:12px}
+  }
   .full{grid-column:1/-1}
   .conbar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:12px;
           font-size:12px;color:var(--dim)}
@@ -3659,7 +3718,19 @@ DASHBOARD = """<!doctype html>
 
   <div id="venueNote" class="say" style="display:none;margin-bottom:14px"></div>
 
-  <div class="grid">
+  <!-- One screen at a time. The page had grown to seventeen panels in
+       one column, which meant the three you actually watch were separated
+       by a screenful of things you were not. -->
+  <div class="tabs" id="tabs">
+    <button class="tab-btn on" id="tabbtn-dash" onclick="showTab('dash')">Dashboard</button>
+    <button class="tab-btn" id="tabbtn-test" onclick="showTab('test')">Testing</button>
+    <button class="tab-btn" id="tabbtn-book" onclick="showTab('book')">Book &amp; liquidity</button>
+    <button class="tab-btn" id="tabbtn-wall" onclick="showTab('wall')">Wallets</button>
+    <button class="tab-btn" id="tabbtn-setup" onclick="showTab('setup')">Settings</button>
+  </div>
+
+  <div class="grid tabpane" id="tab-dash">
+
     <div class="panel full" id="agentPanel"><h2>The call — take it or leave it
       <span class="stamp" id="sugStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Two independent readings.
@@ -3694,14 +3765,16 @@ DASHBOARD = """<!doctype html>
              alone: filled vs hollow says taken vs ignored, and the arrow
              direction says which side. -->
         <div class="chart-key">
-          <span><i class="k-arrow k-entry-long"></i>went long</span>
-          <span><i class="k-arrow k-entry-short"></i>went short</span>
-          <span><i class="k-dot k-long"></i>closed a winner</span>
-          <span><i class="k-dot k-short"></i>closed a loser</span>
-          <span>the line joins entry to exit — its length is how long it
-            held</span>
-          <span><i class="k-dash"></i>target and stop</span>
+          <span><b style="color:var(--up)">L</b> went long — marker under
+            the bar</span>
+          <span><b style="color:var(--down)">S</b> went short — marker over
+            the bar</span>
+          <span><b style="color:var(--up)">●&thinsp;+28</b> closed a winner,
+            net bps</span>
+          <span><b style="color:var(--down)">●&thinsp;&minus;15</b> closed a
+            loser</span>
           <span>hollow triangle = still open</span>
+          <span><i class="k-dash"></i>target and stop</span>
           <span><i class="k-box"></i>bar still forming</span>
         </div>
         <div id="chartNote" class="msg" style="margin-top:4px"></div>
@@ -3740,6 +3813,9 @@ result from the sweep transfers unchanged."><input type="checkbox"
           decide</button>
         <button onclick="stepAutopilot()">Decide once</button>
         <button onclick="loadScorecard()">Refresh score</button>
+        <button onclick="clearBook()" title="Throw the book away and start
+counting from now. Needed after a bad run has written results that cannot
+be true.">Clear the book</button>
       </div>
 
       <div id="apState" class="msg">Off. Turn it on and leave it — a book
@@ -3761,6 +3837,47 @@ result from the sweep transfers unchanged."><input type="checkbox"
           now</button></div>
       <div id="apProposals"></div>
     </div>
+
+    <div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Everything this service knows,
+        assembled into one direction on the candle still forming. Absorption
+        <b>inverts</b> flow: heavy buying that is not moving price is a bearish
+        reading, not a bullish one.</div>
+      <div class="conbar">
+        <label>candle <select id="rInt" onchange="loadRead()">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label>higher TF <select id="rHigh" onchange="loadRead()">
+          <option>15m</option><option>30m</option><option>1h</option>
+          <option selected>4h</option><option>12h</option>
+          <option>1d</option></select></label>
+        <label>alert at <select id="rAlert" onchange="saveAlert()">
+          <option value="0">off</option><option value="0.6">60%</option>
+          <option value="0.7">70%</option><option value="0.8" selected>80%</option>
+          <option value="0.9">90%</option></select> confidence</label>
+        <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
+          poll 10s</label>
+        <label>book window <select id="bkWin" onchange="loadBookCall()">
+          <option value="5">5s</option><option value="10">10s</option>
+          <option value="20" selected>20s</option><option value="60">60s</option>
+        </select></label>
+        <button onclick="startFeed()" id="feedBtn">Go live (websocket)</button>
+        <button onclick="stopFeed()">Stop feed</button>
+        <button onclick="loadRead()">Read now</button>
+        <button onclick="doCalibrate()">Calibrate</button>
+      </div>
+      <div id="feedBar" class="msg" style="margin-bottom:8px">Feed off — the
+        current candle is being polled. Go live to build it from the tape instead.</div>
+      <div id="alertBar" class="alertbar" style="display:none"></div>
+      <div id="tfLadder"></div>
+      <div id="tfSay" class="say" style="display:none;margin-bottom:12px"></div>
+      <div id="readHead" class="msg">—</div>
+      <div id="readSignals"></div>
+      <div id="readSay" class="say" style="display:none"></div>
+    </div>
+  </div>
+
+  <div class="grid tabpane" id="tab-test" hidden>
 
     <div class="panel full" id="sweepPanel"><h2>Target and stop — test every pair
       <span class="stamp" id="swStamp"></span></h2>
@@ -3802,51 +3919,64 @@ result from the sweep transfers unchanged."><input type="checkbox"
       <div id="swShapes" style="margin-top:14px"></div>
     </div>
 
-    <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
-      <span class="stamp" id="bookStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">The order book is the structure.
-        No trend, no higher timeframe, no VWAP. Updates on every book push.</div>
-      <div id="bookHead" class="msg">Press <b>Go live</b> to open the book feed.</div>
-      <div id="bookComps"></div>
-      <div id="bookSay" class="say" style="display:none"></div>
-    </div>
+    <div class="panel full" id="btPanel"><h2>Backtest — measured, not asserted</h2>
+      <div class="msg" style="margin-bottom:8px">Two separate measurements.
+        <b>Historical replay</b> uses real candles pulled from the exchange — the
+        count and date range are shown with the result — split in two by date, with
+        weights tuned on the earlier half only. No exchange serves historical order
+        flow or book depth, so that replay can only measure the candle-structure
+        signals. <b>Forward test</b> is the answer to that: every live read is written
+        down and scored when its candle closes, so flow and absorption get measured
+        too. It fills up as you use the dashboard.</div>
+      <div id="fwd" class="msg" style="margin-bottom:10px">—</div>
 
-    <div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">Everything this service knows,
-        assembled into one direction on the candle still forming. Absorption
-        <b>inverts</b> flow: heavy buying that is not moving price is a bearish
-        reading, not a bullish one.</div>
+      <h3 style="margin:14px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Upload chart history</h3>
+      <div class="msg" style="margin-bottom:8px">A CSV or JSON OHLCV export —
+        TradingView, an exchange, anything with time, open, high, low and
+        close. Column names and order are detected. This extends the
+        historical replay past what the exchange API serves, and it trains
+        the candle-geometry signals only: <b>microprice tilt, replenishment,
+        depletion and absorption are not in an OHLCV file at any length</b>,
+        so that half stays where it is and is measured forward instead.</div>
       <div class="conbar">
-        <label>candle <select id="rInt" onchange="loadRead()">
-          <option>1m</option><option>5m</option><option selected>15m</option>
-          <option>30m</option><option>1h</option></select></label>
-        <label>higher TF <select id="rHigh" onchange="loadRead()">
-          <option>15m</option><option>30m</option><option>1h</option>
-          <option selected>4h</option><option>12h</option>
-          <option>1d</option></select></label>
-        <label>alert at <select id="rAlert" onchange="saveAlert()">
-          <option value="0">off</option><option value="0.6">60%</option>
-          <option value="0.7">70%</option><option value="0.8" selected>80%</option>
-          <option value="0.9">90%</option></select> confidence</label>
-        <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
-          poll 10s</label>
-        <label>book window <select id="bkWin" onchange="loadBookCall()">
-          <option value="5">5s</option><option value="10">10s</option>
-          <option value="20" selected>20s</option><option value="60">60s</option>
-        </select></label>
-        <button onclick="startFeed()" id="feedBtn">Go live (websocket)</button>
-        <button onclick="stopFeed()">Stop feed</button>
-        <button onclick="loadRead()">Read now</button>
-        <button onclick="doCalibrate()">Calibrate</button>
+        <input type="file" id="histFile" accept=".csv,.txt,.json,.tsv">
+        <label>merge into <select id="histMerge">
+          <option value="">— new dataset —</option></select></label>
+        <button onclick="uploadHistory()">Upload</button>
       </div>
-      <div id="feedBar" class="msg" style="margin-bottom:8px">Feed off — the
-        current candle is being polled. Go live to build it from the tape instead.</div>
-      <div id="alertBar" class="alertbar" style="display:none"></div>
-      <div id="tfLadder"></div>
-      <div id="tfSay" class="say" style="display:none;margin-bottom:12px"></div>
-      <div id="readHead" class="msg">—</div>
-      <div id="readSignals"></div>
-      <div id="readSay" class="say" style="display:none"></div>
+      <div id="histSay" class="msg" style="margin-bottom:6px">—</div>
+      <div id="histList"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Run a replay</h3>
+      <div class="conbar">
+        <label>source <select id="btSource">
+          <option value="">exchange candles</option></select></label>
+        <label>bars <input id="btBars" type="number" value="1000" min="200" max="5000"
+          step="100" style="width:88px"></label>
+        <label>train split <select id="btSplit">
+          <option value="0.5">50/50</option><option value="0.6" selected>60/40</option>
+          <option value="0.7">70/30</option></select></label>
+        <label><input type="checkbox" id="btTune" checked> search weights</label>
+        <button onclick="runBacktest()">Run backtest</button>
+      </div>
+      <div id="btHead" class="msg">—</div>
+      <div id="btCurve"></div>
+      <div id="btSay" class="say" style="display:none"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Signal weights — edit and apply</h3>
+      <div class="msg" style="margin-bottom:8px">These are the multipliers the
+        live read uses. Running a backtest fills in a tuned set; you can also
+        type your own. Nothing is applied until you press Apply.</div>
+      <div id="wGrid" class="wgrid"></div>
+      <div style="margin-top:8px">
+        <button onclick="applyWeights()">Apply weights</button>
+        <button onclick="resetWeights()">Reset to defaults</button>
+        <button onclick="useTuned()" id="btUseTuned" disabled>Load tuned values</button>
+        <span id="wMsg" class="msg"></span>
+      </div>
     </div>
 
     <div class="panel full" id="agreePanel"><h2>Book vs price — what actually
@@ -3913,81 +4043,17 @@ result from the sweep transfers unchanged."><input type="checkbox"
       </div>
       <div id="agSlice"></div>
     </div>
+  </div>
 
-    <div class="panel full" id="btPanel"><h2>Backtest — measured, not asserted</h2>
-      <div class="msg" style="margin-bottom:8px">Two separate measurements.
-        <b>Historical replay</b> uses real candles pulled from the exchange — the
-        count and date range are shown with the result — split in two by date, with
-        weights tuned on the earlier half only. No exchange serves historical order
-        flow or book depth, so that replay can only measure the candle-structure
-        signals. <b>Forward test</b> is the answer to that: every live read is written
-        down and scored when its candle closes, so flow and absorption get measured
-        too. It fills up as you use the dashboard.</div>
-      <div id="fwd" class="msg" style="margin-bottom:10px">—</div>
+  <div class="grid tabpane" id="tab-book" hidden>
 
-      <h3 style="margin:14px 0 4px;font-size:12px;text-transform:uppercase;
-        letter-spacing:.06em;color:var(--dim)">Upload chart history</h3>
-      <div class="msg" style="margin-bottom:8px">A CSV or JSON OHLCV export —
-        TradingView, an exchange, anything with time, open, high, low and
-        close. Column names and order are detected. This extends the
-        historical replay past what the exchange API serves, and it trains
-        the candle-geometry signals only: <b>microprice tilt, replenishment,
-        depletion and absorption are not in an OHLCV file at any length</b>,
-        so that half stays where it is and is measured forward instead.</div>
-      <div class="conbar">
-        <input type="file" id="histFile" accept=".csv,.txt,.json,.tsv">
-        <label>merge into <select id="histMerge">
-          <option value="">— new dataset —</option></select></label>
-        <button onclick="uploadHistory()">Upload</button>
-      </div>
-      <div id="histSay" class="msg" style="margin-bottom:6px">—</div>
-      <div id="histList"></div>
-
-      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
-        letter-spacing:.06em;color:var(--dim)">Run a replay</h3>
-      <div class="conbar">
-        <label>source <select id="btSource">
-          <option value="">exchange candles</option></select></label>
-        <label>bars <input id="btBars" type="number" value="1000" min="200" max="5000"
-          step="100" style="width:88px"></label>
-        <label>train split <select id="btSplit">
-          <option value="0.5">50/50</option><option value="0.6" selected>60/40</option>
-          <option value="0.7">70/30</option></select></label>
-        <label><input type="checkbox" id="btTune" checked> search weights</label>
-        <button onclick="runBacktest()">Run backtest</button>
-      </div>
-      <div id="btHead" class="msg">—</div>
-      <div id="btCurve"></div>
-      <div id="btSay" class="say" style="display:none"></div>
-
-      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
-        letter-spacing:.06em;color:var(--dim)">Signal weights — edit and apply</h3>
-      <div class="msg" style="margin-bottom:8px">These are the multipliers the
-        live read uses. Running a backtest fills in a tuned set; you can also
-        type your own. Nothing is applied until you press Apply.</div>
-      <div id="wGrid" class="wgrid"></div>
-      <div style="margin-top:8px">
-        <button onclick="applyWeights()">Apply weights</button>
-        <button onclick="resetWeights()">Reset to defaults</button>
-        <button onclick="useTuned()" id="btUseTuned" disabled>Load tuned values</button>
-        <span id="wMsg" class="msg"></span>
-      </div>
-    </div>
-
-    <div class="panel full" id="conPanel"><h2>Who is winning, and which way<span class="stamp" id="conStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">Of the wallets holding this coin right now,
-        how much winning money is on each side — and how much worse you would enter than
-        they did.</div>
-      <div class="conbar">
-        <label><input type="checkbox" id="winOnly" checked onchange="loadConsensus()">
-          winners only</label>
-        <label>min position $<input id="minNot" type="number" value="0" step="10000"
-          style="width:96px" onchange="loadConsensus()"></label>
-        <label>min account $<input id="minAcct" type="number" value="0" step="100000"
-          style="width:110px" onchange="loadConsensus()"></label>
-      </div>
-      <div id="consensus" class="msg">—</div>
-      <div id="conTraders"></div>
+    <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
+      <span class="stamp" id="bookStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">The order book is the structure.
+        No trend, no higher timeframe, no VWAP. Updates on every book push.</div>
+      <div id="bookHead" class="msg">Press <b>Go live</b> to open the book feed.</div>
+      <div id="bookComps"></div>
+      <div id="bookSay" class="say" style="display:none"></div>
     </div>
 
     <div class="panel full" id="liqPanel"><h2>Liquidity — what it costs and who is winning the level<span class="stamp" id="liqStamp"></span></h2>
@@ -4013,17 +4079,41 @@ result from the sweep transfers unchanged."><input type="checkbox"
       <div id="liqShelves"></div>
     </div>
 
+    <div class="panel full" id="conPanel"><h2>Who is winning, and which way<span class="stamp" id="conStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Of the wallets holding this coin right now,
+        how much winning money is on each side — and how much worse you would enter than
+        they did.</div>
+      <div class="conbar">
+        <label><input type="checkbox" id="winOnly" checked onchange="loadConsensus()">
+          winners only</label>
+        <label>min position $<input id="minNot" type="number" value="0" step="10000"
+          style="width:96px" onchange="loadConsensus()"></label>
+        <label>min account $<input id="minAcct" type="number" value="0" step="100000"
+          style="width:110px" onchange="loadConsensus()"></label>
+      </div>
+      <div id="consensus" class="msg">—</div>
+      <div id="conTraders"></div>
+    </div>
+  </div>
+
+  <div class="grid tabpane" id="tab-wall" hidden>
+
     <div class="panel"><h2>Status</h2><div id="status" class="msg">—</div>
       <div id="firstrun" class="msg"></div></div>
+
     <div class="panel"><h2>Conviction flow · 24h</h2><div id="flow" class="msg">—</div></div>
 
     <div class="panel full"><h2>Position changes — DEFENDED is the one to watch</h2>
       <div id="changes" class="msg">—</div></div>
 
     <div class="panel"><h2>Raw map — where leverage sits</h2><pre id="mapRaw">—</pre></div>
+
     <div class="panel"><h2>Fragility-weighted — where pressure is</h2><pre id="mapW">—</pre></div>
 
     <div class="panel full"><h2>Positions</h2><div id="pos" class="msg">—</div></div>
+  </div>
+
+  <div class="grid tabpane" id="tab-setup" hidden>
 
     <div class="panel full"><h2>Settings</h2>
       <div id="settings" class="msg">—</div>
@@ -4032,6 +4122,7 @@ result from the sweep transfers unchanged."><input type="checkbox"
 
     <div class="panel full"><h2>Validation report</h2><pre id="report">—</pre></div>
   </div>
+
 </div>
 <script>
 const $ = id => document.getElementById(id);
@@ -4508,6 +4599,20 @@ function paintPosition(p) {
     + 'Close it by hand</button></div>';
 }
 
+async function dropSuspect() {
+  try { await api('/api/ledger/clear?suspect_only=true', {method: 'POST'}); }
+  catch (e) { return; }
+  loadScorecard();
+}
+
+async function clearBook() {
+  if (!confirm('Delete every paper trade and decision, and start counting '
+               + 'from now? This cannot be undone.')) return;
+  try { await api('/api/ledger/clear', {method: 'POST'}); }
+  catch (e) { $('apState').textContent = e.message; return; }
+  loadAutopilot();
+}
+
 async function closePaper(id) {
   try { await api('/api/autopilot/close?' + q({id}), {method: 'POST'}); }
   catch (e) { $('apState').textContent = e.message; return; }
@@ -4591,7 +4696,18 @@ async function loadScorecard() {
   if (!d.ok) return;
 
   const o = d.overall;
-  $('apHead').innerHTML = `<b>${esc(d.headline)}</b>`;
+  // A result that cannot be true poisons every average it sits in, and
+  // there is no way to tell afterwards which numbers were real.
+  const bad = (d.suspect || 0);
+  $('apHead').innerHTML =
+    (bad ? `<div class="msg" style="color:var(--down)"><b>${bad} trade`
+           + `${bad === 1 ? '' : 's'} in this book cannot be true</b> — a `
+           + 'move that size is a bug, not a result, and it is dragging '
+           + 'every number below it. '
+           + '<button onclick="dropSuspect()">Drop them</button> or '
+           + '<button onclick="clearBook()">clear the book</button>.</div>'
+         : '')
+    + `<b>${esc(d.headline)}</b>`;
 
   $('apStats').innerHTML = '<div class="conrow">'
     + `<div class="stat"><b>${o.n}</b><span>closed</span></div>`
@@ -4792,7 +4908,7 @@ async function runSweep() {
   $('swGrid').innerHTML = '';
   $('swShapes').innerHTML = '';
   let d;
-  try { d = await api('/api/sweep?' + q(swCfg())); }
+  try { d = await api('/api/grid?' + q(swCfg())); }
   catch (e) { $('swVerdict').textContent = e.message; return; }
 
   if (!d.ok) {
@@ -4896,6 +5012,37 @@ function paintShapes(d) {
             : (r.n < 30 ? 'too few to read' : 'inside the noise')}</td>`
         + '</tr>').join('')
     + '</tbody></table>';
+}
+
+/* ---- tabs -------------------------------------------------------------
+
+   The chart lives on a canvas, and a canvas that was laid out while its
+   tab was hidden has no usable width. So the dashboard redraws on show
+   rather than trusting whatever size it had when nobody could see it.
+   ------------------------------------------------------------------- */
+
+const TAB_KEYS = ['dash', 'test', 'book', 'wall', 'setup'];
+
+function showTab(key) {
+  for (const k of TAB_KEYS) {
+    const pane = $('tab-' + k), btn = $('tabbtn-' + k);
+    if (!pane) continue;
+    pane.hidden = k !== key;
+    if (btn) btn.classList.toggle('on', k === key);
+  }
+  try { localStorage.setItem('liqmap_tab', key); } catch (e) {}
+  if (key === 'dash') {
+    // drawChart reads clientWidth and resizes the backing store itself,
+    // so one call is enough -- but it MUST happen after the pane is
+    // visible, or it measures zero and draws nothing.
+    try { drawChart(); } catch (e) {}
+  }
+}
+
+function restoreTab() {
+  let k = 'dash';
+  try { k = localStorage.getItem('liqmap_tab') || 'dash'; } catch (e) {}
+  showTab(TAB_KEYS.includes(k) ? k : 'dash');
 }
 
 async function loadSuggest() {
@@ -5603,53 +5750,76 @@ function drawChart() {
     }
   });
 
-  // the agent's trades, entry through exit
+  // the agent's trades, drawn ON the candle
+  //
+  // TradingView's convention, and it is the right one: the marker sits
+  // just clear of the bar's low or high rather than at the entry price.
+  // At the price it lands on the candle body and hides the thing you are
+  // trying to verify -- and the whole point of a per-candle mark is that
+  // the candle underneath it stays readable.
   for (const m of marks) {
-    const i = markIndex(m, s), x = xOf(i);
+    const i = markIndex(m, s);
+    if (i < 0 || i >= bars.length) continue;
+    const b = bars[i], x = xOf(i);
     const long = m.side === 'long', c = long ? up : down;
     const xi = exitIndex(m, s);
-    const xe = xi == null ? null : xOf(xi);
+    const xe = (xi != null && xi >= 0 && xi < bars.length) ? xOf(xi) : null;
 
-    // Target and stop, spanning the life of the trade rather than a fixed
-    // stub, so you can see which one price actually reached.
-    const right = xe == null ? x + step * 2.2 : Math.max(xe, x + step * 0.5);
-    g.strokeStyle = c; g.globalAlpha = 0.4; g.setLineDash([2, 3]);
+    // Target and stop, faint, across the life of the trade.
+    const right = xe == null ? x + step * 2 : Math.max(xe, x + step * 0.5);
+    g.strokeStyle = c; g.globalAlpha = 0.22; g.setLineDash([2, 4]);
     for (const p of [m.target, m.stop]) {
       if (!p) continue;
       g.beginPath();
-      g.moveTo(x - step * 0.4, y(p)); g.lineTo(right, y(p));
-      g.stroke();
+      g.moveTo(x - step * 0.4, y(p)); g.lineTo(right, y(p)); g.stroke();
     }
     g.setLineDash([]); g.globalAlpha = 1;
 
-    const yy = y(m.entry);
-
-    // Entry to exit, so the hold shows as a line you can read length off.
-    if (xe != null && m.exit_px) {
-      g.strokeStyle = m.won ? up : down;
-      g.globalAlpha = 0.7; g.lineWidth = 1.5;
-      g.beginPath(); g.moveTo(x, yy); g.lineTo(xe, y(m.exit_px)); g.stroke();
-      g.lineWidth = 1; g.globalAlpha = 1;
-    }
-
-    // The entry triangle: filled once the trade is done, hollow while it
-    // is still running.
+    // Entry: below the low going long, above the high going short.
+    const ay = long ? y(b.l) + 12 : y(b.h) - 12;
+    const tip = long ? ay - 7 : ay + 7;
     g.beginPath();
-    if (long) { g.moveTo(x, yy + 9); g.lineTo(x - 5, yy + 18); g.lineTo(x + 5, yy + 18); }
-    else { g.moveTo(x, yy - 9); g.lineTo(x - 5, yy - 18); g.lineTo(x + 5, yy - 18); }
+    g.moveTo(x, tip);
+    g.lineTo(x - 5.5, ay); g.lineTo(x + 5.5, ay);
     g.closePath();
     g.fillStyle = c; g.strokeStyle = c; g.lineWidth = 1.5;
     if (m.open) g.stroke(); else g.fill();
     g.lineWidth = 1;
 
-    // The exit dot: coloured by WON or LOST, not by which level it was.
-    // Hitting the target is not the question; keeping money is.
-    if (xe != null && m.exit_px) {
-      g.fillStyle = m.won ? up : down;
-      g.strokeStyle = panel; g.lineWidth = 1.5;
-      g.beginPath(); g.arc(xe, y(m.exit_px), 3.5, 0, Math.PI * 2);
-      g.fill(); g.stroke(); g.lineWidth = 1;
-    }
+    // The side, spelled out. A triangle alone needs a legend; a letter
+    // does not, and this is the mark you glance at mid-trade.
+    g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+    g.textAlign = 'center';
+    g.fillStyle = c;
+    g.fillText(long ? 'L' : 'S', x, long ? ay + 10 : ay - 4);
+    g.font = '10px ui-sans-serif,system-ui,sans-serif';
+
+    if (xe == null || !m.exit_px) continue;
+
+    // Exit: same convention on ITS candle, coloured by won or lost.
+    const eb = bars[xi];
+    const ok = !!m.won;
+    const ec = ok ? up : down;
+    const ey = long ? y(eb.h) - 11 : y(eb.l) + 11;
+
+    // A hairline from entry to exit, so a trade reads as one object
+    // without competing with the candles.
+    g.strokeStyle = ec; g.globalAlpha = 0.35; g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(x, ay); g.lineTo(xe, ey); g.stroke();
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    g.fillStyle = ec; g.strokeStyle = panel; g.lineWidth = 1.5;
+    g.beginPath(); g.arc(xe, ey, 4, 0, Math.PI * 2);
+    g.fill(); g.stroke(); g.lineWidth = 1;
+    // The result, as the number. "L" at the exit would have meant loss
+    // while "L" at the entry means long -- the same letter for two
+    // different things on the same chart.
+    g.fillStyle = ec;
+    g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+    const net = m.net_bps == null ? (ok ? 'win' : 'loss')
+      : (m.net_bps >= 0 ? '+' : '') + Number(m.net_bps).toFixed(0);
+    g.fillText(net, xe, long ? ey - 7 : ey + 14);
+    g.font = '10px ui-sans-serif,system-ui,sans-serif';
   }
 
   // crosshair and readout
@@ -6541,6 +6711,9 @@ async function doResolve() {
     loadReport();
   } catch (e) { note(e.message, true); }
 }
+
+// Last thing on the page: pick up whichever tab was open last time.
+restoreTab();
 </script></body></html>
 """
 

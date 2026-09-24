@@ -413,7 +413,44 @@ them back on when you want to compare.
 There is a test that settles the same bar through both paths and fails if
 they disagree.
 
+### One screen at a time
+
+The page had grown to seventeen panels in a single column, which meant the
+three you actually watch were separated by a screenful of things you were
+not. They are now five tabs, and the tab you were on is remembered:
+
+- **Dashboard** — the call, the agent's own book, the live candle read
+- **Testing** — the target/stop grid, the backtest, the agreement table
+- **Book & liquidity** — the book call, liquidity, consensus
+- **Wallets** — sweeps, positions, the leverage map
+- **Settings** — settings and the validation report
+
+One trap worth recording: a pane carrying `.grid{display:grid}` stays on
+screen even with the `hidden` attribute set, because an author rule beats
+the browser's own `[hidden]{display:none}`. Every tab reported itself
+hidden and every panel was still drawn. `.tabpane[hidden]{display:none}`
+states it explicitly, and a test pins it.
+
 ### What the chart shows
+
+Markers are the **agent's own trades**, drawn **on the candle** the way
+TradingView does it — just clear of the bar's low going long, its high
+going short. Not at the entry price: at the price the marker lands on the
+body and hides the bar you are trying to verify, and the point of a
+per-candle mark is that the candle underneath stays readable.
+
+    L   went long, under the bar
+    S   went short, over the bar
+    ●   the exit, on ITS own candle, labelled with the net bps
+
+The exit used to be labelled W or L, which collided with L for long. It
+carries the number instead, which is less ambiguous and more useful.
+
+Hovering either end gives the whole trade: side, why it was taken in
+words, the levels, whether it won, how it ended, net after cost, how long
+it held.
+
+
 
 Markers are the **agent's own trades**, not the old suggestion table.
 
@@ -435,6 +472,32 @@ WIN — target  +28.0bps net
 out at 3,458.82
 held 45m   best +30.0bps
 ```
+
+### The missing mark, and what one bad exit did
+
+Worth recording because the symptom looked nothing like the cause.
+
+`suggest` only sets `entry` on candles it is willing to trade. The agent no
+longer cares what `suggest` thinks — it votes — but it was still reading
+its price out of that field, so on every refused candle it saw **zero**.
+
+Two things followed:
+
+- It stood aside with `no_read` on 37% of polls while holding a perfectly
+  good vote.
+- An invalidation exit closed **at zero**, which is a 10,000 basis point
+  move. One of those in a book of five put `+2494bps a trade` and an
+  `average R of 249.75` on the scorecard.
+
+Fixed in three places, because one was not enough: the payload now always
+carries a mark (book mid, else the forming bar's close, else the last
+bar's); the agent holds rather than closing when it has no usable price;
+and the ledger refuses to write a closed trade at a non-positive price at
+all. A bad row that reaches the database hides inside an average where it
+is very hard to find again.
+
+There is a **Clear the book** button for exactly this, and the scorecard
+now counts trades whose result cannot be true and offers to drop them.
 
 ### Tuning, once there are no gates left
 

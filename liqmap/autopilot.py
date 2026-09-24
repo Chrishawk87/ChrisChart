@@ -69,6 +69,7 @@ That list is enforced by a test, not by good intentions.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal
 
@@ -339,7 +340,7 @@ class Autopilot:
         """
         dt = self._elapsed(now)
         self._last_step = now
-        price = float(payload.get("entry") or payload.get("price") or 0.0)
+        price = float(payload.get("price") or payload.get("entry") or 0.0)
         if price <= 0:
             book = payload.get("book") or {}
             price = float(book.get("mid") or 0.0)
@@ -421,6 +422,20 @@ class Autopilot:
 
     def _close(self, pos: OpenPosition, px: float, reason: ExitReason,
                now: float, words: str) -> Decision:
+        """Close at `px` -- unless `px` cannot possibly be a price.
+
+        Closing at zero is a 10,000 basis point move, and one of those in a
+        book of five makes every average downstream meaningless. A missing
+        mark is a reason to keep holding and look again next poll, never a
+        reason to book a result.
+        """
+        if px <= 0 or not math.isfinite(px):
+            pos.against_s = 0.0
+            return Decision(
+                action="hold", side=pos.side, price=0.0, position=pos,
+                reason=("no usable price this poll — holding rather than "
+                        "booking a result against a missing mark"))
+
         closed = self.ledger.close_position(pos, exit_px=px, reason=reason,
                                             now=now)
         self.position = None
