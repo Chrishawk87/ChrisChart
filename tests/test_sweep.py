@@ -384,3 +384,40 @@ def test_level_readiness_counts_signals_not_trades():
     r = tuner.level_readiness(10)
     assert r["ready"] is False and "10 signals" in r["note"]
     assert tuner.level_readiness(500)["ready"] is True
+
+
+# ------------------------------------------- the candle is the whole life
+
+def test_the_grid_closes_a_trade_when_its_candle_does():
+    """The rule the live agent runs, so a grid result transfers."""
+    quiet = bars(*[(100, 100.02, 99.98, 100.0)] * 30)
+    reason, px, held = sw.resolve("long", 100.0, 500.0, 500.0, quiet,
+                                  deadline=quiet[5].ts)
+    assert reason == "candle_end"
+    assert held == 5
+
+
+def test_a_level_inside_the_candle_still_wins():
+    b = bars((100, 100.01, 99.99, 100.0),
+             (100, 101.0, 99.99, 100.9),
+             (100, 100.01, 99.99, 100.0))
+    reason, _, _ = sw.resolve("long", 100.0, 50.0, 500.0, b,
+                              deadline=b[2].ts)
+    assert reason == "target"
+
+
+def test_without_a_deadline_nothing_changes():
+    quiet = bars(*[(100, 100.02, 99.98, 100.0)] * 5)
+    assert sw.resolve("long", 100.0, 500.0, 500.0, quiet)[0] == "timeout"
+
+
+def test_expiries_are_counted_separately_from_timeouts():
+    b = _walk()
+    sigs = [sw.Signal(ts=x.ts, coin="ETH", interval="15m", side="long",
+                      entry=x.close, agreeing=3, shape="3-0",
+                      deadline=x.ts + 300)
+            for i, x in enumerate(b[:200]) if i % 10 == 0]
+    out = sw.run(sigs, b, [200], [200])
+    c = out["cells"][0]
+    assert c["expiries"] > 0
+    assert c["targets"] + c["stops"] + c["timeouts"] + c["expiries"] == c["n"]

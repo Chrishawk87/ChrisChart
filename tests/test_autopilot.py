@@ -220,20 +220,45 @@ def test_a_level_beats_everything_else(ledger):
     assert d.action == "exit" and d.closed["reason"] == "target"
 
 
-def test_a_quiet_trade_eventually_times_out(ledger):
-    p = Autopilot("ETH", "15m", ledger, exit_on_invalidation=True,
-                  knobs=Knobs(max_hold_bars=1.0, invalidate_s=999.0))
-    p.step(payload(), now=0.0)
-    d = p.step(payload(direction="flat"), now=1000.0)   # > one 900s bar
-    assert d.action == "exit" and d.closed["reason"] == "time"
+def test_a_trade_never_outlives_its_candle(ledger):
+    """A five minute trade lasts five minutes.
+
+    The position was opened on one candle's book, delta and price. Once
+    that candle closes the reading it rests on no longer exists, and a
+    trade allowed to run on is claiming a result the NEXT candle's signal
+    should have had to earn.
+    """
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=999.0))
+    p.step(payload(candle_ts=9000.0), now=9100.0)
+    assert p.position is not None
+    assert p.step(payload(candle_ts=9000.0, direction="flat"),
+                  now=9800.0).action == "hold"
+    d = p.step(payload(candle_ts=9000.0, direction="up"), now=9901.0)
+    assert d.action == "exit" and d.closed["reason"] == "candle_end"
+
+
+def test_the_deadline_comes_from_the_candle_it_opened_on(ledger):
+    """A signal firing forty seconds before the close gets forty seconds,
+    not a fresh full bar measured from entry."""
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=999.0))
+    p.step(payload(candle_ts=9000.0), now=9860.0)
+    d = p.step(payload(candle_ts=9000.0), now=9910.0)
+    assert d.action == "exit" and d.closed["reason"] == "candle_end"
+
+
+def test_a_one_minute_trade_lasts_one_minute(ledger):
+    p = Autopilot("ETH", "1m", ledger, knobs=Knobs(invalidate_s=999.0))
+    pl = dict(payload(candle_ts=600.0), interval_s=60.0, candle_end=660.0)
+    p.step(pl, now=610.0)
+    assert p.step(pl, now=650.0).action == "hold"
+    assert p.step(pl, now=661.0).closed["reason"] == "candle_end"
 
 
 def test_dead_money_and_being_wrong_are_different_rows(ledger):
     p = Autopilot("ETH", "15m", ledger, exit_on_invalidation=True,
-                  knobs=Knobs(stale_s=50.0, invalidate_s=999.0,
-                              max_hold_bars=99.0))
-    p.step(payload(), now=0.0)
-    d = p.step(payload(direction="flat"), now=60.0)
+                  knobs=Knobs(stale_s=50.0, invalidate_s=999.0))
+    p.step(payload(candle_ts=9000.0), now=9010.0)
+    d = p.step(payload(candle_ts=9000.0, direction="flat"), now=9070.0)
     assert d.action == "exit" and d.closed["reason"] == "time"
 
 
@@ -421,7 +446,7 @@ def test_loosening_is_never_proposed():
 
 def test_exit_knobs_are_not_proposed_from_outcomes():
     """They change what happens DURING a trade; replaying needs the path."""
-    for name in ("invalidate_s", "max_hold_bars", "stale_s"):
+    for name in ("invalidate_s", "stale_s"):
         assert name not in tuner_mod.EVALUABLE
         assert name in tuner_mod.NOT_EVALUABLE
         assert tuner_mod.evaluate(name, _book(200), Knobs()) == []

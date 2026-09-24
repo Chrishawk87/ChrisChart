@@ -119,8 +119,6 @@ KNOBS: dict[str, Knob] = {k.name: k for k in (
          "how many of the three columns must point the same way"),
     Knob("invalidate_s", 6.0, 2.0, 40.0, 2.0, True,
          "how long the read must be against a position before it exits"),
-    Knob("max_hold_bars", 3.0, 1.0, 12.0, 1.0, True,
-         "how many bars it will hold before giving up on a quiet trade"),
     Knob("stale_s", 90.0, 20.0, 600.0, 20.0, True,
          "how long a position's read may be flat before it is dead money"),
     # The two that matter most, and the two the ledger cannot judge --
@@ -142,7 +140,6 @@ class Knobs:
     min_agreement_s: float = 4.0
     min_agreeing: float = 2.0
     invalidate_s: float = 6.0
-    max_hold_bars: float = 3.0
     stale_s: float = 90.0
     tp_bps: float = 20.0
     sl_bps: float = 15.0
@@ -288,6 +285,29 @@ class Autopilot:
             return float(left) / (1.0 - frac)
         return 900.0
 
+    def _deadline(self, pos: OpenPosition, payload: dict) -> float:
+        """When this position must be flat, whatever else is happening.
+
+        Taken from the candle it was OPENED on, not from the clock at
+        entry: a signal that fires forty seconds before the close gets
+        forty seconds, which is the honest amount of time its reading is
+        good for.
+        """
+        end = payload.get("candle_end")
+        if isinstance(end, (int, float)) and end > 0 and pos.candle_ts:
+            # Only trust it while it still describes the position's own
+            # candle; by the next poll the payload has moved on.
+            if end - pos.candle_ts <= self._interval_s(payload) * 1.5:
+                if end > pos.candle_ts:
+                    return float(end)
+        if pos.candle_ts:
+            return pos.candle_ts + self._interval_s(payload)
+        return 0.0
+
+    @staticmethod
+    def _interval_word(payload: dict) -> str:
+        return str(payload.get("interval") or "")
+
     def _gate_for(self, payload: dict) -> tuple[str | None, str]:
         """The agent's own entry gates, on top of `suggest`'s.
 
@@ -398,20 +418,30 @@ class Autopilot:
 
         # 3. Dead money. Not wrong, just nothing happening. Recorded
         #    separately because it has a different fix.
+        # THE CANDLE IS THE TRADE'S WHOLE LIFE.
+        #
+        # A five minute trade lasts five minutes. It was opened on the
+        # strength of one candle's book, delta and price, and once that
+        # candle closes the reading it rests on no longer exists -- the
+        # position is riding a signal that has already expired.
+        #
+        # This is also what keeps the grid honest. Every candle is its own
+        # independent test, so a trade that runs into the next one is
+        # borrowing a result the next candle's signal should have earned.
+        deadline = self._deadline(pos, payload)
+        if deadline and now >= deadline:
+            return self._close(
+                pos, price, "candle_end", now,
+                f"the {self._interval_word(payload)} candle it was opened "
+                f"on has closed — the read it was riding is over")
+
         quiet = read_dir == "flat"
-        interval_s = self._interval_s(payload)
         held = now - pos.opened_at
         if (self.exit_on_invalidation and quiet
                 and held >= self.knobs.stale_s and abs(pos.mfe_bps) < 1e-9):
             return self._close(pos, price, "time", now,
                                f"flat for {held:.0f}s and never went "
                                f"in front — dead money")
-
-        if held >= self.knobs.max_hold_bars * interval_s:
-            return self._close(
-                pos, price, "time", now,
-                f"held {self.knobs.max_hold_bars:.0f} bars without "
-                f"resolving")
 
         room = pos.signed_bps(price)
         return Decision(

@@ -51,7 +51,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Sequence
 
 Side = Literal["long", "short"]
-Reason = Literal["target", "stop", "timeout"]
+Reason = Literal["target", "stop", "timeout", "candle_end"]
 
 # A grid bigger than this is a mistake in the box, not a research plan.
 MAX_CELLS = 900
@@ -71,6 +71,9 @@ class Signal:
     agreeing: int = 0
     against: int = 0
     shape: str = ""
+    # When the candle this fired on closes. The trade ends there whatever
+    # price is doing -- see `resolve`.
+    deadline: float = 0.0
     net: float = 0.0
     book: float = 0.0
     delta: float = 0.0
@@ -93,9 +96,20 @@ class Bar:
 
 
 def resolve(side: Side, entry: float, tp_bps: float, sl_bps: float,
-            bars: Sequence[Bar], horizon: int = DEFAULT_HORIZON
-            ) -> tuple[Reason, float, int]:
-    """Walk forward until a level is touched. Stop wins inside a bar."""
+            bars: Sequence[Bar], horizon: int = DEFAULT_HORIZON,
+            deadline: float = 0.0) -> tuple[Reason, float, int]:
+    """Walk forward until a level is touched, or the candle closes.
+
+    `deadline` is when the signal's own candle ends. A trade never outlives
+    it: the position was opened on one candle's reading, and once that
+    candle is closed the reading it rests on has expired. A five minute
+    trade lasts five minutes.
+
+    That is not a risk rule bolted on, it is what makes the grid mean
+    anything -- every candle is an independent test, and a trade allowed to
+    run into the next one is claiming a result the next candle's signal
+    should have earned.
+    """
     if entry <= 0 or not bars:
         return ("timeout", entry, 0)
 
@@ -103,7 +117,12 @@ def resolve(side: Side, entry: float, tp_bps: float, sl_bps: float,
     target = entry * (1 + sgn * tp_bps / 10_000.0)
     stop = entry * (1 - sgn * sl_bps / 10_000.0)
 
+    last_ok = bars[0]
     for i, b in enumerate(bars[:horizon]):
+        # Past the close of its own candle: out at the last price inside it.
+        if deadline and b.ts >= deadline:
+            return ("candle_end", last_ok.close, max(1, i))
+        last_ok = b
         if side == "long":
             hit_stop = b.low <= stop
             hit_target = b.high >= target
@@ -132,6 +151,7 @@ class Cell:
     targets: int = 0
     stops: int = 0
     timeouts: int = 0
+    expiries: int = 0
     wins: int = 0
     net_sum: float = 0.0
     net_sq: float = 0.0
@@ -147,6 +167,8 @@ class Cell:
             self.targets += 1
         elif reason == "stop":
             self.stops += 1
+        elif reason == "candle_end":
+            self.expiries += 1
         else:
             self.timeouts += 1
 
@@ -196,7 +218,7 @@ class Cell:
             "tp_bps": round(self.tp_bps, 2), "sl_bps": round(self.sl_bps, 2),
             "rr": self.rr, "n": self.n, "wins": self.wins,
             "targets": self.targets, "stops": self.stops,
-            "timeouts": self.timeouts,
+            "timeouts": self.timeouts, "expiries": self.expiries,
             "hit_rate": round(self.hit_rate, 4),
             "breakeven": round(self.breakeven, 4),
             "expectancy": round(self.expectancy, 3),
@@ -274,7 +296,8 @@ def run(signals: Sequence[Signal], bars: Sequence[Bar],
     for cell in cells:
         for s, window in windows:
             reason, exit_px, held = resolve(s.side, s.entry, cell.tp_bps,
-                                            cell.sl_bps, window, horizon)
+                                            cell.sl_bps, window, horizon,
+                                            deadline=s.deadline)
             raw = (exit_px - s.entry) / s.entry * 10_000.0
             gross = raw if s.side == "long" else -raw
             cell.add(reason, gross - cost_bps, held)

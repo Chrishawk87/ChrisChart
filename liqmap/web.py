@@ -731,6 +731,8 @@ class Runtime:
         if mark <= 0 and recent:
             mark = recent[-1].close
         payload["price"] = mark
+        payload["interval_s"] = interval_s
+        payload["candle_end"] = candle_end
         payload["feed_age_s"] = feed.age
         payload["book_updates"] = feed.book_updates
         payload["three_way"] = three.to_dict()
@@ -1220,6 +1222,7 @@ class Runtime:
                 coin=r["coin"], interval=r["interval"], side=v.side,
                 entry=float(r["price"]), agreeing=v.agreeing,
                 against=v.against, shape=v.shape(), net=v.net,
+                deadline=float(r.get("candle_end") or 0.0),
                 book=v.book, delta=v.delta, price=v.price))
         return out
 
@@ -1299,7 +1302,7 @@ class Runtime:
                 cost_bps=cost_bps))
             reason, exit_px, held = sweep_mod.resolve(
                 s.side, s.entry, best["tp_bps"], best["sl_bps"], window,
-                horizon)
+                horizon, deadline=s.deadline)
             raw = (exit_px - s.entry) / s.entry * 10_000.0
             gross = raw if s.side == "long" else -raw
             cell.add(reason, gross - cost_bps, held)
@@ -3489,6 +3492,15 @@ DASHBOARD = """<!doctype html>
   button:hover{border-color:var(--accent)}
   button.go{background:var(--accent);color:#14171b;border-color:var(--accent);font-weight:600}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  .chart-tools{display:flex;gap:3px;align-items:center;margin-bottom:5px}
+  .chart-tools button{background:transparent;border:1px solid var(--line);
+                      color:var(--dim);width:26px;height:24px;padding:0;
+                      border-radius:4px;cursor:pointer;font-size:13px;
+                      line-height:1;font-family:inherit}
+  .chart-tools button:hover{color:var(--ink);border-color:var(--dim)}
+  .chart-tools button.on{color:var(--bg);background:var(--accent);
+                         border-color:var(--accent)}
+  .chart-tools button:not([id]){width:auto;padding:0 8px;font-size:11px}
   .chart-key{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:6px;
        font-size:11px;color:var(--dim);align-items:center}
   .chart-key span{display:inline-flex;align-items:center;gap:5px}
@@ -3758,8 +3770,24 @@ DASHBOARD = """<!doctype html>
       <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
       <div id="sugThree" style="display:none;margin-bottom:10px"></div>
       <div id="chartWrap" style="display:none;margin-bottom:12px">
-        <canvas id="sugChart" height="300"
-          style="width:100%;height:300px;display:block;
+        <div class="chart-tools">
+          <button id="tool-cursor" class="on"
+            onclick="pickTool('cursor')" title="Crosshair">✛</button>
+          <button id="tool-hline" onclick="pickTool('hline')"
+            title="Horizontal line — click a price">─</button>
+          <button id="tool-trend" onclick="pickTool('trend')"
+            title="Trendline — drag from one point to another">╱</button>
+          <button id="tool-erase" onclick="pickTool('erase')"
+            title="Erase — click the line you want gone">⌫</button>
+          <button onclick="clearShapes()" title="Remove every line you have
+drawn on this market and timeframe">clear</button>
+          <button onclick="resetChartView()" title="Back to the last 90 bars
+at normal scale">fit</button>
+          <span class="thin" style="margin-left:6px">lines are kept per
+            market and timeframe, in this browser</span>
+        </div>
+        <canvas id="sugChart" height="380"
+          style="width:100%;height:380px;display:block;
                  border:1px solid var(--line);border-radius:4px"></canvas>
         <!-- A legend, not a caption. Identity is never carried by colour
              alone: filled vs hollow says taken vs ignored, and the arrow
@@ -3767,15 +3795,15 @@ DASHBOARD = """<!doctype html>
         <div class="chart-key">
           <span><b style="color:var(--up)">L</b> went long — marker under
             the bar</span>
-          <span><b style="color:var(--down)">S</b> went short — marker over
-            the bar</span>
-          <span><b style="color:var(--up)">●&thinsp;+28</b> closed a winner,
-            net bps</span>
-          <span><b style="color:var(--down)">●&thinsp;&minus;15</b> closed a
-            loser</span>
+          <span><b style="color:var(--down)">S</b> went short — over the
+            bar</span>
+          <span><b style="color:var(--up)">●&thinsp;+28</b> exit, net bps</span>
           <span>hollow triangle = still open</span>
           <span><i class="k-dash"></i>target and stop</span>
-          <span><i class="k-box"></i>bar still forming</span>
+          <span>dashed line across = last price</span>
+          <span>lower pane = volume</span>
+          <span><i class="k-box"></i>bar still forming, with its countdown
+            in the corner</span>
         </div>
         <div id="chartNote" class="msg" style="margin-top:4px"></div>
       </div>
@@ -3899,8 +3927,9 @@ be true.">Clear the book</button>
           <input id="swSlTo" value="40" size="3">step
           <input id="swSlStep" value="5" size="3">bps</label>
         <label>round-trip fee <input id="swFee" value="0" size="3">bps</label>
-        <label>give it <input id="swHorizon" value="60" size="3">
-          minutes</label>
+        <label title="Every trade ends when its own candle closes — a 5m
+signal gets five minutes. Nothing here can change that.">holds
+          <b>until its candle closes</b></label>
         <label>votes <select id="swAgree">
           <option value="0" selected>any — every signal</option>
           <option value="2">2 of 3 or better</option>
@@ -4879,7 +4908,6 @@ function swCfg() {
     sl_to: parseFloat($('swSlTo').value || '40'),
     sl_step: parseFloat($('swSlStep').value || '5'),
     cost_bps: parseFloat($('swFee').value || '0'),
-    horizon: parseInt($('swHorizon').value || '60', 10),
     min_agreeing: parseInt($('swAgree').value || '0', 10),
     side: $('swSide').value,
   };
@@ -4924,7 +4952,7 @@ async function runSweep() {
   $('swVerdict').innerHTML = `<b>${esc(d.verdict)}</b>`;
   $('swAvail').innerHTML = `<b>${d.available} signals</b> available, `
     + `${d.signals} with price after them. Cost ${d.cost_bps}bps a round `
-    + `trip, ${d.horizon} minutes given to each trade.`;
+    + 'trip, and every trade ends when its own candle closes.';
   paintHeat(d);
   paintShapes(d);
 }
@@ -4952,7 +4980,8 @@ function paintHeat(d) {
         + `honest range ${c.ci_low} to ${c.ci_high}\n`
         + `hit ${(c.hit_rate*100).toFixed(0)}% · needs `
         + `${(c.breakeven*100).toFixed(0)}%\n`
-        + `${c.targets} targets, ${c.stops} stops, ${c.timeouts} ran out\n`
+        + `${c.targets} targets, ${c.stops} stops, `
+        + `${c.expiries || 0} ran out of candle\n`
         + `held ${c.avg_bars} min on average`;
       h += `<td class="${cls}" style="background:`
         + `${heatColor(c.expectancy, scale)}" title="${esc(tip)}">`
@@ -5582,53 +5611,77 @@ async function doCalibrate() {
 }
 
 /* ---- the live chart, drawn from OUR OWN data -------------------------
-   Candles the feed built from fills, and the calls that fired on them, on
-   one canvas. A chart drawn from the same bars the signals were computed
-   on cannot disagree with them — so when a marker looks wrong here, it IS
-   wrong, which is the entire reason to look.                            */
+   Candles the feed built from fills, and the trades the agent took, on one
+   canvas. A chart drawn from the same bars the signals were computed on
+   cannot disagree with them — so when a marker looks wrong here, it IS
+   wrong, which is the entire reason to look.
+
+   Laid out the way a trading chart is laid out, because that is what it is
+   for: OHLC pinned in the corner, a last-price line carried to the axis, a
+   volume pane under the price pane, crosshair labels on both scales, and a
+   countdown on the bar still forming.                                   */
 
 let chartData = null;
 /* Viewport over the bar array. `count` is how many bars are visible and
    `offset` is how many are hidden off the right edge, so offset 0 always
-   means "pinned to the live bar" and a new candle arriving does not shove
-   the view sideways while you are reading it. */
-let chartView = {count: 70, offset: 0};
+   means "pinned to the live bar". */
+let chartView = {count: 90, offset: 0, scale: 1.0};
 let chartHover = null;      // {x, y} in CSS pixels, or null
-let chartDrag = null;
+let chartTool = 'cursor';   // cursor | hline | trend | erase
+let chartDraft = null;      // a trendline being dragged out
+let chartShapes = [];       // what has been drawn, for this market+timeframe
+/* The vertical scale drawChart last used. Everything that converts between
+   a pixel and a price reads it from here rather than recomputing, because
+   two copies of this arithmetic drift and drawn lines quietly land in the
+   wrong place. */
+let chartScale = null;      // {hi, lo, top, plotH}
 
-const CH_PAD = {l: 8, r: 64, t: 10, b: 22};
-const CH_PROF = 46;   // width of the volume-profile gutter
+const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
+const CH_VOL = 0.24;        // share of the plot height the volume pane takes
+const CH_GAP = 8;           // breathing room between the two panes
+
+function chartKey() {
+  return 'liqmap_draw_' + (chartData ? chartData.coin : '?') + '_'
+         + (chartData ? chartData.interval : '?');
+}
+
+function loadShapes() {
+  try { chartShapes = JSON.parse(localStorage.getItem(chartKey()) || '[]'); }
+  catch (e) { chartShapes = []; }
+  if (!Array.isArray(chartShapes)) chartShapes = [];
+}
+
+function saveShapes() {
+  // Per viewer, per browser. Lines you drew are a convenience, never
+  // something the agent reads — nothing here reaches a decision.
+  try { localStorage.setItem(chartKey(), JSON.stringify(chartShapes)); }
+  catch (e) {}
+}
 
 function chartGeom() {
   const cv = $('sugChart');
   const w = cv.clientWidth, h = cv.clientHeight;
-  // The forming bar's volume profile gets its own gutter against the price
-  // axis. Drawn over the candles it lands squarely on the live bar, which is
-  // the one bar you are actually watching.
-  const pr = chartData && chartData.profile && chartData.profile.levels
-             && chartData.profile.levels.length ? CH_PROF : 0;
-  return {w, h, prof: pr, plotW: w - CH_PAD.l - CH_PAD.r - pr,
-          plotH: h - CH_PAD.t - CH_PAD.b};
+  const inner = h - CH_PAD.t - CH_PAD.b;
+  const volH = Math.round(inner * CH_VOL);
+  const plotH = inner - volH - CH_GAP;
+  return {w, h, plotW: w - CH_PAD.l - CH_PAD.r, plotH,
+          volH, volTop: CH_PAD.t + plotH + CH_GAP};
 }
 
-/* The slice of bars currently on screen, plus the index maths the pointer
-   handlers need. Kept in one place so drawing and hit-testing can never
-   disagree about which bar is under the cursor. */
 function chartSlice() {
-  if (!chartData || !chartData.bars) return null;
-  const all = chartData.bars;
-  const count = Math.max(10, Math.min(chartView.count, all.length));
-  const maxOff = Math.max(0, all.length - count);
+  const all = (chartData && chartData.bars) || [];
+  const n = all.length;
+  const count = Math.max(10, Math.min(chartView.count, n));
+  const maxOff = Math.max(0, n - count);
   const off = Math.max(0, Math.min(chartView.offset, maxOff));
   chartView.offset = off;
-  const end = all.length - off;
-  return {all, bars: all.slice(end - count, end), start: end - count,
-          count, maxOff};
+  const endIdx = n - off;
+  return {bars: all.slice(Math.max(0, endIdx - count), endIdx),
+          all, count, offset: off, maxOff, atRight: off === 0};
 }
 
-/* Decimals chosen from the price's own magnitude. A fixed 6 gives
-   "3,458.740157" on an instrument that ticks in cents, which is unreadable
-   at a glance and implies a precision the venue does not have. */
+/* Decimals from the size of the number, so a $4,275 gold print and a
+   $0.00002 token both read correctly without a per-market setting. */
 function chPx(v) {
   const a = Math.abs(v);
   const d = a >= 1000 ? 2 : a >= 10 ? 3 : a >= 0.1 ? 5 : 8;
@@ -5638,8 +5691,8 @@ function chPx(v) {
 
 function fmtClock(ts) {
   const d = new Date(ts * 1000);
-  const p = n => String(n).padStart(2, '0');
-  return p(d.getHours()) + ':' + p(d.getMinutes());
+  return String(d.getHours()).padStart(2, '0') + ':'
+       + String(d.getMinutes()).padStart(2, '0');
 }
 
 function fmtDay(ts) {
@@ -5647,15 +5700,39 @@ function fmtDay(ts) {
   return d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
 }
 
+function fmtLeft(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s / 60) % 60).padStart(2, '0')
+       : s >= 60 ? Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0')
+       : s + 's';
+}
+
+/* A filled label against a scale, the way a trading chart marks a price.
+   Text wears the surface colour on a solid chip so it stays legible over
+   candles, grid and everything else. */
+function axisChip(g, x, y, text, bg, fg, align) {
+  g.font = '11px var(--mono, ui-monospace), monospace';
+  const w = Math.max(g.measureText(text).width + 10, 30);
+  const bx = align === 'left' ? x : x - w / 2;
+  g.fillStyle = bg;
+  g.fillRect(bx, y - 8, w, 16);
+  g.fillStyle = fg;
+  g.textAlign = align === 'left' ? 'left' : 'center';
+  g.fillText(text, align === 'left' ? bx + 5 : x, y + 4);
+  g.font = '10px ui-sans-serif,system-ui,sans-serif';
+  return w;
+}
+
 function drawChart() {
-  const wrap = $('chartWrap');
   const s = chartSlice();
-  if (!s || s.bars.length < 2) { wrap.style.display = 'none'; return; }
+  const bars = s.bars;
+  const wrap = $('chartWrap');
+  if (!bars.length) { wrap.style.display = 'none'; return; }
   wrap.style.display = '';
 
   const cv = $('sugChart');
   const dpr = window.devicePixelRatio || 1;
-  const {w, h, prof: profW, plotW, plotH} = chartGeom();
+  const {w, h, plotW, plotH, volH, volTop} = chartGeom();
   cv.width = w * dpr; cv.height = h * dpr;
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -5663,101 +5740,169 @@ function drawChart() {
   const css = getComputedStyle(document.documentElement);
   const col = n => css.getPropertyValue(n).trim() || '#888';
   const up = col('--up'), down = col('--down'), dim = col('--dim'),
-        line = col('--line'), ink = col('--ink'), panel = col('--panel');
+        line = col('--line'), ink = col('--ink'), panel = col('--panel'),
+        accent = col('--accent'), bg = col('--bg');
+  g.clearRect(0, 0, w, h);
+  g.font = '10px ui-sans-serif,system-ui,sans-serif';
+  g.textBaseline = 'alphabetic';
 
-  const bars = s.bars;
-  let lo = Infinity, hi = -Infinity;
-  for (const b of bars) { if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h; }
-  const marks = (chartData.marks || []).filter(m => {
-    const i = markIndex(m, s);
-    return i >= 0 && i < bars.length;
-  });
-  for (const m of marks) {
-    if (m.target) { lo = Math.min(lo, m.target); hi = Math.max(hi, m.target); }
-    if (m.stop) { lo = Math.min(lo, m.stop); hi = Math.max(hi, m.stop); }
+  /* ---- scales ------------------------------------------------------- */
+
+  let hi = -Infinity, lo = Infinity, vMax = 0;
+  for (const b of bars) {
+    if (b.h > hi) hi = b.h;
+    if (b.l < lo) lo = b.l;
+    if ((b.v || 0) > vMax) vMax = b.v || 0;
   }
-  if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return;
-  const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+  for (const m of (chartData.marks || [])) {
+    // Levels belong inside the frame, or a trade's stop sits off-screen
+    // and the chart quietly stops showing you what it risked.
+    const i = markIndex(m, s);
+    if (i < 0 || i >= bars.length) continue;
+    for (const p of [m.target, m.stop, m.entry, m.exit_px]) {
+      if (!p) continue;
+      if (p > hi) hi = p;
+      if (p < lo) lo = p;
+    }
+  }
+  if (!isFinite(hi) || !isFinite(lo) || hi <= lo) { hi = lo + 1; }
+  const mid = (hi + lo) / 2, half = (hi - lo) / 2;
+  // The price axis can be dragged to squash or stretch; 1.0 is a 6% cushion.
+  const span = half * 1.06 / Math.max(0.15, chartView.scale);
+  hi = mid + span; lo = mid - span;
 
+  chartScale = {hi, lo, top: CH_PAD.t, plotH};
   const y = p => CH_PAD.t + (hi - p) / (hi - lo) * plotH;
+  const pxAt = priceAt;
   const step = plotW / bars.length;
   const xOf = i => CH_PAD.l + i * step + step / 2;
-  const bw = Math.max(1, Math.min(step * 0.7, 16));
+  const bw = Math.max(1, Math.min(step * 0.74, 14));
+  const vy = v => volTop + volH - (vMax > 0 ? (v / vMax) * (volH - 2) : 0);
 
-  g.clearRect(0, 0, w, h);
-  g.font = '10px ui-monospace, monospace';
+  /* ---- grid --------------------------------------------------------- */
 
-  /* Grid and price scale. Recessive on purpose — the marks are the data,
-     the axes are furniture. */
-  g.strokeStyle = line; g.fillStyle = dim; g.textAlign = 'left';
-  for (let i = 0; i <= 4; i++) {
-    const p = lo + (hi - lo) * i / 4, yy = Math.round(y(p)) + 0.5;
-    g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(CH_PAD.l + plotW, yy); g.stroke();
-    g.fillText(chPx(p), CH_PAD.l + plotW + profW + 5, yy + 3);
+  g.strokeStyle = line; g.lineWidth = 1;
+  g.fillStyle = dim; g.textAlign = 'left';
+  const ticks = 5;
+  for (let i = 0; i <= ticks; i++) {
+    const p = lo + (hi - lo) * i / ticks, yy = Math.round(y(p)) + 0.5;
+    g.globalAlpha = 0.5;
+    g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(CH_PAD.l + plotW, yy);
+    g.stroke(); g.globalAlpha = 1;
+    g.fillText(chPx(p), CH_PAD.l + plotW + 6, yy + 3);
   }
 
-  /* Time axis. Ticks are spaced by pixels rather than by bar count so the
-     labels stay readable at every zoom level instead of colliding when you
-     zoom out. */
+  // Time axis, spaced by pixels so labels never collide however far you zoom.
+  const minGap = 62;
+  let lastX = -1e9, lastDay = null;
   g.textAlign = 'center';
-  const wantEvery = Math.max(1, Math.ceil(64 / step));
-  let lastDay = null;
   for (let i = 0; i < bars.length; i++) {
-    if (i % wantEvery) continue;
-    const x = xOf(i), ts = bars[i].ts;
-    g.strokeStyle = line;
+    const x = xOf(i);
+    if (x - lastX < minGap) continue;
+    lastX = x;
+    const ts = bars[i].ts;
+    g.strokeStyle = line; g.globalAlpha = 0.35;
     g.beginPath();
     g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
-    g.lineTo(Math.round(x) + 0.5, CH_PAD.t + plotH);
-    g.globalAlpha = 0.35; g.stroke(); g.globalAlpha = 1;
+    g.lineTo(Math.round(x) + 0.5, volTop + volH);
+    g.stroke(); g.globalAlpha = 1;
     g.fillStyle = dim;
     const day = fmtDay(ts);
-    g.fillText(day !== lastDay ? day : fmtClock(ts), x, h - 7);
+    g.fillText(day !== lastDay ? day : fmtClock(ts), x, h - 6);
     lastDay = day;
   }
 
-  /* Volume profile of the forming bar, along the right edge. */
-  const prof = chartData.profile;
-  if (profW) {
-    const right = CH_PAD.l + plotW + profW;
-    const maxV = Math.max(...prof.levels.map(l => l.v));
-    for (const l of prof.levels) {
-      if (l.px < lo || l.px > hi) continue;
-      const lw = Math.max(1, (l.v / maxV) * (profW - 4));
-      const poc = prof.poc && Math.abs(l.px - prof.poc) < 1e-9;
-      g.fillStyle = poc ? ink : dim;
-      g.globalAlpha = poc ? 0.55 : 0.3;
-      g.fillRect(right - lw, y(l.px) - 1, lw, 2);
-    }
-    g.globalAlpha = 1;
+  // The line between the two panes, so the volume reads as its own scale.
+  g.strokeStyle = line; g.globalAlpha = 0.8;
+  g.beginPath();
+  g.moveTo(CH_PAD.l, Math.round(volTop) - 0.5);
+  g.lineTo(CH_PAD.l + plotW, Math.round(volTop) - 0.5);
+  g.stroke(); g.globalAlpha = 1;
+
+  /* ---- volume pane -------------------------------------------------- */
+
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i], x = xOf(i);
+    if (!b.v) continue;
+    g.fillStyle = b.c >= b.o ? up : down;
+    g.globalAlpha = 0.42;
+    const top = vy(b.v);
+    g.fillRect(x - bw / 2, top, bw, volTop + volH - top);
+  }
+  g.globalAlpha = 1;
+  if (vMax > 0) {
+    g.fillStyle = dim; g.textAlign = 'left';
+    g.fillText('vol', CH_PAD.l + 2, volTop + 10);
+    g.fillText(vMax >= 1000 ? (vMax / 1000).toFixed(1) + 'k' : vMax.toFixed(1),
+               CH_PAD.l + plotW + 6, volTop + 10);
   }
 
-  // candles
+  /* ---- anything you drew -------------------------------------------- */
+
+  for (const sh of chartShapes) {
+    g.strokeStyle = accent; g.globalAlpha = 0.75; g.lineWidth = 1.25;
+    g.beginPath();
+    if (sh.k === 'h') {
+      g.moveTo(CH_PAD.l, y(sh.p)); g.lineTo(CH_PAD.l + plotW, y(sh.p));
+    } else {
+      g.moveTo(tsX(sh.t1, s, xOf, step), y(sh.p1));
+      g.lineTo(tsX(sh.t2, s, xOf, step), y(sh.p2));
+    }
+    g.stroke(); g.lineWidth = 1; g.globalAlpha = 1;
+    if (sh.k === 'h') {
+      axisChip(g, CH_PAD.l + plotW + 1, y(sh.p), chPx(sh.p), accent, bg,
+               'left');
+    }
+  }
+  if (chartDraft) {
+    g.strokeStyle = accent; g.globalAlpha = 0.5; g.setLineDash([4, 3]);
+    g.beginPath();
+    g.moveTo(chartDraft.x1, chartDraft.y1);
+    g.lineTo(chartDraft.x2, chartDraft.y2);
+    g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+  }
+
+  /* ---- candles ------------------------------------------------------ */
+
   bars.forEach((b, i) => {
     const x = xOf(i), rising = b.c >= b.o;
-    g.strokeStyle = g.fillStyle = rising ? up : down;
+    const c = rising ? up : down;
+    g.strokeStyle = c; g.fillStyle = c;
+    // Wick as a hairline, body as a filled rect with a one pixel floor so
+    // a doji is still a mark rather than nothing.
     g.beginPath();
-    g.moveTo(Math.round(x) + 0.5, y(b.h));
-    g.lineTo(Math.round(x) + 0.5, y(b.l));
+    g.moveTo(Math.round(x) + 0.5, Math.round(y(b.h)));
+    g.lineTo(Math.round(x) + 0.5, Math.round(y(b.l)));
     g.stroke();
     const top = y(Math.max(b.o, b.c)), bot = y(Math.min(b.o, b.c));
-    g.fillRect(x - bw / 2, top, bw, Math.max(1, bot - top));
-    if (b.live) {                       // mark the bar still forming
-      g.strokeStyle = ink; g.globalAlpha = 0.35; g.setLineDash([2, 2]);
-      g.strokeRect(x - bw / 2 - 2.5, top - 2.5, bw + 5,
-                   Math.max(1, bot - top) + 5);
+    g.fillRect(Math.round(x - bw / 2), Math.round(top),
+               Math.max(1, Math.round(bw)), Math.max(1, Math.round(bot - top)));
+    if (b.live) {
+      g.strokeStyle = ink; g.globalAlpha = 0.3; g.setLineDash([2, 2]);
+      g.strokeRect(Math.round(x - bw / 2) - 2.5, Math.round(top) - 2.5,
+                   Math.round(bw) + 5, Math.max(1, Math.round(bot - top)) + 5);
       g.setLineDash([]); g.globalAlpha = 1;
     }
   });
 
-  // the agent's trades, drawn ON the candle
-  //
-  // TradingView's convention, and it is the right one: the marker sits
-  // just clear of the bar's low or high rather than at the entry price.
-  // At the price it lands on the candle body and hides the thing you are
-  // trying to verify -- and the whole point of a per-candle mark is that
-  // the candle underneath it stays readable.
-  for (const m of marks) {
+  /* ---- last price, carried to the axis ------------------------------ */
+
+  const last = bars[bars.length - 1];
+  const lastUp = last.c >= last.o;
+  const lastY = y(last.c);
+  g.strokeStyle = lastUp ? up : down; g.globalAlpha = 0.55;
+  g.setLineDash([3, 3]);
+  g.beginPath();
+  g.moveTo(CH_PAD.l, Math.round(lastY) + 0.5);
+  g.lineTo(CH_PAD.l + plotW, Math.round(lastY) + 0.5);
+  g.stroke();
+  g.setLineDash([]); g.globalAlpha = 1;
+  axisChip(g, CH_PAD.l + plotW + 1, lastY, chPx(last.c),
+           lastUp ? up : down, bg, 'left');
+
+  /* ---- the agent's trades, ON the candle ---------------------------- */
+
+  for (const m of (chartData.marks || [])) {
     const i = markIndex(m, s);
     if (i < 0 || i >= bars.length) continue;
     const b = bars[i], x = xOf(i);
@@ -5765,7 +5910,6 @@ function drawChart() {
     const xi = exitIndex(m, s);
     const xe = (xi != null && xi >= 0 && xi < bars.length) ? xOf(xi) : null;
 
-    // Target and stop, faint, across the life of the trade.
     const right = xe == null ? x + step * 2 : Math.max(xe, x + step * 0.5);
     g.strokeStyle = c; g.globalAlpha = 0.22; g.setLineDash([2, 4]);
     for (const p of [m.target, m.stop]) {
@@ -5775,45 +5919,30 @@ function drawChart() {
     }
     g.setLineDash([]); g.globalAlpha = 1;
 
-    // Entry: below the low going long, above the high going short.
+    // Clear of the bar, never on it: at the entry price the marker lands
+    // on the body and hides the candle you are trying to verify.
     const ay = long ? y(b.l) + 12 : y(b.h) - 12;
     const tip = long ? ay - 7 : ay + 7;
     g.beginPath();
-    g.moveTo(x, tip);
-    g.lineTo(x - 5.5, ay); g.lineTo(x + 5.5, ay);
+    g.moveTo(x, tip); g.lineTo(x - 5.5, ay); g.lineTo(x + 5.5, ay);
     g.closePath();
     g.fillStyle = c; g.strokeStyle = c; g.lineWidth = 1.5;
     if (m.open) g.stroke(); else g.fill();
     g.lineWidth = 1;
-
-    // The side, spelled out. A triangle alone needs a legend; a letter
-    // does not, and this is the mark you glance at mid-trade.
     g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
-    g.textAlign = 'center';
-    g.fillStyle = c;
+    g.textAlign = 'center'; g.fillStyle = c;
     g.fillText(long ? 'L' : 'S', x, long ? ay + 10 : ay - 4);
     g.font = '10px ui-sans-serif,system-ui,sans-serif';
 
     if (xe == null || !m.exit_px) continue;
-
-    // Exit: same convention on ITS candle, coloured by won or lost.
-    const eb = bars[xi];
-    const ok = !!m.won;
-    const ec = ok ? up : down;
+    const eb = bars[xi], ok = !!m.won, ec = ok ? up : down;
     const ey = long ? y(eb.h) - 11 : y(eb.l) + 11;
-
-    // A hairline from entry to exit, so a trade reads as one object
-    // without competing with the candles.
     g.strokeStyle = ec; g.globalAlpha = 0.35; g.setLineDash([3, 3]);
     g.beginPath(); g.moveTo(x, ay); g.lineTo(xe, ey); g.stroke();
     g.setLineDash([]); g.globalAlpha = 1;
-
     g.fillStyle = ec; g.strokeStyle = panel; g.lineWidth = 1.5;
     g.beginPath(); g.arc(xe, ey, 4, 0, Math.PI * 2);
     g.fill(); g.stroke(); g.lineWidth = 1;
-    // The result, as the number. "L" at the exit would have meant loss
-    // while "L" at the entry means long -- the same letter for two
-    // different things on the same chart.
     g.fillStyle = ec;
     g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
     const net = m.net_bps == null ? (ok ? 'win' : 'loss')
@@ -5822,96 +5951,124 @@ function drawChart() {
     g.font = '10px ui-sans-serif,system-ui,sans-serif';
   }
 
-  // crosshair and readout
+  /* ---- crosshair ---------------------------------------------------- */
+
+  let readBar = last, readMark = null;
   if (chartHover) {
     const i = Math.max(0, Math.min(bars.length - 1,
                                    Math.floor((chartHover.x - CH_PAD.l) / step)));
-    const b = bars[i];
-    if (b) {
-      const x = xOf(i);
-      g.strokeStyle = dim; g.globalAlpha = 0.6; g.setLineDash([3, 3]);
-      g.beginPath();
-      g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
-      g.lineTo(Math.round(x) + 0.5, CH_PAD.t + plotH);
-      g.moveTo(CH_PAD.l, Math.round(chartHover.y) + 0.5);
-      g.lineTo(CH_PAD.l + plotW, Math.round(chartHover.y) + 0.5);
-      g.stroke();
-      g.setLineDash([]); g.globalAlpha = 1;
+    readBar = bars[i] || last;
+    readMark = (chartData.marks || []).find(m => markIndex(m, s) === i)
+            || (chartData.marks || []).find(m => exitIndex(m, s) === i);
+    const x = xOf(i);
+    g.strokeStyle = dim; g.globalAlpha = 0.55; g.setLineDash([3, 3]);
+    g.beginPath();
+    g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
+    g.lineTo(Math.round(x) + 0.5, volTop + volH);
+    g.moveTo(CH_PAD.l, Math.round(chartHover.y) + 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(chartHover.y) + 0.5);
+    g.stroke();
+    g.setLineDash([]); g.globalAlpha = 1;
 
-      // price under the cursor, on the scale
-      const pv = hi - (chartHover.y - CH_PAD.t) / plotH * (hi - lo);
-      g.fillStyle = ink;
-      g.fillRect(CH_PAD.l + plotW + profW + 2, chartHover.y - 7,
-                 CH_PAD.r - 4, 14);
-      g.fillStyle = panel; g.textAlign = 'left';
-      g.fillText(chPx(pv), CH_PAD.l + plotW + profW + 5, chartHover.y + 3);
-
-      // A trade is findable from EITHER end: you hover where you see a
-      // mark, and both ends carry marks.
-      const hit = marks.find(m => markIndex(m, s) === i)
-               || marks.find(m => exitIndex(m, s) === i);
-      const px = chPx;
-      const rows = [
-        fmtDay(b.ts) + ' ' + fmtClock(b.ts),
-        'O ' + px(b.o) + '  H ' + px(b.h),
-        'L ' + px(b.l) + '  C ' + px(b.c),
-      ];
-      if (hit) {
-        rows.push('');
-        rows.push((hit.side || '').toUpperCase() + ' @ ' + px(hit.entry)
-                  + (hit.shape ? '   ' + hit.shape : ''));
-        // Why it took it: the columns, in words. This is the thing that
-        // makes a marker worth hovering over.
-        if (hit.why) rows.push('why: ' + hit.why);
-        if (hit.tp_bps != null && hit.sl_bps != null) {
-          rows.push('target ' + Number(hit.tp_bps).toFixed(0) + 'bps · stop '
-                    + Number(hit.sl_bps).toFixed(0) + 'bps');
-        }
-        if (hit.open) {
-          rows.push('still open');
-        } else {
-          const w = hit.won ? 'WIN' : 'LOSS';
-          const n = hit.net_bps == null ? ''
-            : '  ' + (hit.net_bps >= 0 ? '+' : '')
-              + Number(hit.net_bps).toFixed(1) + 'bps net';
-          rows.push(w + ' — ' + (hit.exit_reason || 'closed') + n);
-          if (hit.exit_px) rows.push('out at ' + px(hit.exit_px));
-          if (hit.held_s != null) {
-            const h = Number(hit.held_s);
-            rows.push('held ' + (h >= 90 ? (h / 60).toFixed(0) + 'm'
-                                         : h.toFixed(0) + 's')
-                      + (hit.mfe_bps != null
-                         ? '   best ' + (hit.mfe_bps >= 0 ? '+' : '')
-                           + Number(hit.mfe_bps).toFixed(1) + 'bps' : ''));
-          }
-        }
-      }
-      const bw2 = 212, bh = 8 + rows.length * 13;
-      let bx = x + 12, by = CH_PAD.t + 6;
-      if (bx + bw2 > CH_PAD.l + plotW) bx = x - 12 - bw2;
-      g.fillStyle = panel; g.globalAlpha = 0.95;
-      g.fillRect(bx, by, bw2, bh);
-      g.globalAlpha = 1; g.strokeStyle = line; g.strokeRect(bx + 0.5, by + 0.5, bw2, bh);
-      g.fillStyle = ink; g.textAlign = 'left';
-      rows.forEach((r, k) => g.fillText(r, bx + 6, by + 15 + k * 13));
+    // Both scales get a label. A crosshair with a price but no time is
+    // half a crosshair.
+    if (chartHover.y < volTop) {
+      axisChip(g, CH_PAD.l + plotW + 1, chartHover.y, chPx(pxAt(chartHover.y)),
+               ink, bg, 'left');
     }
+    axisChip(g, x, h - 10,
+             fmtDay(readBar.ts) + ' ' + fmtClock(readBar.ts), ink, bg);
   }
+
+  /* ---- the corner readout ------------------------------------------- */
+
+  drawCorner(g, {readBar, readMark, up, down, dim, ink, bg, accent, w});
 }
 
-/* Which visible slot a call belongs in. Derived from the bar timestamps
-   rather than from a stored index, so it stays correct while panning. */
+/* The OHLC line, pinned top-left, the way every trading chart does it.
+
+   A floating tooltip box covers whatever it is describing and moves while
+   you read it. In the corner it is always in the same place, so the eye
+   learns where to look and the candles stay uncovered. */
+function drawCorner(g, o) {
+  const b = o.readBar;
+  const rise = b.c >= b.o;
+  const c = rise ? o.up : o.down;
+  const chg = b.o ? (b.c - b.o) / b.o * 100 : 0;
+
+  let x = CH_PAD.l + 2;
+  const yy = CH_PAD.t + 11;
+  const put = (t, col, bold) => {
+    g.font = (bold ? '600 ' : '') + '11px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = col; g.textAlign = 'left';
+    g.fillText(t, x, yy);
+    x += g.measureText(t).width + 6;
+  };
+
+  put((chartData.coin || '') + ' · ' + (chartData.interval || ''), o.ink, true);
+  g.font = '11px var(--mono, ui-monospace), monospace';
+  for (const [k, v] of [['O', b.o], ['H', b.h], ['L', b.l], ['C', b.c]]) {
+    g.fillStyle = o.dim; g.textAlign = 'left';
+    g.fillText(k, x, yy); x += g.measureText(k).width + 3;
+    g.fillStyle = c;
+    g.fillText(chPx(v), x, yy); x += g.measureText(chPx(v)).width + 8;
+  }
+  const pct = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+  g.fillStyle = c; g.fillText(pct, x, yy);
+  x += g.measureText(pct).width + 10;
+
+  // How long the bar being traded has left. On a chart where every trade
+  // dies with its candle, that is not decoration.
+  if (b.live && chartData.interval_s) {
+    const left = b.ts + chartData.interval_s - Date.now() / 1000;
+    g.font = '600 11px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = left < 30 ? o.down : o.accent;
+    g.fillText(fmtLeft(left) + ' left', x, yy);
+  }
+
+  // A trade under the cursor gets a second line, in the same place.
+  const m = o.readMark;
+  if (!m) return;
+  g.font = '11px ui-sans-serif,system-ui,sans-serif';
+  const mc = m.side === 'long' ? o.up : o.down;
+  let t = (m.side || '').toUpperCase() + ' @ ' + chPx(m.entry)
+        + (m.shape ? '  ' + m.shape : '')
+        + (m.why ? '  ·  ' + m.why : '');
+  if (m.open) {
+    t += '  ·  still open';
+  } else {
+    t += '  ·  ' + (m.won ? 'WIN' : 'LOSS') + ' ' + (m.exit_reason || '')
+       + (m.net_bps == null ? ''
+          : '  ' + (m.net_bps >= 0 ? '+' : '') + Number(m.net_bps).toFixed(1)
+            + 'bps net');
+  }
+  g.fillStyle = mc; g.textAlign = 'left';
+  g.fillText(t, CH_PAD.l + 2, CH_PAD.t + 25);
+}
+
+/* Which visible slot a mark belongs in, from timestamps rather than a
+   stored index, so it stays correct while panning. */
 function markIndex(m, s) {
   const iv = chartData.interval_s || 900;
   return Math.round(((m.entry_ts || m.ts) - s.bars[0].ts) / iv);
 }
 
-/* Which slot the EXIT landed in. Drawing the exit on the entry bar --
-   which is what the first version did -- hides the one thing a chart is
-   good at showing: how long the trade took and where it ended. */
 function exitIndex(m, s) {
   if (!m.exit_ts) return null;
   const iv = chartData.interval_s || 900;
   return Math.round((m.exit_ts - s.bars[0].ts) / iv);
+}
+
+/* A timestamp's x, even when it is off the visible slice — a trendline
+   anchored to a bar you have scrolled past still has to point somewhere. */
+function tsX(ts, s, xOf, step) {
+  const iv = chartData.interval_s || 900;
+  return xOf(0) + ((ts - s.bars[0].ts) / iv) * step;
+}
+
+function xTs(x, s, step) {
+  const iv = chartData.interval_s || 900;
+  return s.bars[0].ts + ((x - (CH_PAD.l + step / 2)) / step) * iv;
 }
 
 /* ---- interaction ------------------------------------------------------ */
@@ -5923,75 +6080,182 @@ function chartPoint(ev) {
           y: (t ? t.clientY : ev.clientY) - r.top};
 }
 
+function pickTool(t) {
+  chartTool = t;
+  for (const k of ['cursor', 'hline', 'trend', 'erase']) {
+    const el = $('tool-' + k);
+    if (el) el.classList.toggle('on', k === t);
+  }
+  $('sugChart').style.cursor = t === 'cursor' ? 'crosshair' : 'copy';
+}
+
+function clearShapes() {
+  chartShapes = [];
+  saveShapes();
+  drawChart();
+}
+
 function wireChart() {
   const cv = $('sugChart');
-  if (!cv || cv.dataset.wired) return;
-  cv.dataset.wired = '1';
+  if (cv._wired) return;
+  cv._wired = true;
   cv.style.cursor = 'crosshair';
 
+  cv.addEventListener('mousemove', ev => {
+    const p = chartPoint(ev);
+    chartHover = p;
+    if (chartDraft) { chartDraft.x2 = p.x; chartDraft.y2 = p.y; }
+    drawChart();
+  });
+  cv.addEventListener('mouseleave', () => { chartHover = null; drawChart(); });
+
+  // Wheel zooms about the cursor, so the bar you are looking at stays put.
   cv.addEventListener('wheel', ev => {
-    if (!chartData) return;
     ev.preventDefault();
-    const s = chartSlice(); if (!s) return;
+    const s = chartSlice();
+    if (!s.bars.length) return;
     const {plotW} = chartGeom();
-    // Zoom about the cursor, so the bar under the pointer stays put.
     const frac = Math.max(0, Math.min(1, (chartPoint(ev).x - CH_PAD.l) / plotW));
     const before = chartView.count;
     const next = Math.round(before * (ev.deltaY > 0 ? 1.15 : 0.87));
-    chartView.count = Math.max(10, Math.min(next, s.all.length));
+    chartView.count = Math.max(15, Math.min(next, s.all.length));
     const grew = chartView.count - before;
-    chartView.offset = Math.max(0, chartView.offset + Math.round(grew * (1 - frac)));
+    chartView.offset = Math.max(0, chartView.offset
+                                   - Math.round(grew * (1 - frac)));
     drawChart();
   }, {passive: false});
 
-  const start = ev => {
-    chartDrag = {x: chartPoint(ev).x, offset: chartView.offset};
-    cv.style.cursor = 'grabbing';
+  let drag = null;
+  const down = ev => {
+    const p = chartPoint(ev);
+    const {plotW} = chartGeom();
+    // Past the plot is the price scale: drag it to squash or stretch.
+    if (p.x > CH_PAD.l + plotW) {
+      drag = {axis: true, y: p.y, scale: chartView.scale};
+      return;
+    }
+    if (chartTool === 'hline') {
+      const s = chartSlice();
+      chartShapes.push({k: 'h', p: priceAt(p.y)});
+      saveShapes(); pickTool('cursor'); drawChart(); return;
+    }
+    if (chartTool === 'trend') {
+      chartDraft = {x1: p.x, y1: p.y, x2: p.x, y2: p.y};
+      return;
+    }
+    if (chartTool === 'erase') {
+      eraseNear(p); pickTool('cursor'); drawChart(); return;
+    }
+    drag = {x: p.x, offset: chartView.offset};
   };
   const move = ev => {
+    if (!drag) return;
     const p = chartPoint(ev);
-    chartHover = p;
-    if (chartDrag) {
-      const s = chartSlice();
-      if (s) {
-        const step = chartGeom().plotW / s.count;
-        chartView.offset = Math.max(0, Math.min(
-          s.maxOff, chartDrag.offset + Math.round((p.x - chartDrag.x) / step)));
-      }
+    if (drag.axis) {
+      // Down squashes, up stretches — the direction every chart uses.
+      chartView.scale = Math.max(0.15,
+        Math.min(6, drag.scale * (1 + (p.y - drag.y) / 220)));
+      drawChart();
+      return;
     }
+    const s = chartSlice();
+    const step = chartGeom().plotW / s.count;
+    chartView.offset = Math.max(0, Math.min(s.all.length - s.count,
+      Math.round(drag.offset + (p.x - drag.x) / step)));
     drawChart();
   };
-  const end = () => { chartDrag = null; cv.style.cursor = 'crosshair'; };
+  const upEv = ev => {
+    if (chartDraft) {
+      const s = chartSlice();
+      const step = chartGeom().plotW / s.count;
+      const far = Math.abs(chartDraft.x2 - chartDraft.x1) > 6
+               || Math.abs(chartDraft.y2 - chartDraft.y1) > 6;
+      if (far) {
+        chartShapes.push({k: 't',
+          t1: xTs(chartDraft.x1, s, step), p1: priceAt(chartDraft.y1),
+          t2: xTs(chartDraft.x2, s, step), p2: priceAt(chartDraft.y2)});
+        saveShapes();
+      }
+      chartDraft = null; pickTool('cursor'); drawChart();
+    }
+    drag = null;
+  };
 
-  cv.addEventListener('mousedown', start);
-  cv.addEventListener('mousemove', move);
-  cv.addEventListener('mouseup', end);
-  cv.addEventListener('mouseleave', () => {
-    chartHover = null; end(); drawChart();
-  });
-  cv.addEventListener('touchstart', ev => { start(ev); }, {passive: true});
-  cv.addEventListener('touchmove', ev => { move(ev); }, {passive: true});
-  cv.addEventListener('touchend', end);
+  cv.addEventListener('mousedown', down);
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', upEv);
   cv.addEventListener('dblclick', resetChartView);
+
+  cv.addEventListener('touchstart', ev => { down(ev); }, {passive: true});
+  cv.addEventListener('touchmove', ev => {
+    const p = chartPoint(ev);
+    chartHover = p; move(ev); drawChart();
+  }, {passive: true});
+  cv.addEventListener('touchend', upEv);
+}
+
+/* The price under a y, from the scale drawChart actually used. */
+function priceAt(yy) {
+  const c = chartScale;
+  if (!c || !c.plotH) return 0;
+  return c.hi - (yy - c.top) / c.plotH * (c.hi - c.lo);
+}
+
+function eraseNear(p) {
+  const s = chartSlice();
+  const {plotW} = chartGeom();
+  const step = plotW / s.count;
+  const xOf = i => CH_PAD.l + i * step + step / 2;
+  const target = priceAt(p.y);
+  let best = -1, bestD = 1e18;
+  chartShapes.forEach((sh, i) => {
+    let d;
+    if (sh.k === 'h') {
+      d = Math.abs(sh.p - target);
+    } else {
+      const mx = (tsX(sh.t1, s, xOf, step) + tsX(sh.t2, s, xOf, step)) / 2;
+      d = Math.abs((sh.p1 + sh.p2) / 2 - target) + Math.abs(mx - p.x) * 1e-6;
+    }
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  // Only within a visible distance, so a stray click does not delete
+  // something on the other side of the chart.
+  const reach = Math.abs(priceAt(p.y + 14) - target);
+  if (best >= 0 && bestD <= reach) { chartShapes.splice(best, 1); saveShapes(); }
 }
 
 function resetChartView() {
-  chartView = {count: 70, offset: 0};
+  chartView = {count: 90, offset: 0, scale: 1.0};
   drawChart();
 }
 
 async function loadChart() {
+  const prev = chartData;
+  let d;
   try {
-    chartData = await api('/api/chart?' + q({
+    d = await api('/api/chart?' + q({
       coin: coin(), interval: $('sInt').value, bars: 400}));
   } catch (e) { return; }
-  if (chartData && chartData.error) { chartData = null; return; }
+  if (d && d.error) return;
+
+  // Hold position when new bars arrive. Scrolled back through history and
+  // having the view yanked forward every time a candle closes is the
+  // single most irritating thing a live chart can do.
+  if (prev && prev.bars && d.bars && chartView.offset > 0
+      && prev.coin === d.coin && prev.interval === d.interval) {
+    const grew = d.bars.length - prev.bars.length;
+    if (grew > 0) chartView.offset += grew;
+  }
+  const fresh = !prev || prev.coin !== d.coin || prev.interval !== d.interval;
+  chartData = d;
+  if (fresh) { loadShapes(); resetChartView(); }
+
   wireChart();
   drawChart();
   const n = (chartData.marks || []).length;
   $('chartNote').innerHTML =
-      `${esc(chartData.interval || '')} · ${esc(chartData.source || '')} · `
-    + `${n} call${n === 1 ? '' : 's'} · scroll to zoom, drag to pan, `
+      `${esc(chartData.source || '')} · ${n} trade${n === 1 ? '' : 's'} · `
+    + 'scroll to zoom · drag to pan · drag the price scale to stretch · '
     + 'double-click to reset';
 }
 

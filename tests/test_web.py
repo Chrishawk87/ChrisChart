@@ -1832,6 +1832,56 @@ def test_every_panel_lives_in_exactly_one_tab(client):
     assert "Book call" in html and "paintBookCall" in html
 
 
+def test_the_chart_has_one_source_of_truth_for_its_scale(client):
+    """Two copies of the pixel-to-price arithmetic drift, and drawn lines
+    quietly land somewhere other than where they were placed."""
+    html = client.get("/").text
+    fn = html[html.index("function priceAt(yy)"):]
+    fn = fn[:fn.index("function eraseNear")]
+    assert "chartScale" in fn
+    # It must not recompute the extremes for itself.
+    assert "chartSlice()" not in fn and "for (const b of" not in fn
+
+
+def test_the_chart_carries_both_crosshair_labels(client):
+    """A crosshair with a price but no time is half a crosshair."""
+    html = client.get("/").text
+    draw = html[html.index("function drawChart()"):html.index("function drawCorner")]
+    assert draw.count("axisChip(") >= 3        # last price, price, time
+    assert "fmtDay(readBar.ts)" in draw
+
+
+def test_the_chart_has_a_volume_pane_not_a_side_profile(client):
+    html = client.get("/").text
+    assert "volTop" in html and "CH_VOL" in html
+    # The old side-gutter profile is gone; it competed with the live bar.
+    assert "CH_PROF" not in html
+
+
+def test_the_forming_bar_shows_its_countdown(client):
+    """Every trade dies with its candle, so the time left is not decoration."""
+    html = client.get("/").text
+    corner = html[html.index("function drawCorner"):html.index("function markIndex")]
+    assert "fmtLeft(left)" in corner and "interval_s" in corner
+
+
+def test_the_view_holds_position_when_new_bars_arrive(client):
+    """Being yanked to the right edge every time a candle closes is the
+    single most irritating thing a live chart can do."""
+    html = client.get("/").text
+    fn = html[html.index("async function loadChart()"):]
+    fn = fn[:fn.index("window.addEventListener('resize'")]
+    assert "chartView.offset += grew" in fn
+
+
+def test_drawn_lines_are_kept_per_market_and_timeframe(client):
+    html = client.get("/").text
+    assert "function chartKey()" in html
+    key = html[html.index("function chartKey()"):]
+    key = key[:key.index("function loadShapes")]
+    assert "chartData.coin" in key and "chartData.interval" in key
+
+
 def test_hidden_tab_panes_are_actually_hidden(client):
     """`.grid{display:grid}` is an author rule and beats the browser's own
     `[hidden]{display:none}`, so every pane stayed on screen while

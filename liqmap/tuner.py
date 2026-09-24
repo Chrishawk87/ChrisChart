@@ -113,7 +113,6 @@ NOT_EVALUABLE = {
     "invalidate_s": "changes what happens during a trade, not which trades "
                     "are taken — replaying it needs the price path, which "
                     "the ledger does not keep",
-    "max_hold_bars": "same: an exit rule cannot be re-run from an outcome",
     "stale_s": "same: an exit rule cannot be re-run from an outcome",
     "tp_bps": "not from the ledger — tuned by the grid instead, which "
               "replays every target against real price bars",

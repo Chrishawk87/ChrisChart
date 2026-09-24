@@ -431,6 +431,29 @@ the browser's own `[hidden]{display:none}`. Every tab reported itself
 hidden and every panel was still drawn. `.tabpane[hidden]{display:none}`
 states it explicitly, and a test pins it.
 
+### A trade never outlives its candle
+
+A five minute trade lasts five minutes. The position was opened on one
+candle's book, delta and price; once that candle closes, the reading it
+rests on no longer exists and the trade is riding an expired signal.
+
+It is also what keeps the grid honest. Every candle is an independent
+test, so a trade allowed to run into the next one is claiming a result the
+*next* candle's signal should have had to earn.
+
+Enforced in both places, which is the part that matters:
+
+- the live agent closes at its candle's end, reason `candle_end`
+- `sweep.resolve` takes a `deadline` and stops walking bars there
+
+A signal that fires forty seconds before the close gets forty seconds —
+the deadline comes from the candle it opened on, not from a fresh bar
+measured at entry. The `max_hold_bars` knob is gone; the candle is the
+maximum hold and a second answer to that question is just a way to
+disagree with itself.
+
+### What the chart shows
+
 ### What the chart shows
 
 Markers are the **agent's own trades**, drawn **on the candle** the way
@@ -446,9 +469,39 @@ per-candle mark is that the candle underneath stays readable.
 The exit used to be labelled W or L, which collided with L for long. It
 carries the number instead, which is less ambiguous and more useful.
 
-Hovering either end gives the whole trade: side, why it was taken in
-words, the levels, whether it won, how it ended, net after cost, how long
-it held.
+Hovering either end gives the whole trade in the corner readout: side, why
+it was taken in words, the levels, whether it won, how it ended, and net
+after cost.
+
+### The rest of the chart
+
+Built the way a trading chart is built, because that is what it is for:
+
+- **OHLC pinned top-left**, following the crosshair. A floating tooltip
+  covers the thing it describes and moves while you read it; in the corner
+  it is always in the same place.
+- **Last price** as a dashed line carried to a filled label on the scale.
+- **Crosshair labels on both scales** — price on the right, date and time
+  underneath. A crosshair with a price but no time is half a crosshair.
+- **Countdown on the forming bar.** On a chart where every trade dies with
+  its candle, the time left is not decoration.
+- **Volume in its own pane** under the price pane, coloured by bar, with
+  its own scale. This replaced the side-gutter profile, which competed for
+  space with the live bar.
+- **Drag the price scale** to squash or stretch; `fit` or double-click
+  resets.
+- **The view holds position** when new bars arrive. Being yanked to the
+  right edge every time a candle closes is the single most irritating
+  thing a live chart can do.
+- **Drawing tools** — horizontal lines and trendlines, kept per market and
+  timeframe in your browser. They are a convenience for you; nothing the
+  agent decides ever reads them.
+
+One implementation note worth keeping: everything that converts a pixel to
+a price reads `chartScale`, which `drawChart` sets. The first cut had
+`priceAt()` recomputing the extremes for itself, and two copies of that
+arithmetic drift — at which point a line you drew at one price is stored at
+another. A test pins it.
 
 
 
