@@ -902,6 +902,50 @@ class History(ThreadedDB):
                 (close_px, move, mfe, mae, state_id))
         return True
 
+    def states_for_sweep(self, coin: str | None = None,
+                         interval: str | None = None,
+                         since: float | None = None,
+                         limit: int = 20_000) -> list[dict[str, Any]]:
+        """Raw candle readings, oldest first, for re-scoring under a new rule.
+
+        Resolved or not -- a sweep settles against price bars itself and does
+        not need this table's own resolution. Unresolved rows are the most
+        recent ones, which are exactly the ones a sweep most wants.
+        """
+        import json as _json
+        sql = "SELECT * FROM agreement_states WHERE price > 0"
+        args: list[Any] = []
+        if coin:
+            sql += " AND coin = ?"; args.append(coin)
+        if interval:
+            sql += " AND interval = ?"; args.append(interval)
+        if since is not None:
+            sql += " AND made_at >= ?"; args.append(since)
+        sql += " ORDER BY made_at ASC LIMIT ?"
+        args.append(int(limit))
+        out = []
+        for r in self._conn.execute(sql, args).fetchall():
+            d = dict(r)
+            try:
+                d["features"] = _json.loads(d.get("features") or "{}")
+            except Exception:
+                d["features"] = {}
+            out.append(d)
+        return out
+
+    def state_span(self, coin: str | None = None, interval: str | None = None
+                   ) -> dict[str, Any]:
+        """How much signal history there is, and how far back it goes."""
+        sql = ("SELECT COUNT(*) n, MIN(made_at) lo, MAX(made_at) hi "
+               "FROM agreement_states WHERE price > 0")
+        args: list[Any] = []
+        if coin:
+            sql += " AND coin = ?"; args.append(coin)
+        if interval:
+            sql += " AND interval = ?"; args.append(interval)
+        r = self._conn.execute(sql, args).fetchone()
+        return {"n": int(r["n"] or 0), "first": r["lo"], "last": r["hi"]}
+
     def feature_slice(self, coin: str | None = None,
                       interval: str | None = None,
                       feature: str = "tilt", edges: Sequence[float] = (),

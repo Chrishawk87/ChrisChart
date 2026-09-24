@@ -123,7 +123,7 @@ def test_enters_when_everything_passes(ledger):
 
 
 def test_stand_aside_is_recorded_with_its_gate(ledger):
-    p = Autopilot("ETH", "15m", ledger)
+    p = Autopilot("ETH", "15m", ledger, raw=False)
     d = p.step(payload(take=False, gate="unconfirmed"), now=100.0)
     assert d.action == "stand_aside"
     assert d.gate == "unconfirmed"
@@ -134,15 +134,18 @@ def test_stand_aside_is_recorded_with_its_gate(ledger):
 
 
 def test_its_own_gates_can_refuse_a_tradeable_call(ledger):
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(min_agreement_s=30.0))
+    p = Autopilot("ETH", "15m", ledger, raw=False,
+                  knobs=Knobs(min_agreement_s=30.0))
     d = p.step(payload(held_s=3.0), now=100.0)
     assert d.action == "stand_aside" and d.gate == "agreement_age"
 
-    p2 = Autopilot("ETH", "15m", ledger, knobs=Knobs(min_agreeing=3))
+    p2 = Autopilot("ETH", "15m", ledger, raw=False,
+                   knobs=Knobs(min_agreeing=3))
     assert p2.step(payload(agreeing=2, candle_ts=2.0),
                    now=100.0).gate == "agreeing"
 
-    p3 = Autopilot("ETH", "15m", ledger, knobs=Knobs(max_breakeven=0.55))
+    p3 = Autopilot("ETH", "15m", ledger, raw=False,
+                   knobs=Knobs(max_breakeven=0.55))
     assert p3.step(payload(breakeven=0.8, candle_ts=3.0),
                    now=100.0).gate == "breakeven"
 
@@ -164,13 +167,22 @@ def test_holds_while_the_read_still_agrees(ledger):
     assert d.action == "hold"
 
 
+def test_raw_voting_is_the_default(ledger):
+    """No gates unless asked for, and levels-only exits, so the live book
+    and the grid stay the same strategy."""
+    p = Autopilot("ETH", "15m", ledger)
+    assert p.raw is True
+    assert p.exit_on_invalidation is False
+
+
 def test_flat_is_not_against_you(ledger):
     """The exact problem this agent was built around.
 
     A reading dropping to flat is the absence of a signal, not a signal.
     Treating it as invalidation closes good positions on a quiet poll.
     """
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=4.0))
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=4.0),
+                  exit_on_invalidation=True)
     p.step(payload(), now=100.0)
     for t in (105.0, 110.0, 115.0, 120.0, 125.0):
         d = p.step(payload(direction="flat"), now=t)
@@ -179,7 +191,8 @@ def test_flat_is_not_against_you(ledger):
 
 
 def test_one_opposite_poll_does_not_close_it(ledger):
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=10.0))
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=10.0),
+                  exit_on_invalidation=True)
     p.step(payload(), now=100.0)
     assert p.step(payload(direction="down"), now=103.0).action == "hold"
     # ... and the timer resets the moment it stops being against.
@@ -188,7 +201,8 @@ def test_one_opposite_poll_does_not_close_it(ledger):
 
 
 def test_a_persistent_flip_closes_it(ledger):
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=8.0))
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=8.0),
+                  exit_on_invalidation=True)
     p.step(payload(), now=100.0)
     p.step(payload(direction="down"), now=105.0)
     d = p.step(payload(direction="down"), now=110.0)
@@ -207,7 +221,7 @@ def test_a_level_beats_everything_else(ledger):
 
 
 def test_a_quiet_trade_eventually_times_out(ledger):
-    p = Autopilot("ETH", "15m", ledger,
+    p = Autopilot("ETH", "15m", ledger, exit_on_invalidation=True,
                   knobs=Knobs(max_hold_bars=1.0, invalidate_s=999.0))
     p.step(payload(), now=0.0)
     d = p.step(payload(direction="flat"), now=1000.0)   # > one 900s bar
@@ -215,7 +229,7 @@ def test_a_quiet_trade_eventually_times_out(ledger):
 
 
 def test_dead_money_and_being_wrong_are_different_rows(ledger):
-    p = Autopilot("ETH", "15m", ledger,
+    p = Autopilot("ETH", "15m", ledger, exit_on_invalidation=True,
                   knobs=Knobs(stale_s=50.0, invalidate_s=999.0,
                               max_hold_bars=99.0))
     p.step(payload(), now=0.0)
@@ -464,7 +478,8 @@ def test_readiness_says_how_far_off_it_is(ledger):
 
 # ------------------------------------------------------- the safety rails
 
-AGENT_FILES = ("autopilot.py", "ledger.py", "score.py", "tuner.py")
+AGENT_FILES = ("autopilot.py", "ledger.py", "score.py", "tuner.py",
+               "vote.py", "sweep.py")
 
 
 def _code_only(path: Path) -> str:

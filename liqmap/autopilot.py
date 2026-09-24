@@ -73,6 +73,7 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Literal
 
 from .ledger import Action, ExitReason, Ledger, OpenPosition, Side
+from .vote import Vote, from_payload as vote_from_payload
 
 Direction = Literal["up", "down", "flat"]
 
@@ -121,6 +122,13 @@ KNOBS: dict[str, Knob] = {k.name: k for k in (
          "how many bars it will hold before giving up on a quiet trade"),
     Knob("stale_s", 90.0, 20.0, 600.0, 20.0, True,
          "how long a position's read may be flat before it is dead money"),
+    # The two that matter most, and the two the ledger cannot judge --
+    # changing them changes what happens during a trade. `sweep.py` scores
+    # them properly, by replaying every pair against price bars.
+    Knob("tp_bps", 20.0, 1.0, 300.0, 1.0, False,
+         "how far the target sits, in basis points"),
+    Knob("sl_bps", 15.0, 1.0, 300.0, 1.0, True,
+         "how far the stop sits, in basis points"),
 )}
 
 
@@ -135,6 +143,8 @@ class Knobs:
     invalidate_s: float = 6.0
     max_hold_bars: float = 3.0
     stale_s: float = 90.0
+    tp_bps: float = 20.0
+    sl_bps: float = 15.0
 
     @classmethod
     def from_overrides(cls, overrides: dict[str, float] | None) -> "Knobs":
@@ -233,12 +243,22 @@ class Autopilot:
     """
 
     def __init__(self, coin: str, interval: str, ledger: Ledger,
-                 knobs: Knobs | None = None, size_usd: float = 0.0):
+                 knobs: Knobs | None = None, size_usd: float = 0.0,
+                 raw: bool = True, exit_on_invalidation: bool = False):
         self.coin = coin
         self.interval = interval
         self.ledger = ledger
         self.knobs = knobs or Knobs()
         self.size_usd = size_usd
+        # RAW: the three columns vote, nothing is refused, and the levels
+        # are the ones you set. This is the mode `sweep.py` reproduces
+        # exactly -- which is the point of it. A live agent whose exits
+        # differ from the backtest's makes the backtest decorative.
+        self.raw = raw
+        # Off by default in raw mode for the same reason: the sweep cannot
+        # replay an invalidation exit from bar data, so leaving it on makes
+        # the live book and the grid two different strategies.
+        self.exit_on_invalidation = exit_on_invalidation
         self.position: OpenPosition | None = None
         self._last_step: float = 0.0
         self._entered_candles: set[float] = set()
@@ -325,13 +345,15 @@ class Autopilot:
             price = float(book.get("mid") or 0.0)
         candle_ts = float(payload.get("candle_ts") or 0.0)
 
-        three = payload.get("three_way") or {}
-        read_dir: Direction = three.get("direction") or "flat"
+        ballot = vote_from_payload(payload)
+        read_dir: Direction = (ballot.direction if self.raw
+                               else ((payload.get("three_way") or {})
+                                     .get("direction") or "flat"))
 
         if self.position is not None:
             d = self._manage(payload, now, dt, price, high, low, read_dir)
         else:
-            d = self._consider(payload, now, price, candle_ts)
+            d = self._consider(payload, now, price, candle_ts, ballot)
 
         if record:
             self._log(d, payload, now, candle_ts, price)
@@ -367,7 +389,7 @@ class Autopilot:
         else:
             pos.against_s = 0.0
 
-        if pos.against_s >= self.knobs.invalidate_s:
+        if self.exit_on_invalidation and pos.against_s >= self.knobs.invalidate_s:
             return self._close(
                 pos, price, "invalidated", now,
                 f"the read has been {read_dir} against this "
@@ -378,7 +400,8 @@ class Autopilot:
         quiet = read_dir == "flat"
         interval_s = self._interval_s(payload)
         held = now - pos.opened_at
-        if quiet and held >= self.knobs.stale_s and abs(pos.mfe_bps) < 1e-9:
+        if (self.exit_on_invalidation and quiet
+                and held >= self.knobs.stale_s and abs(pos.mfe_bps) < 1e-9):
             return self._close(pos, price, "time", now,
                                f"flat for {held:.0f}s and never went "
                                f"in front — dead money")
@@ -409,11 +432,14 @@ class Autopilot:
     # ------------------------------------------------------------ consider
 
     def _consider(self, payload: dict, now: float, price: float,
-                  candle_ts: float) -> Decision:
+                  candle_ts: float, ballot: Vote) -> Decision:
         if candle_ts and candle_ts in self._entered_candles:
             return Decision(action="stand_aside", price=price,
                             gate="one_per_candle",
                             reason="already traded this candle")
+
+        if self.raw:
+            return self._consider_raw(payload, now, price, candle_ts, ballot)
 
         if not payload.get("take"):
             gate = payload.get("blocked_by") or "no_trade"
@@ -471,6 +497,62 @@ class Autopilot:
                     f"{entry:,.6g}, invalid at {stop:,.6g} — "
                     f"{three.get('agreeing', 0)} of three agree, "
                     f"needs {float(sug.get('breakeven') or 0):.0%}"))
+
+    def _consider_raw(self, payload: dict, now: float, price: float,
+                      candle_ts: float, ballot: Vote) -> Decision:
+        """Book, delta and price vote. Nothing else gets a say.
+
+        The only thing that produces no trade is all three columns flat,
+        and that is the absence of a reading rather than a refusal -- there
+        is no direction to be long or short of.
+        """
+        if ballot.side is None or price <= 0:
+            return Decision(action="stand_aside", price=price,
+                            gate="no_read", reason=ballot.describe())
+
+        k = self.knobs
+        sgn = 1.0 if ballot.side == "long" else -1.0
+        target = price * (1 + sgn * k.tp_bps / 10_000.0)
+        stop = price * (1 - sgn * k.sl_bps / 10_000.0)
+        cost = float(payload.get("cost_bps")
+                     or (payload.get("suggestion") or {}).get("cost_bps")
+                     or 0.0)
+        denom = k.tp_bps + k.sl_bps
+        breakeven = ((k.sl_bps + cost) / denom) if denom else 0.0
+
+        feats = self._features(payload)
+        feats.update({"vote_shape": ballot.shape(), "vote_net": ballot.net,
+                      "vote_book": ballot.book, "vote_delta": ballot.delta,
+                      "vote_price": ballot.price,
+                      "vote_against": ballot.against,
+                      "tp_bps": k.tp_bps, "sl_bps": k.sl_bps})
+
+        road = payload.get("runway") or {}
+        pos = self.ledger.open_position(
+            coin=self.coin, interval=self.interval, candle_ts=candle_ts,
+            side=ballot.side, entry=price, target_px=target, stop_px=stop,
+            target_bps=k.tp_bps, risk_bps=k.sl_bps, cost_bps=cost,
+            breakeven=breakeven,
+            grade=ballot.shape(), grade_3way=ballot.shape(),
+            agreeing=ballot.agreeing, conviction=abs(ballot.net),
+            runway_bps=float(road.get("clear_bps") or 0.0),
+            size_usd=self.size_usd, features=feats, now=now)
+        if pos is None:
+            self._entered_candles.add(candle_ts)
+            return Decision(action="stand_aside", price=price,
+                            gate="one_per_candle",
+                            reason="already traded this candle")
+
+        self.position = pos
+        self._entered_candles.add(candle_ts)
+        if len(self._entered_candles) > 512:
+            self._entered_candles = set(sorted(self._entered_candles)[-256:])
+
+        return Decision(
+            action="enter_long" if ballot.side == "long" else "enter_short",
+            side=ballot.side, price=price, position=pos,
+            reason=(f"{ballot.describe()} · target {k.tp_bps:.0f}bps, "
+                    f"stop {k.sl_bps:.0f}bps"))
 
     @staticmethod
     def _features(payload: dict) -> dict[str, Any]:
@@ -541,4 +623,6 @@ class Autopilot:
         return {"coin": self.coin, "interval": self.interval,
                 "position": self.position.to_dict() if self.position else None,
                 "knobs": self.knobs.to_dict(),
+                "raw": self.raw,
+                "exit_on_invalidation": self.exit_on_invalidation,
                 "size_usd": self.size_usd}

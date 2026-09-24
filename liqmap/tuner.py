@@ -114,6 +114,10 @@ NOT_EVALUABLE = {
                     "the ledger does not keep",
     "max_hold_bars": "same: an exit rule cannot be re-run from an outcome",
     "stale_s": "same: an exit rule cannot be re-run from an outcome",
+    "tp_bps": "tuned by the sweep instead, which replays every target "
+              "against real price bars rather than guessing from outcomes",
+    "sl_bps": "same: the sweep is the right tool for a stop, and it tests "
+              "every stop at once",
 }
 
 

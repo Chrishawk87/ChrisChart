@@ -44,9 +44,12 @@ from .bucket import build_map, render
 from .history import History, render_changes
 from .settings import Settings, SettingsStore, default_db_path
 from .ledger import Ledger
+from dataclasses import replace
 from .autopilot import Autopilot, Knobs, KNOBS
 from . import score as score_mod
 from . import tuner as tuner_mod
+from . import sweep as sweep_mod
+from . import vote as vote_mod
 from .strength import fragility_weighter, score_all, summarise
 
 APP_TITLE = "liqmap"
@@ -87,6 +90,8 @@ class Runtime:
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
+            "raw": True, "exit_on_invalidation": False,
+            "tp_bps": 20.0, "sl_bps": 15.0,
             "last_step": None, "last_decision": None, "steps": 0,
             "error": None}
         self._last_tune = 0.0
@@ -1119,8 +1124,12 @@ class Runtime:
         key = (coin, interval)
         p = self._pilots.get(key)
         if p is None:
-            p = Autopilot(coin, interval, self.ledger, knobs=self.knobs(),
-                          size_usd=float(self.autopilot.get("notional") or 0))
+            p = Autopilot(
+                coin, interval, self.ledger, knobs=self.knobs(),
+                size_usd=float(self.autopilot.get("notional") or 0),
+                raw=bool(self.autopilot.get("raw", True)),
+                exit_on_invalidation=bool(
+                    self.autopilot.get("exit_on_invalidation", False)))
             self._pilots[key] = p
         return p
 
@@ -1141,7 +1150,13 @@ class Runtime:
                                                        "no reading")}
 
         pilot = self.pilot(coin, interval)
-        pilot.knobs = self.knobs()
+        pilot.knobs = replace(
+            self.knobs(),
+            tp_bps=float(self.autopilot.get("tp_bps") or 20.0),
+            sl_bps=float(self.autopilot.get("sl_bps") or 15.0))
+        pilot.raw = bool(self.autopilot.get("raw", True))
+        pilot.exit_on_invalidation = bool(
+            self.autopilot.get("exit_on_invalidation", False))
         pilot.size_usd = notional
 
         # The bar's extremes, so a level reached between two polls still
@@ -1166,6 +1181,117 @@ class Runtime:
         self.autopilot["last_decision"] = out
         self.autopilot["steps"] = int(self.autopilot.get("steps") or 0) + 1
         return out
+
+    def signals_from_history(self, coin: str, interval: str,
+                             since: float | None = None
+                             ) -> list[sweep_mod.Signal]:
+        """Every stored candle reading, re-read as a book+delta+price vote.
+
+        The readings were stored raw rather than as a verdict, so a rule
+        invented today can be scored against candles collected weeks ago.
+        That is the difference between testing tonight and testing next
+        month.
+        """
+        rows = self.history.states_for_sweep(coin, interval, since=since)
+        out = []
+        for r in rows:
+            v = vote_mod.from_state(r)
+            if v.side is None:
+                continue          # nothing to read, not a refusal
+            out.append(sweep_mod.Signal(
+                ts=float(r.get("made_at") or r.get("candle_ts") or 0.0),
+                coin=r["coin"], interval=r["interval"], side=v.side,
+                entry=float(r["price"]), agreeing=v.agreeing,
+                against=v.against, shape=v.shape(), net=v.net,
+                book=v.book, delta=v.delta, price=v.price))
+        return out
+
+    def bars_for_sweep(self, coin: str, start: float, end: float,
+                       interval: str = "1m") -> list[sweep_mod.Bar]:
+        """One-minute bars covering the signal span.
+
+        One minute rather than the signal's own timeframe: a bar that
+        touches both levels is settled as a stop, so the ambiguous window
+        should be as small as the data allows.
+        """
+        span_min = max(1.0, (end - start) / 60.0) + sweep_mod.DEFAULT_HORIZON
+        want = int(min(5000, max(200, span_min)))
+        cs = self.client().candles(coin, interval, bars=want)
+        return [sweep_mod.Bar(ts=c.ts, open=c.open, high=c.high,
+                              low=c.low, close=c.close) for c in cs]
+
+    def run_sweep(self, coin: str, interval: str = "15m", *,
+                  tp_from: float = 5.0, tp_to: float = 40.0,
+                  tp_step: float = 5.0, sl_from: float = 5.0,
+                  sl_to: float = 40.0, sl_step: float = 5.0,
+                  cost_bps: float = 0.0,
+                  horizon: int = sweep_mod.DEFAULT_HORIZON,
+                  min_agreeing: int = 0, max_against: int = 3,
+                  side: str = "both", hours: float = 0.0) -> dict[str, Any]:
+        """Every target against every stop, over the signals already stored."""
+        since = (time.time() - hours * 3600.0) if hours else None
+        signals = self.signals_from_history(coin, interval, since=since)
+        if not signals:
+            span = self.history.state_span(coin, interval)
+            return {"ok": False, "signals": 0,
+                    "detail": ("no stored readings for that market and "
+                               "timeframe yet — leave the feed running and "
+                               "they accumulate one per candle"),
+                    "span": span}
+
+        lo = min(s.ts for s in signals)
+        hi = max(s.ts for s in signals)
+        try:
+            bars = self.bars_for_sweep(coin, lo, hi)
+        except Exception as exc:
+            return {"ok": False, "detail": f"could not fetch bars: {exc}"}
+
+        out = sweep_mod.run(
+            signals, bars,
+            sweep_mod.axis(tp_from, tp_to, tp_step),
+            sweep_mod.axis(sl_from, sl_to, sl_step),
+            cost_bps=cost_bps, horizon=horizon,
+            min_agreeing=min_agreeing, max_against=max_against, side=side)
+        out["coin"] = coin
+        out["interval"] = interval
+        out["available"] = len(signals)
+        out["span_hours"] = round((hi - lo) / 3600.0, 1)
+        # How each vote shape did at the best cell, so "do two-of-three
+        # trades pay" is answered from the same run rather than guessed.
+        if out.get("ok"):
+            out["by_shape"] = self._shape_breakdown(
+                signals, bars, out["best"], cost_bps, horizon, side)
+        return out
+
+    @staticmethod
+    def _shape_breakdown(signals, bars, best, cost_bps, horizon, side
+                         ) -> list[dict[str, Any]]:
+        """The best cell, split by how the columns voted."""
+        by: dict[str, sweep_mod.Cell] = {}
+        stamps = [b.ts for b in bars]
+        import bisect as _bisect
+        for s in signals:
+            if side != "both" and s.side != side:
+                continue
+            i = _bisect.bisect_right(stamps, s.ts)
+            window = bars[i:i + horizon]
+            if not window:
+                continue
+            cell = by.setdefault(s.shape, sweep_mod.Cell(
+                tp_bps=best["tp_bps"], sl_bps=best["sl_bps"],
+                cost_bps=cost_bps))
+            reason, exit_px, held = sweep_mod.resolve(
+                s.side, s.entry, best["tp_bps"], best["sl_bps"], window,
+                horizon)
+            raw = (exit_px - s.entry) / s.entry * 10_000.0
+            gross = raw if s.side == "long" else -raw
+            cell.add(reason, gross - cost_bps, held)
+        rows = []
+        for shape, cell in sorted(by.items(), key=lambda kv: -kv[1].n):
+            d = cell.to_dict()
+            d["shape"] = shape
+            rows.append(d)
+        return rows
 
     def scorecard(self, coin: str | None = None, interval: str | None = None
                   ) -> dict[str, Any]:
@@ -2236,7 +2362,9 @@ def create_app() -> FastAPI:
     @app.post("/api/autopilot", dependencies=[Depends(require_token)])
     def api_autopilot(on: bool, coin: str = "", interval: str = "15m",
                       mode: str = "scalp", notional: float = 10_000.0,
-                      fee_bps: float = 0.0) -> dict[str, Any]:
+                      fee_bps: float = 0.0, tp_bps: float = 20.0,
+                      sl_bps: float = 15.0, raw: bool = True,
+                      exit_on_invalidation: bool = False) -> dict[str, Any]:
         """Turn the agent's own book on or off.
 
         It keeps deciding whether or not anyone is watching. A record that
@@ -2249,11 +2377,15 @@ def create_app() -> FastAPI:
         rt.autopilot.update({
             "on": bool(on), "coin": c, "interval": interval or "15m",
             "mode": mode, "notional": float(notional),
-            "fee_bps": float(fee_bps), "error": None})
+            "fee_bps": float(fee_bps), "tp_bps": float(tp_bps),
+            "sl_bps": float(sl_bps), "raw": bool(raw),
+            "exit_on_invalidation": bool(exit_on_invalidation),
+            "error": None})
         return {"ok": True, "autopilot": rt.autopilot,
                 "knobs": rt.knobs().to_dict(),
-                "note": ("deciding every 5s — it suggests and records, it "
-                         "never places an order"
+                "note": (("deciding every 5s on the three columns alone, "
+                          f"target {tp_bps:.0f}bps / stop {sl_bps:.0f}bps — "
+                          "it records, it never places an order")
                          if on else "stopped; open positions stay open")}
 
     @app.get("/api/autopilot", dependencies=[Depends(require_token)])
@@ -2291,6 +2423,41 @@ def create_app() -> FastAPI:
                 pilot.position = None
                 return {"ok": closed is not None, "closed": closed}
         return {"ok": False, "detail": "no open position with that id"}
+
+    @app.get("/api/sweep", dependencies=[Depends(require_token)])
+    def api_sweep(coin: str, interval: str = "15m",
+                  tp_from: float = 5.0, tp_to: float = 40.0,
+                  tp_step: float = 5.0, sl_from: float = 5.0,
+                  sl_to: float = 40.0, sl_step: float = 5.0,
+                  cost_bps: float = 0.0, horizon: int = 60,
+                  min_agreeing: int = 0, max_against: int = 3,
+                  side: str = "both", hours: float = 0.0) -> dict[str, Any]:
+        """Every target against every stop, over the readings already stored.
+
+        The signal is independent of where the levels sit, so one pass over
+        the candle history scores the whole grid.
+        """
+        c = rt.resolve_symbol(coin)[0]
+        return rt.run_sweep(
+            c, interval, tp_from=tp_from, tp_to=tp_to, tp_step=tp_step,
+            sl_from=sl_from, sl_to=sl_to, sl_step=sl_step,
+            cost_bps=cost_bps, horizon=horizon, min_agreeing=min_agreeing,
+            max_against=max_against, side=side, hours=hours)
+
+    @app.get("/api/signals", dependencies=[Depends(require_token)])
+    def api_signals(coin: str, interval: str = "15m", limit: int = 50
+                    ) -> dict[str, Any]:
+        """What the three columns have been saying, candle by candle."""
+        c = rt.resolve_symbol(coin)[0]
+        sigs = rt.signals_from_history(c, interval)
+        span = rt.history.state_span(c, interval)
+        shapes: dict[str, int] = {}
+        for s2 in sigs:
+            shapes[s2.shape] = shapes.get(s2.shape, 0) + 1
+        return {"ok": True, "coin": c, "interval": interval,
+                "n": len(sigs), "span": span,
+                "shapes": sorted(shapes.items(), key=lambda kv: -kv[1]),
+                "recent": [s2.to_dict() for s2 in sigs[-limit:]][::-1]}
 
     @app.get("/api/scorecard", dependencies=[Depends(require_token)])
     def api_scorecard(coin: str = "", interval: str = "") -> dict[str, Any]:
@@ -3254,6 +3421,22 @@ DASHBOARD = """<!doctype html>
             font-size:11px;color:var(--dim)}
   .band-key span{display:inline-flex;align-items:center;gap:5px}
   .band-key i{display:inline-block;flex:none}
+  /* The grid. Diverging, because the metric has a real zero: blue pays,
+     red loses, neutral is breaking even. Blue-red rather than the app's
+     green-red because dozens of adjacent cells have to be told apart --
+     measured, green/red collapses to deltaE 5 under deuteranopia while
+     blue/red holds at 19. Every cell prints its number as well, so the
+     colour never carries the meaning by itself. */
+  .heat{border-collapse:separate;border-spacing:2px;font-size:11px}
+  .heat th{font-weight:600;color:var(--dim);font-size:11px;padding:2px 6px;
+           white-space:nowrap}
+  .heat td{padding:5px 7px;text-align:right;font-family:var(--mono);
+           color:var(--ink);border-radius:3px;min-width:56px;cursor:default}
+  .heat td.sig{outline:1.5px solid var(--ink);outline-offset:-1.5px}
+  .heat td.best{outline:2px solid var(--accent);outline-offset:-2px}
+  .heat-key{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;
+            margin:8px 0;font-size:11px;color:var(--dim)}
+  .heat-key i{display:inline-block;height:10px;border-radius:2px}
   .prop{border:1px solid var(--grid);border-radius:4px;padding:10px 12px;
         margin-bottom:8px}
   .prop pre{white-space:pre-wrap;font-family:var(--mono);font-size:11px;
@@ -3438,17 +3621,23 @@ DASHBOARD = """<!doctype html>
     <div class="panel full" id="pilotPanel"><h2>The agent's own book
       <span class="stamp" id="apStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Its decisions, not yours.
-        Every poll it commits — long, short, hold, exit, or stand aside — and
-        lives with the result. <b>Nothing here places an order.</b> It is a
-        written record of what it would have done, kept honestly enough to
-        be scored against what you actually did.</div>
+        Book, delta and price vote; whichever way they add up is the
+        direction. Nothing is refused except all three going flat, which is
+        no reading rather than a veto. Levels are the ones you set below —
+        the same ones the grid tests — so a result up there transfers down
+        here unchanged. <b>Nothing places an order.</b></div>
 
       <div class="conbar">
         <label>candle <select id="apInt">
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></select></label>
         <label>size $<input id="apSize" value="10000" size="8"></label>
+        <label><b>take profit</b> <input id="apTp" value="20" size="3">bps</label>
+        <label><b>stop loss</b> <input id="apSl" value="15" size="3">bps</label>
         <label>round-trip fee <input id="apFee" value="0" size="4">bps</label>
+        <label title="Off keeps the live book identical to the grid, so a
+result from the sweep transfers unchanged."><input type="checkbox"
+          id="apInval">also exit when the read flips</label>
         <button class="go" id="apToggle" onclick="toggleAutopilot()">Let it
           decide</button>
         <button onclick="stepAutopilot()">Decide once</button>
@@ -3473,6 +3662,46 @@ DASHBOARD = """<!doctype html>
         <button style="margin-left:8px" onclick="scanProposals()">Look
           now</button></div>
       <div id="apProposals"></div>
+    </div>
+
+    <div class="panel full" id="sweepPanel"><h2>Target and stop — test every pair
+      <span class="stamp" id="swStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">A signal does not know where
+        its target is — book, delta and price point a direction at a price,
+        and that is the whole decision. So one pass over the candles you have
+        already recorded scores <b>every</b> target against <b>every</b> stop.
+        Set the ranges and look at the shape of the surface, not at the best
+        square.</div>
+
+      <div class="conbar">
+        <label>candle <select id="swInt">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label><b>take profit</b> <input id="swTpFrom" value="5" size="3">to
+          <input id="swTpTo" value="40" size="3">step
+          <input id="swTpStep" value="5" size="3">bps</label>
+        <label><b>stop loss</b> <input id="swSlFrom" value="5" size="3">to
+          <input id="swSlTo" value="40" size="3">step
+          <input id="swSlStep" value="5" size="3">bps</label>
+        <label>round-trip fee <input id="swFee" value="0" size="3">bps</label>
+        <label>give it <input id="swHorizon" value="60" size="3">
+          minutes</label>
+        <label>votes <select id="swAgree">
+          <option value="0" selected>any — every signal</option>
+          <option value="2">2 of 3 or better</option>
+          <option value="3">all three only</option></select></label>
+        <label>side <select id="swSide">
+          <option value="both" selected>both</option>
+          <option value="long">long only</option>
+          <option value="short">short only</option></select></label>
+        <button class="go" onclick="runSweep()">Run the grid</button>
+        <button onclick="loadSignals()">What have I got?</button>
+      </div>
+
+      <div id="swAvail" class="msg"></div>
+      <div id="swVerdict" class="say" style="display:none;margin:10px 0"></div>
+      <div id="swGrid" style="overflow-x:auto"></div>
+      <div id="swShapes" style="margin-top:14px"></div>
     </div>
 
     <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
@@ -4092,7 +4321,11 @@ let apOn = false;
 function apCfg() {
   return {coin: coin(), interval: $('apInt').value,
           notional: parseFloat($('apSize').value || '10000'),
-          fee_bps: parseFloat($('apFee').value || '0')};
+          fee_bps: parseFloat($('apFee').value || '0'),
+          tp_bps: parseFloat($('apTp').value || '20'),
+          sl_bps: parseFloat($('apSl').value || '15'),
+          raw: true,
+          exit_on_invalidation: $('apInval').checked};
 }
 
 async function toggleAutopilot() {
@@ -4135,7 +4368,9 @@ async function loadAutopilot() {
   const last = d.autopilot.last_decision;
   $('apState').innerHTML = apOn
     ? `<b>Running on ${esc(d.autopilot.coin || '—')} `
-      + `${esc(d.autopilot.interval || '')}</b> — ${c.closed || 0} closed, `
+      + `${esc(d.autopilot.interval || '')}</b> at `
+      + `${d.autopilot.tp_bps}bps target / ${d.autopilot.sl_bps}bps stop — `
+      + `${c.closed || 0} closed, `
       + `${c.open || 0} open, ${c.decisions || 0} decisions logged. `
       + (last ? 'Last: ' + esc(last.sentence) : '')
       + (d.autopilot.error ? ` <span class="err">${esc(d.autopilot.error)}</span>` : '')
@@ -4378,6 +4613,175 @@ async function scanProposals() {
   try { await api('/api/proposals/scan', {method: 'POST'}); }
   catch (e) { $('apProposals').textContent = e.message; return; }
   loadProposals();
+}
+
+/* ---------------------------------------------------------------------
+   The target / stop grid.
+
+   Diverging colour, because the metric has a real zero. The pair is
+   blue-red rather than the app's green-red for one measured reason: a
+   grid asks you to tell dozens of adjacent cells apart, and green-red
+   separates at deltaE 5 under deuteranopia where blue-red holds at 19.
+   Every cell carries its number too, so colour is never doing the work
+   alone.
+   --------------------------------------------------------------------- */
+
+const HEAT_POS = [42, 107, 176];    // pays
+const HEAT_NEG = [196, 69, 54];     // loses
+const HEAT_MID = [44, 49, 56];      // breaking even
+
+function heatColor(v, scale) {
+  if (v == null || !scale) return 'rgb(44,49,56)';
+  const t = Math.max(-1, Math.min(1, v / scale));
+  const pole = t >= 0 ? HEAT_POS : HEAT_NEG;
+  const k = Math.abs(t);
+  const c = HEAT_MID.map((m, i) => Math.round(m + (pole[i] - m) * k));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+function swCfg() {
+  return {
+    coin: coin(), interval: $('swInt').value,
+    tp_from: parseFloat($('swTpFrom').value || '5'),
+    tp_to: parseFloat($('swTpTo').value || '40'),
+    tp_step: parseFloat($('swTpStep').value || '5'),
+    sl_from: parseFloat($('swSlFrom').value || '5'),
+    sl_to: parseFloat($('swSlTo').value || '40'),
+    sl_step: parseFloat($('swSlStep').value || '5'),
+    cost_bps: parseFloat($('swFee').value || '0'),
+    horizon: parseInt($('swHorizon').value || '60', 10),
+    min_agreeing: parseInt($('swAgree').value || '0', 10),
+    side: $('swSide').value,
+  };
+}
+
+async function loadSignals() {
+  let d;
+  try {
+    d = await api('/api/signals?' + q({coin: coin(),
+                                       interval: $('swInt').value}));
+  } catch (e) { $('swAvail').textContent = e.message; return; }
+  if (!d.ok) { $('swAvail').textContent = d.detail || 'nothing stored'; return; }
+  const hrs = (d.span && d.span.first && d.span.last)
+    ? ((d.span.last - d.span.first) / 3600).toFixed(1) : '0';
+  $('swAvail').innerHTML = `<b>${d.n} signals</b> on ${esc(d.coin)} `
+    + `${esc(d.interval)} over ${hrs}h. `
+    + (d.shapes || []).map(([sh, n]) =>
+        `${esc(sh)}: ${n}`).join(' · ')
+    + (d.n < 30 ? ' — <b>too few to test yet.</b> Leave the feed running; '
+                + 'one lands per candle.' : '');
+}
+
+async function runSweep() {
+  $('swVerdict').style.display = '';
+  $('swVerdict').textContent = 'walking every pair over every signal…';
+  $('swGrid').innerHTML = '';
+  $('swShapes').innerHTML = '';
+  let d;
+  try { d = await api('/api/sweep?' + q(swCfg())); }
+  catch (e) { $('swVerdict').textContent = e.message; return; }
+
+  if (!d.ok) {
+    $('swVerdict').innerHTML = `<b>${esc(d.detail || 'no result')}</b>`;
+    if (d.span && d.span.n) {
+      $('swAvail').textContent = `${d.span.n} readings stored for this `
+        + 'market, but none matched.';
+    }
+    return;
+  }
+
+  $('swStamp').textContent = `${d.signals} signals · ${d.span_hours}h`;
+  $('swVerdict').innerHTML = `<b>${esc(d.verdict)}</b>`;
+  $('swAvail').innerHTML = `<b>${d.available} signals</b> available, `
+    + `${d.signals} with price after them. Cost ${d.cost_bps}bps a round `
+    + `trip, ${d.horizon} minutes given to each trade.`;
+  paintHeat(d);
+  paintShapes(d);
+}
+
+function paintHeat(d) {
+  const scale = Math.max(...d.cells.map(c => Math.abs(c.expectancy)), 0.01);
+  const by = {};
+  for (const c of d.cells) by[c.tp_bps + '|' + c.sl_bps] = c;
+  const bestKey = d.best.tp_bps + '|' + d.best.sl_bps;
+
+  let h = '<table class="heat"><thead><tr>'
+        + '<th style="text-align:left">stop \\u2193 / target \\u2192</th>'
+        + d.tp_values.map(t => `<th>${t}</th>`).join('')
+        + '</tr></thead><tbody>';
+  for (const sl of d.sl_values) {
+    h += `<tr><th style="text-align:left">${sl}</th>`;
+    for (const tp of d.tp_values) {
+      const c = by[tp + '|' + sl];
+      if (!c) { h += '<td></td>'; continue; }
+      const key = tp + '|' + sl;
+      const cls = (key === bestKey ? 'best' : (c.significant ? 'sig' : ''));
+      const tip = `target ${tp}bps / stop ${sl}bps · ${c.rr}R\n`
+        + `${c.expectancy >= 0 ? '+' : ''}${c.expectancy}bps a trade `
+        + `over ${c.n}\n`
+        + `honest range ${c.ci_low} to ${c.ci_high}\n`
+        + `hit ${(c.hit_rate*100).toFixed(0)}% · needs `
+        + `${(c.breakeven*100).toFixed(0)}%\n`
+        + `${c.targets} targets, ${c.stops} stops, ${c.timeouts} ran out\n`
+        + `held ${c.avg_bars} min on average`;
+      h += `<td class="${cls}" style="background:`
+        + `${heatColor(c.expectancy, scale)}" title="${esc(tip)}">`
+        + `${c.expectancy >= 0 ? '+' : ''}${c.expectancy.toFixed(1)}</td>`;
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+
+  const swatch = v =>
+    `<i style="width:22px;background:${heatColor(v, scale)}"></i>`;
+  h += '<div class="heat-key">'
+    + `<span>${swatch(-scale)}${swatch(-scale/2)}${swatch(0)}`
+    + `${swatch(scale/2)}${swatch(scale)}</span>`
+    + `<span>&minus;${scale.toFixed(1)}bps &rarr; breaking even &rarr; `
+    + `+${scale.toFixed(1)}bps a trade, after cost</span>`
+    + '<span><i style="width:12px;outline:1.5px solid var(--ink);'
+    + 'outline-offset:-1.5px;background:transparent"></i>the whole honest '
+    + 'range is on one side of zero</span>'
+    + '<span><i style="width:12px;outline:2px solid var(--accent);'
+    + 'outline-offset:-2px;background:transparent"></i>best cell</span>'
+    + '<span>hover any square for its full numbers</span></div>'
+    + '<div class="thin">Both levels touched inside one minute counts as a '
+    + '<b>stop</b> — nothing in a bar says which came first, and taking the '
+    + 'good one is what makes a grid look better than it is. Trades that '
+    + 'never reach either level are marked out at the close, not dropped.</div>';
+
+  $('swGrid').innerHTML = h;
+}
+
+function paintShapes(d) {
+  const rows = d.by_shape || [];
+  if (!rows.length) return;
+  $('swShapes').innerHTML =
+    '<h3 style="margin:0 0 4px;font-size:13px">How each vote shape did at '
+    + `the best cell (${d.best.tp_bps}bps target, ${d.best.sl_bps}bps stop)`
+    + '</h3>'
+    + '<div class="thin" style="margin-bottom:6px">agreeing&ndash;against. '
+    + '<b>3&ndash;0</b> is all three columns; <b>2&ndash;1</b> is two '
+    + 'outvoting one; <b>1&ndash;0</b> is one column with two staying '
+    + 'quiet. The cell was picked using all of them, so treat one '
+    + 'shape standing out here as a lead to check, not a finding.'
+    + '</div>'
+    + '<table><thead><tr><th>shape</th><th>n</th><th>per trade</th>'
+    + '<th>honest range</th><th>hit</th><th>needed</th>'
+    + '<th>reads as</th></tr></thead><tbody>'
+    + rows.map(r => `<tr><td><b>${esc(r.shape)}</b></td><td>${r.n}</td>`
+        + `<td class="${r.expectancy > 0 ? 'long' : 'short'}">`
+        + `${r.expectancy >= 0 ? '+' : ''}${r.expectancy.toFixed(2)}bps</td>`
+        + `<td class="thin">${r.ci_low == null ? '—'
+            : (r.ci_low >= 0 ? '+' : '') + r.ci_low.toFixed(1) + ' to '
+              + (r.ci_high >= 0 ? '+' : '') + r.ci_high.toFixed(1)}</td>`
+        + `<td>${(r.hit_rate*100).toFixed(0)}%</td>`
+        + `<td>${(r.breakeven*100).toFixed(0)}%</td>`
+        + `<td class="thin">${r.significant
+            ? 'real at this sample size'
+            : (r.n < 30 ? 'too few to read' : 'inside the noise')}</td>`
+        + '</tr>').join('')
+    + '</tbody></table>';
 }
 
 async function loadSuggest() {

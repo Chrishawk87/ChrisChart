@@ -341,6 +341,85 @@ P&L is reported **net of the round trip**, alongside gross. Gross says whether
 the read was right; net says whether the trade made money. Only one of those
 pays for anything.
 
+## Book, delta, price — the vote, and the grid that sizes it
+
+`liqmap/vote.py`, `liqmap/sweep.py`
+
+### The decision is three columns added up
+
+```
+net = book + delta + price        signed by direction, sized by strength
+
+net > 0  ->  long
+net < 0  ->  short
+net == 0 ->  nothing
+```
+
+That is the whole entry rule. Two agreeing is a trade. One column with two
+quiet ones is a trade. Two outvoting one is a trade in the direction of the
+two. None of that is decided in code — it falls out of the arithmetic, and
+the vote *shape* (`3-0`, `2-1`, `2-0`, `1-1`) is recorded so the scorecard
+can tell you afterwards which shapes actually paid.
+
+The only thing producing no trade is all three flat, and that is the absence
+of a reading rather than a veto: there is no direction to be long or short
+of.
+
+This deliberately removes the gates in `suggest.py` — conviction floors,
+breakeven ceilings, cost multiples, agreement age. Each was a guess about
+what a good trade looks like, applied before any evidence existed. The
+problem is not that they are wrong; it is that a filtered sample cannot
+measure its own filter, because the trades it refused have no outcome. The
+gated path still exists (`Autopilot(raw=False)`) if you want to compare.
+
+### The grid
+
+A signal does not know where its target is — it is a direction at a price at
+a time, identical whether the target is four ticks away or forty. So the
+expensive part runs once and scoring a hundred target/stop pairs is a
+hundred cheap walks over the same bars.
+
+Set the boxes, hit **Run the grid**. Every take-profit against every stop,
+over the candle readings the service already stored, net of cost. Read the
+*shape* of the surface rather than the best square:
+
+- a **solid region** of positive cells is a real preference
+- a **lone bright square** is the maximum of many noisy numbers, which
+  searching alone biases upward — the verdict line says so when the best
+  cell's interval straddles zero
+- the **share of the grid that is positive** is in the verdict, because 91%
+  positive and 9% positive mean very different things about the same best
+  cell
+
+Two settlement rules decide whether any of it is true:
+
+- **A bar touching both levels is a stop.** Nothing in OHLC orders the two
+  touches. Taking the good one flatters the tightest stops most — exactly
+  the cells that would then look best. One-minute bars are used rather than
+  the signal's timeframe so the ambiguous window is a minute, not fifteen.
+- **Trades that never reach a level are marked out at the close, not
+  dropped.** The unresolved ones are disproportionately the ones that went
+  nowhere; discarding them is the other classic way to manufacture an edge.
+
+### The live agent runs the same strategy
+
+The levels you set on the agent panel are the ones the grid tests, and in
+raw mode the agent exits on those levels only. Invalidation exits are off by
+default for one reason: the grid cannot replay an invalidation from bar
+data, so leaving them on would make the live book and the backtest two
+different strategies and the grid decorative. There is a checkbox to turn
+them back on when you want to compare.
+
+There is a test that settles the same bar through both paths and fails if
+they disagree.
+
+### Routes
+
+```
+GET /api/sweep?coin=ETH&tp_from=5&tp_to=40&tp_step=5&sl_from=5&sl_to=40&sl_step=5
+GET /api/signals?coin=ETH&interval=15m     what the columns have been saying
+```
+
 ## The agent's own book — it decides, logs, and marks itself
 
 `liqmap/autopilot.py`, `liqmap/ledger.py`, `liqmap/score.py`, `liqmap/tuner.py`
