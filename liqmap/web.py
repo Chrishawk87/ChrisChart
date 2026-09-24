@@ -43,6 +43,10 @@ from . import consensus as consensus_mod
 from .bucket import build_map, render
 from .history import History, render_changes
 from .settings import Settings, SettingsStore, default_db_path
+from .ledger import Ledger
+from .autopilot import Autopilot, Knobs, KNOBS
+from . import score as score_mod
+from . import tuner as tuner_mod
 from .strength import fragility_weighter, score_all, summarise
 
 APP_TITLE = "liqmap"
@@ -75,6 +79,17 @@ class Runtime:
         self.db_path = default_db_path()
         self.settings_store = SettingsStore(self.db_path)
         self.history = History(self.db_path)
+        # The agent's own book, separate from yours on purpose: yours is
+        # filtered by your judgement, which is the thing it is being
+        # measured against.
+        self.ledger = Ledger(self.db_path)
+        self._pilots: dict[tuple[str, str], Autopilot] = {}
+        self.autopilot: dict[str, Any] = {
+            "on": False, "coin": None, "interval": "15m", "mode": "scalp",
+            "notional": 10_000.0, "fee_bps": 0.0,
+            "last_step": None, "last_decision": None, "steps": 0,
+            "error": None}
+        self._last_tune = 0.0
         self.token = os.environ.get("LIQMAP_TOKEN", "").strip()
         self.wallets: list[str] = []
         self.last_error: str | None = None
@@ -1085,6 +1100,99 @@ class Runtime:
                 "pending": len(self.history.pending_states(time.time())),
                 "errors": errors[:5]}
 
+    # ------------------------------------------------------------ autopilot
+
+    def knobs(self) -> Knobs:
+        """Live settings: shipped defaults, displaced by adopted proposals."""
+        try:
+            return Knobs.from_overrides(self.ledger.overrides())
+        except Exception:
+            return Knobs()
+
+    def pilot(self, coin: str, interval: str) -> Autopilot:
+        """One agent per market and timeframe, rehydrated on first use.
+
+        Built lazily so a restart picks up whatever was open rather than
+        abandoning it -- an abandoned position never closes, and a trade
+        with no exit silently drops out of every average computed later.
+        """
+        key = (coin, interval)
+        p = self._pilots.get(key)
+        if p is None:
+            p = Autopilot(coin, interval, self.ledger, knobs=self.knobs(),
+                          size_usd=float(self.autopilot.get("notional") or 0))
+            self._pilots[key] = p
+        return p
+
+    def autopilot_step(self, coin: str, interval: str,
+                       mode: str = "scalp", notional: float = 10_000.0,
+                       fee_bps: float = 0.0) -> dict[str, Any]:
+        """One decision, on exactly what the panel would have shown.
+
+        The agent reads the same payload you do. Deciding on anything else
+        would make the screen and the ledger two different stories, and
+        there would be no way to audit a call after the fact.
+        """
+        payload = self.suggest_for(coin, interval, mode=mode,
+                                   notional=notional, fee_bps=fee_bps,
+                                   record=True)
+        if not payload.get("ok"):
+            return {"ok": False, "detail": payload.get("detail",
+                                                       "no reading")}
+
+        pilot = self.pilot(coin, interval)
+        pilot.knobs = self.knobs()
+        pilot.size_usd = notional
+
+        # The bar's extremes, so a level reached between two polls still
+        # counts. Polling the last print only would hand the agent a fill
+        # model money will not reproduce.
+        high = low = 0.0
+        feed = self.feed
+        if feed is not None:
+            bar = feed.candle(interval)
+            if bar is not None:
+                high, low = bar.high, bar.low
+
+        now = time.time()
+        d = pilot.step(payload, now, high=high, low=low)
+        out = d.to_dict()
+        out["ok"] = True
+        out["coin"] = coin
+        out["interval"] = interval
+        out["grade"] = payload.get("grade")
+        out["three_way"] = payload.get("three_way")
+        self.autopilot["last_step"] = now
+        self.autopilot["last_decision"] = out
+        self.autopilot["steps"] = int(self.autopilot.get("steps") or 0) + 1
+        return out
+
+    def scorecard(self, coin: str | None = None, interval: str | None = None
+                  ) -> dict[str, Any]:
+        """How the agent has actually done, error bars included."""
+        positions = self.ledger.closed(coin=coin, interval=interval)
+        decisions = self.ledger.decisions(coin=coin, interval=interval,
+                                          limit=5000)
+        card = score_mod.scorecard(positions, decisions)
+        card["ok"] = True
+        card["counts"] = self.ledger.counts()
+        card["open"] = [p.to_dict() for p in self.ledger.load_open(coin)]
+        card["knobs"] = self.knobs().to_dict()
+        return card
+
+    def maybe_tune(self, min_gap_s: float = 3600.0) -> list[dict[str, Any]]:
+        """Look for a change worth proposing. Files nothing most of the time.
+
+        Rate limited because the answer only moves when the book grows, and
+        re-running a walk-forward every five seconds burns CPU to file the
+        same proposal repeatedly.
+        """
+        now = time.time()
+        if now - self._last_tune < min_gap_s:
+            return []
+        self._last_tune = now
+        return tuner_mod.propose_all(self.ledger, self.knobs(), now=now)
+
     def now(self, coin: str) -> dict[str, Any]:
         """Spot price plus how old everything else on the dashboard is.
 
@@ -1368,6 +1476,7 @@ def _worker_loop(rt: Runtime) -> None:
     last_sweep = 0.0
     last_price = 0.0
     last_resolve = 0.0
+    last_pilot = 0.0
 
     while True:
         try:
@@ -1407,6 +1516,28 @@ def _worker_loop(rt: Runtime) -> None:
                     rt.resolve_states(limit=300)
                 except Exception as exc:
                     rt.last_error = f"resolve states: {exc}"
+
+            # The agent decides on its own cadence, independent of whether
+            # anyone has the panel open. That is the point: a book that only
+            # fills while you are watching measures your attention, not the
+            # strategy.
+            ap = rt.autopilot
+            if ap.get("on") and ap.get("coin") and now - last_pilot >= 5:
+                last_pilot = now
+                try:
+                    rt.autopilot_step(
+                        ap["coin"], ap.get("interval") or "15m",
+                        mode=ap.get("mode") or "scalp",
+                        notional=float(ap.get("notional") or 10_000.0),
+                        fee_bps=float(ap.get("fee_bps") or 0.0))
+                    ap["error"] = None
+                except Exception as exc:
+                    ap["error"] = str(exc)
+                    rt.last_error = f"autopilot: {exc}"
+                try:
+                    rt.maybe_tune()
+                except Exception as exc:
+                    rt.last_error = f"tuner: {exc}"
 
             if now - last_sweep >= cfg.sweep_interval_minutes * 60:
                 last_sweep = now
@@ -2099,6 +2230,124 @@ def create_app() -> FastAPI:
             "stats": rt.history.suggestion_stats(c, interval or None),
             "recent": rt.history.recent_suggestions(c, limit=max(1, min(recent, 200))),
         }
+
+    # ---------------------------------------------------------- autopilot
+
+    @app.post("/api/autopilot", dependencies=[Depends(require_token)])
+    def api_autopilot(on: bool, coin: str = "", interval: str = "15m",
+                      mode: str = "scalp", notional: float = 10_000.0,
+                      fee_bps: float = 0.0) -> dict[str, Any]:
+        """Turn the agent's own book on or off.
+
+        It keeps deciding whether or not anyone is watching. A record that
+        only fills while the page is open measures your attention rather
+        than the strategy.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else rt.autopilot.get("coin")
+        if on and not c:
+            return {"ok": False, "detail": "name a market first"}
+        rt.autopilot.update({
+            "on": bool(on), "coin": c, "interval": interval or "15m",
+            "mode": mode, "notional": float(notional),
+            "fee_bps": float(fee_bps), "error": None})
+        return {"ok": True, "autopilot": rt.autopilot,
+                "knobs": rt.knobs().to_dict(),
+                "note": ("deciding every 5s — it suggests and records, it "
+                         "never places an order"
+                         if on else "stopped; open positions stay open")}
+
+    @app.get("/api/autopilot", dependencies=[Depends(require_token)])
+    def api_autopilot_state() -> dict[str, Any]:
+        coin = rt.autopilot.get("coin")
+        return {"ok": True, "autopilot": rt.autopilot,
+                "knobs": rt.knobs().to_dict(),
+                "counts": rt.ledger.counts(),
+                "open": [p.to_dict() for p in rt.ledger.load_open(coin)],
+                "recent": rt.ledger.decisions(coin=coin, limit=40)}
+
+    @app.post("/api/autopilot/step", dependencies=[Depends(require_token)])
+    def api_autopilot_step(coin: str, interval: str = "15m",
+                           mode: str = "scalp", notional: float = 10_000.0,
+                           fee_bps: float = 0.0) -> dict[str, Any]:
+        """One decision now, for testing without waiting on the loop."""
+        c = rt.resolve_symbol(coin)[0]
+        return rt.autopilot_step(c, interval, mode=mode, notional=notional,
+                                 fee_bps=fee_bps)
+
+    @app.post("/api/autopilot/close", dependencies=[Depends(require_token)])
+    def api_autopilot_close(id: str, price: float = 0.0) -> dict[str, Any]:
+        """Close one by hand. Recorded as `manual`, never as a stop.
+
+        Kept honestly separate: a hand-closed trade says nothing about the
+        exit rules, and filing it as one would put your decision inside the
+        agent's score.
+        """
+        for key, pilot in rt._pilots.items():
+            pos = pilot.position
+            if pos is not None and pos.id == id:
+                px = price if price > 0 else pos.entry
+                closed = rt.ledger.close_position(pos, exit_px=px,
+                                                  reason="manual")
+                pilot.position = None
+                return {"ok": closed is not None, "closed": closed}
+        return {"ok": False, "detail": "no open position with that id"}
+
+    @app.get("/api/scorecard", dependencies=[Depends(require_token)])
+    def api_scorecard(coin: str = "", interval: str = "") -> dict[str, Any]:
+        """The agent marking its own homework, error bars included."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return rt.scorecard(c, interval or None)
+
+    @app.get("/api/ledger", dependencies=[Depends(require_token)])
+    def api_ledger(coin: str = "", interval: str = "", limit: int = 100
+                   ) -> dict[str, Any]:
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        rows = rt.ledger.closed(coin=c, interval=interval or None)
+        rows = list(reversed(rows))[:max(1, min(limit, 1000))]
+        return {"ok": True, "closed": rows,
+                "open": [p.to_dict() for p in rt.ledger.load_open(c)],
+                "counts": rt.ledger.counts()}
+
+    @app.get("/api/proposals", dependencies=[Depends(require_token)])
+    def api_proposals(status: str = "pending") -> dict[str, Any]:
+        """Changes the agent wants to make to itself, and why."""
+        return {"ok": True,
+                "proposals": rt.ledger.proposals(status or None),
+                "history": rt.ledger.override_history(),
+                "knobs": rt.knobs().to_dict(),
+                "readiness": tuner_mod.readiness(
+                    rt.ledger, rt.autopilot.get("coin"))}
+
+    @app.post("/api/proposals/decide", dependencies=[Depends(require_token)])
+    def api_proposal_decide(id: str, adopt: bool) -> dict[str, Any]:
+        """Adopt or reject. Only this changes a setting -- nothing auto."""
+        row = rt.ledger.decide_proposal(id, adopt)
+        if row is None:
+            return {"ok": False,
+                    "detail": "unknown id, or already decided"}
+        # Every pilot picks the new value up on its next step.
+        for pilot in rt._pilots.values():
+            pilot.knobs = rt.knobs()
+        return {"ok": True, "proposal": row,
+                "knobs": rt.knobs().to_dict()}
+
+    @app.post("/api/proposals/revert", dependencies=[Depends(require_token)])
+    def api_proposal_revert(param: str) -> dict[str, Any]:
+        """Put one knob back to the shipped default."""
+        ok = rt.ledger.clear_override(param)
+        for pilot in rt._pilots.values():
+            pilot.knobs = rt.knobs()
+        return {"ok": ok, "param": param, "knobs": rt.knobs().to_dict()}
+
+    @app.post("/api/proposals/scan", dependencies=[Depends(require_token)])
+    def api_proposal_scan() -> dict[str, Any]:
+        """Run the walk-forward now instead of waiting for the hourly one."""
+        rt._last_tune = 0.0
+        filed = rt.maybe_tune(min_gap_s=0.0)
+        return {"ok": True, "filed": filed,
+                "proposals": rt.ledger.proposals("pending"),
+                "readiness": tuner_mod.readiness(
+                    rt.ledger, rt.autopilot.get("coin"))}
 
     @app.get("/api/chart", dependencies=[Depends(require_token)])
     def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120
@@ -2989,6 +3238,27 @@ DASHBOARD = """<!doctype html>
   .stat{display:flex;flex-direction:column}
   .stat b{font-family:var(--mono);font-size:15px;font-weight:700}
   .stat span{font-size:11px;color:var(--dim)}
+  /* Hit rate as a RANGE, never a point: a rate with no sample size behind
+     it is a mood, not a measurement. */
+  .band{position:relative;height:16px;background:var(--grid);border-radius:3px;
+        overflow:hidden;min-width:140px}
+  .band .fill{position:absolute;top:0;bottom:0;border-radius:3px;opacity:.55}
+  .band .fill.clear{background:var(--up)}
+  .band .fill.short{background:var(--down)}
+  .band .fill.undecided{background:var(--dim)}
+  .band .need{position:absolute;top:-2px;bottom:-2px;width:2px;
+              background:var(--ink)}
+  .band .point{position:absolute;top:3px;width:2px;height:10px;
+               background:var(--ink);opacity:.9}
+  .band-key{display:flex;flex-wrap:wrap;gap:4px 14px;margin:6px 0 2px;
+            font-size:11px;color:var(--dim)}
+  .band-key span{display:inline-flex;align-items:center;gap:5px}
+  .band-key i{display:inline-block;flex:none}
+  .prop{border:1px solid var(--grid);border-radius:4px;padding:10px 12px;
+        margin-bottom:8px}
+  .prop pre{white-space:pre-wrap;font-family:var(--mono);font-size:11px;
+            color:var(--dim);margin:6px 0}
+  .thin{font-size:11px;color:var(--dim)}
   .gap-bad b{color:var(--down)}
   .gap-ok b{color:var(--up)}
   .flag{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;
@@ -3163,6 +3433,46 @@ DASHBOARD = """<!doctype html>
         <span id="sugDecided" class="msg" style="margin-left:10px"></span>
       </div>
       <div id="sugScore" class="say" style="display:none;margin-top:12px"></div>
+    </div>
+
+    <div class="panel full" id="pilotPanel"><h2>The agent's own book
+      <span class="stamp" id="apStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Its decisions, not yours.
+        Every poll it commits — long, short, hold, exit, or stand aside — and
+        lives with the result. <b>Nothing here places an order.</b> It is a
+        written record of what it would have done, kept honestly enough to
+        be scored against what you actually did.</div>
+
+      <div class="conbar">
+        <label>candle <select id="apInt">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label>size $<input id="apSize" value="10000" size="8"></label>
+        <label>round-trip fee <input id="apFee" value="0" size="4">bps</label>
+        <button class="go" id="apToggle" onclick="toggleAutopilot()">Let it
+          decide</button>
+        <button onclick="stepAutopilot()">Decide once</button>
+        <button onclick="loadScorecard()">Refresh score</button>
+      </div>
+
+      <div id="apState" class="msg">Off. Turn it on and leave it — a book
+        that only fills while you are watching measures your attention, not
+        the strategy.</div>
+      <div id="apPos" style="display:none;margin-top:10px"></div>
+      <div id="apFeed" style="display:none;margin-top:10px"></div>
+
+      <h3 style="margin:16px 0 6px">How it is doing</h3>
+      <div id="apHead" class="say">Nothing settled yet.</div>
+      <div id="apStats" style="margin-top:10px"></div>
+      <div id="apSlices" style="margin-top:10px"></div>
+
+      <h3 style="margin:16px 0 6px">Changes it wants to make</h3>
+      <div class="msg" style="margin-bottom:6px">It picks a value on older
+        trades and scores it on newer ones it has never seen. Nothing changes
+        until you say so.
+        <button style="margin-left:8px" onclick="scanProposals()">Look
+          now</button></div>
+      <div id="apProposals"></div>
     </div>
 
     <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
@@ -3465,7 +3775,7 @@ async function loadAll() {
   try {
     await Promise.all([loadStatus(), loadCoins(), loadBookCall(), loadWeights(), loadRead(),
                        loadForward(), loadConsensus(), loadDecisions(),
-                       loadDatasets(), loadAgreement(),
+                       loadDatasets(), loadAgreement(), loadAutopilot(),
                        loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
                        loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
@@ -3769,6 +4079,306 @@ function paintBookCall(d) {
 
 let sugPoll = null;
 let sugId = null;
+
+/* ---------------------------------------------------------------------
+   The agent's own book.
+
+   Everything here is a record of decisions, not an instruction to anyone.
+   The panel never offers to place an order because nothing behind it can.
+   --------------------------------------------------------------------- */
+
+let apOn = false;
+
+function apCfg() {
+  return {coin: coin(), interval: $('apInt').value,
+          notional: parseFloat($('apSize').value || '10000'),
+          fee_bps: parseFloat($('apFee').value || '0')};
+}
+
+async function toggleAutopilot() {
+  const c = apCfg();
+  let d;
+  try {
+    d = await api('/api/autopilot?' + q(Object.assign({on: !apOn}, c)),
+                  {method: 'POST'});
+  } catch (e) { $('apState').textContent = e.message; return; }
+  if (!d.ok) { $('apState').textContent = d.detail || 'could not start'; return; }
+  apOn = d.autopilot.on;
+  $('apToggle').textContent = apOn ? 'Stop deciding' : 'Let it decide';
+  loadAutopilot();
+  if (apOn && !apPoll) apPoll = setInterval(loadAutopilot, 5000);
+  if (!apOn && apPoll) { clearInterval(apPoll); apPoll = null; }
+}
+
+let apPoll = null;
+
+async function stepAutopilot() {
+  const c = apCfg();
+  try {
+    const d = await api('/api/autopilot/step?' + q(c), {method: 'POST'});
+    if (!d.ok) { $('apState').textContent = d.detail || 'no reading'; return; }
+  } catch (e) { $('apState').textContent = e.message; return; }
+  loadAutopilot();
+}
+
+async function loadAutopilot() {
+  let d;
+  try { d = await api('/api/autopilot'); }
+  catch (e) { $('apState').textContent = e.message; return; }
+  apOn = !!(d.autopilot && d.autopilot.on);
+  $('apToggle').textContent = apOn ? 'Stop deciding' : 'Let it decide';
+  $('apStamp').textContent = d.autopilot.last_step
+    ? 'decided ' + Math.round(Date.now()/1000 - d.autopilot.last_step) + 's ago'
+    : '';
+
+  const c = d.counts || {};
+  const last = d.autopilot.last_decision;
+  $('apState').innerHTML = apOn
+    ? `<b>Running on ${esc(d.autopilot.coin || '—')} `
+      + `${esc(d.autopilot.interval || '')}</b> — ${c.closed || 0} closed, `
+      + `${c.open || 0} open, ${c.decisions || 0} decisions logged. `
+      + (last ? 'Last: ' + esc(last.sentence) : '')
+      + (d.autopilot.error ? ` <span class="err">${esc(d.autopilot.error)}</span>` : '')
+    : `Off. ${c.closed || 0} trades in the book so far. Turn it on and leave `
+      + `it — a book that only fills while you are watching measures your `
+      + `attention, not the strategy.`;
+
+  paintPosition((d.open || [])[0]);
+  paintDecisionFeed(d.recent || []);
+  loadScorecard();
+}
+
+function paintPosition(p) {
+  const el = $('apPos');
+  if (!p) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const dirCls = p.side === 'long' ? 'long' : 'short';
+  el.innerHTML =
+    `<div class="verdict-big ${dirCls}">${p.side.toUpperCase()} `
+    + `${esc(p.coin)} <span class="thin">open</span></div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${chPx(p.entry)}</b><span>entry</span></div>`
+    + `<div class="stat"><b>${chPx(p.target_px)}</b><span>target</span></div>`
+    + `<div class="stat"><b>${chPx(p.stop_px)}</b><span>invalid at</span></div>`
+    + `<div class="stat"><b>${p.mfe_bps.toFixed(1)}bps</b>`
+      + '<span>best it saw</span></div>'
+    + `<div class="stat"><b>${p.mae_bps.toFixed(1)}bps</b>`
+      + '<span>worst it saw</span></div>'
+    + (p.against_s > 0
+        ? `<div class="stat gap-bad"><b>${p.against_s.toFixed(0)}s</b>`
+          + '<span>read against it</span></div>' : '')
+    + '</div>'
+    + `<div class="msg"><b>Needs ${(p.breakeven*100).toFixed(0)}%</b> to break `
+    + `even. ${p.agreeing} of three agreed at entry; runway was `
+    + `${p.runway_bps.toFixed(0)}bps. `
+    + `<button style="margin-left:6px" onclick="closePaper('${esc(p.id)}')">`
+    + 'Close it by hand</button></div>';
+}
+
+async function closePaper(id) {
+  try { await api('/api/autopilot/close?' + q({id}), {method: 'POST'}); }
+  catch (e) { $('apState').textContent = e.message; return; }
+  loadAutopilot();
+}
+
+const AP_WORD = {enter_long: 'LONG', enter_short: 'SHORT', exit: 'EXIT',
+                 hold: 'hold', stand_aside: 'aside'};
+
+function paintDecisionFeed(rows) {
+  const el = $('apFeed');
+  if (!rows.length) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  // Holds are the overwhelming majority and say nothing on their own;
+  // showing them would bury the decisions that changed something.
+  // Runs of the same stand-aside are collapsed. Eighty identical rows is
+  // not a feed, and it buries the decisions that changed something.
+  const runs = [];
+  for (const r of rows.filter(r => r.action !== 'hold')) {
+    const last = runs[runs.length - 1];
+    const same = last && last.action === r.action && last.gate === r.gate
+                 && r.action === 'stand_aside';
+    if (same) { last.count++; last.ts = Math.min(last.ts, r.ts); }
+    else runs.push({action: r.action, gate: r.gate, reason: r.reason,
+                    ts: r.ts, count: 1});
+  }
+  el.innerHTML = '<table><thead><tr><th>when</th><th>did</th>'
+    + '<th>why</th></tr></thead><tbody>'
+    + runs.slice(0, 12).map(r => {
+        const cls = r.action === 'enter_long' ? 'long'
+                  : r.action === 'enter_short' ? 'short' : '';
+        const times = r.count > 1 ? ` <span class="thin">×${r.count}</span>` : '';
+        return `<tr><td class="thin">`
+          + new Date(r.ts * 1000).toLocaleTimeString()
+          + `</td><td><b class="${cls}">${AP_WORD[r.action] || r.action}</b>`
+          + `${times}</td><td class="thin">`
+          + esc(r.gate ? r.gate + ' — ' + (r.reason || '') : (r.reason || ''))
+          + '</td></tr>';
+      }).join('')
+    + '</tbody></table>'
+    + '<div class="thin" style="margin-top:4px">Holds are left out and '
+    + 'repeats collapsed — only decisions that changed something.</div>';
+}
+
+/* ------------------------------------------------------------ scorecard */
+
+function band(b) {
+  /* Hit rate drawn as the RANGE it honestly is, against the rate the
+     entries needed. This is a diagnostic of the ENTRY SHAPE only — it is
+     not the verdict, because once an exit rule can close a trade between
+     the levels, clearing this line stops implying making money. The
+     verdict column is expectancy. */
+  const verdict = b.beats_breakeven === true ? 'clear'
+                : b.beats_breakeven === false ? 'short' : 'undecided';
+  const lo = b.ci_low * 100, hi = b.ci_high * 100;
+  return `<div class="band" title="${esc(b.verdict)}">`
+    + `<div class="fill ${verdict}" style="left:${lo}%;width:${hi-lo}%"></div>`
+    + `<div class="point" style="left:${b.hit_rate*100}%"></div>`
+    + `<div class="need" style="left:${b.needed*100}%"></div></div>`;
+}
+
+const BAND_KEY =
+  '<div class="thin" style="margin-top:8px">The bar below is about entry '
+  + '<i>shape</i> — did it hit often enough for the way the trades were '
+  + 'sized. The money column is the verdict; they can disagree, and when '
+  + 'they do the row says why.</div>'
+  + '<div class="band-key">'
+  + '<span><i style="width:18px;height:9px;background:var(--dim);opacity:.55;'
+  + 'border-radius:2px"></i>where the true hit rate honestly sits</span>'
+  + '<span><i style="width:2px;height:11px;background:var(--ink);'
+  + 'opacity:.9"></i>what it actually hit</span>'
+  + '<span><i style="width:2px;height:13px;background:var(--ink)"></i>'
+  + 'what it had to hit to break even</span>'
+  + '<span>green = the whole range clears it · red = none of it does · '
+  + 'grey = too close to call</span></div>';
+
+async function loadScorecard() {
+  let d;
+  try { d = await api('/api/scorecard?' + q({coin: coin()})); }
+  catch (e) { $('apHead').textContent = e.message; return; }
+  if (!d.ok) return;
+
+  const o = d.overall;
+  $('apHead').innerHTML = `<b>${esc(d.headline)}</b>`;
+
+  $('apStats').innerHTML = '<div class="conrow">'
+    + `<div class="stat"><b>${o.n}</b><span>closed</span></div>`
+    + `<div class="stat"><b class="${o.profitable === true ? 'long'
+        : o.profitable === false ? 'short' : ''}">`
+      + `${o.expectancy_bps > 0 ? '+' : ''}${o.expectancy_bps}bps</b>`
+      + `<span>per trade${o.exp_low == null ? '' :
+          ' · ' + (o.exp_low > 0 ? '+' : '') + o.exp_low + ' to '
+          + (o.exp_high > 0 ? '+' : '') + o.exp_high + ' honest range'}</span></div>`
+    + `<div class="stat"><b>${(o.hit_rate*100).toFixed(0)}%</b>`
+      + `<span>hit · needed ${(o.needed*100).toFixed(0)}%</span></div>`
+    + `<div class="stat"><b>${o.avg_r}</b><span>average R</span></div>`
+    + `<div class="stat"><b>${o.cost_drag_bps}bps</b>`
+      + '<span>cost per trade</span></div>'
+    + '</div>'
+    + (d.exits && d.exits.n
+        ? `<div class="msg"><b>Exits:</b> ${esc(d.exits.note)}</div>` : '')
+    + (d.stops && d.stops.n
+        ? `<div class="msg"><b>Stops:</b> ${esc(d.stops.note)}.</div>` : '');
+
+  const slice = (title, rows) => !rows.length ? '' :
+    `<h3 style="margin:14px 0 4px;font-size:13px">${title}</h3>`
+    + '<table><thead><tr><th>slice</th><th>n</th>'
+    + '<th>entry shape: hit vs needed</th>'
+    + '<th>per trade, after cost</th><th>reads as</th></tr></thead><tbody>'
+    + rows.map(b => {
+        const cls = b.profitable === true ? 'long'
+                  : b.profitable === false ? 'short' : '';
+        const range = (b.exp_low == null) ? ''
+          : `<span class="thin"> (${b.exp_low > 0 ? '+' : ''}${b.exp_low}`
+            + ` to ${b.exp_high > 0 ? '+' : ''}${b.exp_high})</span>`;
+        return `<tr><td>${esc(b.label)}</td><td>${b.n}</td>`
+          + `<td style="width:180px">${band(b)}</td>`
+          + `<td class="${cls}">${b.expectancy_bps > 0 ? '+' : ''}`
+          + `${b.expectancy_bps}bps${b.meaningful ? range : ''}</td>`
+          + `<td class="thin">${b.meaningful ? esc(b.verdict)
+              : 'too few to read'}`
+          + (b.divergence ? `<br><b>${esc(b.divergence)}</b>` : '')
+          + '</td></tr>';
+      }).join('')
+    + '</tbody></table>';
+
+  $('apSlices').innerHTML = BAND_KEY
+    + slice('By how many columns agreed', d.by_agreeing)
+    + slice('By grade', d.by_grade)
+    + slice('By how it ended', d.by_exit)
+    + slice('By how much room it had', d.by_runway)
+    + (d.gates && d.gates.length
+        ? '<h3 style="margin:14px 0 4px;font-size:13px">What it refused</h3>'
+          + '<table><thead><tr><th>gate</th><th>blocked</th>'
+          + '<th>of all polls</th></tr></thead><tbody>'
+          + d.gates.slice(0, 8).map(g => `<tr><td>${esc(g.gate)}</td>`
+              + `<td>${g.blocked}</td>`
+              + `<td>${(g.share_of_all*100).toFixed(0)}%</td></tr>`).join('')
+          + '</tbody></table>'
+          + '<div class="thin">A gate that fires on most polls IS the '
+          + 'strategy, whatever the description says.</div>'
+        : '');
+
+  loadProposals();
+}
+
+/* ------------------------------------------------------------ proposals */
+
+async function loadProposals() {
+  let d;
+  try { d = await api('/api/proposals'); }
+  catch (e) { $('apProposals').textContent = e.message; return; }
+
+  const knobs = d.knobs || {};
+  const changed = Object.entries(knobs).filter(([, v]) => v.changed);
+  const current = '<div class="msg"><b>Settings now:</b> '
+    + Object.entries(knobs).map(([k, v]) =>
+        `${esc(k)} ${v.value}${v.changed
+          ? ` <span class="thin">(default ${v.default}, `
+            + `<a href="#" onclick="revertKnob('${esc(k)}');return false">`
+            + 'put back</a>)</span>' : ''}`).join(' · ')
+    + '</div>';
+
+  const r = d.readiness || {};
+  if (!d.proposals.length) {
+    $('apProposals').innerHTML = current
+      + `<div class="msg">${esc(r.note || '')} Nothing to propose — which `
+      + 'is the normal answer. It only asks when a change beats the current '
+      + 'setting on trades it has never seen.</div>'
+      + '<div class="thin">Exit rules are not proposed at all: changing one '
+      + 'changes what happens during a trade, and re-running that needs the '
+      + 'price path, not the outcome. Same for loosening anything — the book '
+      + 'has no result for trades it refused to take.</div>';
+    return;
+  }
+
+  $('apProposals').innerHTML = current + d.proposals.map(p => `
+    <div class="prop">
+      <b>${esc(p.param)}: ${p.current_val} → ${p.proposed_val}</b>
+      <pre>${esc(p.rationale)}</pre>
+      <button class="go" onclick="decideProposal('${esc(p.id)}',true)">
+        Adopt</button>
+      <button onclick="decideProposal('${esc(p.id)}',false)">Reject</button>
+    </div>`).join('');
+}
+
+async function decideProposal(id, adopt) {
+  try { await api('/api/proposals/decide?' + q({id, adopt}), {method: 'POST'}); }
+  catch (e) { $('apProposals').textContent = e.message; return; }
+  loadProposals();
+}
+
+async function revertKnob(param) {
+  try { await api('/api/proposals/revert?' + q({param}), {method: 'POST'}); }
+  catch (e) { return; }
+  loadProposals();
+}
+
+async function scanProposals() {
+  $('apProposals').textContent = 'walking forward…';
+  try { await api('/api/proposals/scan', {method: 'POST'}); }
+  catch (e) { $('apProposals').textContent = e.message; return; }
+  loadProposals();
+}
 
 async function loadSuggest() {
   let d;

@@ -341,6 +341,107 @@ P&L is reported **net of the round trip**, alongside gross. Gross says whether
 the read was right; net says whether the trade made money. Only one of those
 pays for anything.
 
+## The agent's own book — it decides, logs, and marks itself
+
+`liqmap/autopilot.py`, `liqmap/ledger.py`, `liqmap/score.py`, `liqmap/tuner.py`
+
+The call panel answers a question when asked. This makes the agent commit.
+Every poll it says one of five things — long, short, hold, exit, stand aside
+— writes it down with the reading behind it, manages what it opened, and
+closes it for a stated reason.
+
+**It still does not place orders.** Nothing in these four files can. There
+is a test that greps the compiled source (comments and docstrings stripped)
+for order-placement vocabulary and fails if any of it appears.
+
+### Why a separate book from yours
+
+`history.py` already records suggestions and what you did with them. That
+measures the two of you together, because the sample is filtered by your
+judgement — and your judgement is what the agent is being compared against,
+not blended into. So it keeps its own. When the two disagree about a market,
+that is the interesting row.
+
+### The exit rule
+
+It exits on **invalidation**: the trade was taken because the book was thin
+one way and price was going that way, so when that stops being true the
+trade is over, stop or no stop. Three guards stop that being trigger-happy:
+
+- **Flat is not against you.** A read going quiet is the absence of a
+  signal. Only an *opposite* read counts.
+- **It has to persist.** The opposite read must hold continuously for
+  `invalidate_s`. One poll does not close a position, and the timer resets
+  the moment it stops being against.
+- **Quiet is its own exit.** A position whose read went flat and stayed
+  flat is not invalidated, it is dead money. Closed as `time`, because "I
+  was wrong" and "nothing happened" have different fixes.
+
+Levels are checked against the bar's range, not the last print — a stop
+reached between two polls was still reached. A bar touching both levels
+counts as a **stop**; nothing in OHLC says which came first, and taking the
+good one manufactures a hit rate money will not reproduce.
+
+### The scorecard, and the bug it shipped with
+
+The first version reported a book losing 2bps a trade as "paying for
+itself", because its hit rate cleared the rate its entries needed. Both
+numbers were right; the inference was not.
+
+Breakeven hit rate assumes every loser loses exactly the planned risk and
+every winner makes exactly the target. That holds when the levels are the
+only way out — and stops holding the moment an exit rule can close a trade
+in between, which is most of this agent's trades.
+
+So **expectancy decides**: net basis points per trade, with a confidence
+interval on the mean. Hit-rate-against-breakeven is kept as a diagnostic of
+*entry shape*, and when the two disagree the panel says so — "hits 51%
+against the 42% its entries needed and still loses 13bps a trade; the
+winners are not reaching the target the risk was sized against" is a
+specific, fixable finding that neither number gives alone.
+
+Every rate carries a **Wilson interval**. Eleven wins from twenty is 55%,
+and the honest reading of eleven from twenty is "somewhere between 32% and
+77%", which is compatible with a great strategy and with a coin. Nothing is
+described as meaningful under 30 trades, or conclusive under 100.
+
+### Self-improvement, and the three things that keep it honest
+
+- **Walk forward.** A threshold is chosen on the older part of the book and
+  scored on the newer part it has never seen.
+- **Bounded.** Every knob has a hard range, a step, and a cap of two steps
+  per adoption.
+- **Ask first.** A proposal is a row with the evidence attached. Nothing
+  changes until you adopt it, and adoption is recorded.
+
+Two things it will **not** propose, and the reasons are not cosmetic:
+
+- **Loosening anything.** The book has outcomes for trades it took, not for
+  trades it refused. Arguing for a looser threshold from this data would
+  rest on rows that do not exist.
+- **Exit rules** (`invalidate_s`, `max_hold_bars`, `stale_s`). They change
+  what happens *during* a trade; re-running them needs the price path, and
+  the ledger stores outcomes. Tune those by hand.
+
+A tightening-only tuner has its own failure mode — a ratchet that filters
+until it never trades — so a proposal discarding more than half the book is
+refused however good the survivors look.
+
+### Routes
+
+```
+POST /api/autopilot?on=true&coin=ETH&interval=15m   start/stop
+GET  /api/autopilot                                  state, open position, feed
+POST /api/autopilot/step                             one decision now
+POST /api/autopilot/close?id=...                     close by hand (logged `manual`)
+GET  /api/scorecard                                  the marking, with error bars
+GET  /api/ledger                                     every closed paper trade
+GET  /api/proposals                                  changes it wants to make
+POST /api/proposals/decide?id=...&adopt=true         adopt or reject
+POST /api/proposals/revert?param=...                 back to the shipped default
+POST /api/proposals/scan                             run the walk-forward now
+```
+
 ## Uploading chart history
 
 `POST /api/upload-history` takes a CSV or JSON OHLCV export — TradingView, an
