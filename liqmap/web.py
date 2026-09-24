@@ -2941,6 +2941,20 @@ DASHBOARD = """<!doctype html>
   button:hover{border-color:var(--accent)}
   button.go{background:var(--accent);color:#14171b;border-color:var(--accent);font-weight:600}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  .chart-key{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:6px;
+       font-size:11px;color:var(--dim);align-items:center}
+  .chart-key span{display:inline-flex;align-items:center;gap:5px}
+  .chart-key i{display:inline-block;flex:none}
+  .k-arrow{width:0;height:0;border-left:5px solid transparent;
+       border-right:5px solid transparent}
+  .k-arrow.k-long{border-top:8px solid var(--up)}
+  .k-arrow.k-short{border-bottom:8px solid var(--down);border-top:none}
+  .k-arrow.k-hollow{opacity:.4}
+  .k-dot{width:7px;height:7px;border-radius:50%}
+  .k-dot.k-long{background:var(--up)}
+  .k-dot.k-short{background:var(--down)}
+  .k-dash{width:16px;height:0;border-top:1px dashed var(--dim)}
+  .k-box{width:9px;height:9px;border:1.5px solid var(--ink);opacity:.6}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:14px}
   .panel h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;
        color:var(--dim);margin:0 0 10px;font-weight:600}
@@ -3103,15 +3117,6 @@ DASHBOARD = """<!doctype html>
         the pressure is winning. A trade only when they agree — if the book
         favours buyers and price is falling, somebody is absorbing them and
         we stand aside. <b>Nothing here places an order.</b></div>
-      <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
-      <div id="sugThree" style="display:none;margin-bottom:10px"></div>
-      <div id="sugCompare" style="display:none;margin-bottom:10px"></div>
-      <div id="chartWrap" style="display:none;margin-bottom:12px">
-        <canvas id="sugChart" height="260"
-          style="width:100%;height:260px;display:block;
-                 border:1px solid var(--line);border-radius:4px"></canvas>
-        <div id="chartNote" class="msg" style="margin-top:4px"></div>
-      </div>
       <div class="conbar">
         <label>candle <select id="sInt" onchange="loadSuggest()">
           <option>1m</option><option>5m</option><option selected>15m</option>
@@ -3128,6 +3133,27 @@ DASHBOARD = """<!doctype html>
         <button class="go" onclick="startFeed()" id="sugLive">Go live</button>
         <button onclick="stopFeed()">Stop feed</button>
         <button onclick="loadSuggest()">Ask</button>
+      </div>
+      <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
+      <div id="sugThree" style="display:none;margin-bottom:10px"></div>
+      <div id="chartWrap" style="display:none;margin-bottom:12px">
+        <canvas id="sugChart" height="300"
+          style="width:100%;height:300px;display:block;
+                 border:1px solid var(--line);border-radius:4px"></canvas>
+        <!-- A legend, not a caption. Identity is never carried by colour
+             alone: filled vs hollow says taken vs ignored, and the arrow
+             direction says which side. -->
+        <div class="chart-key">
+          <span><i class="k-arrow k-long"></i>long call</span>
+          <span><i class="k-arrow k-short"></i>short call</span>
+          <span><i class="k-arrow k-long k-hollow"></i>hollow = you ignored it</span>
+          <span><i class="k-arrow k-long k-solid"></i>solid = you took it</span>
+          <span><i class="k-dot k-long"></i>target hit</span>
+          <span><i class="k-dot k-short"></i>stopped out</span>
+          <span><i class="k-dash"></i>target &amp; stop levels</span>
+          <span><i class="k-box"></i>bar still forming</span>
+        </div>
+        <div id="chartNote" class="msg" style="margin-top:4px"></div>
       </div>
       <div id="sugCard" class="msg">Press <b>Go live</b>, give it ten seconds
         of book pushes, then <b>Ask</b>.</div>
@@ -3811,6 +3837,11 @@ function paintThreeWay(d) {
   const gradeCls = t.grade === 'A' ? 'long' : t.grade === 'X' ? 'short' : '';
   const road = d.runway;
   const dl = d.delta;
+  // Stability, folded in here rather than repeated in a second row.
+  const c = d.confirmation || {};
+  const p = c.participation;
+  const heldCls = c.settled ? 'long' : c.agree ? 'short' : '';
+  const partCls = !p ? '' : p.backed ? 'long' : 'short';
 
   box.style.display = '';
   box.innerHTML =
@@ -3825,20 +3856,27 @@ function paintThreeWay(d) {
     + `${esc(t.grade)}</b><span>grade · ${t.agreeing}/3</span></div>`
     + (road ? `<div class="stat"><b>${road.clear_bps.toFixed(0)}bps</b>`
               + `<span>runway${road.open_road ? ' · open' : ''}</span></div>` : '')
+    + (p ? `<div class="stat"><b class="${partCls}">`
+           + `${(p.effort * 100).toFixed(0)}%</b><span>paid for</span></div>` : '')
+    + `<div class="stat"><b class="${heldCls}">${(c.held_s || 0).toFixed(0)}s</b>`
+    + `<span>held${c.flips ? ' · ' + c.flips + ' flips' : ''}</span></div>`
     + '</div>'
     + `<div class="msg" style="margin-top:6px">${esc(t.detail || '')}</div>`
     + (road ? `<div class="msg" style="margin-top:4px"><b>How far:</b> `
               + `${esc(road.describe || '')}.</div>` : '')
     + (dl && (dl.absorbed || dl.divergent || dl.working)
         ? `<div class="msg" style="margin-top:4px"><b>Tape:</b> `
-          + `${esc(dl.describe || '')}.</div>` : '');
+          + `${esc(dl.describe || '')}.</div>` : '')
+    + (c.instability
+        ? `<div class="msg" style="margin-top:4px;color:var(--down)">`
+          + `<b>Agreeing but not settled</b> — ${esc(c.instability)}.</div>`
+        : '');
 }
 
 function paintSuggest(d) {
   if (!d) return;
   sugId = d.id || null;
   const act = $('sugActions');
-  paintCompare(d);
   paintThreeWay(d);
   loadChart();
 
@@ -4275,137 +4313,337 @@ async function doCalibrate() {
    wrong, which is the entire reason to look.                            */
 
 let chartData = null;
+/* Viewport over the bar array. `count` is how many bars are visible and
+   `offset` is how many are hidden off the right edge, so offset 0 always
+   means "pinned to the live bar" and a new candle arriving does not shove
+   the view sideways while you are reading it. */
+let chartView = {count: 70, offset: 0};
+let chartHover = null;      // {x, y} in CSS pixels, or null
+let chartDrag = null;
+
+const CH_PAD = {l: 8, r: 64, t: 10, b: 22};
+const CH_PROF = 46;   // width of the volume-profile gutter
+
+function chartGeom() {
+  const cv = $('sugChart');
+  const w = cv.clientWidth, h = cv.clientHeight;
+  // The forming bar's volume profile gets its own gutter against the price
+  // axis. Drawn over the candles it lands squarely on the live bar, which is
+  // the one bar you are actually watching.
+  const pr = chartData && chartData.profile && chartData.profile.levels
+             && chartData.profile.levels.length ? CH_PROF : 0;
+  return {w, h, prof: pr, plotW: w - CH_PAD.l - CH_PAD.r - pr,
+          plotH: h - CH_PAD.t - CH_PAD.b};
+}
+
+/* The slice of bars currently on screen, plus the index maths the pointer
+   handlers need. Kept in one place so drawing and hit-testing can never
+   disagree about which bar is under the cursor. */
+function chartSlice() {
+  if (!chartData || !chartData.bars) return null;
+  const all = chartData.bars;
+  const count = Math.max(10, Math.min(chartView.count, all.length));
+  const maxOff = Math.max(0, all.length - count);
+  const off = Math.max(0, Math.min(chartView.offset, maxOff));
+  chartView.offset = off;
+  const end = all.length - off;
+  return {all, bars: all.slice(end - count, end), start: end - count,
+          count, maxOff};
+}
+
+/* Decimals chosen from the price's own magnitude. A fixed 6 gives
+   "3,458.740157" on an instrument that ticks in cents, which is unreadable
+   at a glance and implies a precision the venue does not have. */
+function chPx(v) {
+  const a = Math.abs(v);
+  const d = a >= 1000 ? 2 : a >= 10 ? 3 : a >= 0.1 ? 5 : 8;
+  return Number(v).toLocaleString(undefined,
+    {minimumFractionDigits: d, maximumFractionDigits: d});
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
+function fmtDay(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+}
 
 function drawChart() {
   const wrap = $('chartWrap');
-  const cv = $('sugChart');
-  if (!chartData || !chartData.bars || chartData.bars.length < 2) {
-    wrap.style.display = 'none';
-    return;
-  }
+  const s = chartSlice();
+  if (!s || s.bars.length < 2) { wrap.style.display = 'none'; return; }
   wrap.style.display = '';
 
-  // Match the backing store to the CSS size, or everything is blurry on a
-  // retina display and the hit-testing is off by a factor of two.
+  const cv = $('sugChart');
   const dpr = window.devicePixelRatio || 1;
-  const w = cv.clientWidth, h = cv.clientHeight;
+  const {w, h, prof: profW, plotW, plotH} = chartGeom();
   cv.width = w * dpr; cv.height = h * dpr;
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
 
   const css = getComputedStyle(document.documentElement);
   const col = n => css.getPropertyValue(n).trim() || '#888';
-  const up = col('--up'), down = col('--down'),
-        dim = col('--dim'), line = col('--line'), ink = col('--ink');
+  const up = col('--up'), down = col('--down'), dim = col('--dim'),
+        line = col('--line'), ink = col('--ink'), panel = col('--panel');
 
-  const bars = chartData.bars;
-  const padL = 8, padR = 62, padT = 10, padB = 18;
-  const plotW = w - padL - padR, plotH = h - padT - padB;
-
+  const bars = s.bars;
   let lo = Infinity, hi = -Infinity;
   for (const b of bars) { if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h; }
-  for (const m of (chartData.marks || [])) {
+  const marks = (chartData.marks || []).filter(m => {
+    const i = markIndex(m, s);
+    return i >= 0 && i < bars.length;
+  });
+  for (const m of marks) {
     if (m.target) { lo = Math.min(lo, m.target); hi = Math.max(hi, m.target); }
     if (m.stop) { lo = Math.min(lo, m.stop); hi = Math.max(hi, m.stop); }
   }
   if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return;
   const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
 
-  const y = p => padT + (hi - p) / (hi - lo) * plotH;
+  const y = p => CH_PAD.t + (hi - p) / (hi - lo) * plotH;
   const step = plotW / bars.length;
-  const bw = Math.max(1, Math.min(step * 0.7, 14));
+  const xOf = i => CH_PAD.l + i * step + step / 2;
+  const bw = Math.max(1, Math.min(step * 0.7, 16));
 
   g.clearRect(0, 0, w, h);
+  g.font = '10px ui-monospace, monospace';
 
-  // price grid
-  g.strokeStyle = line; g.fillStyle = dim;
-  g.font = '10px ui-monospace, monospace'; g.textAlign = 'left';
+  /* Grid and price scale. Recessive on purpose — the marks are the data,
+     the axes are furniture. */
+  g.strokeStyle = line; g.fillStyle = dim; g.textAlign = 'left';
   for (let i = 0; i <= 4; i++) {
     const p = lo + (hi - lo) * i / 4, yy = Math.round(y(p)) + 0.5;
-    g.beginPath(); g.moveTo(padL, yy); g.lineTo(padL + plotW, yy); g.stroke();
-    g.fillText(p.toLocaleString(undefined, {maximumFractionDigits: 6}),
-               padL + plotW + 5, yy + 3);
+    g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(CH_PAD.l + plotW, yy); g.stroke();
+    g.fillText(chPx(p), CH_PAD.l + plotW + profW + 5, yy + 3);
   }
 
-  // volume profile of the forming bar, along the right edge
+  /* Time axis. Ticks are spaced by pixels rather than by bar count so the
+     labels stay readable at every zoom level instead of colliding when you
+     zoom out. */
+  g.textAlign = 'center';
+  const wantEvery = Math.max(1, Math.ceil(64 / step));
+  let lastDay = null;
+  for (let i = 0; i < bars.length; i++) {
+    if (i % wantEvery) continue;
+    const x = xOf(i), ts = bars[i].ts;
+    g.strokeStyle = line;
+    g.beginPath();
+    g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
+    g.lineTo(Math.round(x) + 0.5, CH_PAD.t + plotH);
+    g.globalAlpha = 0.35; g.stroke(); g.globalAlpha = 1;
+    g.fillStyle = dim;
+    const day = fmtDay(ts);
+    g.fillText(day !== lastDay ? day : fmtClock(ts), x, h - 7);
+    lastDay = day;
+  }
+
+  /* Volume profile of the forming bar, along the right edge. */
   const prof = chartData.profile;
-  if (prof && prof.levels && prof.levels.length) {
+  if (profW) {
+    const right = CH_PAD.l + plotW + profW;
     const maxV = Math.max(...prof.levels.map(l => l.v));
-    g.globalAlpha = 0.28;
     for (const l of prof.levels) {
-      const yy = y(l.px);
-      const lw = Math.max(1, (l.v / maxV) * 46);
-      g.fillStyle = (prof.poc && Math.abs(l.px - prof.poc) < 1e-9) ? ink : dim;
-      g.fillRect(padL + plotW - lw, yy - 1, lw, 2);
+      if (l.px < lo || l.px > hi) continue;
+      const lw = Math.max(1, (l.v / maxV) * (profW - 4));
+      const poc = prof.poc && Math.abs(l.px - prof.poc) < 1e-9;
+      g.fillStyle = poc ? ink : dim;
+      g.globalAlpha = poc ? 0.55 : 0.3;
+      g.fillRect(right - lw, y(l.px) - 1, lw, 2);
     }
     g.globalAlpha = 1;
   }
 
   // candles
   bars.forEach((b, i) => {
-    const x = padL + i * step + step / 2;
-    const rising = b.c >= b.o;
+    const x = xOf(i), rising = b.c >= b.o;
     g.strokeStyle = g.fillStyle = rising ? up : down;
-    g.globalAlpha = b.live ? 1 : 0.85;
     g.beginPath();
     g.moveTo(Math.round(x) + 0.5, y(b.h));
     g.lineTo(Math.round(x) + 0.5, y(b.l));
     g.stroke();
     const top = y(Math.max(b.o, b.c)), bot = y(Math.min(b.o, b.c));
     g.fillRect(x - bw / 2, top, bw, Math.max(1, bot - top));
-    g.globalAlpha = 1;
+    if (b.live) {                       // mark the bar still forming
+      g.strokeStyle = ink; g.globalAlpha = 0.35; g.setLineDash([2, 2]);
+      g.strokeRect(x - bw / 2 - 2.5, top - 2.5, bw + 5,
+                   Math.max(1, bot - top) + 5);
+      g.setLineDash([]); g.globalAlpha = 1;
+    }
   });
 
-  // the calls, on the bar they fired on
-  const first = bars[0].ts, iv = chartData.interval_s || 900;
-  for (const m of (chartData.marks || [])) {
-    const idx = Math.round((m.ts - first) / iv);
-    if (idx < 0 || idx >= bars.length) continue;
-    const x = padL + idx * step + step / 2;
-    const long = m.side === 'long';
-    const c = long ? up : down;
+  // the calls
+  for (const m of marks) {
+    const i = markIndex(m, s), x = xOf(i);
+    const long = m.side === 'long', c = long ? up : down;
 
-    // target and stop as short rails, so a call's shape is visible
-    g.strokeStyle = c; g.globalAlpha = 0.5; g.setLineDash([2, 2]);
+    g.strokeStyle = c; g.globalAlpha = 0.45; g.setLineDash([2, 3]);
     for (const p of [m.target, m.stop]) {
       if (!p) continue;
       g.beginPath();
-      g.moveTo(x - step * 0.4, y(p)); g.lineTo(x + step * 1.6, y(p));
+      g.moveTo(x - step * 0.4, y(p)); g.lineTo(x + step * 2.2, y(p));
       g.stroke();
     }
     g.setLineDash([]); g.globalAlpha = 1;
 
-    // the entry marker: filled when taken, hollow when ignored
     const yy = y(m.entry);
     g.beginPath();
-    if (long) { g.moveTo(x, yy + 9); g.lineTo(x - 5, yy + 17); g.lineTo(x + 5, yy + 17); }
-    else { g.moveTo(x, yy - 9); g.lineTo(x - 5, yy - 17); g.lineTo(x + 5, yy - 17); }
+    if (long) { g.moveTo(x, yy + 9); g.lineTo(x - 5, yy + 18); g.lineTo(x + 5, yy + 18); }
+    else { g.moveTo(x, yy - 9); g.lineTo(x - 5, yy - 18); g.lineTo(x + 5, yy - 18); }
     g.closePath();
     g.fillStyle = c; g.strokeStyle = c; g.lineWidth = 1.5;
     if (m.decision === 'taken') g.fill(); else g.stroke();
     g.lineWidth = 1;
 
-    // how it resolved
     if (m.outcome === 'target' || m.outcome === 'stop') {
       g.fillStyle = m.outcome === 'target' ? up : down;
-      g.beginPath(); g.arc(x, yy, 2.5, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = panel; g.lineWidth = 1.5;
+      g.beginPath(); g.arc(x, yy, 3, 0, Math.PI * 2);
+      g.fill(); g.stroke(); g.lineWidth = 1;
     }
   }
 
-  const n = (chartData.marks || []).length;
-  $('chartNote').innerHTML =
-      `${bars.length} ${esc(chartData.interval || '')} bars · `
-    + `${esc(chartData.source || '')} · ${n} call${n === 1 ? '' : 's'} plotted`
-    + ' · solid marker = taken, hollow = ignored, dot = how it settled';
+  // crosshair and readout
+  if (chartHover) {
+    const i = Math.max(0, Math.min(bars.length - 1,
+                                   Math.floor((chartHover.x - CH_PAD.l) / step)));
+    const b = bars[i];
+    if (b) {
+      const x = xOf(i);
+      g.strokeStyle = dim; g.globalAlpha = 0.6; g.setLineDash([3, 3]);
+      g.beginPath();
+      g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
+      g.lineTo(Math.round(x) + 0.5, CH_PAD.t + plotH);
+      g.moveTo(CH_PAD.l, Math.round(chartHover.y) + 0.5);
+      g.lineTo(CH_PAD.l + plotW, Math.round(chartHover.y) + 0.5);
+      g.stroke();
+      g.setLineDash([]); g.globalAlpha = 1;
+
+      // price under the cursor, on the scale
+      const pv = hi - (chartHover.y - CH_PAD.t) / plotH * (hi - lo);
+      g.fillStyle = ink;
+      g.fillRect(CH_PAD.l + plotW + profW + 2, chartHover.y - 7,
+                 CH_PAD.r - 4, 14);
+      g.fillStyle = panel; g.textAlign = 'left';
+      g.fillText(chPx(pv), CH_PAD.l + plotW + profW + 5, chartHover.y + 3);
+
+      const hit = marks.find(m => markIndex(m, s) === i);
+      const px = chPx;
+      const rows = [
+        fmtDay(b.ts) + ' ' + fmtClock(b.ts),
+        'O ' + px(b.o) + '  H ' + px(b.h),
+        'L ' + px(b.l) + '  C ' + px(b.c),
+      ];
+      if (hit) {
+        rows.push((hit.side || '').toUpperCase() + ' @ ' + px(hit.entry)
+                  + ' · ' + (hit.decision || 'pending'));
+        if (hit.outcome) {
+          rows.push(hit.outcome + (hit.pnl_bps == null ? ''
+                    : ' ' + (hit.pnl_bps >= 0 ? '+' : '')
+                      + hit.pnl_bps.toFixed(1) + 'bps'));
+        }
+      }
+      const bw2 = 168, bh = 8 + rows.length * 13;
+      let bx = x + 12, by = CH_PAD.t + 6;
+      if (bx + bw2 > CH_PAD.l + plotW) bx = x - 12 - bw2;
+      g.fillStyle = panel; g.globalAlpha = 0.95;
+      g.fillRect(bx, by, bw2, bh);
+      g.globalAlpha = 1; g.strokeStyle = line; g.strokeRect(bx + 0.5, by + 0.5, bw2, bh);
+      g.fillStyle = ink; g.textAlign = 'left';
+      rows.forEach((r, k) => g.fillText(r, bx + 6, by + 15 + k * 13));
+    }
+  }
+}
+
+/* Which visible slot a call belongs in. Derived from the bar timestamps
+   rather than from a stored index, so it stays correct while panning. */
+function markIndex(m, s) {
+  const iv = chartData.interval_s || 900;
+  return Math.round((m.ts - s.bars[0].ts) / iv);
+}
+
+/* ---- interaction ------------------------------------------------------ */
+
+function chartPoint(ev) {
+  const r = $('sugChart').getBoundingClientRect();
+  const t = ev.touches && ev.touches[0];
+  return {x: (t ? t.clientX : ev.clientX) - r.left,
+          y: (t ? t.clientY : ev.clientY) - r.top};
+}
+
+function wireChart() {
+  const cv = $('sugChart');
+  if (!cv || cv.dataset.wired) return;
+  cv.dataset.wired = '1';
+  cv.style.cursor = 'crosshair';
+
+  cv.addEventListener('wheel', ev => {
+    if (!chartData) return;
+    ev.preventDefault();
+    const s = chartSlice(); if (!s) return;
+    const {plotW} = chartGeom();
+    // Zoom about the cursor, so the bar under the pointer stays put.
+    const frac = Math.max(0, Math.min(1, (chartPoint(ev).x - CH_PAD.l) / plotW));
+    const before = chartView.count;
+    const next = Math.round(before * (ev.deltaY > 0 ? 1.15 : 0.87));
+    chartView.count = Math.max(10, Math.min(next, s.all.length));
+    const grew = chartView.count - before;
+    chartView.offset = Math.max(0, chartView.offset + Math.round(grew * (1 - frac)));
+    drawChart();
+  }, {passive: false});
+
+  const start = ev => {
+    chartDrag = {x: chartPoint(ev).x, offset: chartView.offset};
+    cv.style.cursor = 'grabbing';
+  };
+  const move = ev => {
+    const p = chartPoint(ev);
+    chartHover = p;
+    if (chartDrag) {
+      const s = chartSlice();
+      if (s) {
+        const step = chartGeom().plotW / s.count;
+        chartView.offset = Math.max(0, Math.min(
+          s.maxOff, chartDrag.offset + Math.round((p.x - chartDrag.x) / step)));
+      }
+    }
+    drawChart();
+  };
+  const end = () => { chartDrag = null; cv.style.cursor = 'crosshair'; };
+
+  cv.addEventListener('mousedown', start);
+  cv.addEventListener('mousemove', move);
+  cv.addEventListener('mouseup', end);
+  cv.addEventListener('mouseleave', () => {
+    chartHover = null; end(); drawChart();
+  });
+  cv.addEventListener('touchstart', ev => { start(ev); }, {passive: true});
+  cv.addEventListener('touchmove', ev => { move(ev); }, {passive: true});
+  cv.addEventListener('touchend', end);
+  cv.addEventListener('dblclick', resetChartView);
+}
+
+function resetChartView() {
+  chartView = {count: 70, offset: 0};
+  drawChart();
 }
 
 async function loadChart() {
   try {
     chartData = await api('/api/chart?' + q({
-      coin: coin(), interval: $('sInt').value, bars: 120}));
+      coin: coin(), interval: $('sInt').value, bars: 400}));
   } catch (e) { return; }
-  if (chartData && chartData.error) { chartData = null; }
+  if (chartData && chartData.error) { chartData = null; return; }
+  wireChart();
   drawChart();
+  const n = (chartData.marks || []).length;
+  $('chartNote').innerHTML =
+      `${esc(chartData.interval || '')} · ${esc(chartData.source || '')} · `
+    + `${n} call${n === 1 ? '' : 's'} · scroll to zoom, drag to pan, `
+    + 'double-click to reset';
 }
 
 window.addEventListener('resize', () => { if (chartData) drawChart(); });
