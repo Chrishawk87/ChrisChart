@@ -133,7 +133,13 @@ CREATE TABLE IF NOT EXISTS tuning_proposals (
     base_metric  REAL NOT NULL,
     rationale    TEXT NOT NULL DEFAULT '',
     status       TEXT NOT NULL DEFAULT 'pending',
-    decided_at   REAL
+    decided_at   REAL,
+    -- A paired change. Target and stop are one decision: adopting a wider
+    -- target without the stop it was measured with is a setting nobody
+    -- tested.
+    param2       TEXT,
+    current_val2 REAL,
+    proposed_val2 REAL
 );
 CREATE INDEX IF NOT EXISTS ix_tp_status ON tuning_proposals(status, created_at);
 
@@ -248,7 +254,19 @@ class Ledger(ThreadedDB):
 
     def _bootstrap(self, conn: sqlite3.Connection) -> None:
         conn.executescript(SCHEMA)
+        self._migrate(conn)
         conn.commit()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Add later columns to a database created by an earlier build."""
+        have = {r["name"] for r in
+                conn.execute("PRAGMA table_info(tuning_proposals)")}
+        for col, decl in (("param2", "TEXT"), ("current_val2", "REAL"),
+                          ("proposed_val2", "REAL")):
+            if col not in have:
+                conn.execute(
+                    f"ALTER TABLE tuning_proposals ADD COLUMN {col} {decl}")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -431,6 +449,32 @@ class Ledger(ThreadedDB):
             out.append(d)
         return out
 
+    def positions_between(self, coin: str | None = None,
+                          interval: str | None = None,
+                          since: float | None = None,
+                          limit: int = 500) -> list[dict[str, Any]]:
+        """Open and closed together, for drawing on the chart.
+
+        Open ones matter as much as closed: a position still running is the
+        one you are looking at the chart to think about.
+        """
+        sql = "SELECT * FROM paper_positions WHERE 1=1"
+        args: list[Any] = []
+        if coin:
+            sql += " AND coin = ?"; args.append(coin)
+        if interval:
+            sql += " AND interval = ?"; args.append(interval)
+        if since is not None:
+            sql += " AND opened_at >= ?"; args.append(since)
+        sql += " ORDER BY opened_at ASC LIMIT ?"
+        args.append(int(limit))
+        out = []
+        for r in self._conn.execute(sql, args).fetchall():
+            d = dict(r)
+            d["features"] = json.loads(d.get("features") or "{}")
+            out.append(d)
+        return out
+
     def position(self, pid: str) -> dict[str, Any] | None:
         d = _row(self._conn.execute(
             "SELECT * FROM paper_positions WHERE id = ?", (pid,)).fetchone())
@@ -443,6 +487,8 @@ class Ledger(ThreadedDB):
     def propose(self, *, param: str, current: float, proposed: float,
                 n_fit: int, n_test: int, fit_metric: float,
                 test_metric: float, base_metric: float, rationale: str,
+                param2: str | None = None, current2: float | None = None,
+                proposed2: float | None = None,
                 now: float | None = None) -> str:
         """File a change for approval. Supersedes any pending one for the
         same knob, so the list never grows two competing answers."""
@@ -452,13 +498,20 @@ class Ledger(ThreadedDB):
             conn.execute(
                 "UPDATE tuning_proposals SET status='superseded', decided_at=? "
                 "WHERE param=? AND status='pending'", (ts, param))
+            if param2:
+                conn.execute(
+                    "UPDATE tuning_proposals SET status='superseded', "
+                    "decided_at=? WHERE param2=? AND status='pending'",
+                    (ts, param2))
             conn.execute(
                 "INSERT INTO tuning_proposals (id, created_at, param, "
                 "current_val, proposed_val, n_fit, n_test, fit_metric, "
-                "test_metric, base_metric, rationale, status) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending')",
+                "test_metric, base_metric, rationale, status, param2, "
+                "current_val2, proposed_val2) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',?,?,?)",
                 (pid, ts, param, current, proposed, int(n_fit), int(n_test),
-                 fit_metric, test_metric, base_metric, rationale))
+                 fit_metric, test_metric, base_metric, rationale,
+                 param2, current2, proposed2))
         return pid
 
     def proposals(self, status: str | None = "pending", limit: int = 50
@@ -489,13 +542,20 @@ class Ledger(ThreadedDB):
                 "UPDATE tuning_proposals SET status=?, decided_at=? WHERE id=?",
                 ("adopted" if adopt else "rejected", ts, pid))
             if adopt:
-                conn.execute(
-                    "INSERT INTO param_overrides (param, value, adopted_at, "
-                    "proposal_id) VALUES (?,?,?,?) "
-                    "ON CONFLICT(param) DO UPDATE SET value=excluded.value, "
-                    "adopted_at=excluded.adopted_at, "
-                    "proposal_id=excluded.proposal_id",
-                    (row["param"], row["proposed_val"], ts, pid))
+                pairs = [(row["param"], row["proposed_val"])]
+                # Both halves of a paired change, or neither. Half of a
+                # tested pair is an untested setting.
+                if row.get("param2") and row.get("proposed_val2") is not None:
+                    pairs.append((row["param2"], row["proposed_val2"]))
+                for name, value in pairs:
+                    conn.execute(
+                        "INSERT INTO param_overrides (param, value, "
+                        "adopted_at, proposal_id) VALUES (?,?,?,?) "
+                        "ON CONFLICT(param) DO UPDATE SET "
+                        "value=excluded.value, "
+                        "adopted_at=excluded.adopted_at, "
+                        "proposal_id=excluded.proposal_id",
+                        (name, value, ts, pid))
         row["status"] = "adopted" if adopt else "rejected"
         row["decided_at"] = ts
         return row

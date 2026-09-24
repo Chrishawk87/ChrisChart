@@ -650,21 +650,66 @@ def test_the_forming_bar_is_marked_live(client, monkeypatch):
     assert "seeded" in forming[0]
 
 
-def test_calls_are_plotted_on_the_bar_they_fired_on(client, monkeypatch):
+def test_the_agents_trades_are_plotted_entry_to_exit(client, monkeypatch):
+    """The chart draws the AGENT'S BOOK, not the old suggestion table.
+
+    It used to draw suggestions, which after the agent started keeping its
+    own book meant every marker read "pending" forever — nothing decides
+    those rows any more. A marker has to carry the whole trade: side, why
+    it was taken, where it ended, and whether that was a win.
+    """
     rt = web.runtime()
     feed = _live_feed()
     monkeypatch.setattr(rt, "feed", feed, raising=False)
     monkeypatch.setattr(type(feed), "running", property(lambda self: True))
 
-    ts, sid = _pending(rt)
-    client.post(f"/api/decide?id={sid}&taken=true", headers=AUTH)
+    bars = feed.history("15m")
+    assert bars, "need bars to place a trade on"
+    b = bars[-3]
+    pos = rt.ledger.open_position(
+        coin="BTC", interval="15m", candle_ts=b.ts, side="long",
+        entry=b.close, target_px=b.close * 1.003, stop_px=b.close * 0.998,
+        target_bps=30.0, risk_bps=20.0, cost_bps=2.0, breakeven=0.42,
+        grade="3-0", agreeing=3,
+        features={"vote_shape": "3-0", "vote_book": 0.5,
+                  "vote_delta": 0.4, "vote_price": 0.6},
+        now=b.ts + 60)
+    assert pos is not None
+    rt.ledger.close_position(pos, exit_px=b.close * 1.003, reason="target",
+                             now=b.ts + 900)
 
     d = client.get("/api/chart?coin=BTC&interval=15m", headers=AUTH).json()
     marks = d["marks"]
-    assert marks, "the call was not plotted"
+    assert marks, d.get("marks_error") or "the trade was not plotted"
     m = marks[0]
-    assert m["side"] == "long" and m["decision"] == "taken"
+    assert m["side"] == "long"
     assert m["target"] > m["entry"] > m["stop"]
+    # The exit is its own point in time, so the chart can show the hold.
+    assert m["exit_ts"] > m["entry_ts"]
+    assert m["exit_reason"] == "target" and m["won"] is True
+    assert m["net_bps"] == pytest.approx(28.0, abs=0.5)
+    # And the reason it was taken, in words.
+    assert m["shape"] == "3-0"
+    assert "book up" in m["why"] and "price up" in m["why"]
+    assert not m["open"]
+
+
+def test_an_open_trade_is_plotted_without_an_exit(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    b = feed.history("15m")[-2]
+    rt.ledger.open_position(
+        coin="BTC", interval="15m", candle_ts=b.ts, side="short",
+        entry=b.close, target_px=b.close * 0.997, stop_px=b.close * 1.002,
+        target_bps=30.0, risk_bps=20.0, now=b.ts + 60)
+
+    d = client.get("/api/chart?coin=BTC&interval=15m", headers=AUTH).json()
+    m = [x for x in d["marks"] if x["open"]]
+    assert m, "a running position should still be drawn"
+    assert m[0]["exit_ts"] is None and m[0]["won"] is None
 
 
 def test_the_chart_carries_the_forming_bar_volume_profile(client, monkeypatch):

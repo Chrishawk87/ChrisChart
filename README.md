@@ -413,6 +413,50 @@ them back on when you want to compare.
 There is a test that settles the same bar through both paths and fails if
 they disagree.
 
+### What the chart shows
+
+Markers are the **agent's own trades**, not the old suggestion table.
+
+They used to come from the suggestions you took or ignored, which after the
+agent started keeping its own book meant every marker on the chart read
+`pending` forever — nothing decides those rows any more.
+
+Each trade now draws entry to exit: a triangle where it went in, a line to
+where it came out (length = how long it held), and a dot coloured by **won
+or lost** rather than by which level it was — hitting the target is not the
+question, keeping money is. A hollow triangle is still open. Hovering
+either end gives the whole trade:
+
+```
+SHORT @ 3,469.23    2-1
+why: book down, delta down, price up
+target 30bps · stop 20bps
+WIN — target  +28.0bps net
+out at 3,458.82
+held 45m   best +30.0bps
+```
+
+### Tuning, once there are no gates left
+
+The proposal engine was built for the gated agent: tighten a threshold,
+walk it forward, ask before adopting. In raw mode that has nothing to say,
+because the vote refuses nothing — there is no threshold to tighten.
+
+So it now tunes the thing that is actually left: **where the levels sit**,
+using the grid. Same discipline, different parameter. It picks a target and
+stop on the older 60% of your stored signals, scores that pair on the newer
+40% it has never seen, and proposes only when the out-of-sample interval is
+entirely above zero and it beats what is running by at least 1bps a trade.
+
+The pair moves together. A target that measured well beside a 25bps stop is
+not evidence for that target beside a 10bps one, so adopting half of a
+tested pair is refused — it would produce a setting nobody tested.
+
+The ledger cannot judge levels at all, and this is worth being clear about:
+changing a target changes what happens *during* a trade, not which trades
+were taken, and an outcome cannot be replayed into a different outcome.
+Only the grid can, because it walks real bars.
+
 ### Routes
 
 ```

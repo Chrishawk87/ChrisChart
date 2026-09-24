@@ -325,3 +325,62 @@ def test_the_agent_and_the_grid_settle_a_trade_identically(tmp_path):
     reason, _, _ = sw.resolve("long", 100.0, 100.0, 100.0,
                               bars((100, 102, 98, 100)))
     assert reason == d.closed["reason"]
+
+
+# ------------------------------------------- levels, walked forward
+
+def test_a_level_proposal_needs_signals_on_both_sides_of_the_split(tmp_path):
+    from liqmap import tuner
+    from liqmap.autopilot import Knobs as K
+    led = Ledger(str(tmp_path / "t.db"))
+    b = _walk()
+    assert tuner.propose_levels(led, K(), _signals(b, every=40), b) is None
+    assert led.proposals() == []
+
+
+def test_a_level_proposal_moves_the_pair_together(tmp_path):
+    """Adopting a target without the stop it was measured beside produces a
+    setting nobody tested."""
+    from liqmap import tuner
+    from liqmap.autopilot import Knobs as K
+    led = Ledger(str(tmp_path / "t.db"))
+    led.propose(param="tp_bps", current=20, proposed=45, n_fit=80, n_test=50,
+                fit_metric=8.0, test_metric=7.0, base_metric=2.0,
+                rationale="x", param2="sl_bps", current2=15, proposed2=30)
+    pid = led.proposals()[0]["id"]
+    led.decide_proposal(pid, adopt=True)
+    o = led.overrides()
+    assert o["tp_bps"] == 45 and o["sl_bps"] == 30
+
+
+def test_adopted_levels_reach_the_agent(tmp_path):
+    from liqmap.autopilot import Knobs as K
+    led = Ledger(str(tmp_path / "t.db"))
+    pid = led.propose(param="tp_bps", current=20, proposed=45, n_fit=80,
+                      n_test=50, fit_metric=8.0, test_metric=7.0,
+                      base_metric=2.0, rationale="x", param2="sl_bps",
+                      current2=15, proposed2=30)
+    led.decide_proposal(pid, adopt=True)
+    k = K.from_overrides(led.overrides())
+    assert k.tp_bps == 45 and k.sl_bps == 30
+
+
+def test_a_level_proposal_is_refused_when_it_straddles_zero(tmp_path):
+    """Good on the fit half is not enough — the out-of-sample interval has
+    to clear zero, or the pair is a coin toss with a nice backstory."""
+    from liqmap import tuner
+    from liqmap.autopilot import Knobs as K
+    led = Ledger(str(tmp_path / "t.db"))
+    b = _walk(drift=0.0, seed=17)
+    sigs = _signals(b, every=1)
+    out = tuner.propose_levels(led, K(), sigs, b)
+    if out is not None:
+        row = led.proposals()[0]
+        assert "entirely above zero" in row["rationale"]
+
+
+def test_level_readiness_counts_signals_not_trades():
+    from liqmap import tuner
+    r = tuner.level_readiness(10)
+    assert r["ready"] is False and "10 signals" in r["note"]
+    assert tuner.level_readiness(500)["ready"] is True

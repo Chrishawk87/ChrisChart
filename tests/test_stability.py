@@ -346,7 +346,13 @@ def test_the_live_candle_builds_a_profile_from_the_same_fills():
 
     # Timestamps near now, or `candle()` rolls the bar forward to the
     # present and hands back a fresh, empty one.
-    now = _t.time()
+    #
+    # Pinned a safe distance INSIDE the current bar rather than taken raw.
+    # A raw clock puts the 20-second window across a bar boundary roughly
+    # every 45th run, the early trades land in the previous bar, and the
+    # test fails with a count three short of what it asked for -- which
+    # reads like a bug in the builder and is a bug in the test.
+    now = (_t.time() // 900) * 900 + 100.0
     b = CandleBuilder(900.0)
     for i in range(20):
         b.add(Trade(px=100.0 + i * 0.01, sz=1.0, aggressor="buy",

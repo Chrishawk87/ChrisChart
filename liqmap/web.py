@@ -1317,7 +1317,45 @@ class Runtime:
         if now - self._last_tune < min_gap_s:
             return []
         self._last_tune = now
-        return tuner_mod.propose_all(self.ledger, self.knobs(), now=now)
+        k = replace(self.knobs(),
+                    tp_bps=float(self.autopilot.get("tp_bps") or 20.0),
+                    sl_bps=float(self.autopilot.get("sl_bps") or 15.0))
+        filed = []
+
+        # In raw mode there are no entry gates left to tighten -- the vote
+        # refuses nothing. What is worth tuning is where the levels sit, and
+        # only the grid can judge that.
+        if self.autopilot.get("raw", True):
+            coin = self.autopilot.get("coin")
+            interval = self.autopilot.get("interval") or "15m"
+            if coin:
+                try:
+                    one = self.propose_levels_now(coin, interval, k, now=now)
+                    if one:
+                        filed.append(one)
+                except Exception as exc:
+                    self.last_error = f"level proposal: {exc}"
+        else:
+            filed.extend(tuner_mod.propose_all(self.ledger, k, now=now))
+        return filed
+
+    def propose_levels_now(self, coin: str, interval: str,
+                           knobs=None, now: float | None = None
+                           ) -> dict[str, Any] | None:
+        """Walk the grid forward over stored signals and file the result."""
+        k = knobs or replace(
+            self.knobs(),
+            tp_bps=float(self.autopilot.get("tp_bps") or 20.0),
+            sl_bps=float(self.autopilot.get("sl_bps") or 15.0))
+        signals = self.signals_from_history(coin, interval)
+        if not signals:
+            return None
+        lo = min(x.ts for x in signals)
+        hi = max(x.ts for x in signals)
+        bars = self.bars_for_sweep(coin, lo, hi)
+        return tuner_mod.propose_levels(
+            self.ledger, k, signals, bars,
+            cost_bps=float(self.autopilot.get("fee_bps") or 0.0), now=now)
 
     def now(self, coin: str) -> dict[str, Any]:
         """Spot price plus how old everything else on the dashboard is.
@@ -2478,12 +2516,26 @@ def create_app() -> FastAPI:
     @app.get("/api/proposals", dependencies=[Depends(require_token)])
     def api_proposals(status: str = "pending") -> dict[str, Any]:
         """Changes the agent wants to make to itself, and why."""
-        return {"ok": True,
-                "proposals": rt.ledger.proposals(status or None),
-                "history": rt.ledger.override_history(),
-                "knobs": rt.knobs().to_dict(),
-                "readiness": tuner_mod.readiness(
-                    rt.ledger, rt.autopilot.get("coin"))}
+        raw = bool(rt.autopilot.get("raw", True))
+        out = {"ok": True, "raw": raw,
+               "proposals": rt.ledger.proposals(status or None),
+               "history": rt.ledger.override_history(),
+               "knobs": rt.knobs().to_dict()}
+        coin = rt.autopilot.get("coin")
+        if raw:
+            n = 0
+            if coin:
+                try:
+                    n = len(rt.signals_from_history(
+                        coin, rt.autopilot.get("interval") or "15m"))
+                except Exception:
+                    n = 0
+            out["readiness"] = tuner_mod.level_readiness(n)
+            out["tunes"] = "the target and stop, using the grid"
+        else:
+            out["readiness"] = tuner_mod.readiness(rt.ledger, coin)
+            out["tunes"] = "the entry gates, using closed trades"
+        return out
 
     @app.post("/api/proposals/decide", dependencies=[Depends(require_token)])
     def api_proposal_decide(id: str, adopt: bool) -> dict[str, Any]:
@@ -2510,11 +2562,23 @@ def create_app() -> FastAPI:
     def api_proposal_scan() -> dict[str, Any]:
         """Run the walk-forward now instead of waiting for the hourly one."""
         rt._last_tune = 0.0
+        coin = rt.autopilot.get("coin")
+        if not coin:
+            return {"ok": False,
+                    "detail": ("name a market first — pick one above and "
+                               "the grid has something to walk over")}
         filed = rt.maybe_tune(min_gap_s=0.0)
+        n = 0
+        try:
+            n = len(rt.signals_from_history(
+                coin, rt.autopilot.get("interval") or "15m"))
+        except Exception:
+            pass
         return {"ok": True, "filed": filed,
                 "proposals": rt.ledger.proposals("pending"),
-                "readiness": tuner_mod.readiness(
-                    rt.ledger, rt.autopilot.get("coin"))}
+                "readiness": (tuner_mod.level_readiness(n)
+                              if rt.autopilot.get("raw", True)
+                              else tuner_mod.readiness(rt.ledger, coin))}
 
     @app.get("/api/chart", dependencies=[Depends(require_token)])
     def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120
@@ -2566,19 +2630,48 @@ def create_app() -> FastAPI:
                          "l": live.low, "c": live.close, "v": live.volume,
                          "live": True, "seeded": bool(live.seeded)})
 
-        # The markers: what was called, on which bar, and how it resolved.
+        # The markers: the AGENT'S OWN TRADES, entry to exit.
+        #
+        # These used to come from the suggestion table -- the calls you took
+        # or ignored -- which after the agent started keeping its own book
+        # meant every marker on the chart read "pending" forever, because
+        # nothing decides those rows any more. The chart should show what
+        # the agent actually did.
         marks = []
         try:
             span = rows[0]["ts"] if rows else 0.0
-            for s in rt.history.recent_suggestions(coin, limit=200):
-                if s["interval"] != interval or s["candle_ts"] < span:
-                    continue
+            for p in rt.ledger.positions_between(coin, interval,
+                                                 since=span - 3600):
+                f = p.get("features") or {}
+                cols = []
+                for name in ("book", "delta", "price"):
+                    v = f.get(f"vote_{name}")
+                    if isinstance(v, (int, float)) and v:
+                        cols.append(f"{name} {'up' if v > 0 else 'down'}")
+                    elif f.get(f"{name}_dir") in ("up", "down"):
+                        cols.append(f"{name} {f[name + '_dir']}")
+                net = p.get("net_bps")
                 marks.append({
-                    "ts": s["candle_ts"], "made_at": s["made_at"],
-                    "side": s["side"], "entry": s["entry"],
-                    "target": s["target_px"], "stop": s["stop_px"],
-                    "decision": s["decision"], "outcome": s["outcome"],
-                    "pnl_bps": s["pnl_bps"]})
+                    "id": p["id"],
+                    "ts": p["candle_ts"],
+                    "entry_ts": p["opened_at"],
+                    "exit_ts": p.get("closed_at"),
+                    "side": p["side"], "entry": p["entry"],
+                    "target": p["target_px"], "stop": p["stop_px"],
+                    "exit_px": p.get("exit_px"),
+                    "exit_reason": p.get("exit_reason"),
+                    "open": p["status"] == "open",
+                    "net_bps": net,
+                    "gross_bps": p.get("gross_bps"),
+                    "won": (net > 0) if isinstance(net, (int, float)) else None,
+                    "shape": f.get("vote_shape") or p.get("grade") or "",
+                    "why": ", ".join(cols),
+                    "tp_bps": p.get("target_bps"),
+                    "sl_bps": p.get("risk_bps"),
+                    "held_s": p.get("held_s"),
+                    "mae_bps": p.get("mae_bps"),
+                    "mfe_bps": p.get("mfe_bps"),
+                })
         except Exception as exc:
             out["marks_error"] = str(exc)
 
@@ -3365,6 +3458,10 @@ DASHBOARD = """<!doctype html>
        border-right:5px solid transparent}
   .k-arrow.k-long{border-top:8px solid var(--up)}
   .k-arrow.k-short{border-bottom:8px solid var(--down);border-top:none}
+  /* What the canvas actually draws for a trade: long is an UP triangle in
+     the up colour, short is a DOWN triangle in the down colour. */
+  .k-arrow.k-entry-long{border-bottom:8px solid var(--up);border-top:none}
+  .k-arrow.k-entry-short{border-top:8px solid var(--down);border-bottom:none}
   .k-arrow.k-hollow{opacity:.4}
   .k-dot{width:7px;height:7px;border-radius:50%}
   .k-dot.k-long{background:var(--up)}
@@ -3597,13 +3694,14 @@ DASHBOARD = """<!doctype html>
              alone: filled vs hollow says taken vs ignored, and the arrow
              direction says which side. -->
         <div class="chart-key">
-          <span><i class="k-arrow k-long"></i>long call</span>
-          <span><i class="k-arrow k-short"></i>short call</span>
-          <span><i class="k-arrow k-long k-hollow"></i>hollow = you ignored it</span>
-          <span><i class="k-arrow k-long k-solid"></i>solid = you took it</span>
-          <span><i class="k-dot k-long"></i>target hit</span>
-          <span><i class="k-dot k-short"></i>stopped out</span>
-          <span><i class="k-dash"></i>target &amp; stop levels</span>
+          <span><i class="k-arrow k-entry-long"></i>went long</span>
+          <span><i class="k-arrow k-entry-short"></i>went short</span>
+          <span><i class="k-dot k-long"></i>closed a winner</span>
+          <span><i class="k-dot k-short"></i>closed a loser</span>
+          <span>the line joins entry to exit — its length is how long it
+            held</span>
+          <span><i class="k-dash"></i>target and stop</span>
+          <span>hollow triangle = still open</span>
           <span><i class="k-box"></i>bar still forming</span>
         </div>
         <div id="chartNote" class="msg" style="margin-top:4px"></div>
@@ -4576,24 +4674,40 @@ async function loadProposals() {
   const r = d.readiness || {};
   if (!d.proposals.length) {
     $('apProposals').innerHTML = current
-      + `<div class="msg">${esc(r.note || '')} Nothing to propose — which `
-      + 'is the normal answer. It only asks when a change beats the current '
-      + 'setting on trades it has never seen.</div>'
-      + '<div class="thin">Exit rules are not proposed at all: changing one '
-      + 'changes what happens during a trade, and re-running that needs the '
-      + 'price path, not the outcome. Same for loosening anything — the book '
-      + 'has no result for trades it refused to take.</div>';
+      + `<div class="msg"><b>Tuning ${esc(d.tunes || '')}.</b> `
+      + `${esc(r.note || '')}`
+      + (r.ready ? ' Nothing to propose right now — it only asks when a '
+                 + 'pair beats what is running on signals it has never '
+                 + 'seen, and most of the time nothing does.' : '')
+      + '</div>'
+      + (d.raw
+          ? '<div class="thin">There are no entry gates to tune any more — '
+            + 'the vote refuses nothing, so the only thing left worth '
+            + 'changing is where the levels sit. That is judged by the grid '
+            + 'above, not by closed trades: a target changes what happens '
+            + '<i>during</i> a trade, which an outcome cannot replay. '
+            + 'Target and stop always move together.</div>'
+          : '<div class="thin">Loosening is never proposed — the book has '
+            + 'no result for trades it refused to take.</div>');
     return;
   }
 
-  $('apProposals').innerHTML = current + d.proposals.map(p => `
+  $('apProposals').innerHTML = current + d.proposals.map(p => {
+    const head = p.param2
+      ? `${esc(p.param)} + ${esc(p.param2)}: `
+        + `${p.current_val}/${p.current_val2} → `
+        + `${p.proposed_val}/${p.proposed_val2}`
+      : `${esc(p.param)}: ${p.current_val} → ${p.proposed_val}`;
+    return `
     <div class="prop">
-      <b>${esc(p.param)}: ${p.current_val} → ${p.proposed_val}</b>
+      <b>${head}</b>
+      ${p.param2 ? '<div class="thin">Adopted together — half of a tested '
+        + 'pair is a setting nobody tested.</div>' : ''}
       <pre>${esc(p.rationale)}</pre>
       <button class="go" onclick="decideProposal('${esc(p.id)}',true)">
         Adopt</button>
       <button onclick="decideProposal('${esc(p.id)}',false)">Reject</button>
-    </div>`).join('');
+    </div>`; }).join('');
 }
 
 async function decideProposal(id, adopt) {
@@ -5489,33 +5603,51 @@ function drawChart() {
     }
   });
 
-  // the calls
+  // the agent's trades, entry through exit
   for (const m of marks) {
     const i = markIndex(m, s), x = xOf(i);
     const long = m.side === 'long', c = long ? up : down;
+    const xi = exitIndex(m, s);
+    const xe = xi == null ? null : xOf(xi);
 
-    g.strokeStyle = c; g.globalAlpha = 0.45; g.setLineDash([2, 3]);
+    // Target and stop, spanning the life of the trade rather than a fixed
+    // stub, so you can see which one price actually reached.
+    const right = xe == null ? x + step * 2.2 : Math.max(xe, x + step * 0.5);
+    g.strokeStyle = c; g.globalAlpha = 0.4; g.setLineDash([2, 3]);
     for (const p of [m.target, m.stop]) {
       if (!p) continue;
       g.beginPath();
-      g.moveTo(x - step * 0.4, y(p)); g.lineTo(x + step * 2.2, y(p));
+      g.moveTo(x - step * 0.4, y(p)); g.lineTo(right, y(p));
       g.stroke();
     }
     g.setLineDash([]); g.globalAlpha = 1;
 
     const yy = y(m.entry);
+
+    // Entry to exit, so the hold shows as a line you can read length off.
+    if (xe != null && m.exit_px) {
+      g.strokeStyle = m.won ? up : down;
+      g.globalAlpha = 0.7; g.lineWidth = 1.5;
+      g.beginPath(); g.moveTo(x, yy); g.lineTo(xe, y(m.exit_px)); g.stroke();
+      g.lineWidth = 1; g.globalAlpha = 1;
+    }
+
+    // The entry triangle: filled once the trade is done, hollow while it
+    // is still running.
     g.beginPath();
     if (long) { g.moveTo(x, yy + 9); g.lineTo(x - 5, yy + 18); g.lineTo(x + 5, yy + 18); }
     else { g.moveTo(x, yy - 9); g.lineTo(x - 5, yy - 18); g.lineTo(x + 5, yy - 18); }
     g.closePath();
     g.fillStyle = c; g.strokeStyle = c; g.lineWidth = 1.5;
-    if (m.decision === 'taken') g.fill(); else g.stroke();
+    if (m.open) g.stroke(); else g.fill();
     g.lineWidth = 1;
 
-    if (m.outcome === 'target' || m.outcome === 'stop') {
-      g.fillStyle = m.outcome === 'target' ? up : down;
+    // The exit dot: coloured by WON or LOST, not by which level it was.
+    // Hitting the target is not the question; keeping money is.
+    if (xe != null && m.exit_px) {
+      g.fillStyle = m.won ? up : down;
       g.strokeStyle = panel; g.lineWidth = 1.5;
-      g.beginPath(); g.arc(x, yy, 3, 0, Math.PI * 2);
+      g.beginPath(); g.arc(xe, y(m.exit_px), 3.5, 0, Math.PI * 2);
       g.fill(); g.stroke(); g.lineWidth = 1;
     }
   }
@@ -5544,7 +5676,10 @@ function drawChart() {
       g.fillStyle = panel; g.textAlign = 'left';
       g.fillText(chPx(pv), CH_PAD.l + plotW + profW + 5, chartHover.y + 3);
 
-      const hit = marks.find(m => markIndex(m, s) === i);
+      // A trade is findable from EITHER end: you hover where you see a
+      // mark, and both ends carry marks.
+      const hit = marks.find(m => markIndex(m, s) === i)
+               || marks.find(m => exitIndex(m, s) === i);
       const px = chPx;
       const rows = [
         fmtDay(b.ts) + ' ' + fmtClock(b.ts),
@@ -5552,15 +5687,36 @@ function drawChart() {
         'L ' + px(b.l) + '  C ' + px(b.c),
       ];
       if (hit) {
+        rows.push('');
         rows.push((hit.side || '').toUpperCase() + ' @ ' + px(hit.entry)
-                  + ' · ' + (hit.decision || 'pending'));
-        if (hit.outcome) {
-          rows.push(hit.outcome + (hit.pnl_bps == null ? ''
-                    : ' ' + (hit.pnl_bps >= 0 ? '+' : '')
-                      + hit.pnl_bps.toFixed(1) + 'bps'));
+                  + (hit.shape ? '   ' + hit.shape : ''));
+        // Why it took it: the columns, in words. This is the thing that
+        // makes a marker worth hovering over.
+        if (hit.why) rows.push('why: ' + hit.why);
+        if (hit.tp_bps != null && hit.sl_bps != null) {
+          rows.push('target ' + Number(hit.tp_bps).toFixed(0) + 'bps · stop '
+                    + Number(hit.sl_bps).toFixed(0) + 'bps');
+        }
+        if (hit.open) {
+          rows.push('still open');
+        } else {
+          const w = hit.won ? 'WIN' : 'LOSS';
+          const n = hit.net_bps == null ? ''
+            : '  ' + (hit.net_bps >= 0 ? '+' : '')
+              + Number(hit.net_bps).toFixed(1) + 'bps net';
+          rows.push(w + ' — ' + (hit.exit_reason || 'closed') + n);
+          if (hit.exit_px) rows.push('out at ' + px(hit.exit_px));
+          if (hit.held_s != null) {
+            const h = Number(hit.held_s);
+            rows.push('held ' + (h >= 90 ? (h / 60).toFixed(0) + 'm'
+                                         : h.toFixed(0) + 's')
+                      + (hit.mfe_bps != null
+                         ? '   best ' + (hit.mfe_bps >= 0 ? '+' : '')
+                           + Number(hit.mfe_bps).toFixed(1) + 'bps' : ''));
+          }
         }
       }
-      const bw2 = 168, bh = 8 + rows.length * 13;
+      const bw2 = 212, bh = 8 + rows.length * 13;
       let bx = x + 12, by = CH_PAD.t + 6;
       if (bx + bw2 > CH_PAD.l + plotW) bx = x - 12 - bw2;
       g.fillStyle = panel; g.globalAlpha = 0.95;
@@ -5576,7 +5732,16 @@ function drawChart() {
    rather than from a stored index, so it stays correct while panning. */
 function markIndex(m, s) {
   const iv = chartData.interval_s || 900;
-  return Math.round((m.ts - s.bars[0].ts) / iv);
+  return Math.round(((m.entry_ts || m.ts) - s.bars[0].ts) / iv);
+}
+
+/* Which slot the EXIT landed in. Drawing the exit on the entry bar --
+   which is what the first version did -- hides the one thing a chart is
+   good at showing: how long the trade took and where it ended. */
+function exitIndex(m, s) {
+  if (!m.exit_ts) return null;
+  const iv = chartData.interval_s || 900;
+  return Math.round((m.exit_ts - s.bars[0].ts) / iv);
 }
 
 /* ---- interaction ------------------------------------------------------ */
