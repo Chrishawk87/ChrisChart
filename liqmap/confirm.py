@@ -66,6 +66,29 @@ THRUST_FULL = 0.35
 # as directional. 0.5 is the middle; this is the distance either side.
 POSITION_BAND = 0.15
 
+# Hysteresis. A reading sitting near the flat boundary flips between "down"
+# and "flat" on changes far too small to be a market event, and every flip
+# breaks an agreement that was never really broken. So a direction is harder
+# to LEAVE than it was to enter: cross FLAT_BAND to take a side, fall below
+# EXIT_BAND to give it up.
+EXIT_BAND = 0.08
+
+# How long book and price must agree before the agreement is worth acting
+# on. An agreement that appeared on this tick and one that has held for ten
+# seconds are not the same thing, and treating them alike is why a
+# confirmation can evaporate between seeing it and clicking.
+MIN_AGREEMENT_S = 4.0
+
+# Above this many direction changes in the recent window, the market is
+# chopping and no reading of it is stable enough to trade.
+MAX_FLIPS = 4
+FLIP_WINDOW_S = 60.0
+
+# Aggressive volume in the window, as a multiple of what this market
+# normally does in that much time. Below this, whatever moved price was not
+# paid for.
+MIN_PARTICIPATION = 0.6
+
 
 @dataclass
 class CandleAction:
@@ -172,6 +195,93 @@ class CandleAction:
                    if self.extending != "flat" else "") + ".")
 
 
+@dataclass
+class Participation:
+    """Whether the move was PAID FOR.
+
+    This is the piece that decides whether an agreement between the book and
+    price action holds together or evaporates, and it is the answer to "what
+    holds those two together".
+
+    Book says down, price says down. Two completely different worlds produce
+    that reading:
+
+        bids were HIT -- aggressive sellers paying the spread, volume well
+        above normal. Somebody with size is working an order and they are
+        not finished. The agreement persists because the cause persists.
+
+        bids were PULLED -- quotes withdrawn, price drifted down on almost
+        no volume. Nothing was paid for, nobody is positioned, and the next
+        quote refresh undoes it. The agreement evaporates within seconds by
+        construction.
+
+    Both look identical to price and to the book. Only volume separates
+    them, which is why a confirmation rule without this catches vacuum moves
+    and real moves in the same net.
+
+    `effort` is aggressive volume against what this market normally trades
+    in the same span; `aligned` is whether that volume was on the side the
+    call is taking.
+    """
+
+    effort: float          # 1.0 == a normal amount of volume for this span
+    aligned: float         # -1..+1, signed with the aggressor lean
+    notional: float
+    window_s: float
+
+    @property
+    def backed(self) -> bool:
+        return self.effort >= MIN_PARTICIPATION
+
+    def supports(self, direction: Direction) -> bool:
+        """Does the flow back a call in this direction?"""
+        if direction == "flat" or not self.backed:
+            return False
+        want = 1.0 if direction == "up" else -1.0
+        return self.aligned * want > 0.15
+
+    def describe(self, direction: Direction = "flat") -> str:
+        if not self.backed:
+            return (f"only {self.effort:.0%} of normal volume — whatever "
+                    f"moved price was not paid for, so there is nothing "
+                    f"holding this together")
+        side = "buyers" if self.aligned > 0 else "sellers"
+        agree = self.supports(direction)
+        return (f"{self.effort:.0%} of normal volume and {side} are the ones "
+                f"paying for it" + ("" if agree or direction == "flat"
+                                    else " — which is the wrong side for "
+                                         "this call"))
+
+    def to_dict(self) -> dict:
+        return {"effort": round(self.effort, 3),
+                "aligned": round(self.aligned, 3),
+                "notional": round(self.notional, 2),
+                "backed": self.backed, "window_s": self.window_s}
+
+
+def sticky(score: float, previous: Direction | None,
+           enter: float = FLAT_BAND, leave: float = EXIT_BAND) -> Direction:
+    """Classify a score into a direction, but make it hard to give one up.
+
+    Without hysteresis a score hovering at 0.14 against a 0.15 threshold
+    reports down, flat, down, flat on noise that is not a market event —
+    and each of those flips breaks an agreement that never actually broke.
+    """
+    if previous == "up":
+        return "up" if score > leave else _fresh(score, enter)
+    if previous == "down":
+        return "down" if score < -leave else _fresh(score, enter)
+    return _fresh(score, enter)
+
+
+def _fresh(score: float, enter: float) -> Direction:
+    if score > enter:
+        return "up"
+    if score < -enter:
+        return "down"
+    return "flat"
+
+
 def typical_bar_bps(bars: Sequence[Candle], n: int = 20) -> float:
     """Median bar range in basis points, for scaling. 0.0 when unmeasurable."""
     out = []
@@ -237,9 +347,52 @@ class Confirmation:
     verdict: Verdict
     detail: str
 
+    # Stability, from the tracker. Defaults keep every existing caller
+    # working; a caller that does not supply them simply gets no stability
+    # gate rather than a fabricated one.
+    held_s: float = 0.0
+    flips: int = 0
+    participation: Participation | None = None
+
     @property
     def agree(self) -> bool:
         return self.verdict == "confirmed"
+
+    @property
+    def settled(self) -> bool:
+        """Agreeing, AND has been for long enough, AND is not chopping.
+
+        The distinction that matters for acting: `agree` is a snapshot,
+        `settled` is a state you can still be in a few seconds from now.
+        """
+        return (self.agree
+                and self.held_s >= MIN_AGREEMENT_S
+                and self.flips <= MAX_FLIPS)
+
+    @property
+    def backed(self) -> bool:
+        """Settled and paid for. The full bar for a scalp."""
+        if not self.settled:
+            return False
+        p = self.participation
+        return p is None or p.supports(self.book)
+
+    def instability(self) -> str:
+        """Why a real agreement is still not tradeable, in plain words."""
+        if not self.agree:
+            return ""
+        if self.flips > MAX_FLIPS:
+            return (f"but the read has changed {self.flips} times in the last "
+                    f"minute — this market is chopping and nothing read from "
+                    f"it will hold")
+        if self.held_s < MIN_AGREEMENT_S:
+            return (f"but they have only agreed for {self.held_s:.1f}s "
+                    f"(needs {MIN_AGREEMENT_S:.0f}s) — a fresh agreement is "
+                    f"the one that evaporates before you can act")
+        p = self.participation
+        if p is not None and not p.supports(self.book):
+            return "but " + p.describe(self.book)
+        return ""
 
     @property
     def direction(self) -> Direction:
@@ -263,12 +416,75 @@ class Confirmation:
                 "book_strength": round(self.book_strength, 4),
                 "candle_strength": round(self.candle_strength, 4),
                 "verdict": self.verdict, "agree": self.agree,
+                "settled": self.settled, "backed": self.backed,
+                "held_s": round(self.held_s, 1), "flips": self.flips,
+                "instability": self.instability(),
+                "participation": (self.participation.to_dict()
+                                  if self.participation else None),
                 "direction": self.direction,
                 "strength": self.strength, "detail": self.detail}
 
 
+class AgreementTracker:
+    """Memory for one market and timeframe, so agreement has an AGE.
+
+    `confirm()` answers "do they agree at this instant". That is a snapshot,
+    and a snapshot cannot tell a confirmation that has held for ten seconds
+    from one that appeared on this tick — which is exactly why a call can
+    evaporate between seeing it and acting on it.
+
+    This holds three things a single reading cannot:
+
+        held_s   how long the current state has been unbroken. A young
+                 agreement is the one that dies.
+        flips    how often the state has changed recently. A market
+                 producing six direction changes a minute is chopping, and
+                 no reading of it is stable enough to trade.
+        sticky   the previous direction of each side, so hysteresis has
+                 something to be sticky about.
+    """
+
+    def __init__(self, flip_window_s: float = FLIP_WINDOW_S):
+        self.flip_window_s = flip_window_s
+        self.book_dir: Direction | None = None
+        self.price_dir: Direction | None = None
+        self._state: tuple[str, str] | None = None
+        self._since: float | None = None
+        self._changes: list[float] = []
+
+    def classify(self, book_score: float, price_score: float
+                 ) -> tuple[Direction, Direction]:
+        """Both sides, with hysteresis applied to each."""
+        self.book_dir = sticky(book_score, self.book_dir)
+        self.price_dir = sticky(price_score, self.price_dir)
+        return self.book_dir, self.price_dir
+
+    def observe(self, verdict: str, direction: Direction,
+                now: float) -> tuple[float, int]:
+        """Record the current state. Returns (seconds held, recent flips)."""
+        key = (verdict, direction)
+        if key != self._state:
+            if self._state is not None:
+                self._changes.append(now)
+            self._state = key
+            self._since = now
+
+        cutoff = now - self.flip_window_s
+        self._changes = [t for t in self._changes if t >= cutoff]
+        held = (now - self._since) if self._since is not None else 0.0
+        return max(0.0, held), len(self._changes)
+
+    def reset(self) -> None:
+        self.book_dir = self.price_dir = None
+        self._state = None
+        self._since = None
+        self._changes.clear()
+
+
 def confirm(book_dir: Direction, book_strength: float,
-            action: CandleAction | None) -> Confirmation:
+            action: CandleAction | None,
+            held_s: float = 0.0, flips: int = 0,
+            participation: Participation | None = None) -> Confirmation:
     """Does price agree with the book?
 
     The four states are not symmetric and the language matters, because
@@ -276,11 +492,14 @@ def confirm(book_dir: Direction, book_strength: float,
     falling" is not a weak buy. It is somebody selling into every bid without
     moving the price, and the book is the last place that becomes visible.
     """
+    extra = dict(held_s=held_s, flips=flips, participation=participation)
+
     if action is None:
         return Confirmation(book_dir, "flat", book_strength, 0.0,
                             "unconfirmed",
                             "no price action to check the book against — "
-                            "the candle has not moved enough to read")
+                            "the candle has not moved enough to read",
+                            **extra)
 
     candle_dir = action.direction
     cs = action.strength
@@ -288,21 +507,22 @@ def confirm(book_dir: Direction, book_strength: float,
     if book_dir == "flat":
         return Confirmation(book_dir, candle_dir, book_strength, cs,
                             "no signal",
-                            f"the book is balanced. {action.describe()}")
+                            f"the book is balanced. {action.describe()}",
+                            **extra)
 
     if candle_dir == "flat":
         side = "buyers" if book_dir == "up" else "sellers"
         return Confirmation(
             book_dir, candle_dir, book_strength, cs, "unconfirmed",
             f"the book favours {side} but price is not moving with them yet. "
-            f"{action.describe()} Nothing to trade until it does")
+            f"{action.describe()} Nothing to trade until it does", **extra)
 
     if candle_dir == book_dir:
         side = "buyers" if book_dir == "up" else "sellers"
         return Confirmation(
             book_dir, candle_dir, book_strength, cs, "confirmed",
             f"the book favours {side} and price is going with them. "
-            f"{action.describe()}")
+            f"{action.describe()}", **extra)
 
     # The expensive case.
     winning = "buyers" if book_dir == "up" else "sellers"
@@ -313,7 +533,51 @@ def confirm(book_dir: Direction, book_strength: float,
         f"the book favours {winning} but price is going {way}. That is "
         f"{losing} absorbing them — filling every order without letting "
         f"price move. Standing aside; this is where trading the book alone "
-        f"loses money. {action.describe()}")
+        f"loses money. {action.describe()}", **extra)
+
+
+def participation_from_feed(feed, interval: str, interval_s: float,
+                            window_s: float = 30.0) -> Participation | None:
+    """Was the recent move paid for?
+
+    `effort` compares aggressive volume in the window against what this
+    market normally trades in the same span, taken from the median of recent
+    closed bars. A ratio, not an absolute, so the same threshold means
+    something on BTC and on a thin HIP-3 perp.
+    """
+    try:
+        w = feed.tape.window(window_s)
+    except Exception:
+        return None
+    if w is None:
+        return None
+
+    bars = feed.history(interval)
+    notionals = []
+    for c in bars[-20:]:
+        n = getattr(c, "buy_notional", 0.0) + getattr(c, "sell_notional", 0.0)
+        if n <= 0:
+            # Closed `Candle` objects carry size, not notional. Price it at
+            # the bar's own midpoint rather than skipping the bar, which
+            # would make a quiet market look like a busy one.
+            mid = (c.high + c.low) / 2.0
+            n = c.volume * mid if mid > 0 else 0.0
+        if n > 0:
+            notionals.append(n)
+
+    if not notionals or interval_s <= 0:
+        return None
+    notionals.sort()
+    m = len(notionals)
+    typical_bar = (notionals[m // 2] if m % 2
+                   else (notionals[m // 2 - 1] + notionals[m // 2]) / 2)
+    expected = typical_bar * (window_s / interval_s)
+    if expected <= 0:
+        return None
+
+    return Participation(effort=w.total / expected,
+                         aligned=w.lean, notional=w.total,
+                         window_s=window_s)
 
 
 def from_feed(feed, interval: str, window_s: float = 30.0

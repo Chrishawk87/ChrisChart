@@ -79,7 +79,24 @@ def acting(direction="up", strength=1.0, bar_range_bps=100.0):
         extending=("up" if sign > 0 else "down" if sign < 0 else "flat"))
 
 
+def settled(effort=1.4, aligned=1.0):
+    """A held, paid-for agreement.
+
+    Most tests here are about sizing and cost, not about stability, so they
+    supply an agreement that has already settled — otherwise scalp mode
+    correctly refuses every one of them as too fresh and nothing else gets
+    exercised. The stability gate has its own tests.
+    """
+    from liqmap.confirm import Participation
+
+    return {"held_s": 30.0, "flips": 0,
+            "participation": Participation(effort=effort, aligned=aligned,
+                                           notional=5e5, window_s=30.0)}
+
+
 def ask(read=None, book=None, recent=None, **kw):
+    for k, v in settled().items():
+        kw.setdefault(k, v)
     kw.setdefault("coin", "BTC")
     kw.setdefault("interval", "15m")
     kw.setdefault("interval_s", 900.0)
@@ -89,6 +106,8 @@ def ask(read=None, book=None, recent=None, **kw):
     # Default to price agreeing with the book, so tests of everything else
     # reach everything else.
     kw.setdefault("action", acting(r.direction if r else "up"))
+    if r is not None and r.direction == "down":
+        kw["participation"] = settled(aligned=-1.0)["participation"]
     return suggest(r, book if book is not None else book_at(),
                    recent=bars() if recent is None else recent, **kw)
 
@@ -643,6 +662,8 @@ def _call(**kw):
     r = kw.pop("read", read_at())
     b = kw.pop("book", book_at())
     kw.setdefault("action", acting(r.direction if r else "up"))
+    for k, v in settled(aligned=-1.0 if (r and r.direction == "down") else 1.0).items():
+        kw.setdefault(k, v)
     return assess(r, b, **kw)
 
 

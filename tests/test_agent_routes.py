@@ -361,12 +361,31 @@ def _live_feed(coin="BTC", interval="15m", rising=True):
     return f
 
 
+def _settle(rt, coin="BTC", interval="15m", direction="up", seconds=60.0):
+    """Pre-age the agreement tracker, as if the feed had been up a while.
+
+    On a genuinely fresh feed `held_s` really is zero and scalp mode
+    correctly refuses — that behaviour has its own test below. These tests
+    are about the suggestion itself, so they start from an agreement that
+    has already settled.
+    """
+    import time as _t
+
+    from liqmap.confirm import AgreementTracker
+
+    tr = AgreementTracker()
+    tr.observe("agree", direction, _t.time() - seconds)
+    rt._trackers[(coin, interval)] = tr
+    return tr
+
+
 def test_a_running_feed_produces_a_real_suggestion_that_can_be_decided(client,
                                                                       monkeypatch):
     rt = web.runtime()
     feed = _live_feed()
     monkeypatch.setattr(rt, "feed", feed, raising=False)
     monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    _settle(rt)
 
     d = client.get("/api/suggest?coin=BTC&interval=15m&size=10000&fee_bps=2",
                    headers=AUTH).json()
@@ -401,6 +420,7 @@ def test_polling_the_same_candle_does_not_write_a_second_suggestion(client,
     feed = _live_feed()
     monkeypatch.setattr(rt, "feed", feed, raising=False)
     monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    _settle(rt)
 
     ids = {client.get("/api/suggest?coin=BTC&interval=15m",
                       headers=AUTH).json().get("id") for _ in range(5)}
@@ -414,6 +434,7 @@ def test_record_false_asks_without_writing_anything(client, monkeypatch):
     feed = _live_feed()
     monkeypatch.setattr(rt, "feed", feed, raising=False)
     monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    _settle(rt)
 
     d = client.get("/api/suggest?coin=BTC&interval=15m&record=false",
                    headers=AUTH).json()
@@ -427,6 +448,7 @@ def test_a_short_book_produces_a_short_suggestion(client, monkeypatch):
     feed = _live_feed(rising=False)      # book AND tape both bearish
     monkeypatch.setattr(rt, "feed", feed, raising=False)
     monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    _settle(rt, direction="down")
 
     d = client.get("/api/suggest?coin=BTC&interval=15m", headers=AUTH).json()
     assert d["take"] is True, d.get("detail")

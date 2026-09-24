@@ -52,6 +52,7 @@ from typing import Callable, Iterable, Sequence
 
 from .flow import Book, FlowTape, ImpactBaseline, Trade
 from .structure import Candle
+from .volume import VolumeProfile
 
 # Intervals the builder understands, in seconds. Mirrors the exchange's.
 INTERVALS: dict[str, int] = {
@@ -88,6 +89,10 @@ class LiveCandle:
     buy_notional: float = 0.0
     sell_notional: float = 0.0
     seeded: bool = True          # False when the open was never observed
+    # Where inside this bar the business was done. Built from the same
+    # fills that build the OHLC, which were previously being discarded
+    # after their four prices had been extracted.
+    profile: VolumeProfile = field(default_factory=VolumeProfile)
 
     @property
     def end_ts(self) -> float:
@@ -184,6 +189,7 @@ class CandleBuilder:
             c.buy_notional += trade.notional
         else:
             c.sell_notional += trade.notional
+        c.profile.add(trade.px, trade.notional, trade.aggressor)
         return rolled
 
     def roll_to(self, now: float) -> LiveCandle | None:

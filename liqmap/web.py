@@ -86,6 +86,10 @@ class Runtime:
                                         "error": None, "minutes": 0}
         self.backfill: dict[str, Any] = {"running": False, "progress": None,
                                          "plan": None, "error": None}
+        # Agreement memory, one per (market, timeframe). Held here rather
+        # than on the feed so switching markets does not lose the history
+        # of the one you came from.
+        self._trackers: dict[tuple[str, str], Any] = {}
         # One level watch at a time. Watching several would multiply the book
         # polls against a shared rate-limit budget that the position sweep
         # also draws on, and in practice you are looking at one level.
@@ -557,7 +561,8 @@ class Runtime:
         there is no suggestion, and saying so is the correct answer -- the
         alternative is a target sized from a stale snapshot.
         """
-        from .confirm import from_feed as read_price_action
+        from .confirm import (AgreementTracker, from_feed as read_price_action,
+                              participation_from_feed)
         from .live import INTERVALS
         from .suggest import assess as make_call
 
@@ -638,14 +643,33 @@ class Runtime:
         #
         # The window is scoped to the timeframe -- thirty seconds is the
         # right question on a 15m bar and far too long on a 1m one.
-        action = read_price_action(
-            feed, interval, window_s=max(10.0, min(interval_s / 30.0, 120.0)))
+        window_s = max(10.0, min(interval_s / 30.0, 120.0))
+        action = read_price_action(feed, interval, window_s=window_s)
+
+        # Was it paid for? The piece that decides whether an agreement holds
+        # together or evaporates between seeing it and acting on it.
+        part = participation_from_feed(feed, interval, interval_s, window_s)
+
+        # Agreement needs an AGE, and age needs memory that survives the
+        # poll. One tracker per market and timeframe.
+        tracker = self._trackers.setdefault((coin, interval),
+                                            AgreementTracker())
+        book_score = read.score if read is not None else 0.0
+        price_score = action.score if action is not None else 0.0
+        tracker.classify(book_score, price_score)
+        held, flips = tracker.observe(
+            "agree" if (read is not None and action is not None
+                        and read.direction == action.direction
+                        and read.direction != "flat")
+            else "no",
+            read.direction if read is not None else "flat", now)
 
         call = make_call(
             read, book, coin=coin, interval=interval, interval_s=interval_s,
             seconds_left=seconds_left, recent=recent, notional=notional,
             fee_bps=fee_bps, mode=("scalp" if mode == "scalp" else "range"),
             action=action, require_confirmation=True,
+            held_s=held, flips=flips, participation=part,
             measured_rate=measured_rate, measured_n=measured_n)
         out = call.suggestion
 
@@ -703,6 +727,31 @@ class Runtime:
             # direction improve a confirmed candle" becomes something the
             # feature slice can answer from data already collected, instead
             # of a weight guessed at now and argued about later.
+            # Stability and participation, stored so the table can later
+            # answer "do agreements that held 10s beat fresh ones" from
+            # data already collected rather than from a guessed threshold.
+            feats["held_s"] = round(held, 2)
+            feats["flips"] = flips
+            if part is not None:
+                feats["effort"] = round(part.effort, 3)
+                feats["effort_aligned"] = round(part.aligned, 3)
+
+            # Where the business was done inside this bar.
+            live_bar = feed.candle(interval)
+            prof = getattr(live_bar, "profile", None) if live_bar else None
+            if prof is not None and prof.total_notional > 0:
+                px = live_bar.close
+                feats["vol_position"] = round(prof.position(px), 4)
+                feats["vol_poc_bps"] = (
+                    round((px - prof.poc) / px * 10_000.0, 2)
+                    if prof.poc else None)
+                if out is not None:
+                    # Volume standing between price and the target: the
+                    # number that says whether a thin book ahead is air or
+                    # a level that already traded and will be defended.
+                    feats["vol_ahead"] = round(
+                        prof.ahead_ratio(px, out.target_px), 4)
+
             spot = book.mid if book is not None and not book.empty else 0.0
             if spot > 0:
                 mag_bps, mag_notional = self.magnet_for(coin, spot)
@@ -2938,9 +2987,12 @@ DASHBOARD = """<!doctype html>
           onchange="loadSuggest()">bps</label>
         <label><input type="checkbox" id="sAuto" onchange="toggleSuggestAuto()">
           poll 5s</label>
+        <button class="go" onclick="startFeed()" id="sugLive">Go live</button>
+        <button onclick="stopFeed()">Stop feed</button>
         <button onclick="loadSuggest()">Ask</button>
       </div>
-      <div id="sugCard" class="msg">Press <b>Go live</b>, then <b>Ask</b>.</div>
+      <div id="sugCard" class="msg">Press <b>Go live</b>, give it ten seconds
+        of book pushes, then <b>Ask</b>.</div>
       <div id="sugActions" style="display:none;margin-top:10px">
         <button class="go" onclick="decide(true)">Take it</button>
         <button onclick="decide(false)">Ignore</button>
@@ -3580,6 +3632,12 @@ function paintCompare(d) {
   const verdictCls = c.verdict === 'confirmed' ? 'long'
                    : c.verdict === 'conflict' ? 'short' : '';
 
+  // Held time and participation are what separate an agreement you can act
+  // on from one that evaporates while you reach for the mouse.
+  const p = c.participation;
+  const heldCls = c.settled ? 'long' : c.agree ? 'short' : '';
+  const partCls = !p ? '' : p.backed ? 'long' : 'short';
+
   box.style.display = '';
   box.innerHTML =
       '<div class="conrow">'
@@ -3587,10 +3645,19 @@ function paintCompare(d) {
     + `${esc((c.book || '').toUpperCase())}</b><span>order book</span></div>`
     + `<div class="stat"><b class="${cls(c.candle)}">${arrow(c.candle)} `
     + `${esc((c.candle || '').toUpperCase())}</b><span>price action</span></div>`
+    + (p ? `<div class="stat"><b class="${partCls}">`
+           + `${(p.effort * 100).toFixed(0)}%</b>`
+           + '<span>paid for</span></div>' : '')
+    + `<div class="stat"><b class="${heldCls}">${(c.held_s || 0).toFixed(0)}s</b>`
+    + `<span>held${c.flips ? ' · ' + c.flips + ' flips' : ''}</span></div>`
     + `<div class="stat"><b class="${verdictCls}">`
     + `${esc((c.verdict || '').toUpperCase())}</b><span>verdict</span></div>`
     + '</div>'
-    + `<div class="msg" style="margin-top:6px">${esc(c.detail || '')}</div>`;
+    + `<div class="msg" style="margin-top:6px">${esc(c.detail || '')}</div>`
+    + (c.instability
+        ? `<div class="msg" style="margin-top:4px;color:var(--down)">`
+          + `<b>Agreeing but not settled</b> — ${esc(c.instability)}.</div>`
+        : '');
 }
 
 function paintSuggest(d) {

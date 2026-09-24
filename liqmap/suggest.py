@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 from .bookread import BookRead
 from .confirm import CandleAction, Confirmation, confirm
@@ -442,6 +442,8 @@ def suggest(read: BookRead | None, book: Book | None, *,
             tick: float | None = None,
             action: CandleAction | None = None,
             require_confirmation: bool = True,
+            held_s: float = 0.0, flips: int = 0,
+            participation: Any = None,
             mode: Mode = "range",
             min_conviction: float = MIN_CONVICTION,
             min_rr: float = MIN_RR,
@@ -516,13 +518,28 @@ def suggest(read: BookRead | None, book: Book | None, *,
     # every bid without moving the price.
     agreement: Confirmation | None = None
     if action is not None or require_confirmation:
-        agreement = confirm(read.direction, read.conviction, action)
+        agreement = confirm(read.direction, read.conviction, action,
+                            held_s=held_s, flips=flips,
+                            participation=participation)
         if agreement.verdict == "conflict":
             return NoTrade("conflict", agreement.detail,
                            side=side, conviction=read.conviction)
         if agreement.verdict == "unconfirmed":
             return NoTrade("unconfirmed", agreement.detail,
                            side=side, conviction=read.conviction)
+
+        # Agreeing is not the same as holding. A confirmation that appeared
+        # on this tick, or one in a market flipping six times a minute, or
+        # one nobody paid for, is the confirmation that evaporates between
+        # seeing it and acting on it. Scalp mode refuses those; range mode
+        # holds long enough not to care.
+        if mode == "scalp" and not agreement.backed:
+            why = agreement.instability()
+            if why:
+                return NoTrade("unsettled",
+                               f"the book and price agree {agreement.book} — "
+                               f"{why}",
+                               side=side, conviction=read.conviction)
 
     if read.conviction < min_conviction:
         return NoTrade("conviction",
@@ -907,7 +924,10 @@ def assess(read: BookRead | None, book: Book | None, **kw) -> Call:
     agreement = None
     if read is not None and (action is not None
                              or kw.get("require_confirmation", True)):
-        agreement = confirm(read.direction, read.conviction, action)
+        agreement = confirm(read.direction, read.conviction, action,
+                            held_s=kw.get("held_s", 0.0),
+                            flips=kw.get("flips", 0),
+                            participation=kw.get("participation"))
 
     grade = "D" if side else "—"
     if out.gate == "conflict":
