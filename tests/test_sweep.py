@@ -421,3 +421,82 @@ def test_expiries_are_counted_separately_from_timeouts():
     c = out["cells"][0]
     assert c["expiries"] > 0
     assert c["targets"] + c["stops"] + c["timeouts"] + c["expiries"] == c["n"]
+
+
+# --------------------------------------------- the rule, tested on history
+
+def _mixed(bars_):
+    """A mix of shapes and volumes, as the recorder would have stored."""
+    out = []
+    for i, b in enumerate(bars_[:200]):
+        if i % 5:
+            continue
+        unan = i % 10 == 0
+        out.append(sw.Signal(
+            ts=b.ts, coin="ETH", interval="15m", side="long", entry=b.close,
+            agreeing=3 if unan else 2, against=0 if unan else 1,
+            shape="3-0" if unan else "2-1",
+            effort=(3.0 if unan else 0.5) if i % 15 else None,
+            deadline=b.ts + 900))
+    return out
+
+
+def test_the_grid_can_ask_for_unanimous_only():
+    b = _walk()
+    sigs = _mixed(b)
+    everything = sw.run(sigs, b, [10], [10])
+    strict = sw.run(sigs, b, [10], [10], unanimous=True)
+    assert strict["signals"] < everything["signals"]
+    assert strict["considered"] == len(sigs)
+
+
+def test_the_grid_can_ask_for_volume():
+    b = _walk()
+    sigs = _mixed(b)
+    loud = sw.run(sigs, b, [10], [10], min_effort=2.0)
+    assert loud["ok"]
+    assert loud["signals"] < sw.run(sigs, b, [10], [10])["signals"]
+
+
+def test_a_candle_with_no_volume_reading_is_excluded_not_counted_quiet():
+    """Absent is not quiet. Counting it as a refusal flatters the filter."""
+    b = _walk()
+    sigs = [sw.Signal(ts=x.ts, coin="ETH", interval="15m", side="long",
+                      entry=x.close, agreeing=3, shape="3-0", effort=None,
+                      deadline=x.ts + 900)
+            for i, x in enumerate(b[:100]) if i % 5 == 0]
+    out = sw.run(sigs, b, [10], [10], min_effort=2.0)
+    assert not out["ok"] and out["considered"] == len(sigs)
+
+
+def test_the_refused_filter_says_how_many_it_looked_at():
+    b = _walk()
+    sigs = _mixed(b)
+    out = sw.run(sigs, b, [10], [10], min_effort=99.0)
+    assert not out["ok"] and out["considered"] == len(sigs)
+
+
+def test_a_direction_with_no_strength_still_counts_as_agreeing():
+    """What the panel shows and what the agent counts must be the same.
+
+    A column reporting a direction whose strength rounds to zero used to
+    contribute nothing to the sum and so counted as flat — the screen said
+    all three agree while the agent stood aside on "only 2 of 3".
+    """
+    v = vt.cast("up", 0.5, "up", 0.4, "up", 0.0)
+    assert v.agreeing == 3 and v.unanimous and v.side == "long"
+
+
+def test_a_side_is_still_found_when_the_weights_cancel():
+    v = vt.cast("up", 0.0, "up", 0.0, "up", 0.0)
+    assert v.side == "long" and v.unanimous
+
+
+def test_genuinely_opposed_columns_with_equal_weight_read_as_nothing():
+    v = vt.cast("up", 0.5, "down", 0.5, "flat", 0.0)
+    assert v.side is None
+
+
+def test_strength_still_decides_the_side_when_columns_disagree():
+    v = vt.cast("up", 0.9, "down", 0.2, "down", 0.2)
+    assert v.side == "long" and v.agreeing == 1 and v.against == 2

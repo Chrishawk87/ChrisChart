@@ -372,6 +372,52 @@ problem is not that they are wrong; it is that a filtered sample cannot
 measure its own filter, because the trades it refused have no outcome. The
 gated path still exists (`Autopilot(raw=False)`) if you want to compare.
 
+### The rule it runs
+
+Set on the panel, enforced in the agent, and testable on stored history
+with the same two filters in the grid:
+
+    ALL THREE AGREE      book, delta and price pointing the same way.
+                         3-0 only: not two outvoting one, not one column
+                         with two staying quiet.
+
+    PAID FOR OVER 200%   aggressive volume at more than twice what this
+                         market normally trades for the span. A direction
+                         three columns agree on that nobody is trading
+                         through is a reading, not a move.
+
+    SMALL TARGETS        10 by default, in basis points or in the market's
+                         own ticks — ten ticks on gold and ten ticks on a
+                         cheap perp are different numbers of basis points,
+                         so the conversion happens per market at entry
+                         from the book's own increment. No tick size
+                         available means it reads the number as bps rather
+                         than inventing one.
+
+These are gates, and they are back after the others were removed for one
+reason: they are your rules with numbers on them, not my guess at what a
+good trade looks like. The refusals are still written to the book with the
+shape and the volume that was refused, so "what did unanimity cost me" is a
+question the ledger can answer later rather than an article of faith.
+
+A candle with no volume reading yet is **excluded**, not counted as quiet.
+Absent is not the same as zero, and treating it as zero would refuse every
+trade in the first seconds of a bar — and, in the grid, would flatter the
+filter by scoring it against candles it never really saw.
+
+Expect this to trade rarely. That is the point of it, but it means the
+scorecard will say "too few to read" for a good while; the gate audit under
+*What it refused* is the interesting panel in the meantime.
+
+#### One thing this exposed
+
+Agreement is counted from the three **directions**, which is what the panel
+shows and what you check by eye. It used to be counted from the weighted
+sum — so a column reporting a direction whose strength rounded to zero
+contributed nothing and was treated as flat. The screen would have said all
+three agree while the agent stood aside on "only 2 of 3". Strength still
+decides the *side* when columns disagree; direction decides who agrees.
+
 ### The grid
 
 A signal does not know where its target is — it is a direction at a price at

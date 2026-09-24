@@ -74,6 +74,9 @@ class Signal:
     # When the candle this fired on closes. The trade ends there whatever
     # price is doing -- see `resolve`.
     deadline: float = 0.0
+    # Volume behind the move against normal for this market. None where the
+    # candle carried no reading, which is not the same as a quiet one.
+    effort: float | None = None
     net: float = 0.0
     book: float = 0.0
     delta: float = 0.0
@@ -250,7 +253,8 @@ def run(signals: Sequence[Signal], bars: Sequence[Bar],
         tp_values: Sequence[float], sl_values: Sequence[float],
         cost_bps: float = 0.0, horizon: int = DEFAULT_HORIZON,
         min_agreeing: int = 0, max_against: int = 3,
-        side: str = "both") -> dict[str, Any]:
+        side: str = "both", min_effort: float = 0.0,
+        unanimous: bool = False) -> dict[str, Any]:
     """Score every pair over every signal.
 
     `min_agreeing` and `max_against` are for asking the question rather than
@@ -267,12 +271,27 @@ def run(signals: Sequence[Signal], bars: Sequence[Bar],
                            f"{len(tp_values) * len(sl_values)} cells — "
                            f"widen the step, the cap is {MAX_CELLS}")}
 
-    picked = [s for s in signals
-              if s.agreeing >= min_agreeing and s.against <= max_against
-              and (side == "both" or s.side == side)]
+    def keep(s: Signal) -> bool:
+        if s.agreeing < min_agreeing or s.against > max_against:
+            return False
+        if side != "both" and s.side != side:
+            return False
+        if unanimous and not (s.agreeing == 3 and s.against == 0):
+            return False
+        if min_effort > 0:
+            # A candle with no volume reading is excluded rather than
+            # treated as zero: absent is not the same as quiet, and
+            # counting it as a refusal would flatter the filter.
+            if s.effort is None or s.effort < min_effort:
+                return False
+        return True
+
+    picked = [s for s in signals if keep(s)]
     if not picked:
-        return {"ok": False, "detail": "no signals match that filter",
-                "signals": 0}
+        return {"ok": False, "signals": 0,
+                "detail": ("no signals match that filter — try relaxing it, "
+                           "or leave the feed running for more candles"),
+                "considered": len(signals)}
 
     bars = sorted(bars, key=lambda b: b.ts)
     stamps = _index(bars)
@@ -312,6 +331,7 @@ def run(signals: Sequence[Signal], bars: Sequence[Bar],
         "tp_values": tp_values,
         "sl_values": sl_values,
         "signals": len(windows),
+        "considered": len(signals),
         "skipped": len(picked) - len(windows),
         "cost_bps": cost_bps,
         "horizon": horizon,

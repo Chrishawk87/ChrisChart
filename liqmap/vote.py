@@ -114,20 +114,48 @@ class Vote:
 def cast(book_dir: str | None, book_strength: float,
          delta_dir: str | None, delta_strength: float,
          price_dir: str | None, price_strength: float) -> Vote:
-    """Add up the three columns. Nothing is refused."""
+    """Add up the three columns. Nothing is refused.
+
+    Two different jobs, deliberately kept apart:
+
+        STRENGTH picks the SIDE. A column shouting and a column whispering
+        are not the same vote when they disagree.
+
+        DIRECTION decides who AGREES. This is what the panel shows -- book
+        UP, delta UP, price UP -- and it is what you check by eye.
+
+    They were once the same calculation, and that was wrong in a way that
+    would have been maddening to debug: a column reporting a direction with
+    a strength that rounded to zero contributed nothing to the sum, so it
+    counted as flat. The screen said all three agree and the agent stood
+    aside on "only 2 of 3". Agreement now means what it looks like.
+    """
     b = _signed(book_dir, book_strength)
     d = _signed(delta_dir, delta_strength)
     p = _signed(price_dir, price_strength)
     net = b + d + p
 
-    side: Side | None = "long" if net > 0 else "short" if net < 0 else None
+    dirs = [x if x in ("up", "down") else "flat"
+            for x in (book_dir, delta_dir, price_dir)]
 
-    # A dead-even split (one up, one down, one flat, equal strength) reads
-    # as nothing, which is honest: the columns cancelled.
-    want = 1.0 if net > 0 else -1.0 if net < 0 else 0.0
-    agreeing = sum(1 for v in (b, d, p) if want and v * want > 0)
-    against = sum(1 for v in (b, d, p) if want and v * want < 0)
-    flat = sum(1 for v in (b, d, p) if v == 0)
+    if net > 0:
+        direction = "up"
+    elif net < 0:
+        direction = "down"
+    else:
+        # The sum cancelled, or carried no weight at all. If the columns
+        # that are saying anything all say the same thing, that is still a
+        # direction; genuinely opposed columns are not.
+        spoken = {x for x in dirs if x != "flat"}
+        direction = spoken.pop() if len(spoken) == 1 else "flat"
+
+    side: Side | None = ("long" if direction == "up"
+                         else "short" if direction == "down" else None)
+
+    opposite = {"up": "down", "down": "up"}.get(direction)
+    agreeing = sum(1 for x in dirs if direction != "flat" and x == direction)
+    against = sum(1 for x in dirs if opposite and x == opposite)
+    flat = sum(1 for x in dirs if x == "flat")
 
     return Vote(side=side, net=net, book=b, delta=d, price=p,
                 agreeing=agreeing, against=against, flat=flat)

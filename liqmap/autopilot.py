@@ -128,6 +128,10 @@ KNOBS: dict[str, Knob] = {k.name: k for k in (
          "how far the target sits, in basis points"),
     Knob("sl_bps", 15.0, 1.0, 300.0, 1.0, True,
          "how far the stop sits, in basis points"),
+    # How much of the market's normal volume had to show up behind the
+    # move. 1.0 is a normal amount; 2.0 is twice normal.
+    Knob("min_effort", 0.0, 0.0, 10.0, 0.25, True,
+         "how much volume must be behind the move, against normal"),
 )}
 
 
@@ -143,6 +147,7 @@ class Knobs:
     stale_s: float = 90.0
     tp_bps: float = 20.0
     sl_bps: float = 15.0
+    min_effort: float = 0.0
 
     @classmethod
     def from_overrides(cls, overrides: dict[str, float] | None) -> "Knobs":
@@ -242,7 +247,8 @@ class Autopilot:
 
     def __init__(self, coin: str, interval: str, ledger: Ledger,
                  knobs: Knobs | None = None, size_usd: float = 0.0,
-                 raw: bool = True, exit_on_invalidation: bool = False):
+                 raw: bool = True, exit_on_invalidation: bool = False,
+                 require_unanimous: bool = False, unit: str = "bps"):
         self.coin = coin
         self.interval = interval
         self.ledger = ledger
@@ -257,6 +263,17 @@ class Autopilot:
         # replay an invalidation exit from bar data, so leaving it on makes
         # the live book and the grid two different strategies.
         self.exit_on_invalidation = exit_on_invalidation
+        # Only 3-0. Not two outvoting one, not one with two quiet.
+        #
+        # This is a gate, and the reason it is allowed back after the rest
+        # were removed is that it is YOUR rule with a number on it, not my
+        # guess at what a good trade looks like. The difference matters:
+        # the shape it refuses is recorded either way, so the ledger can
+        # still tell you afterwards what the refusals would have done.
+        self.require_unanimous = require_unanimous
+        # "bps" or "ticks" -- ten of the market's own increments, where
+        # that is how you think about the target.
+        self.unit = unit if unit in ("bps", "ticks") else "bps"
         self.position: OpenPosition | None = None
         self._last_step: float = 0.0
         self._entered_candles: set[float] = set()
@@ -556,27 +573,53 @@ class Autopilot:
                             gate="no_read", reason=ballot.describe())
 
         k = self.knobs
+
+        # All three, or nothing.
+        if self.require_unanimous and not ballot.unanimous:
+            return Decision(
+                action="stand_aside", price=price, gate="not_unanimous",
+                reason=(f"{ballot.shape()} — {ballot.describe()}; this "
+                        f"wants all three pointing the same way"))
+
+        # And somebody had to pay for it. A direction three columns agree
+        # on but nobody is trading through is a reading, not a move.
+        effort = self._effort(payload)
+        if k.min_effort > 0:
+            if effort is None:
+                return Decision(
+                    action="stand_aside", price=price, gate="no_effort_read",
+                    reason="no volume reading on this candle yet")
+            if effort < k.min_effort:
+                return Decision(
+                    action="stand_aside", price=price, gate="not_paid_for",
+                    reason=(f"only {effort:.0%} of normal volume behind it "
+                            f"(wants {k.min_effort:.0%})"))
+
+        tp_bps, sl_bps, unit_note = self._levels(payload, price)
         sgn = 1.0 if ballot.side == "long" else -1.0
-        target = price * (1 + sgn * k.tp_bps / 10_000.0)
-        stop = price * (1 - sgn * k.sl_bps / 10_000.0)
+        target = price * (1 + sgn * tp_bps / 10_000.0)
+        stop = price * (1 - sgn * sl_bps / 10_000.0)
         cost = float(payload.get("cost_bps")
                      or (payload.get("suggestion") or {}).get("cost_bps")
                      or 0.0)
-        denom = k.tp_bps + k.sl_bps
-        breakeven = ((k.sl_bps + cost) / denom) if denom else 0.0
+        denom = tp_bps + sl_bps
+        breakeven = ((sl_bps + cost) / denom) if denom else 0.0
 
         feats = self._features(payload)
         feats.update({"vote_shape": ballot.shape(), "vote_net": ballot.net,
                       "vote_book": ballot.book, "vote_delta": ballot.delta,
                       "vote_price": ballot.price,
                       "vote_against": ballot.against,
-                      "tp_bps": k.tp_bps, "sl_bps": k.sl_bps})
+                      "tp_bps": tp_bps, "sl_bps": sl_bps,
+                      "unit": self.unit, "tick": payload.get("tick"),
+                      "effort": effort,
+                      "unanimous_required": self.require_unanimous})
 
         road = payload.get("runway") or {}
         pos = self.ledger.open_position(
             coin=self.coin, interval=self.interval, candle_ts=candle_ts,
             side=ballot.side, entry=price, target_px=target, stop_px=stop,
-            target_bps=k.tp_bps, risk_bps=k.sl_bps, cost_bps=cost,
+            target_bps=tp_bps, risk_bps=sl_bps, cost_bps=cost,
             breakeven=breakeven,
             grade=ballot.shape(), grade_3way=ballot.shape(),
             agreeing=ballot.agreeing, conviction=abs(ballot.net),
@@ -596,8 +639,50 @@ class Autopilot:
         return Decision(
             action="enter_long" if ballot.side == "long" else "enter_short",
             side=ballot.side, price=price, position=pos,
-            reason=(f"{ballot.describe()} · target {k.tp_bps:.0f}bps, "
-                    f"stop {k.sl_bps:.0f}bps"))
+            reason=(f"{ballot.describe()}"
+                    + (f", {effort:.0%} of normal volume"
+                       if effort is not None else "")
+                    + f" · target {unit_note}"))
+
+    @staticmethod
+    def _effort(payload: dict) -> float | None:
+        """Volume behind the move, against what this market normally does.
+
+        1.0 is a normal amount for the span. None means the candle has no
+        volume reading yet, which is not the same as a quiet one -- and
+        treating it as zero would refuse every trade in the first seconds
+        of a bar.
+        """
+        part = (payload.get("confirmation") or {}).get("participation")
+        if not isinstance(part, dict):
+            return None
+        v = part.get("effort")
+        return float(v) if isinstance(v, (int, float)) else None
+
+    def _levels(self, payload: dict, price: float
+                ) -> tuple[float, float, str]:
+        """Target and stop in basis points, whatever unit they were set in.
+
+        Ten ticks on gold and ten ticks on a small-cap perp are different
+        numbers of basis points, so the conversion happens per market at
+        the moment of entry, from the book's own increment.
+        """
+        k = self.knobs
+        if self.unit != "ticks":
+            return (k.tp_bps, k.sl_bps,
+                    f"{k.tp_bps:.0f}bps, stop {k.sl_bps:.0f}bps")
+        tick = float(payload.get("tick") or 0.0)
+        if tick <= 0 or price <= 0:
+            # No usable increment: fall back to reading them as basis
+            # points rather than inventing a tick size.
+            return (k.tp_bps, k.sl_bps,
+                    f"{k.tp_bps:.0f}bps, stop {k.sl_bps:.0f}bps "
+                    f"(no tick size — read as bps)")
+        per = tick / price * 10_000.0
+        tp, sl = k.tp_bps * per, k.sl_bps * per
+        return (tp, sl,
+                f"{k.tp_bps:.0f} ticks ({tp:.1f}bps), stop "
+                f"{k.sl_bps:.0f} ticks ({sl:.1f}bps)")
 
     @staticmethod
     def _features(payload: dict) -> dict[str, Any]:
@@ -670,4 +755,6 @@ class Autopilot:
                 "knobs": self.knobs.to_dict(),
                 "raw": self.raw,
                 "exit_on_invalidation": self.exit_on_invalidation,
+                "require_unanimous": self.require_unanimous,
+                "unit": self.unit,
                 "size_usd": self.size_usd}

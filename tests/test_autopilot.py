@@ -38,7 +38,9 @@ def payload(*, take=True, side="long", entry=100.0, target=101.0,
                       "grade": "A", "book": direction, "delta": direction,
                       "price": direction},
         "confirmation": {"held_s": held_s, "flips": 0,
+                         "candle_strength": 0.6,
                          "participation": {"effort": 0.9}},
+        "action": {"score": 0.6},
         "runway": {"clear_bps": 60.0, "open_road": False},
         "delta": {"score": 0.4},
     }
@@ -577,3 +579,114 @@ def test_the_score_module_never_drops_losing_trades():
     card = score_mod.scorecard(rows)
     assert card["overall"]["n"] == 100
     assert card["overall"]["wins"] == 50
+
+
+# ------------------------------------------- the rule: 3-0, paid for, small
+
+def _unanimous(**kw):
+    return payload(**kw)
+
+
+def _split(**kw):
+    """Two agreeing, one against — a 2-1."""
+    d = payload(**kw)
+    d["three_way"]["delta"] = "down"
+    d["delta"] = {"score": -0.4}
+    return d
+
+
+def _paid(d, effort):
+    d["confirmation"]["participation"] = {"effort": effort}
+    return d
+
+
+def test_only_three_nil_is_taken(ledger):
+    p = Autopilot("ETH", "15m", ledger, require_unanimous=True)
+    d = p.step(_paid(_split(), 5.0), now=100.0)
+    assert d.action == "stand_aside" and d.gate == "not_unanimous"
+    assert p.position is None
+
+
+def test_three_nil_with_volume_is_taken(ledger):
+    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
+                  knobs=Knobs(min_effort=2.0, tp_bps=10.0, sl_bps=10.0))
+    d = p.step(_paid(_unanimous(), 5.0), now=100.0)
+    assert d.action == "enter_long"
+    assert p.position.target_bps == 10.0 and p.position.risk_bps == 10.0
+
+
+def test_a_unanimous_read_nobody_paid_for_is_refused(ledger):
+    """Three columns agreeing on a direction nobody is trading through is
+    a reading, not a move."""
+    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
+                  knobs=Knobs(min_effort=2.0))
+    d = p.step(_paid(_unanimous(), 1.2), now=100.0)      # 120% of normal
+    assert d.action == "stand_aside" and d.gate == "not_paid_for"
+    assert "120%" in d.reason and "200%" in d.reason
+
+
+def test_two_hundred_percent_is_the_line(ledger):
+    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
+                  knobs=Knobs(min_effort=2.0))
+    assert p.step(_paid(_unanimous(candle_ts=1.0), 1.99),
+                  now=100.0).gate == "not_paid_for"
+    p2 = Autopilot("ETH", "15m", ledger, require_unanimous=True,
+                   knobs=Knobs(min_effort=2.0))
+    assert p2.step(_paid(_unanimous(candle_ts=2.0), 2.0),
+                   now=100.0).action == "enter_long"
+
+
+def test_a_candle_with_no_volume_reading_is_not_treated_as_quiet(ledger):
+    """Absent is not the same as zero. Treating it as zero would refuse
+    every trade in the first seconds of a bar."""
+    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
+                  knobs=Knobs(min_effort=2.0))
+    d = _unanimous()
+    d["confirmation"].pop("participation", None)
+    out = p.step(d, now=100.0)
+    assert out.gate == "no_effort_read"
+    assert out.gate != "not_paid_for"
+
+
+def test_ticks_convert_per_market(ledger, tmp_path):
+    """Ten ticks on gold and ten ticks on a cheap perp are different
+    numbers of basis points."""
+    p = Autopilot("ETH", "15m", ledger, unit="ticks",
+                  knobs=Knobs(tp_bps=10.0, sl_bps=10.0, min_effort=0.0))
+    d = _paid(_unanimous(entry=100.0), 5.0)
+    d["tick"] = 0.01                      # 1 tick = 1bps at price 100
+    p.step(d, now=100.0)
+    assert p.position.target_bps == pytest.approx(10.0)
+    assert p.position.target_px == pytest.approx(100.10)
+
+    # Its own book: a second pilot on the same ledger rehydrates the first
+    # one's open position and manages that instead.
+    other = Ledger(str(tmp_path / "b.db"))
+    p2 = Autopilot("ETH", "15m", other, unit="ticks",
+                   knobs=Knobs(tp_bps=10.0, sl_bps=10.0, min_effort=0.0))
+    d2 = _paid(_unanimous(entry=4000.0, candle_ts=2.0), 5.0)
+    d2["tick"] = 0.1                      # 1 tick = 0.25bps at price 4000
+    p2.step(d2, now=100.0)
+    assert p2.position.target_bps == pytest.approx(2.5)
+
+
+def test_ticks_without_a_tick_size_fall_back_rather_than_invent_one(ledger):
+    p = Autopilot("ETH", "15m", ledger, unit="ticks",
+                  knobs=Knobs(tp_bps=10.0, sl_bps=10.0, min_effort=0.0))
+    d = _paid(_unanimous(entry=100.0), 5.0)
+    d["tick"] = 0.0
+    out = p.step(d, now=100.0)
+    assert out.action == "enter_long"
+    assert p.position.target_bps == 10.0
+    assert "read as bps" in out.reason or p.position.target_bps == 10.0
+
+
+def test_the_refusals_are_still_recorded(ledger):
+    """A gate you set is still a gate: the shape it refused has to stay in
+    the book, or the ledger cannot tell you later what it cost."""
+    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
+                  knobs=Knobs(min_effort=2.0))
+    p.step(_paid(_split(candle_ts=1.0), 5.0), now=100.0)
+    p.step(_paid(_unanimous(candle_ts=2.0), 0.5), now=200.0)
+    gates = {r["gate"] for r in ledger.decisions(action="stand_aside")}
+    assert gates == {"not_unanimous", "not_paid_for"}

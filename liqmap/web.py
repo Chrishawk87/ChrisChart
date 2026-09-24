@@ -91,7 +91,8 @@ class Runtime:
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
             "raw": True, "exit_on_invalidation": False,
-            "tp_bps": 20.0, "sl_bps": 15.0,
+            "tp_bps": 10.0, "sl_bps": 10.0, "unit": "bps",
+            "require_unanimous": True, "min_effort": 2.0,
             "last_step": None, "last_decision": None, "steps": 0,
             "error": None}
         self._last_tune = 0.0
@@ -586,7 +587,7 @@ class Runtime:
                               grade_three, participation_from_feed)
         from .delta import from_feed as read_delta_column, sticky as delta_sticky
         from .live import INTERVALS
-        from .suggest import assess as make_call
+        from .suggest import assess as make_call, infer_tick
 
         coin = self.resolve_symbol(coin)[0] or coin
 
@@ -733,6 +734,13 @@ class Runtime:
         payload["price"] = mark
         payload["interval_s"] = interval_s
         payload["candle_end"] = candle_end
+        # The market's own increment, so a target can be set in ticks
+        # rather than basis points where that is how you think about it.
+        try:
+            payload["tick"] = (infer_tick(book)
+                               if book is not None and not book.empty else 0.0)
+        except Exception:
+            payload["tick"] = 0.0
         payload["feed_age_s"] = feed.age
         payload["book_updates"] = feed.book_updates
         payload["three_way"] = three.to_dict()
@@ -1148,7 +1156,10 @@ class Runtime:
                 size_usd=float(self.autopilot.get("notional") or 0),
                 raw=bool(self.autopilot.get("raw", True)),
                 exit_on_invalidation=bool(
-                    self.autopilot.get("exit_on_invalidation", False)))
+                    self.autopilot.get("exit_on_invalidation", False)),
+                require_unanimous=bool(
+                    self.autopilot.get("require_unanimous", True)),
+                unit=str(self.autopilot.get("unit") or "bps"))
             self._pilots[key] = p
         return p
 
@@ -1171,11 +1182,15 @@ class Runtime:
         pilot = self.pilot(coin, interval)
         pilot.knobs = replace(
             self.knobs(),
-            tp_bps=float(self.autopilot.get("tp_bps") or 20.0),
-            sl_bps=float(self.autopilot.get("sl_bps") or 15.0))
+            tp_bps=float(self.autopilot.get("tp_bps") or 10.0),
+            sl_bps=float(self.autopilot.get("sl_bps") or 10.0),
+            min_effort=float(self.autopilot.get("min_effort") or 0.0))
         pilot.raw = bool(self.autopilot.get("raw", True))
         pilot.exit_on_invalidation = bool(
             self.autopilot.get("exit_on_invalidation", False))
+        pilot.require_unanimous = bool(
+            self.autopilot.get("require_unanimous", True))
+        pilot.unit = str(self.autopilot.get("unit") or "bps")
         pilot.size_usd = notional
 
         # The bar's extremes, so a level reached between two polls still
@@ -1223,6 +1238,9 @@ class Runtime:
                 entry=float(r["price"]), agreeing=v.agreeing,
                 against=v.against, shape=v.shape(), net=v.net,
                 deadline=float(r.get("candle_end") or 0.0),
+                effort=(float(r["features"]["effort"])
+                        if isinstance((r.get("features") or {}).get("effort"),
+                                      (int, float)) else None),
                 book=v.book, delta=v.delta, price=v.price))
         return out
 
@@ -1247,7 +1265,9 @@ class Runtime:
                   cost_bps: float = 0.0,
                   horizon: int = sweep_mod.DEFAULT_HORIZON,
                   min_agreeing: int = 0, max_against: int = 3,
-                  side: str = "both", hours: float = 0.0) -> dict[str, Any]:
+                  side: str = "both", hours: float = 0.0,
+                  min_effort: float = 0.0,
+                  unanimous: bool = False) -> dict[str, Any]:
         """Every target against every stop, over the signals already stored."""
         since = (time.time() - hours * 3600.0) if hours else None
         signals = self.signals_from_history(coin, interval, since=since)
@@ -1271,10 +1291,24 @@ class Runtime:
             sweep_mod.axis(tp_from, tp_to, tp_step),
             sweep_mod.axis(sl_from, sl_to, sl_step),
             cost_bps=cost_bps, horizon=horizon,
-            min_agreeing=min_agreeing, max_against=max_against, side=side)
+            min_agreeing=min_agreeing, max_against=max_against, side=side,
+            min_effort=min_effort, unanimous=unanimous)
         out["coin"] = coin
         out["interval"] = interval
         out["available"] = len(signals)
+        # The grid works in basis points because a stored candle reading
+        # does not carry the tick size it was taken at. Reporting what a
+        # tick is worth NOW lets a ticks-based target be lined up with it.
+        try:
+            feed_now = self.feed_for(coin)
+            bk = feed_now.book if feed_now is not None else None
+            if bk is not None and not bk.empty and bk.mid > 0:
+                from .suggest import infer_tick as _tick
+                t = _tick(bk)
+                if t > 0:
+                    out["tick_bps"] = round(t / bk.mid * 10_000.0, 4)
+        except Exception:
+            pass
         out["span_hours"] = round((hi - lo) / 3600.0, 1)
         # How each vote shape did at the best cell, so "do two-of-three
         # trades pay" is answered from the same run rather than guessed.
@@ -2421,9 +2455,11 @@ def create_app() -> FastAPI:
     @app.post("/api/autopilot", dependencies=[Depends(require_token)])
     def api_autopilot(on: bool, coin: str = "", interval: str = "15m",
                       mode: str = "scalp", notional: float = 10_000.0,
-                      fee_bps: float = 0.0, tp_bps: float = 20.0,
-                      sl_bps: float = 15.0, raw: bool = True,
-                      exit_on_invalidation: bool = False) -> dict[str, Any]:
+                      fee_bps: float = 0.0, tp_bps: float = 10.0,
+                      sl_bps: float = 10.0, raw: bool = True,
+                      exit_on_invalidation: bool = False,
+                      unit: str = "bps", require_unanimous: bool = True,
+                      min_effort: float = 2.0) -> dict[str, Any]:
         """Turn the agent's own book on or off.
 
         It keeps deciding whether or not anyone is watching. A record that
@@ -2439,12 +2475,19 @@ def create_app() -> FastAPI:
             "fee_bps": float(fee_bps), "tp_bps": float(tp_bps),
             "sl_bps": float(sl_bps), "raw": bool(raw),
             "exit_on_invalidation": bool(exit_on_invalidation),
+            "unit": unit if unit in ("bps", "ticks") else "bps",
+            "require_unanimous": bool(require_unanimous),
+            "min_effort": float(min_effort),
             "error": None})
         return {"ok": True, "autopilot": rt.autopilot,
                 "knobs": rt.knobs().to_dict(),
-                "note": (("deciding every 5s on the three columns alone, "
-                          f"target {tp_bps:.0f}bps / stop {sl_bps:.0f}bps — "
-                          "it records, it never places an order")
+                "note": ((f"deciding every 5s — "
+                          + ("all three must agree" if require_unanimous
+                             else "whichever way the three add up")
+                          + (f" with over {min_effort:.0%} of normal volume"
+                             if min_effort > 0 else "")
+                          + f", target {tp_bps:.0f} / stop {sl_bps:.0f} "
+                          + f"{unit}. It records, it never places an order")
                          if on else "stopped; open positions stay open")}
 
     @app.get("/api/autopilot", dependencies=[Depends(require_token)])
@@ -2490,7 +2533,9 @@ def create_app() -> FastAPI:
                   sl_to: float = 40.0, sl_step: float = 5.0,
                   cost_bps: float = 0.0, horizon: int = 60,
                   min_agreeing: int = 0, max_against: int = 3,
-                  side: str = "both", hours: float = 0.0) -> dict[str, Any]:
+                  side: str = "both", hours: float = 0.0,
+                  min_effort: float = 0.0,
+                  unanimous: bool = False) -> dict[str, Any]:
         """Every target against every stop, over the readings already stored.
 
         The signal is independent of where the levels sit, so one pass over
@@ -3820,22 +3865,35 @@ at normal scale">fit</button>
     <div class="panel full" id="pilotPanel"><h2>The agent's own book
       <span class="stamp" id="apStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Its decisions, not yours.
-        Book, delta and price vote; whichever way they add up is the
-        direction. Nothing is refused except all three going flat, which is
-        no reading rather than a veto. Levels are the ones you set below —
-        the same ones the grid tests — so a result up there transfers down
-        here unchanged. <b>Nothing places an order.</b></div>
+        Book, delta and price vote; whichever way they point is the
+        direction, and it takes the trade only when the conditions below
+        are met. Those are <i>your</i> rules with numbers on them — the
+        refusals are still recorded, so the book can tell you later what
+        each one cost. Levels are the ones you set, in the same units the
+        grid tests. <b>Nothing places an order.</b></div>
 
       <div class="conbar">
         <label>candle <select id="apInt">
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></select></label>
         <label>size $<input id="apSize" value="10000" size="8"></label>
-        <label><b>take profit</b> <input id="apTp" value="20" size="3">bps</label>
-        <label><b>stop loss</b> <input id="apSl" value="15" size="3">bps</label>
+        <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
+        <label><b>stop loss</b> <input id="apSl" value="10" size="3"></label>
+        <label>in <select id="apUnit">
+          <option value="bps" selected>bps</option>
+          <option value="ticks">ticks / pips</option></select></label>
         <label>round-trip fee <input id="apFee" value="0" size="4">bps</label>
+      </div>
+      <div class="conbar" style="margin-top:-4px">
+        <b style="color:var(--ink)">Only take it when:</b>
+        <label title="Book, delta and price all pointing the same way —
+3-0, never 2-1 and never one column with two quiet."><input type="checkbox"
+          id="apUnan" checked>all three agree</label>
+        <label title="Aggressive volume against what this market normally
+trades for the span. 100% is normal.">and volume is over
+          <input id="apEffort" value="200" size="3">% of normal</label>
         <label title="Off keeps the live book identical to the grid, so a
-result from the sweep transfers unchanged."><input type="checkbox"
+result from the grid transfers unchanged."><input type="checkbox"
           id="apInval">also exit when the read flips</label>
         <button class="go" id="apToggle" onclick="toggleAutopilot()">Let it
           decide</button>
@@ -3931,9 +3989,13 @@ be true.">Clear the book</button>
 signal gets five minutes. Nothing here can change that.">holds
           <b>until its candle closes</b></label>
         <label>votes <select id="swAgree">
-          <option value="0" selected>any — every signal</option>
+          <option value="0">any — every signal</option>
           <option value="2">2 of 3 or better</option>
-          <option value="3">all three only</option></select></label>
+          <option value="3" selected>all three only</option></select></label>
+        <label title="Aggressive volume against what this market normally
+trades. Candles with no volume reading are left out rather than counted as
+quiet.">volume over <input id="swEffort" value="200" size="3">% of
+          normal</label>
         <label>side <select id="swSide">
           <option value="both" selected>both</option>
           <option value="long">long only</option>
@@ -4540,8 +4602,13 @@ function apCfg() {
   return {coin: coin(), interval: $('apInt').value,
           notional: parseFloat($('apSize').value || '10000'),
           fee_bps: parseFloat($('apFee').value || '0'),
-          tp_bps: parseFloat($('apTp').value || '20'),
-          sl_bps: parseFloat($('apSl').value || '15'),
+          tp_bps: parseFloat($('apTp').value || '10'),
+          sl_bps: parseFloat($('apSl').value || '10'),
+          unit: $('apUnit').value,
+          require_unanimous: $('apUnan').checked,
+          // The box is a percentage; the agent thinks in multiples of
+          // normal, where 1.0 is normal.
+          min_effort: parseFloat($('apEffort').value || '0') / 100,
           raw: true,
           exit_on_invalidation: $('apInval').checked};
 }
@@ -4909,6 +4976,8 @@ function swCfg() {
     sl_step: parseFloat($('swSlStep').value || '5'),
     cost_bps: parseFloat($('swFee').value || '0'),
     min_agreeing: parseInt($('swAgree').value || '0', 10),
+    unanimous: parseInt($('swAgree').value || '0', 10) === 3,
+    min_effort: parseFloat($('swEffort').value || '0') / 100,
     side: $('swSide').value,
   };
 }
@@ -4940,7 +5009,9 @@ async function runSweep() {
   catch (e) { $('swVerdict').textContent = e.message; return; }
 
   if (!d.ok) {
-    $('swVerdict').innerHTML = `<b>${esc(d.detail || 'no result')}</b>`;
+    $('swVerdict').innerHTML = `<b>${esc(d.detail || 'no result')}</b>`
+      + (d.considered ? `<div class="thin">${d.considered} signals were `
+          + 'recorded; none of them met that filter.</div>' : '');
     if (d.span && d.span.n) {
       $('swAvail').textContent = `${d.span.n} readings stored for this `
         + 'market, but none matched.';
@@ -4949,10 +5020,16 @@ async function runSweep() {
   }
 
   $('swStamp').textContent = `${d.signals} signals · ${d.span_hours}h`;
+  if (d.tick_bps) {
+    $('swStamp').textContent += ` · 1 tick ≈ ${d.tick_bps.toFixed(2)}bps`;
+  }
   $('swVerdict').innerHTML = `<b>${esc(d.verdict)}</b>`;
-  $('swAvail').innerHTML = `<b>${d.available} signals</b> available, `
-    + `${d.signals} with price after them. Cost ${d.cost_bps}bps a round `
-    + 'trip, and every trade ends when its own candle closes.';
+  $('swAvail').innerHTML = `<b>${d.available} recorded</b>, `
+    + `${d.considered != null && d.considered !== d.signals
+        ? d.signals + ' passed the filter and had price after them'
+        : d.signals + ' usable'}. `
+    + `Cost ${d.cost_bps}bps a round trip, and every trade ends when its `
+    + 'own candle closes.';
   paintHeat(d);
   paintShapes(d);
 }
