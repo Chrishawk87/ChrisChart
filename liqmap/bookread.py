@@ -168,8 +168,11 @@ class BookRead:
     depletion: float          # touch queues shrinking: + bid eaten, - ask eaten
     replenish: float          # which side keeps coming back
     mid_drift_bps: float      # what the mid actually did over the window
-    aggression: float         # tape: who is crossing, -1..+1
-    absorbed: bool            # aggression not moving the mid
+    # Kept for callers that still display them, but NO LONGER SCORED. Both
+    # come from the tape, and the book's job is resting orders. `delta.py`
+    # owns aggression and absorption now.
+    aggression: float = 0.0   # informational only
+    absorbed: bool = False    # informational only
 
     samples: int = 0
     window_s: float = DYNAMICS_WINDOW_S
@@ -178,8 +181,18 @@ class BookRead:
     # Weights. Microprice tilt leads because it is the mechanism; replenish
     # beats raw imbalance because displayed size can be cancelled and
     # replaced size has been paid for.
+    # RESTING ORDERS ONLY.
+    #
+    # `aggression` used to live here, weighted into the book score, and it
+    # came from the TAPE. That made this module depend on the trade feed,
+    # and — worse — it put the same input on both sides of the confirmation
+    # check, so the book and the tape were partly agreeing with themselves.
+    #
+    # Aggression now has its own column in `delta.py`, and absorption went
+    # with it, because "somebody is crossing and price will not move" is a
+    # delta/price divergence and was never a property of the book.
     W = {"tilt": 1.0, "replenish": 0.8, "imbalance": 0.6,
-         "depletion": 0.7, "aggression": 0.6, "drift": 0.5}
+         "depletion": 0.7, "drift": 0.5}
 
     @property
     def score(self) -> float:
@@ -189,7 +202,6 @@ class BookRead:
             "replenish": self.replenish,
             "imbalance": self.imbalance,
             "depletion": -self.depletion,   # bid being eaten is bearish
-            "aggression": (0.0 if self.absorbed else self.aggression),
             "drift": max(-1.0, min(1.0, self.mid_drift_bps / 10.0)),
         }
         total = sum(self.W.values())
@@ -232,14 +244,6 @@ class BookRead:
              "note": ("the bid is being eaten" if self.depletion > 0 else
                       "the offer is being eaten" if self.depletion < 0 else
                       "queues holding")},
-            {"name": "aggression", "value": (0.0 if self.absorbed
-                                             else self.aggression),
-             "weight": self.W["aggression"],
-             "note": ("absorbed — aggression is not moving the mid"
-                      if self.absorbed else
-                      "buyers crossing" if self.aggression > 0 else
-                      "sellers crossing" if self.aggression < 0 else
-                      "no aggression")},
             {"name": "mid drift", "value": max(-1.0, min(1.0, self.mid_drift_bps / 10.0)),
              "weight": self.W["drift"],
              "note": f"mid {self.mid_drift_bps:+.2f}bps over {self.window_s:.0f}s"},
@@ -254,9 +258,6 @@ class BookRead:
                 f"conviction {self.conviction:.0%}, "
                 f"from {self.samples} book updates over {self.window_s:.0f}s.")
 
-        if self.absorbed:
-            head += (" Aggression is being absorbed, so it is not counted: "
-                     "somebody is taking the other side without price moving.")
         if abs(self.tilt) > 0.5:
             head += (f" The touch is {abs(self.tilt):.0%} tilted toward the "
                      f"{'offer' if self.tilt > 0 else 'bid'} — the thin side "

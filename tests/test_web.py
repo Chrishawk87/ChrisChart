@@ -1756,8 +1756,12 @@ def test_bookcall_reports_every_component(client):
 
     d = client.get(f"/api/bookcall?coin=BTC&token={TOKEN}").json()
     names = {c["name"] for c in d["components"]}
+    # Aggression is NOT here. It comes from the trade feed, and scoring it
+    # inside the book put the same input on both sides of the confirmation
+    # check — so it moved to its own column in `delta.py`, and absorption
+    # went with it.
     assert names == {"microprice tilt", "replenishment", "near imbalance",
-                     "queue depletion", "aggression", "mid drift"}
+                     "queue depletion", "mid drift"}
 
 
 def test_bookcall_window_is_adjustable(client):

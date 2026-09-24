@@ -609,3 +609,110 @@ def test_env_credentials_are_detected_without_touching_the_network(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAFAKE")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
     assert arch.Archive().credentials_present() is True
+
+
+# --------------------------------------------------------------------------
+# the live chart, drawn from our own data
+# --------------------------------------------------------------------------
+
+def test_the_chart_route_is_locked(locked):
+    assert locked.get("/api/chart").status_code == 503
+
+
+def test_the_chart_serves_bars_from_our_own_feed(client, monkeypatch):
+    """Not an embedded widget and not somebody else's rendering — the same
+    bars the signals were computed on, so a marker that looks wrong on the
+    chart IS wrong."""
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    d = client.get("/api/chart?coin=BTC&interval=15m", headers=AUTH).json()
+    assert d["bars"], d.get("error")
+    assert "websocket" in d["source"]
+    for key in ("ts", "o", "h", "l", "c"):
+        assert key in d["bars"][0]
+
+
+def test_the_forming_bar_is_marked_live(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    d = client.get("/api/chart?coin=BTC&interval=15m", headers=AUTH).json()
+    forming = [b for b in d["bars"] if b.get("live")]
+    assert forming, "the bar being traded is missing from the chart"
+    # Shown even when unseeded — its high, low and close are real fills and
+    # only the open is approximate, so the flag is carried rather than the
+    # bar hidden.
+    assert "seeded" in forming[0]
+
+
+def test_calls_are_plotted_on_the_bar_they_fired_on(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    ts, sid = _pending(rt)
+    client.post(f"/api/decide?id={sid}&taken=true", headers=AUTH)
+
+    d = client.get("/api/chart?coin=BTC&interval=15m", headers=AUTH).json()
+    marks = d["marks"]
+    assert marks, "the call was not plotted"
+    m = marks[0]
+    assert m["side"] == "long" and m["decision"] == "taken"
+    assert m["target"] > m["entry"] > m["stop"]
+
+
+def test_the_chart_carries_the_forming_bar_volume_profile(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    d = client.get("/api/chart?coin=BTC&interval=15m", headers=AUTH).json()
+    assert d["profile"] is not None
+    assert d["profile"]["poc"] is not None
+    assert d["profile"]["levels"]
+
+
+def test_the_chart_falls_back_to_polled_candles_without_a_feed(client):
+    """No feed is not an error — it is a slower chart."""
+    r = client.get("/api/chart?coin=BTC&interval=15m", headers=AUTH)
+    assert r.status_code == 200
+    d = r.json()
+    assert "error" in d or d.get("bars") is not None
+
+
+def test_a_running_feed_grades_all_three_columns(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    _settle(rt)
+
+    d = client.get("/api/suggest?coin=BTC&interval=15m&record=false",
+                   headers=AUTH).json()
+    t = d["three_way"]
+    assert t["grade"] in ("A", "B", "C", "X", "—")
+    assert set(t) >= {"book", "delta", "price", "agreeing", "tradeable"}
+    assert d["delta"] is not None
+
+
+def test_a_graded_call_reports_how_far_it_can_run(client, monkeypatch):
+    """Direction quality and holding distance are different questions."""
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    _settle(rt)
+
+    d = client.get("/api/suggest?coin=BTC&interval=15m&record=false",
+                   headers=AUTH).json()
+    if d.get("three_way", {}).get("direction") != "flat":
+        assert d.get("runway") is not None
+        assert d["runway"]["clear_bps"] > 0
+        assert d["runway"]["describe"]

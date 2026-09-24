@@ -169,18 +169,24 @@ def test_a_balanced_book_calls_flat():
     assert abs(read.score) < 0.12
 
 
-def test_aggression_that_is_not_moving_the_mid_is_not_counted():
-    """Somebody is crossing and the mid has not moved: they are being
-    absorbed, so their aggression is evidence of nothing."""
+def test_the_book_no_longer_scores_the_tape_at_all():
+    """Aggression and absorption used to live here. Both came from the trade
+    feed, which made this module depend on the tape AND put the same input
+    on both sides of the book-versus-price confirmation — so the book was
+    partly agreeing with itself.
+
+    They moved to `delta.py`, which owns the tape as its own independent
+    column. The fields survive for callers that display them; the SCORE must
+    not touch them."""
     r = BookReader()
     for i in range(12):
         r.add(ladder(mid=100.0, bid_sz=5.0, ask_sz=5.0, ts=float(i)))
-    read = r.read(aggression=0.9)
 
-    assert read.absorbed is True
-    agg = next(c for c in read.components() if c["name"] == "aggression")
-    assert agg["value"] == 0.0
-    assert "absorbed" in read.verdict()
+    quiet = r.read(aggression=0.0)
+    loud = r.read(aggression=0.9)
+    assert quiet.score == loud.score
+    assert "aggression" not in {c["name"] for c in loud.components()}
+    assert "aggression" not in BookRead.W
 
 
 def test_aggression_that_moves_the_mid_is_counted():
@@ -239,8 +245,12 @@ def test_every_component_is_reported_with_its_weight():
         r.add(ladder(ts=float(i)))
     comps = r.read().components()
     names = {c["name"] for c in comps}
+    # Aggression is NOT here. It comes from the trade feed, and scoring it
+    # inside the book put the same input on both sides of the confirmation
+    # check — so it moved to its own column in `delta.py`, and absorption
+    # went with it.
     assert names == {"microprice tilt", "replenishment", "near imbalance",
-                     "queue depletion", "aggression", "mid drift"}
+                     "queue depletion", "mid drift"}
     assert all(c["weight"] > 0 for c in comps)
 
 

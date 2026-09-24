@@ -561,8 +561,10 @@ class Runtime:
         there is no suggestion, and saying so is the correct answer -- the
         alternative is a target sized from a stale snapshot.
         """
+        from . import runway as runway_mod
         from .confirm import (AgreementTracker, from_feed as read_price_action,
-                              participation_from_feed)
+                              grade_three, participation_from_feed)
+        from .delta import from_feed as read_delta_column, sticky as delta_sticky
         from .live import INTERVALS
         from .suggest import assess as make_call
 
@@ -650,6 +652,10 @@ class Runtime:
         # together or evaporates between seeing it and acting on it.
         part = participation_from_feed(feed, interval, interval_s, window_s)
 
+        # The third column: who is crossing the spread. Independent of the
+        # book by construction — `delta.py` never reads one.
+        tape = read_delta_column(feed, interval, interval_s, window_s)
+
         # Agreement needs an AGE, and age needs memory that survives the
         # poll. One tracker per market and timeframe.
         tracker = self._trackers.setdefault((coin, interval),
@@ -663,6 +669,15 @@ class Runtime:
                         and read.direction != "flat")
             else "no",
             read.direction if read is not None else "flat", now)
+
+        # Three-way grade. Price is mandatory: it is the only column that
+        # reports an outcome rather than an intention.
+        tracker_delta = delta_sticky(tape.score if tape else 0.0,
+                                     getattr(tracker, "delta_dir", None))
+        tracker.delta_dir = tracker_delta
+        three = grade_three(
+            tracker.book_dir or "flat", tracker_delta,
+            tracker.price_dir or "flat")
 
         call = make_call(
             read, book, coin=coin, interval=interval, interval_s=interval_s,
@@ -681,6 +696,28 @@ class Runtime:
         payload["mode"] = mode
         payload["feed_age_s"] = feed.age
         payload["book_updates"] = feed.book_updates
+        payload["three_way"] = three.to_dict()
+        payload["delta"] = tape.to_dict() if tape else None
+
+        # How far can it go? Direction quality and holding distance are
+        # different questions and are answered separately.
+        live_bar_now = feed.candle(interval)
+        prof_now = getattr(live_bar_now, "profile", None) if live_bar_now else None
+        entry_px = 0.0
+        if out is not None:
+            entry_px = out.entry
+        elif book is not None and not book.empty:
+            entry_px = book.mid
+        if entry_px > 0 and three.direction != "flat":
+            mag_bps, mag_not = self.magnet_for(coin, entry_px)
+            road = runway_mod.measure(
+                entry=entry_px,
+                side="long" if three.direction == "up" else "short",
+                book=book, profile=prof_now, bars=recent,
+                magnet_bps=mag_bps, magnet_notional=mag_not)
+            payload["runway"] = road.to_dict()
+            if out is not None:
+                payload["runway"]["holdable"] = road.holdable(out.target_bps)
         payload["updates_per_s"] = feed.updates_per_s
         payload["feed_quality"] = feed.feed_quality
         payload["fast_book"] = feed.fast_book
@@ -732,6 +769,20 @@ class Runtime:
             # data already collected rather than from a guessed threshold.
             feats["held_s"] = round(held, 2)
             feats["flips"] = flips
+            feats["grade_3way"] = three.grade
+            feats["agreeing"] = three.agreeing
+            if tape is not None:
+                feats["delta_score"] = tape.score
+                feats["delta_lean"] = round(tape.lean, 4)
+                feats["delta_effort"] = round(tape.effort, 3)
+                feats["delta_persistence"] = tape.persistence
+                feats["delta_absorbed"] = tape.absorbed
+                feats["delta_working"] = tape.working
+                feats["delta_divergent"] = tape.divergent
+            road_d = payload.get("runway")
+            if road_d:
+                feats["runway_bps"] = road_d.get("clear_bps")
+                feats["runway_open"] = road_d.get("open_road")
             if part is not None:
                 feats["effort"] = round(part.effort, 3)
                 feats["effort_aligned"] = round(part.aligned, 3)
@@ -2049,6 +2100,86 @@ def create_app() -> FastAPI:
             "recent": rt.history.recent_suggestions(c, limit=max(1, min(recent, 200))),
         }
 
+    @app.get("/api/chart", dependencies=[Depends(require_token)])
+    def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120
+                  ) -> dict[str, Any]:
+        """Candles plus the calls that fired on them, for the live chart.
+
+        Everything comes from this service's own data: bars built from the
+        tape by the live feed where it is running, and the recorded
+        agreement states. No third-party chart, no embedded widget, nobody
+        else's rendering of the same market.
+
+        That matters for more than independence. A chart drawn from the same
+        candles the signals were computed on cannot disagree with them, so
+        when a marker looks wrong on the chart it IS wrong — which is the
+        whole point of looking.
+        """
+        coin = rt.resolve_symbol(coin)[0] or coin
+        n = max(20, min(bars, 500))
+        out: dict[str, Any] = {"coin": coin, "interval": interval}
+
+        feed = rt.feed_for(coin)
+        candles: list[Any] = []
+        source = "polled"
+
+        if feed is not None:
+            hist = feed.history(interval)
+            if len(hist) >= 10:
+                candles = list(hist[-n:])
+                source = "websocket (built from fills)"
+
+        if not candles:
+            try:
+                candles = rt.client().candles(coin, interval, bars=n)
+            except Exception as exc:
+                return {**out, "error": f"candles unavailable: {exc}"}
+
+        live = feed.candle(interval) if feed else None
+        rows = [{"ts": c.ts, "o": c.open, "h": c.high, "l": c.low,
+                 "c": c.close, "v": c.volume} for c in candles]
+        if live is not None:
+            # Shown even when unseeded. An unseeded bar's high, low and close
+            # are real fills; only its OPEN is the first trade seen rather
+            # than the true open. Hiding the forming candle to avoid a
+            # slightly wrong open loses the one bar the operator is actually
+            # trading, so it is drawn and flagged instead.
+            if rows and abs(rows[-1]["ts"] - live.start_ts) < 1.0:
+                rows.pop()
+            rows.append({"ts": live.start_ts, "o": live.open, "h": live.high,
+                         "l": live.low, "c": live.close, "v": live.volume,
+                         "live": True, "seeded": bool(live.seeded)})
+
+        # The markers: what was called, on which bar, and how it resolved.
+        marks = []
+        try:
+            span = rows[0]["ts"] if rows else 0.0
+            for s in rt.history.recent_suggestions(coin, limit=200):
+                if s["interval"] != interval or s["candle_ts"] < span:
+                    continue
+                marks.append({
+                    "ts": s["candle_ts"], "made_at": s["made_at"],
+                    "side": s["side"], "entry": s["entry"],
+                    "target": s["target_px"], "stop": s["stop_px"],
+                    "decision": s["decision"], "outcome": s["outcome"],
+                    "pnl_bps": s["pnl_bps"]})
+        except Exception as exc:
+            out["marks_error"] = str(exc)
+
+        # Where volume traded inside the forming bar, for the side profile.
+        profile = None
+        prof = getattr(live, "profile", None) if live is not None else None
+        if prof is not None and prof.total_notional > 0:
+            levels = prof.levels
+            top = sorted(levels, key=lambda x: -x[1])[:40]
+            profile = {"poc": prof.poc,
+                       "total": round(prof.total_notional, 2),
+                       "levels": [{"px": p, "v": round(v, 2)} for p, v in top]}
+
+        return {**out, "source": source, "bars": rows, "marks": marks,
+                "profile": profile,
+                "interval_s": rt.client().INTERVALS.get(interval, 900)}
+
     @app.get("/api/agreement", dependencies=[Depends(require_token)])
     def api_agreement(coin: str = "", interval: str = "",
                       min_strength: float = 0.0) -> dict[str, Any]:
@@ -2973,7 +3104,14 @@ DASHBOARD = """<!doctype html>
         favours buyers and price is falling, somebody is absorbing them and
         we stand aside. <b>Nothing here places an order.</b></div>
       <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
+      <div id="sugThree" style="display:none;margin-bottom:10px"></div>
       <div id="sugCompare" style="display:none;margin-bottom:10px"></div>
+      <div id="chartWrap" style="display:none;margin-bottom:12px">
+        <canvas id="sugChart" height="260"
+          style="width:100%;height:260px;display:block;
+                 border:1px solid var(--line);border-radius:4px"></canvas>
+        <div id="chartNote" class="msg" style="margin-top:4px"></div>
+      </div>
       <div class="conbar">
         <label>candle <select id="sInt" onchange="loadSuggest()">
           <option>1m</option><option>5m</option><option selected>15m</option>
@@ -3660,11 +3798,49 @@ function paintCompare(d) {
         : '');
 }
 
+/* Three independent columns and a letter. Never blended — averaging three
+   directions turns a disagreement into a confident-looking number, and the
+   disagreement is the part worth keeping. */
+function paintThreeWay(d) {
+  const box = $('sugThree');
+  const t = d.three_way;
+  if (!t) { box.style.display = 'none'; return; }
+
+  const cls = v => v === 'up' ? 'long' : v === 'down' ? 'short' : '';
+  const arrow = v => v === 'up' ? '▲' : v === 'down' ? '▼' : '—';
+  const gradeCls = t.grade === 'A' ? 'long' : t.grade === 'X' ? 'short' : '';
+  const road = d.runway;
+  const dl = d.delta;
+
+  box.style.display = '';
+  box.innerHTML =
+      '<div class="conrow">'
+    + `<div class="stat"><b class="${cls(t.book)}">${arrow(t.book)} `
+    + `${esc((t.book || '').toUpperCase())}</b><span>book (resting)</span></div>`
+    + `<div class="stat"><b class="${cls(t.delta)}">${arrow(t.delta)} `
+    + `${esc((t.delta || '').toUpperCase())}</b><span>delta (crossing)</span></div>`
+    + `<div class="stat"><b class="${cls(t.price)}">${arrow(t.price)} `
+    + `${esc((t.price || '').toUpperCase())}</b><span>price (outcome)</span></div>`
+    + `<div class="stat"><b class="${gradeCls}" style="font-size:20px">`
+    + `${esc(t.grade)}</b><span>grade · ${t.agreeing}/3</span></div>`
+    + (road ? `<div class="stat"><b>${road.clear_bps.toFixed(0)}bps</b>`
+              + `<span>runway${road.open_road ? ' · open' : ''}</span></div>` : '')
+    + '</div>'
+    + `<div class="msg" style="margin-top:6px">${esc(t.detail || '')}</div>`
+    + (road ? `<div class="msg" style="margin-top:4px"><b>How far:</b> `
+              + `${esc(road.describe || '')}.</div>` : '')
+    + (dl && (dl.absorbed || dl.divergent || dl.working)
+        ? `<div class="msg" style="margin-top:4px"><b>Tape:</b> `
+          + `${esc(dl.describe || '')}.</div>` : '');
+}
+
 function paintSuggest(d) {
   if (!d) return;
   sugId = d.id || null;
   const act = $('sugActions');
   paintCompare(d);
+  paintThreeWay(d);
+  loadChart();
 
   // The feed rate decides whether anything below it is worth reading. Every
   // book signal measures CHANGE, so the rate change arrives at IS the
@@ -4091,6 +4267,148 @@ async function doCalibrate() {
     loadRead();
   } catch (e) { note(e.message, true); }
 }
+
+/* ---- the live chart, drawn from OUR OWN data -------------------------
+   Candles the feed built from fills, and the calls that fired on them, on
+   one canvas. A chart drawn from the same bars the signals were computed
+   on cannot disagree with them — so when a marker looks wrong here, it IS
+   wrong, which is the entire reason to look.                            */
+
+let chartData = null;
+
+function drawChart() {
+  const wrap = $('chartWrap');
+  const cv = $('sugChart');
+  if (!chartData || !chartData.bars || chartData.bars.length < 2) {
+    wrap.style.display = 'none';
+    return;
+  }
+  wrap.style.display = '';
+
+  // Match the backing store to the CSS size, or everything is blurry on a
+  // retina display and the hit-testing is off by a factor of two.
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const css = getComputedStyle(document.documentElement);
+  const col = n => css.getPropertyValue(n).trim() || '#888';
+  const up = col('--up'), down = col('--down'),
+        dim = col('--dim'), line = col('--line'), ink = col('--ink');
+
+  const bars = chartData.bars;
+  const padL = 8, padR = 62, padT = 10, padB = 18;
+  const plotW = w - padL - padR, plotH = h - padT - padB;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const b of bars) { if (b.l < lo) lo = b.l; if (b.h > hi) hi = b.h; }
+  for (const m of (chartData.marks || [])) {
+    if (m.target) { lo = Math.min(lo, m.target); hi = Math.max(hi, m.target); }
+    if (m.stop) { lo = Math.min(lo, m.stop); hi = Math.max(hi, m.stop); }
+  }
+  if (!isFinite(lo) || !isFinite(hi) || hi <= lo) return;
+  const pad = (hi - lo) * 0.06; lo -= pad; hi += pad;
+
+  const y = p => padT + (hi - p) / (hi - lo) * plotH;
+  const step = plotW / bars.length;
+  const bw = Math.max(1, Math.min(step * 0.7, 14));
+
+  g.clearRect(0, 0, w, h);
+
+  // price grid
+  g.strokeStyle = line; g.fillStyle = dim;
+  g.font = '10px ui-monospace, monospace'; g.textAlign = 'left';
+  for (let i = 0; i <= 4; i++) {
+    const p = lo + (hi - lo) * i / 4, yy = Math.round(y(p)) + 0.5;
+    g.beginPath(); g.moveTo(padL, yy); g.lineTo(padL + plotW, yy); g.stroke();
+    g.fillText(p.toLocaleString(undefined, {maximumFractionDigits: 6}),
+               padL + plotW + 5, yy + 3);
+  }
+
+  // volume profile of the forming bar, along the right edge
+  const prof = chartData.profile;
+  if (prof && prof.levels && prof.levels.length) {
+    const maxV = Math.max(...prof.levels.map(l => l.v));
+    g.globalAlpha = 0.28;
+    for (const l of prof.levels) {
+      const yy = y(l.px);
+      const lw = Math.max(1, (l.v / maxV) * 46);
+      g.fillStyle = (prof.poc && Math.abs(l.px - prof.poc) < 1e-9) ? ink : dim;
+      g.fillRect(padL + plotW - lw, yy - 1, lw, 2);
+    }
+    g.globalAlpha = 1;
+  }
+
+  // candles
+  bars.forEach((b, i) => {
+    const x = padL + i * step + step / 2;
+    const rising = b.c >= b.o;
+    g.strokeStyle = g.fillStyle = rising ? up : down;
+    g.globalAlpha = b.live ? 1 : 0.85;
+    g.beginPath();
+    g.moveTo(Math.round(x) + 0.5, y(b.h));
+    g.lineTo(Math.round(x) + 0.5, y(b.l));
+    g.stroke();
+    const top = y(Math.max(b.o, b.c)), bot = y(Math.min(b.o, b.c));
+    g.fillRect(x - bw / 2, top, bw, Math.max(1, bot - top));
+    g.globalAlpha = 1;
+  });
+
+  // the calls, on the bar they fired on
+  const first = bars[0].ts, iv = chartData.interval_s || 900;
+  for (const m of (chartData.marks || [])) {
+    const idx = Math.round((m.ts - first) / iv);
+    if (idx < 0 || idx >= bars.length) continue;
+    const x = padL + idx * step + step / 2;
+    const long = m.side === 'long';
+    const c = long ? up : down;
+
+    // target and stop as short rails, so a call's shape is visible
+    g.strokeStyle = c; g.globalAlpha = 0.5; g.setLineDash([2, 2]);
+    for (const p of [m.target, m.stop]) {
+      if (!p) continue;
+      g.beginPath();
+      g.moveTo(x - step * 0.4, y(p)); g.lineTo(x + step * 1.6, y(p));
+      g.stroke();
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    // the entry marker: filled when taken, hollow when ignored
+    const yy = y(m.entry);
+    g.beginPath();
+    if (long) { g.moveTo(x, yy + 9); g.lineTo(x - 5, yy + 17); g.lineTo(x + 5, yy + 17); }
+    else { g.moveTo(x, yy - 9); g.lineTo(x - 5, yy - 17); g.lineTo(x + 5, yy - 17); }
+    g.closePath();
+    g.fillStyle = c; g.strokeStyle = c; g.lineWidth = 1.5;
+    if (m.decision === 'taken') g.fill(); else g.stroke();
+    g.lineWidth = 1;
+
+    // how it resolved
+    if (m.outcome === 'target' || m.outcome === 'stop') {
+      g.fillStyle = m.outcome === 'target' ? up : down;
+      g.beginPath(); g.arc(x, yy, 2.5, 0, Math.PI * 2); g.fill();
+    }
+  }
+
+  const n = (chartData.marks || []).length;
+  $('chartNote').innerHTML =
+      `${bars.length} ${esc(chartData.interval || '')} bars · `
+    + `${esc(chartData.source || '')} · ${n} call${n === 1 ? '' : 's'} plotted`
+    + ' · solid marker = taken, hollow = ignored, dot = how it settled';
+}
+
+async function loadChart() {
+  try {
+    chartData = await api('/api/chart?' + q({
+      coin: coin(), interval: $('sInt').value, bars: 120}));
+  } catch (e) { return; }
+  if (chartData && chartData.error) { chartData = null; }
+  drawChart();
+}
+
+window.addEventListener('resize', () => { if (chartData) drawChart(); });
 
 /* ---- book vs price: the table ---------------------------------------- */
 

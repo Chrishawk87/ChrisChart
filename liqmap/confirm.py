@@ -425,6 +425,103 @@ class Confirmation:
                 "strength": self.strength, "detail": self.detail}
 
 
+@dataclass(frozen=True)
+class ThreeWay:
+    """Book, delta and price graded together — but never blended.
+
+    Three independent columns, each answering a different question:
+
+        BOOK    what is resting, where is the thin side
+        DELTA   who is crossing the spread, and how hard
+        PRICE   whether any of it is working
+
+    PRICE IS MANDATORY. It is the only one of the three that reports an
+    OUTCOME rather than an intention, and a setup price is arguing against
+    is not a setup. Book and delta can both be screaming and still be
+    getting absorbed; that is the case this whole design exists to refuse.
+
+    Beyond that the grade is a count, not an average. Averaging three
+    directions produces a confident-looking number from a disagreement,
+    which is exactly the information worth keeping.
+
+        A   all three aligned
+        B   price plus one of book or delta
+        C   price alone, the other two flat
+        X   price against the others — somebody is absorbing
+        —   nothing to say
+    """
+
+    book: Direction
+    delta: Direction
+    price: Direction
+    grade: str
+    direction: Direction
+    detail: str
+
+    @property
+    def tradeable(self) -> bool:
+        return self.grade in ("A", "B", "C") and self.direction != "flat"
+
+    @property
+    def agreeing(self) -> int:
+        """How many columns point the tradeable way."""
+        if self.direction == "flat":
+            return 0
+        return sum(1 for d in (self.book, self.delta, self.price)
+                   if d == self.direction)
+
+    def to_dict(self) -> dict:
+        return {"book": self.book, "delta": self.delta, "price": self.price,
+                "grade": self.grade, "direction": self.direction,
+                "agreeing": self.agreeing, "tradeable": self.tradeable,
+                "detail": self.detail}
+
+
+def grade_three(book: Direction, delta: Direction,
+                price: Direction) -> ThreeWay:
+    """Grade the three columns. Price decides whether there is a trade."""
+    if price == "flat":
+        lean = book if book != "flat" else delta
+        if lean == "flat":
+            return ThreeWay(book, delta, price, "—", "flat",
+                            "nothing is saying anything")
+        return ThreeWay(
+            book, delta, price, "—", "flat",
+            f"the book and tape lean {lean} but price has not moved with "
+            f"them — pressure that has not paid yet, and nothing to trade "
+            f"until it does")
+
+    against = [name for name, d in (("the book", book), ("delta", delta))
+               if d != "flat" and d != price]
+    with_it = [d for d in (book, delta) if d == price]
+
+    if against and not with_it:
+        who = " and ".join(against)
+        verb = "say" if len(against) > 1 else "says"
+        return ThreeWay(
+            book, delta, price, "X", "flat",
+            f"price is going {price} while {who} {verb} the opposite — "
+            f"somebody is absorbing, and this is where trading intent "
+            f"without checking the outcome loses money")
+
+    if len(with_it) == 2:
+        return ThreeWay(book, delta, price, "A", price,
+                        f"all three agree {price}: the book is thin that "
+                        f"way, the tape is crossing that way, and price is "
+                        f"going")
+    if len(with_it) == 1:
+        other = "the book" if book == price else "delta"
+        quiet = "delta" if book == price else "the book"
+        extra = (f" ({quiet} disagrees)" if against else
+                 f" ({quiet} is flat)")
+        return ThreeWay(book, delta, price, "B", price,
+                        f"price is going {price} and {other} agrees{extra}")
+
+    return ThreeWay(book, delta, price, "C", price,
+                    f"price is going {price} on its own — neither the book "
+                    f"nor the tape is backing it")
+
+
 class AgreementTracker:
     """Memory for one market and timeframe, so agreement has an AGE.
 
