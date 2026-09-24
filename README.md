@@ -349,14 +349,47 @@ in any order, delimiters and timestamp units are detected, and malformed rows
 are **dropped and counted, never repaired**.
 
 This extends the historical replay well past the few thousand bars the exchange
-API serves. What it does **not** do is train the book:
+API serves. What a bar file does **not** contain is the book:
 
 > A bar records four prices and a volume. It does not record what was resting
 > at the touch, which side kept replacing size, or whether aggression moved the
 > mid. Microprice tilt, replenishment, depletion and absorption are about 70%
-> of the weight in the book call, and no exchange serves historical L2 depth at
-> this resolution — so that half cannot be uploaded at any length. It is
-> measured forward, live, in the suggestions table.
+> of the weight in the book call, and none of them are in an OHLCV export.
+
+For the book half there is a better source — see below.
+
+## Backfilling the book from Hyperliquid's own archive
+
+Hyperliquid publishes real L2 snapshots, about twice a second, to a public
+requester-pays bucket:
+
+```
+s3://hyperliquid-archive/market_data/{YYYYMMDD}/{H}/l2Book/{COIN}.lz4
+```
+
+That is *higher* resolution than the throttled public WebSocket currently
+delivers, and it goes back years. `archive.py` reads it; `backfill.py` replays
+those snapshots through the **same `BookReader` the live feed uses** and writes
+settled rows into the agreement table, so a question that would take three
+weeks of live recording is answered in an afternoon.
+
+Two rules the implementation holds to:
+
+**The two sides stay independent.** The book side comes from the archive. The
+price-action side comes from one-minute candles, which the exchange builds from
+*fills*. Taking price action from the snapshots' own mid would be the book
+agreeing with itself — a superb-looking confirmation rate meaning nothing.
+There is a test that parses `backfill.py` and fails if any argument to the
+price-action reader is derived from a book.
+
+**It costs real money.** Requester-pays charges every byte to *your* AWS
+account. The job estimates before it starts, counts bytes as it runs, reports
+them in dollars, and stops at a cap. Set `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY` before using it.
+
+Only `l2Book` lives under `market_data` — no trades, no candles, no spot. The
+uploads land roughly monthly with no completeness guarantee, so missing hours
+are normal and are counted rather than treated as failures.
 
 Every upload report and every replay result says this. Uploading three months
 of bars and being told the model is now trained on three months would be a lie
@@ -392,6 +425,9 @@ Everything else is tested. Run `check` first and expect to fix something.
 
 ```
 liqmap/
+  archive.py       Hyperliquid's S3 book archive — real historical L2
+  backfill.py      replays archived books into the agreement table
+  confirm.py       book against price action; agreement is a hard gate
   suggest.py       book read -> a trade to take or leave, or a named refusal
   ingest.py        uploaded OHLCV -> candles, with what it can and cannot train
   bookread.py      the order book calls the candle; nothing else consulted

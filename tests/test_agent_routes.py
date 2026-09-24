@@ -512,3 +512,78 @@ def test_a_refusal_is_never_recorded_as_a_trade(client, monkeypatch):
     d = client.get("/api/suggest?coin=BTC&interval=15m", headers=AUTH).json()
     assert d["take"] is False
     assert rt.history.recent_suggestions() == []
+
+
+# --------------------------------------------------------------------------
+# the archive backfill routes
+# --------------------------------------------------------------------------
+
+def test_backfill_routes_are_locked(locked):
+    assert locked.get("/api/backfill").status_code == 503
+    assert locked.post("/api/backfill?coin=BTC").status_code == 503
+    assert locked.get("/api/backfill/estimate").status_code == 503
+
+
+def test_an_estimate_is_available_before_spending_anything(client):
+    d = client.get("/api/backfill/estimate?coin=BTC&days=2", headers=AUTH).json()
+    assert d["hours"] == 48
+    assert d["estimated_usd"] >= 0
+    assert "requester-pays" in d["bucket"]
+    assert isinstance(d["credentials"], bool)
+
+
+def test_a_backfill_without_credentials_says_so_rather_than_failing_later(
+        client, monkeypatch):
+    """Requester-pays means there must be an account to charge. Finding
+    that out an hour into a job is the wrong time."""
+    from liqmap import archive as arch
+
+    monkeypatch.setattr(arch.Archive, "credentials_present",
+                        lambda self: False)
+    d = client.post("/api/backfill?coin=BTC&days=1", headers=AUTH).json()
+    assert d["ok"] is False
+    assert "AWS_ACCESS_KEY_ID" in d["error"]
+
+
+def test_an_unknown_interval_is_refused_before_any_download(client, monkeypatch):
+    from liqmap import archive as arch
+
+    monkeypatch.setattr(arch.Archive, "credentials_present", lambda self: True)
+    d = client.post("/api/backfill?coin=BTC&interval=7m", headers=AUTH).json()
+    assert d["ok"] is False and "timeframe" in d["error"]
+
+
+def test_the_backfill_status_route_reports_idle_cleanly(client):
+    d = client.get("/api/backfill", headers=AUTH).json()
+    assert d["running"] is False
+
+
+def test_a_backfill_can_be_stopped(client):
+    rt = web.runtime()
+    rt.backfill["running"] = True
+    d = client.post("/api/backfill/stop", headers=AUTH).json()
+    assert d["running"] is False
+
+
+def test_credentials_check_does_not_hang_without_aws(monkeypatch):
+    """The full boto3 chain ends at EC2 instance metadata, which on a
+    non-EC2 host waits for a connection that never comes."""
+    import time as _t
+
+    from liqmap import archive as arch
+
+    for var in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_PROFILE",
+                "AWS_SHARED_CREDENTIALS_FILE"):
+        monkeypatch.delenv(var, raising=False)
+
+    t0 = _t.time()
+    arch.Archive().credentials_present()
+    assert _t.time() - t0 < 10.0, "the credentials check stalled"
+
+
+def test_env_credentials_are_detected_without_touching_the_network(monkeypatch):
+    from liqmap import archive as arch
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAFAKE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret")
+    assert arch.Archive().credentials_present() is True

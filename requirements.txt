@@ -12,6 +12,13 @@ uvicorn[standard]>=0.27
 # parser rather than a missing dependency.
 python-multipart>=0.0.9
 
+# Reading Hyperliquid's own historical book archive
+# (s3://hyperliquid-archive, requester-pays). Only needed for the backfill —
+# the service runs without them and the endpoint says so rather than
+# failing at import time.
+boto3>=1.34
+lz4>=4.3
+
 # Required for the live feed and wallet harvesting (both use the
 # public trades websocket). Without it the service still runs, but the
 # current candle falls back to polling.

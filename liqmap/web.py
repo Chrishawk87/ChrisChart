@@ -84,6 +84,8 @@ class Runtime:
         self.harvest: dict[str, Any] = {"running": False, "found": 0,
                                         "started": None, "finished": None,
                                         "error": None, "minutes": 0}
+        self.backfill: dict[str, Any] = {"running": False, "progress": None,
+                                         "plan": None, "error": None}
         # One level watch at a time. Watching several would multiply the book
         # polls against a shared rate-limit budget that the position sweep
         # also draws on, and in practice you are looking at one level.
@@ -822,6 +824,82 @@ class Runtime:
         return {"ok": True, "resolved": resolved, "unresolvable": failed,
                 "pending": len(self.history.pending_suggestions(time.time())),
                 "errors": errors[:5]}
+
+    def start_backfill(self, coin: str, interval: str, days: float,
+                       at: float = 0.33, max_gib: float = 2.0
+                       ) -> dict[str, Any]:
+        """Fill the agreement table from Hyperliquid's own book archive.
+
+        Runs in the background because it is slow and costs money: the
+        bucket is requester-pays, so every hour downloaded is on the
+        caller's AWS bill. The job reports bytes as it goes and stops at
+        the cap rather than discovering the total afterwards.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        from .archive import Archive, estimate
+        from .backfill import Progress, backfill as run_backfill
+        from .live import INTERVALS
+
+        if self.backfill.get("running"):
+            return {**self.backfill, "ok": False,
+                    "error": "a backfill is already running"}
+        if interval not in INTERVALS:
+            return {"ok": False,
+                    "error": f"{interval!r} is not a timeframe this service "
+                             f"builds"}
+
+        coin = self.resolve_symbol(coin)[0] or coin
+        interval_s = float(INTERVALS[interval])
+
+        archive = Archive(max_bytes=int(max(0.1, max_gib) * 1024 ** 3))
+        if not archive.credentials_present():
+            return {"ok": False,
+                    "error": "no AWS credentials found. The Hyperliquid "
+                             "archive is requester-pays, so there has to be "
+                             "an account to charge — set AWS_ACCESS_KEY_ID "
+                             "and AWS_SECRET_ACCESS_KEY in Railway"}
+
+        end = _dt.now(_tz.utc).replace(minute=0, second=0, microsecond=0)
+        start = end - _td(days=max(0.04, min(days, 30.0)))
+
+        plan = estimate([coin], start, end)
+        prog = Progress(coin=coin, interval=interval)
+        self.backfill = {"running": True, "ok": True, "plan": plan,
+                         "progress": prog.to_dict(), "error": None}
+
+        def run() -> None:
+            try:
+                # One-minute candles for the whole window, from the
+                # exchange. These are built from FILLS, which is what keeps
+                # the price side independent of the book side.
+                need = int((end - start).total_seconds() // 60) + 10
+                minute_bars = self.client().candles(
+                    coin, "1m", bars=min(need, 5000))
+                if not minute_bars:
+                    prog.error = ("no one-minute candles came back for this "
+                                  "window")
+                    prog.done = True
+                    return
+
+                oldest = min(c.ts for c in minute_bars)
+                from_ts = max(start.timestamp(), oldest)
+                run_backfill(
+                    archive, self.history, coin=coin, interval=interval,
+                    interval_s=interval_s,
+                    start=_dt.fromtimestamp(from_ts, _tz.utc),
+                    end=end, minute_bars=minute_bars, at=at, progress=prog,
+                    should_stop=lambda: not self.backfill.get("running"))
+            except Exception as exc:                    # noqa: BLE001
+                prog.error = f"{type(exc).__name__}: {exc}"
+                prog.done = True
+            finally:
+                self.backfill["running"] = False
+                self.backfill["progress"] = prog.to_dict()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return self.backfill
 
     def magnet_for(self, coin: str, spot: float) -> tuple[float, float]:
         """The nearest liquidation cluster, signed, and its size.
@@ -1934,6 +2012,43 @@ def create_app() -> FastAPI:
         c = rt.resolve_symbol(coin)[0] if coin else None
         return rt.history.agreement_table(c, interval or None, min_strength)
 
+    @app.post("/api/backfill", dependencies=[Depends(require_token)])
+    def api_backfill(coin: str = "BTC", interval: str = "15m",
+                     days: float = 2.0, at: float = 0.33,
+                     max_gib: float = 2.0) -> dict[str, Any]:
+        """Fill the agreement table from Hyperliquid's own book archive.
+
+        COSTS REAL MONEY. `s3://hyperliquid-archive` is requester-pays, so
+        every byte is charged to your AWS account. The job reports bytes as
+        it runs and stops at `max_gib`.
+        """
+        return rt.start_backfill(coin, interval, days=days, at=at,
+                                 max_gib=max_gib)
+
+    @app.get("/api/backfill", dependencies=[Depends(require_token)])
+    def api_backfill_status() -> dict[str, Any]:
+        return rt.backfill
+
+    @app.post("/api/backfill/stop", dependencies=[Depends(require_token)])
+    def api_backfill_stop() -> dict[str, Any]:
+        rt.backfill["running"] = False
+        return rt.backfill
+
+    @app.get("/api/backfill/estimate", dependencies=[Depends(require_token)])
+    def api_backfill_estimate(coin: str = "BTC", days: float = 2.0
+                              ) -> dict[str, Any]:
+        """What a job would cost, before spending anything."""
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        from .archive import Archive, estimate
+
+        end = _dt.now(_tz.utc).replace(minute=0, second=0, microsecond=0)
+        start = end - _td(days=max(0.04, min(days, 30.0)))
+        out = estimate([coin], start, end)
+        out["credentials"] = Archive().credentials_present()
+        out["bucket"] = "s3://hyperliquid-archive (requester-pays)"
+        return out
+
     @app.post("/api/resolve-states", dependencies=[Depends(require_token)])
     def api_resolve_states(limit: int = 300) -> dict[str, Any]:
         return rt.resolve_states(limit=limit)
@@ -2902,6 +3017,33 @@ DASHBOARD = """<!doctype html>
       </div>
       <div id="agSay" class="say" style="display:none;margin-bottom:10px"></div>
       <div id="agTable"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Backfill from the archive</h3>
+      <div class="msg" style="margin-bottom:8px">Hyperliquid publishes real
+        book snapshots twice a second to
+        <code>s3://hyperliquid-archive</code>, going back years — higher
+        resolution than the live public feed currently gives. This replays
+        them through the same reader the live feed uses, so the table above
+        fills in this afternoon instead of over three weeks.
+        <b class="short">This is a requester-pays bucket: every byte is
+        charged to your own AWS account.</b> Set
+        <code>AWS_ACCESS_KEY_ID</code> and <code>AWS_SECRET_ACCESS_KEY</code>
+        in Railway first.</div>
+      <div class="conbar">
+        <label>days back <input id="bfDays" type="number" value="2" min="1"
+          max="30" step="1" style="width:70px" onchange="estimateBackfill()"></label>
+        <label>read at <select id="bfAt">
+          <option value="0.25">25% in</option>
+          <option value="0.33" selected>33% in</option>
+          <option value="0.5">50% in</option></select></label>
+        <label>stop at <input id="bfCap" type="number" value="2" min="0.1"
+          max="50" step="0.5" style="width:70px">GiB</label>
+        <button onclick="estimateBackfill()">Estimate cost</button>
+        <button class="go" onclick="startBackfill()">Run backfill</button>
+        <button onclick="stopBackfill()">Stop</button>
+      </div>
+      <div id="bfSay" class="msg">—</div>
 
       <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
         letter-spacing:.06em;color:var(--dim)">Which reading matters</h3>
@@ -3986,6 +4128,69 @@ async function loadSlice() {
         + `<td>${pctCell(b.hit_rate)}</td></tr>`).join('')
     + '</table>'
     + `<div class="msg" style="margin-top:6px">${esc(d.note || '')}</div>`;
+}
+
+/* ---- backfill from the S3 archive ------------------------------------ */
+
+let bfPoll = null;
+
+async function estimateBackfill() {
+  let d;
+  try {
+    d = await api('/api/backfill/estimate?' + q({
+      coin: coin(), days: parseFloat($('bfDays').value || '2')}));
+  } catch (e) { $('bfSay').textContent = e.message; return; }
+
+  $('bfSay').innerHTML =
+      `About <b>${d.estimated_gib} GiB</b> across ${d.object_count} hourly `
+    + `objects — roughly <b>$${d.estimated_usd}</b> on your AWS bill. `
+    + (d.credentials
+        ? '<span class="long">AWS credentials found.</span>'
+        : '<b class="short">No AWS credentials — set AWS_ACCESS_KEY_ID and '
+          + 'AWS_SECRET_ACCESS_KEY in Railway.</b>')
+    + `<div class="msg" style="margin-top:4px">${esc(d.note || '')}</div>`;
+}
+
+async function startBackfill() {
+  let d;
+  try {
+    d = await api('/api/backfill?' + q({
+      coin: coin(), interval: $('agInt').value || '15m',
+      days: parseFloat($('bfDays').value || '2'),
+      at: parseFloat($('bfAt').value || '0.33'),
+      max_gib: parseFloat($('bfCap').value || '2')}), {method: 'POST'});
+  } catch (e) { $('bfSay').textContent = e.message; return; }
+
+  if (d.ok === false) { $('bfSay').innerHTML = `<b class="short">${esc(d.error)}</b>`; return; }
+  if (!bfPoll) bfPoll = setInterval(pollBackfill, 2000);
+  pollBackfill();
+}
+
+async function stopBackfill() {
+  try { await api('/api/backfill/stop', {method: 'POST'}); } catch (e) {}
+  pollBackfill();
+}
+
+async function pollBackfill() {
+  let d;
+  try { d = await api('/api/backfill'); } catch (e) { return; }
+  const p = d.progress || {};
+
+  $('bfSay').innerHTML =
+      (d.running ? `<b>Running — ${p.pct || 0}%</b> · ` : '<b>Finished.</b> ')
+    + `${p.hours_done || 0}/${p.hours_total || 0} hours · `
+    + `${p.bars_seen || 0} bars read · <b>${p.states || 0} states recorded</b>`
+    + (p.transfer ? `<div class="msg" style="margin-top:4px">${esc(p.transfer)}</div>` : '')
+    + (p.error ? `<div class="msg" style="margin-top:4px"><b class="short">${esc(p.error)}</b></div>` : '')
+    + (p.skipped && Object.keys(p.skipped).length
+        ? `<div class="msg" style="margin-top:4px">skipped: `
+          + Object.entries(p.skipped).map(([k, v]) => `${v} ${esc(k)}`).join(', ')
+          + '</div>' : '');
+
+  if (!d.running) {
+    if (bfPoll) { clearInterval(bfPoll); bfPoll = null; }
+    loadAgreement();          // the table just grew
+  }
 }
 
 /* ---- uploaded chart history ------------------------------------------ */
