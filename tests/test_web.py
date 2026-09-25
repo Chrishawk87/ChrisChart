@@ -1911,6 +1911,23 @@ def test_the_agent_reads_the_panels_own_candle_and_size(client):
     assert "apInt" not in html and "apSize" not in html
 
 
+def test_the_indicator_pane_shares_one_scale(client):
+    """The line, its signal and their difference are the same units.
+
+    Separate scales would make a crossover look like something it is not.
+    """
+    html = client.get("/").text
+    blk = html[html.index("Chris's Tick Counter PPO, in its own pane"):]
+    blk = blk[:blk.index("the corner readout")]
+    assert "for (const arr of [P, S, H])" in blk
+    assert blk.count("const py = ") == 1
+
+
+def test_the_indicator_colours_are_the_validated_pair(client):
+    html = client.get("/").text
+    assert "#4d8fd1" in html and "#c17d33" in html
+
+
 def test_every_element_the_script_reaches_for_exists(client):
     """`$('someId')` on an id that is not in the page returns null, and the
     next property access throws — taking the whole poll with it.

@@ -569,6 +569,65 @@ them back on when you want to compare.
 There is a test that settles the same bar through both paths and fails if
 they disagree.
 
+## The Tick Counter PPO
+
+`liqmap/ppo.py` — Chris's Pine indicator, translated and drawn in its own
+pane under the volume pane. The `ppo` button in the chart toolbar toggles
+it, and the corner readout carries `PPO / sig / h` beside the OHLC.
+
+### What the original actually computes
+
+Two lines of the Pine do less than they look like they do, and a faithful
+translation has to match the behaviour rather than the apparent intent.
+
+```
+ad_formula  = ((2*close - low - high) / (high - low)) * volume
+ad_current  = cum(ad_formula)
+ad_previous = cum(ad_formula)[1]
+tickCounter = ad_current - ad_previous
+```
+
+A running total minus the same running total one bar ago is just the
+current bar's contribution, so **`tickCounter` is `ad_formula` for this
+bar** — the cumulative cancels out entirely. The momentum half does the
+same thing: a cumulative built and then differenced one line later. Both
+are implemented as the per-bar value they reduce to, and a test pins the
+identity so nobody later "fixes" the indicator by deleting the wrong half.
+
+The rest is as written: each series divided by its own 50-bar population
+standard deviation and clamped to ±3, combined 70/30, smoothed, with an
+EMA signal line and their difference as the histogram.
+
+### Three honest notes
+
+- **`showArrows` does nothing.** The input is declared in the original and
+  never read — there are no arrow plots in the script.
+- **It is single-timeframe here.** The original can take A/D and momentum
+  from different timeframes. This computes both from the chart's bars. On
+  the 15m chart with the original's defaults (A/D blank = chart, momentum
+  = 15) those are the same thing; on any other timeframe they are not.
+- **The numbers will not match TradingView.** These are our bars, built
+  from the venue's own fills with the venue's own volume. The shape should
+  agree; the values are not comparable, and expecting them to be is how
+  you conclude something is broken when nothing is.
+
+### A property worth knowing
+
+An unvarying series produces **no reading at all**, not a flat line at
+zero. The normalisation divides by the window's own standard deviation, so
+a market that has not moved makes the ratio undefined rather than infinite.
+The pane draws a gap there, because a line pinned at zero would be a claim
+about a market that has told us nothing.
+
+### Colours
+
+Your blue and orange, nudged into the palette's lightness band:
+`#4d8fd1` and `#c17d33`. Validated rather than eyeballed — they hold ΔE 22
+under protanopia, which is what two lines crossing in one small pane need.
+The line, its signal and the histogram share one symmetric scale, because
+they are the same units and separate scales would make a crossover look
+like something it is not.
+
 ### One panel
 
 Everything the agent does lives on **The call**: the chart with its trades

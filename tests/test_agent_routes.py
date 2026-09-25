@@ -929,3 +929,34 @@ def test_a_manual_trade_needs_a_real_side(client):
     r = client.post("/api/manual-trade?coin=BTC&side=sideways",
                     headers=AUTH).json()
     assert not r["ok"] and "long or short" in r["detail"]
+
+
+
+def test_the_chart_carries_the_tick_ppo(client, monkeypatch):
+    """Computed server side so the arithmetic is unit tested, and so the
+    agent could read it later without a second implementation."""
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    d = client.get("/api/chart?coin=BTC&interval=15m&bars=200",
+                   headers=AUTH).json()
+    t = d["tick_ppo"]
+    for k in ("ppo", "signal", "hist"):
+        assert k in t and len(t[k]) == len(d["bars"]), k
+    assert "warmup" in t
+
+
+def test_the_ppo_settings_come_through_the_query(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    a = client.get("/api/chart?coin=BTC&interval=15m&ppo_ad=1&ppo_mom=0",
+                   headers=AUTH).json()["tick_ppo"]
+    b = client.get("/api/chart?coin=BTC&interval=15m&ppo_ad=0&ppo_mom=1",
+                   headers=AUTH).json()["tick_ppo"]
+    if a["ready"] and b["ready"]:
+        assert a["ppo"] != b["ppo"]

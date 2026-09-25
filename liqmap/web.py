@@ -52,6 +52,7 @@ from . import score as score_mod
 from . import tuner as tuner_mod
 from . import sweep as sweep_mod
 from . import vote as vote_mod
+from . import ppo as ppo_mod
 from .strength import fragility_weighter, score_all, summarise
 
 APP_TITLE = "liqmap"
@@ -2948,7 +2949,9 @@ def create_app() -> FastAPI:
                               else tuner_mod.readiness(rt.ledger, coin))}
 
     @app.get("/api/chart", dependencies=[Depends(require_token)])
-    def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120
+    def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120,
+                  ppo_smooth: int = 1, ppo_signal: int = 9,
+                  ppo_ad: float = 0.7, ppo_mom: float = 0.3
                   ) -> dict[str, Any]:
         """Candles plus the calls that fired on them, for the live chart.
 
@@ -3052,8 +3055,19 @@ def create_app() -> FastAPI:
                        "total": round(prof.total_notional, 2),
                        "levels": [{"px": p, "v": round(v, 2)} for p, v in top]}
 
+        # Chris's Tick Counter PPO, computed from the same bars the chart
+        # draws. Server side so the arithmetic is unit tested and can be
+        # reused; the panel just plots what comes back.
+        try:
+            tick = ppo_mod.tick_ppo(
+                rows, smooth=max(1, ppo_smooth), signal=max(1, ppo_signal),
+                ad_weight=ppo_ad, mom_weight=ppo_mom)
+        except Exception as exc:
+            tick = {"ppo": [], "signal": [], "hist": [], "ready": False,
+                    "error": str(exc)}
+
         return {**out, "source": source, "bars": rows, "marks": marks,
-                "profile": profile,
+                "profile": profile, "tick_ppo": tick,
                 "interval_s": rt.client().INTERVALS.get(interval, 900)}
 
     @app.get("/api/agreement", dependencies=[Depends(require_token)])
@@ -4150,11 +4164,14 @@ counting from now.">Clear the book</button>
 drawn on this market and timeframe">clear</button>
           <button onclick="resetChartView()" title="Back to the last 90 bars
 at normal scale">fit</button>
+          <button id="tool-ppo" class="on" onclick="togglePPO()"
+            title="Tick Counter PPO — your indicator, computed from these
+bars">ppo</button>
           <span class="thin" style="margin-left:6px">lines are kept per
             market and timeframe, in this browser</span>
         </div>
-        <canvas id="sugChart" height="380"
-          style="width:100%;height:380px;display:block;
+        <canvas id="sugChart" height="470"
+          style="width:100%;height:470px;display:block;
                  border:1px solid var(--line);border-radius:4px"></canvas>
         <!-- A legend, not a caption. Identity is never carried by colour
              alone: filled vs hollow says taken vs ignored, and the arrow
@@ -4168,9 +4185,13 @@ at normal scale">fit</button>
           <span>hollow triangle = still open</span>
           <span><i class="k-dash"></i>target and stop</span>
           <span>dashed line across = last price</span>
-          <span>lower pane = volume</span>
           <span><i class="k-box"></i>bar still forming, with its countdown
             in the corner</span>
+          <span><i style="width:14px;height:2px;background:#4d8fd1;
+            display:inline-block"></i>tick PPO</span>
+          <span><i style="width:14px;height:2px;background:#c17d33;
+            display:inline-block"></i>its signal</span>
+          <span>bars = the two apart, green over zero</span>
         </div>
         <div id="chartNote" class="msg" style="margin-top:4px"></div>
       </div>
@@ -6093,11 +6114,28 @@ let chartScale = null;      // {hi, lo, top, plotH}
 
 const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
 const CH_VOL = 0.24;        // share of the plot height the volume pane takes
-const CH_GAP = 8;           // breathing room between the two panes
+const CH_PPO = 0.26;        // ... and the indicator pane, when it is on
+const CH_GAP = 8;           // breathing room between panes
+let chartPPO = true;        // Chris's Tick Counter PPO in its own pane
+/* Your blue and orange from the Pine, nudged into the palette's lightness
+   band so both sit properly against this surface. Validated: they hold
+   deltaE 22 under protanopia, which is what two lines crossing in one
+   small pane need. */
+const PPO_LINE_COL = '#4d8fd1';
+const PPO_SIGNAL_COL = '#c17d33';
 
 function chartKey() {
   return 'liqmap_draw_' + (chartData ? chartData.coin : '?') + '_'
          + (chartData ? chartData.interval : '?');
+}
+
+function loadPPOPref() {
+  try {
+    const v = localStorage.getItem('liqmap_ppo');
+    if (v !== null) chartPPO = v === '1';
+  } catch (e) {}
+  const b = $('tool-ppo');
+  if (b) b.classList.toggle('on', chartPPO);
 }
 
 function loadShapes() {
@@ -6117,10 +6155,16 @@ function chartGeom() {
   const cv = $('sugChart');
   const w = cv.clientWidth, h = cv.clientHeight;
   const inner = h - CH_PAD.t - CH_PAD.b;
+  const on = chartPPO && chartData && chartData.tick_ppo
+             && chartData.tick_ppo.ready;
   const volH = Math.round(inner * CH_VOL);
-  const plotH = inner - volH - CH_GAP;
+  const ppoH = on ? Math.round(inner * CH_PPO) : 0;
+  const gaps = on ? CH_GAP * 2 : CH_GAP;
+  const plotH = inner - volH - ppoH - gaps;
+  const volTop = CH_PAD.t + plotH + CH_GAP;
   return {w, h, plotW: w - CH_PAD.l - CH_PAD.r, plotH,
-          volH, volTop: CH_PAD.t + plotH + CH_GAP};
+          volH, volTop, ppoH, ppoOn: !!on,
+          ppoTop: volTop + volH + CH_GAP};
 }
 
 function chartSlice() {
@@ -6191,7 +6235,8 @@ function drawChart() {
 
   const cv = $('sugChart');
   const dpr = window.devicePixelRatio || 1;
-  const {w, h, plotW, plotH, volH, volTop} = chartGeom();
+  const {w, h, plotW, plotH, volH, volTop, ppoH, ppoTop,
+         ppoOn} = chartGeom();
   cv.width = w * dpr; cv.height = h * dpr;
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -6263,7 +6308,7 @@ function drawChart() {
     g.strokeStyle = line; g.globalAlpha = 0.35;
     g.beginPath();
     g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
-    g.lineTo(Math.round(x) + 0.5, volTop + volH);
+    g.lineTo(Math.round(x) + 0.5, ppoOn ? ppoTop + ppoH : volTop + volH);
     g.stroke(); g.globalAlpha = 1;
     g.fillStyle = dim;
     const day = fmtDay(ts);
@@ -6435,7 +6480,7 @@ function drawChart() {
     g.strokeStyle = dim; g.globalAlpha = 0.55; g.setLineDash([3, 3]);
     g.beginPath();
     g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
-    g.lineTo(Math.round(x) + 0.5, volTop + volH);
+    g.lineTo(Math.round(x) + 0.5, ppoOn ? ppoTop + ppoH : volTop + volH);
     g.moveTo(CH_PAD.l, Math.round(chartHover.y) + 0.5);
     g.lineTo(CH_PAD.l + plotW, Math.round(chartHover.y) + 0.5);
     g.stroke();
@@ -6451,9 +6496,81 @@ function drawChart() {
              fmtDay(readBar.ts) + ' ' + fmtClock(readBar.ts), ink, bg);
   }
 
+  /* ---- Chris's Tick Counter PPO, in its own pane -------------------- */
+
+  let readPPO = null;
+  if (ppoOn) {
+    const t = chartData.tick_ppo;
+    const from = s.all.length - s.offset - bars.length;
+    const cut = a => (a || []).slice(Math.max(0, from),
+                                     Math.max(0, from) + bars.length);
+    const P = cut(t.ppo), S = cut(t.signal), H = cut(t.hist);
+
+    // One scale for all three, symmetric about zero: the line, its signal
+    // and their difference are the same units, and giving them separate
+    // scales would make a crossover look like something it is not.
+    let m = 0;
+    for (const arr of [P, S, H]) {
+      for (const v of arr) if (v != null && Math.abs(v) > m) m = Math.abs(v);
+    }
+    m = m || 1;
+    const py = v => ppoTop + ppoH / 2 - (v / m) * (ppoH / 2 - 2);
+
+    g.strokeStyle = line; g.globalAlpha = 0.8;
+    g.beginPath();
+    g.moveTo(CH_PAD.l, Math.round(ppoTop) - 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(ppoTop) - 0.5);
+    g.stroke(); g.globalAlpha = 1;
+
+    // The histogram first, so the lines sit over it.
+    const zero = py(0);
+    for (let i = 0; i < bars.length; i++) {
+      const v = H[i];
+      if (v == null) continue;
+      const p = P[i];
+      g.fillStyle = p == null || p === 0 ? dim : p > 0 ? up : down;
+      g.globalAlpha = 0.45;
+      const yv = py(v);
+      g.fillRect(xOf(i) - bw / 2, Math.min(zero, yv), Math.max(bw, 1),
+                 Math.max(1, Math.abs(yv - zero)));
+    }
+    g.globalAlpha = 1;
+
+    g.strokeStyle = dim; g.globalAlpha = 0.5; g.setLineDash([2, 3]);
+    g.beginPath(); g.moveTo(CH_PAD.l, Math.round(zero) + 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(zero) + 0.5); g.stroke();
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    const stroke = (arr, col, width) => {
+      g.strokeStyle = col; g.lineWidth = width; g.beginPath();
+      let open = false;
+      for (let i = 0; i < bars.length; i++) {
+        const v = arr[i];
+        if (v == null) { open = false; continue; }
+        const x = xOf(i), yv = py(v);
+        if (!open) { g.moveTo(x, yv); open = true; } else { g.lineTo(x, yv); }
+      }
+      g.stroke(); g.lineWidth = 1;
+    };
+    stroke(S, PPO_SIGNAL_COL, 1);
+    stroke(P, PPO_LINE_COL, 2);
+
+    g.fillStyle = dim; g.textAlign = 'left';
+    g.fillText('tick ppo', CH_PAD.l + 2, ppoTop + 10);
+    g.fillText(m.toFixed(2), CH_PAD.l + plotW + 6, ppoTop + 10);
+    g.fillText('-' + m.toFixed(2), CH_PAD.l + plotW + 6, ppoTop + ppoH - 2);
+
+    const hi2 = chartHover
+      ? Math.max(0, Math.min(bars.length - 1,
+          Math.floor((chartHover.x - CH_PAD.l) / step)))
+      : bars.length - 1;
+    readPPO = {ppo: P[hi2], signal: S[hi2], hist: H[hi2]};
+  }
+
   /* ---- the corner readout ------------------------------------------- */
 
-  drawCorner(g, {readBar, readMark, up, down, dim, ink, bg, accent, w});
+  drawCorner(g, {readBar, readMark, readPPO, up, down, dim, ink, bg,
+                 accent, w});
 }
 
 /* The OHLC line, pinned top-left, the way every trading chart does it.
@@ -6494,7 +6611,30 @@ function drawCorner(g, o) {
     const left = b.ts + chartData.interval_s - Date.now() / 1000;
     g.font = '600 11px ui-sans-serif,system-ui,sans-serif';
     g.fillStyle = left < 30 ? o.down : o.accent;
-    g.fillText(fmtLeft(left) + ' to close', x, yy);
+    const t = fmtLeft(left) + ' to close';
+    g.fillText(t, x, yy);
+    // Advance the cursor. Every other field on this line does, and the
+    // one that did not printed the indicator on top of the countdown.
+    x += g.measureText(t).width + 10;
+  }
+
+  // The indicator, on the same line as the price it belongs to.
+  if (o.readPPO && o.readPPO.ppo != null) {
+    const r = o.readPPO;
+    g.font = '11px var(--mono, ui-monospace), monospace';
+    const put2 = (label, v, col) => {
+      g.fillStyle = o.dim; g.textAlign = 'left';
+      g.fillText(label, x, yy); x += g.measureText(label).width + 3;
+      const t = (v >= 0 ? '+' : '') + v.toFixed(2);
+      g.fillStyle = col;
+      g.fillText(t, x, yy); x += g.measureText(t).width + 8;
+    };
+    x += 4;
+    put2('PPO', r.ppo, PPO_LINE_COL);
+    if (r.signal != null) put2('sig', r.signal, PPO_SIGNAL_COL);
+    if (r.hist != null) {
+      put2('h', r.hist, r.ppo > 0 ? o.up : r.ppo < 0 ? o.down : o.dim);
+    }
   }
 
   // A trade under the cursor gets a second line, in the same place.
@@ -6558,6 +6698,14 @@ function pickTool(t) {
     if (el) el.classList.toggle('on', k === t);
   }
   $('sugChart').style.cursor = t === 'cursor' ? 'crosshair' : 'copy';
+}
+
+function togglePPO() {
+  chartPPO = !chartPPO;
+  const b = $('tool-ppo');
+  if (b) b.classList.toggle('on', chartPPO);
+  try { localStorage.setItem('liqmap_ppo', chartPPO ? '1' : '0'); } catch (e) {}
+  drawChart();
 }
 
 function clearShapes() {
@@ -6719,7 +6867,7 @@ async function loadChart() {
   }
   const fresh = !prev || prev.coin !== d.coin || prev.interval !== d.interval;
   chartData = d;
-  if (fresh) { loadShapes(); resetChartView(); }
+  if (fresh) { loadShapes(); loadPPOPref(); resetChartView(); }
 
   wireChart();
   drawChart();
