@@ -569,6 +569,67 @@ them back on when you want to compare.
 There is a test that settles the same bar through both paths and fails if
 they disagree.
 
+## The projected candle
+
+`liqmap/project.py` — where the bar still forming is likely to close,
+drawn one slot right of the live bar, with a band that narrows as the bar
+fills. The `proj` button in the chart toolbar toggles it.
+
+### The reframe
+
+Nothing here predicts a candle. At minute seven of a fifteen minute bar
+the open, the high so far, the low so far and the volume so far are all
+known exactly — the only unknown is the remaining eight minutes. So the
+question is not "what will this bar do", it is "given everything already
+printed, where does the close land". Much smaller question, and its
+uncertainty collapses as the bar fills.
+
+It also dissolves the horizon problem. Order-book microstructure is worth
+something over the next thirty seconds and very little over the next
+fifteen minutes. A fifteen minute bar is thirty of those windows, so the
+read is not stretched to cover the bar — it is applied to the time
+actually left and integrated forward. **Microstructure does not become a
+superpower by reaching further. It becomes one by being accumulated.**
+
+### Two projections, always
+
+Every projection is produced twice: once with the drift the signal
+implies, once with no drift at all. The second is the null — same
+volatility cone, no opinion about direction.
+
+Scored against the bars that follow, the difference between them measures
+directly whether the three columns carry any directional information. It
+is far faster than trading: every bar closes, so every projection is
+graded within minutes, and a few hundred bars arrive in a couple of days
+rather than the weeks the same number of trades would take.
+
+If the drifted projection is not better calibrated than the null, the read
+carries nothing at that horizon, and no amount of position sizing rescues
+it. That is a finding about the signal, not about the projection.
+
+### How it is scored
+
+Not by counting hits. By the **probability integral transform**: where the
+actual close landed inside the predicted distribution. A calibrated model
+spreads those evenly over [0, 1]; an over-confident one piles them at both
+ends; one whose drift points the wrong way leans to one side.
+
+It grades the *shape* of the forecast, not just its direction — so an
+over-confident model is caught even on the bars it happens to get right.
+The histogram is reported beside the score because its shape says what is
+wrong: a U is over-confidence, a hump is vagueness, a lean is a drift with
+the wrong sign.
+
+Nothing is concluded under 20 graded bars, and the comparison against the
+null needs both sides ready.
+
+### What it will not do
+
+A well-calibrated projection says "wide" most of the time, and that is the
+correct answer. The value is in the minority of bars where the book is
+genuinely one-sided, and in knowing which those are. A projection sharp
+enough to trade blindly would have had its edge arbitraged away already.
+
 ## The Tick Counter PPO
 
 `liqmap/ppo.py` — Chris's Pine indicator, translated and drawn in its own
@@ -663,6 +724,23 @@ record instead of two that disagree), the **you-versus-the-tool
 scorecard** it fed, and `paintCompare`, whose two-way row was absorbed
 into the three-way row several changes earlier and had had no call site
 since.
+
+#### Defined twice, silently
+
+The same failure hit three times in one session, at three levels, and it
+is invisible by reading either definition on its own:
+
+- a page `function` — a second `checkAlert` replaced the first, and the
+  survivor was handed a payload it could not read
+- a **route handler** — a second `/api/calibration` landed on the path the
+  candle read already owned; the new one never ran
+- a **method on a class** — a second `Runtime.calibration` replaced the
+  first, so the caller silently got the other one
+
+None of these is an error in Python or JavaScript. The later definition
+simply wins. Five tests now fail the build on any of them: duplicate page
+functions, duplicate page consts, duplicate routes by path and by handler
+name, duplicate methods in a class, and duplicate module-level functions.
 
 #### The guard that found them
 

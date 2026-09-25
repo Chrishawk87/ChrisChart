@@ -960,3 +960,120 @@ def test_the_ppo_settings_come_through_the_query(client, monkeypatch):
                    headers=AUTH).json()["tick_ppo"]
     if a["ready"] and b["ready"]:
         assert a["ppo"] != b["ppo"]
+
+
+def test_every_candle_carries_its_round_trip_cost(client, monkeypatch):
+    """The agent votes and takes candles `suggest` refused, so it cannot
+    rely on `suggest` having attached a cost.
+
+    Without this it booked every trade gross — 10bps in, 10bps out, with
+    breakeven reported as 50% when the fees make the truth far higher.
+    """
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    d = rt.suggest_for("BTC", "15m", fee_bps=9.0, record=False)
+    assert d["ok"]
+    assert "cost_bps" in d
+    # The fee is in it whatever the book did.
+    assert d["cost_bps"] >= 9.0
+    assert d["fee_bps"] == 9.0
+    # And the spread half is reported separately, so it can be told apart.
+    assert d["cost_bps"] == pytest.approx(d["spread_cost_bps"] + 9.0,
+                                          abs=1e-3)
+
+
+def test_the_agent_books_the_cost_it_was_given(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    rt.autopilot.update({"fee_bps": 9.0, "tp_bps": 10.0, "sl_bps": 10.0,
+                         "require_unanimous": False, "min_effort": 0.0,
+                         "raw": True})
+    rt._pilots.clear()
+
+    rt.autopilot_step("BTC", "15m", fee_bps=9.0)
+    rows = rt.ledger.export_rows("BTC")
+    if rows:
+        assert rows[0]["cost_bps"] >= 9.0
+        # 10bps target against a 10bps stop with 9bps of cost needs 95%.
+        assert rows[0]["breakeven"] > 0.9
+
+
+def test_a_projection_is_recorded_and_graded(client, monkeypatch):
+    """Every bar closes, so every projection is graded within minutes.
+
+    That is the whole reason this beats waiting on trades: a few hundred
+    labelled outcomes arrive in a couple of days.
+    """
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    out = rt.project_now("BTC", "15m", record=True)
+    if not out.get("ok") or not out.get("ready"):
+        pytest.skip(out.get("detail", "no projection from this fixture"))
+
+    for key in ("signal", "null"):
+        c = out[key]["close"]
+        assert c["q5"] <= c["q50"] <= c["q95"]
+    # The bands must never walk back what already printed.
+    assert out["signal"]["high"]["q5"] >= out["high_so_far"] - 1e-6
+
+    assert rt.ledger.counts()["projections"] >= 1
+    pend = rt.ledger.pending_projections(out["candle_end"] + 1)
+    assert pend
+    assert rt.ledger.resolve_projection(pend[0]["id"], out["price"] * 1.001)
+    pits = rt.ledger.projection_pits()
+    assert len(pits["signal"]) == 1 and len(pits["null"]) == 1
+
+
+def test_calibration_refuses_to_conclude_on_nothing(client):
+    r = client.get("/api/projection-calibration", headers=AUTH).json()
+    assert r["ok"] and r["ready"] is False
+
+
+def test_no_two_routes_share_a_path_and_method():
+    """FastAPI does not complain about a duplicate route — the first one
+    registered wins and the second is dead code.
+
+    This shipped: a new `/api/calibration` for the projection landed on
+    the path the candle read already owned, and the new one never ran.
+    """
+    from collections import Counter
+    app = web.create_app()
+    seen = Counter()
+    for r in app.routes:
+        for m in getattr(r, "methods", ()) or ():
+            if m in ("HEAD", "OPTIONS"):
+                continue
+            seen[(m, getattr(r, "path", ""))] += 1
+    dupes = sorted(k for k, n in seen.items() if n > 1)
+    assert not dupes, f"registered more than once: {dupes}"
+
+
+def test_no_two_route_handlers_share_a_name():
+    """Same hazard one level up, and just as invisible."""
+    from collections import Counter
+    app = web.create_app()
+    names = Counter(getattr(r, "name", "") for r in app.routes
+                    if getattr(r, "name", ""))
+    dupes = sorted(n for n, c in names.items() if c > 1)
+    assert not dupes, f"handler names used twice: {dupes}"
+
+
+def test_polling_the_same_slot_does_not_fill_the_table(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+    a = rt.project_now("BTC", "15m", record=True)
+    if not a.get("ready"):
+        pytest.skip("no projection from this fixture")
+    before = rt.ledger.counts()["projections"]
+    rt.project_now("BTC", "15m", record=True)
+    assert rt.ledger.counts()["projections"] == before

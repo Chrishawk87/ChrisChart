@@ -2085,3 +2085,50 @@ def test_the_chart_redraws_when_its_tab_is_shown(client):
     fn = html[html.index("function showTab"):]
     fn = fn[:fn.index("function restoreTab")]
     assert "drawChart()" in fn
+
+
+def test_no_class_defines_a_method_twice():
+    """A later `def` in a class body silently replaces the earlier one.
+
+    No error, no warning — the first is simply gone. This bit three times
+    in one session: a page function, a route handler, and a Runtime
+    method, each invisible by reading either definition on its own.
+    """
+    import ast
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / "liqmap"
+    problems = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            seen = {}
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    # A property and its setter legitimately share a name.
+                    decs = {getattr(d, "attr", getattr(d, "id", ""))
+                            for d in item.decorator_list}
+                    if "setter" in decs or "deleter" in decs:
+                        continue
+                    if item.name in seen:
+                        problems.append(
+                            f"{path.name}:{node.name}.{item.name}")
+                    seen[item.name] = True
+    assert not problems, f"defined twice: {problems}"
+
+
+def test_no_module_defines_a_function_twice():
+    import ast
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent / "liqmap"
+    problems = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text())
+        seen = {}
+        for item in tree.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if item.name in seen:
+                    problems.append(f"{path.name}:{item.name}")
+                seen[item.name] = True
+    assert not problems, f"defined twice: {problems}"

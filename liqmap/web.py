@@ -53,6 +53,7 @@ from . import tuner as tuner_mod
 from . import sweep as sweep_mod
 from . import vote as vote_mod
 from . import ppo as ppo_mod
+from . import project as pj_mod
 from .strength import fragility_weighter, score_all, summarise
 
 APP_TITLE = "liqmap"
@@ -736,6 +737,29 @@ class Runtime:
         if mark <= 0 and recent:
             mark = recent[-1].close
         payload["price"] = mark
+
+        # THE ROUND TRIP, ALWAYS — walked on this book at this size, plus
+        # the fee.
+        #
+        # `suggest` only attaches a cost to candles it was willing to
+        # trade. The agent votes instead and takes candles `suggest`
+        # refused, so it was reading no cost at all and booking every
+        # trade gross: 10bps in, 10bps out, breakeven reported as 50% when
+        # 9bps of Hyperliquid taker fees make the truth 95%. Every net
+        # figure in the book was a gross one wearing the wrong label.
+        cost_bps = 0.0
+        if book is not None and not book.empty:
+            try:
+                buy = book.walk(notional, "buy")
+                sell = book.walk(notional, "sell")
+                if not (buy.exhausted or sell.exhausted):
+                    cost_bps = buy.slippage_bps + sell.slippage_bps
+            except Exception:
+                cost_bps = 0.0
+        payload["cost_bps"] = round(cost_bps + max(fee_bps, 0.0), 4)
+        payload["fee_bps"] = fee_bps
+        payload["spread_cost_bps"] = round(cost_bps, 4)
+
         payload["interval_s"] = interval_s
         payload["candle_end"] = candle_end
         # The market's own increment, so a target can be set in ticks
@@ -1209,6 +1233,13 @@ class Runtime:
             if bar is not None:
                 high, low = bar.high, bar.low
 
+        # A projection on the same poll, so the two always describe the
+        # same reading of the same bar.
+        try:
+            self.project_now(coin, interval, record=True)
+        except Exception as exc:
+            self.last_error = f"projection: {exc}"
+
         now = time.time()
         d = pilot.step(payload, now, high=high, low=low)
         out = d.to_dict()
@@ -1513,6 +1544,94 @@ class Runtime:
         except Exception:
             pass
         return (tp, sl)
+
+    def project_now(self, coin: str, interval: str, record: bool = True
+                    ) -> dict[str, Any]:
+        """Where this bar closes, from where it already is.
+
+        Made on the same reading the panel shows, so the projection and
+        the call can never describe different markets.
+        """
+        payload = self.suggest_for(coin, interval, record=False)
+        if not payload.get("ok"):
+            return {"ok": False, "detail": payload.get("detail", "no read")}
+
+        feed = self.feed_for(coin)
+        if feed is None:
+            return {"ok": False, "detail": "no feed running"}
+        live = feed.candle(interval)
+        if live is None:
+            return {"ok": False, "detail": "no bar forming yet"}
+
+        hist = list(feed.history(interval))
+        interval_s = float(payload.get("interval_s") or 900.0)
+        sigma = pj_mod.realised_sigma_bps(hist, interval_s)
+        ballot = vote_mod.from_payload(payload)
+
+        candle_end = float(payload.get("candle_end")
+                           or live.start_ts + interval_s)
+        now = time.time()
+        remaining = max(0.0, candle_end - now)
+        elapsed = 1.0 - (remaining / interval_s) if interval_s > 0 else 0.0
+
+        out = pj_mod.project(
+            price=float(payload.get("price") or live.close),
+            open_px=live.open, high_so_far=live.high, low_so_far=live.low,
+            remaining_s=remaining, sigma_bps_s=sigma, net=ballot.net)
+
+        if record and out.get("ready"):
+            try:
+                self.ledger.record_projection(
+                    coin=coin, interval=interval, candle_ts=live.start_ts,
+                    candle_end=candle_end, elapsed_frac=elapsed, out=out,
+                    now=now)
+            except Exception as exc:
+                self.last_error = f"projection: {exc}"
+
+        out = {k: v for k, v in out.items() if not k.startswith("_")}
+        out.update({"ok": True, "coin": coin, "interval": interval,
+                    "candle_ts": live.start_ts, "candle_end": candle_end,
+                    "elapsed_frac": round(elapsed, 3),
+                    "shape": ballot.shape(),
+                    "describe": ballot.describe()})
+        return out
+
+    def resolve_projections(self, limit: int = 300) -> dict[str, Any]:
+        """Grade every projection whose bar has closed."""
+        done = failed = 0
+        for row in self.ledger.pending_projections(time.time(), limit):
+            try:
+                bars = self.client().candles(row["coin"], "1m", bars=120)
+            except Exception:
+                failed += 1
+                continue
+            end = float(row["candle_end"])
+            inside = [b for b in bars if b.ts < end]
+            if not inside:
+                failed += 1
+                continue
+            if self.ledger.resolve_projection(row["id"], inside[-1].close):
+                done += 1
+            else:
+                failed += 1
+        return {"ok": True, "graded": done, "unresolvable": failed}
+
+    def projection_calibration(self, coin: str | None = None,
+                               interval: str | None = None
+                               ) -> dict[str, Any]:
+        """Is the projection telling the truth, and does the signal help?
+
+        Not `calibration` — the candle read already has a method by that
+        name further down the class, and in a class body the later
+        definition simply replaces the earlier one. No error, no warning;
+        the first is just gone.
+        """
+        pits = self.ledger.projection_pits(coin, interval)
+        out = pj_mod.compare(pits["signal"], pits["null"])
+        out["ok"] = True
+        out["by_slot"] = pits["by_slot"]
+        out["counts"] = self.ledger.counts()
+        return out
 
     def scorecard(self, coin: str | None = None, interval: str | None = None
                   ) -> dict[str, Any]:
@@ -1902,6 +2021,10 @@ def _worker_loop(rt: Runtime) -> None:
                     rt.resolve_states(limit=300)
                 except Exception as exc:
                     rt.last_error = f"resolve states: {exc}"
+                try:
+                    rt.resolve_projections(limit=200)
+                except Exception as exc:
+                    rt.last_error = f"resolve projections: {exc}"
 
             # The agent decides on its own cadence, independent of whether
             # anyone has the panel open. That is the point: a book that only
@@ -2864,6 +2987,32 @@ def create_app() -> FastAPI:
         return Response(
             content=buf.getvalue(), media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    @app.get("/api/projection", dependencies=[Depends(require_token)])
+    def api_projection(coin: str, interval: str = "15m",
+                       record: bool = False) -> dict[str, Any]:
+        """Where this bar closes, given everything already printed."""
+        c = rt.resolve_symbol(coin)[0]
+        return rt.project_now(c, interval, record=record)
+
+    @app.get("/api/projection-calibration",
+             dependencies=[Depends(require_token)])
+    def api_projection_calibration(coin: str = "", interval: str = ""
+                                   ) -> dict[str, Any]:
+        """Do the bands mean what they say, and does the signal beat the
+        same cone with no opinion in it?
+
+        Named for the projection rather than `/api/calibration`, which the
+        candle read already owns. Two routes on one path is not an error
+        anywhere — the first registered simply wins, and the second is
+        dead until someone wonders why its response never changes.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return rt.projection_calibration(c, interval or None)
+
+    @app.post("/api/resolve-projections", dependencies=[Depends(require_token)])
+    def api_resolve_projections(limit: int = 300) -> dict[str, Any]:
+        return rt.resolve_projections(limit=limit)
 
     @app.get("/api/scorecard", dependencies=[Depends(require_token)])
     def api_scorecard(coin: str = "", interval: str = "") -> dict[str, Any]:
@@ -4108,7 +4257,10 @@ DASHBOARD = """<!doctype html>
           <option value="ticks">ticks / pips</option></select></label>
         <label>size $<input id="sSize" value="10000" size="7"
           onchange="loadSuggest()"></label>
-        <label>fee <input id="sFee" value="0" size="3"
+        <label title="Round trip. Hyperliquid base tier is 4.5bps a side
+taker, so 9 both ways; a HIP-3 builder market can add more on top. Book
+slippage at your size is measured separately and added to this.">fee
+          <input id="sFee" value="9" size="3"
           onchange="loadSuggest()">bps</label>
         <label><input type="checkbox" id="sAuto" onchange="toggleSuggestAuto()">
           poll 5s</label>
@@ -4164,6 +4316,9 @@ counting from now.">Clear the book</button>
 drawn on this market and timeframe">clear</button>
           <button onclick="resetChartView()" title="Back to the last 90 bars
 at normal scale">fit</button>
+          <button id="tool-proj" class="on" onclick="toggleProj()"
+            title="Projected close — where this bar lands, given what has
+already printed">proj</button>
           <button id="tool-ppo" class="on" onclick="togglePPO()"
             title="Tick Counter PPO — your indicator, computed from these
 bars">ppo</button>
@@ -4193,6 +4348,8 @@ bars">ppo</button>
           <span>dashed line across = last price</span>
           <span><i class="k-box"></i>bar still forming, with its countdown
             in the corner</span>
+          <span>shaded block right of the live bar = where this candle is
+            projected to close, darker is the middle half</span>
           <span><i style="width:14px;height:2px;background:#4d8fd1;
             display:inline-block"></i>tick PPO</span>
           <span><i style="width:14px;height:2px;background:#c17d33;
@@ -6117,6 +6274,7 @@ let chartShapes = [];       // what has been drawn, for this market+timeframe
    two copies of this arithmetic drift and drawn lines quietly land in the
    wrong place. */
 let chartScale = null;      // {hi, lo, top, plotH}
+let chartProj = null;       // the projection for the bar still forming
 
 const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
 /* Pane heights, as a share of the drawing area. Drag either divider to
@@ -6129,6 +6287,13 @@ const PANE_MIN = 0.08, PANE_MAX = 0.6, PRICE_MIN = 0.25;
 let volShare = 0.24;
 let ppoShare = 0.26;
 let chartPPO = true;        // Chris's Tick Counter PPO in its own pane
+let chartProjOn = true;     // the projected close on the forming bar
+/* One empty slot on the right when the projection is on, so the block it
+   draws past the live bar is not clipped by the price axis. Every place
+   that converts a bar index to an x must use the same step, or panning
+   drifts against the candles. */
+function rightSlots() { return chartProjOn ? 1 : 0; }
+function chartStep(plotW, n) { return plotW / Math.max(1, n + rightSlots()); }
 /* Your blue and orange from the Pine, nudged into the palette's lightness
    band so both sit properly against this surface. Validated: they hold
    deltaE 22 under protanopia, which is what two lines crossing in one
@@ -6176,9 +6341,13 @@ function loadPPOPref() {
   try {
     const v = localStorage.getItem('liqmap_ppo');
     if (v !== null) chartPPO = v === '1';
+    const p2 = localStorage.getItem('liqmap_proj');
+    if (p2 !== null) chartProjOn = p2 === '1';
   } catch (e) {}
   const b = $('tool-ppo');
   if (b) b.classList.toggle('on', chartPPO);
+  const b2 = $('tool-proj');
+  if (b2) b2.classList.toggle('on', chartProjOn);
 }
 
 function loadShapes() {
@@ -6310,6 +6479,12 @@ function drawChart() {
     if (b.l < lo) lo = b.l;
     if ((b.v || 0) > vMax) vMax = b.v || 0;
   }
+  if (chartProj && chartProj.ready) {
+    // The projection's own extremes, so the band is never clipped.
+    const a = chartProj.signal.high.q95, b2 = chartProj.signal.low.q5;
+    if (a > hi) hi = a;
+    if (b2 < lo) lo = b2;
+  }
   for (const m of (chartData.marks || [])) {
     // Levels belong inside the frame, or a trade's stop sits off-screen
     // and the chart quietly stops showing you what it risked.
@@ -6330,7 +6505,7 @@ function drawChart() {
   chartScale = {hi, lo, top: CH_PAD.t, plotH};
   const y = p => CH_PAD.t + (hi - p) / (hi - lo) * plotH;
   const pxAt = priceAt;
-  const step = plotW / bars.length;
+  const step = chartStep(plotW, bars.length);
   const xOf = i => CH_PAD.l + i * step + step / 2;
   const bw = Math.max(1, Math.min(step * 0.74, 14));
   const vy = v => volTop + volH - (vMax > 0 ? (v / vMax) * (volH - 2) : 0);
@@ -6454,6 +6629,47 @@ function drawChart() {
       g.setLineDash([]); g.globalAlpha = 1;
     }
   });
+
+  /* ---- the bar that has not closed yet ------------------------------ */
+
+  // Drawn one slot to the right of the live bar: a translucent body from
+  // the current price to the projected close, with the 5-95 band as its
+  // wick. It narrows as the bar fills, because the only thing being
+  // projected is the time still left.
+  if (chartProj && chartProj.ready && bars[bars.length - 1] &&
+      bars[bars.length - 1].live) {
+    const q = chartProj.signal.close, hq = chartProj.signal.high,
+          lq = chartProj.signal.low;
+    const px = xOf(bars.length - 1) + step;
+    const now = bars[bars.length - 1].c;
+    const rising = q.q50 >= now;
+    const c = rising ? up : down;
+
+    // The band first, so the body reads over it.
+    g.fillStyle = c; g.globalAlpha = 0.10;
+    g.fillRect(px - bw * 0.8, y(hq.q95), bw * 1.6, y(lq.q5) - y(hq.q95));
+    g.globalAlpha = 0.20;
+    g.fillRect(px - bw * 0.7, y(q.q75), bw * 1.4, y(q.q25) - y(q.q75));
+    g.globalAlpha = 1;
+
+    g.strokeStyle = c; g.globalAlpha = 0.85; g.setLineDash([3, 2]);
+    g.lineWidth = 1.5;
+    g.beginPath();
+    g.moveTo(px, y(q.q50));
+    g.lineTo(px, y(now));
+    g.stroke();
+    g.setLineDash([]); g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(px - 5, y(q.q50)); g.lineTo(px + 5, y(q.q50)); g.stroke();
+    g.globalAlpha = 1;
+
+    // What it is claiming, in one line nobody has to decode.
+    g.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = c; g.textAlign = 'left';
+    const pu = chartProj.signal.p_up;
+    g.fillText(`${(pu * 100).toFixed(0)}% up`, px + 8, y(q.q50) - 4);
+    g.font = '10px ui-sans-serif,system-ui,sans-serif';
+  }
 
   /* ---- last price, carried to the axis ------------------------------ */
 
@@ -6762,6 +6978,16 @@ function pickTool(t) {
   $('sugChart').style.cursor = t === 'cursor' ? 'crosshair' : 'copy';
 }
 
+function toggleProj() {
+  chartProjOn = !chartProjOn;
+  const b = $('tool-proj');
+  if (b) b.classList.toggle('on', chartProjOn);
+  try {
+    localStorage.setItem('liqmap_proj', chartProjOn ? '1' : '0');
+  } catch (e) {}
+  loadChart();
+}
+
 function togglePPO() {
   chartPPO = !chartPPO;
   const b = $('tool-ppo');
@@ -6867,7 +7093,7 @@ function wireChart() {
       return;
     }
     const s = chartSlice();
-    const step = chartGeom().plotW / s.count;
+    const step = chartStep(chartGeom().plotW, s.count);
     chartView.offset = Math.max(0, Math.min(s.all.length - s.count,
       Math.round(drag.offset + (p.x - drag.x) / step)));
     drawChart();
@@ -6875,7 +7101,7 @@ function wireChart() {
   const upEv = ev => {
     if (chartDraft) {
       const s = chartSlice();
-      const step = chartGeom().plotW / s.count;
+      const step = chartStep(chartGeom().plotW, s.count);
       const far = Math.abs(chartDraft.x2 - chartDraft.x1) > 6
                || Math.abs(chartDraft.y2 - chartDraft.y1) > 6;
       if (far) {
@@ -6912,7 +7138,7 @@ function priceAt(yy) {
 function eraseNear(p) {
   const s = chartSlice();
   const {plotW} = chartGeom();
-  const step = plotW / s.count;
+  const step = chartStep(plotW, s.count);
   const xOf = i => CH_PAD.l + i * step + step / 2;
   const target = priceAt(p.y);
   let best = -1, bestD = 1e18;
@@ -6957,6 +7183,17 @@ async function loadChart() {
   const fresh = !prev || prev.coin !== d.coin || prev.interval !== d.interval;
   chartData = d;
   if (fresh) { loadShapes(); loadPPOPref(); loadPanes(); resetChartView(); }
+
+  // The projection rides along with the chart: same poll, same bar.
+  if (chartProjOn) {
+    try {
+      const pr = await api('/api/projection?' + q({
+        coin: coin(), interval: $('sInt').value}));
+      chartProj = pr && pr.ok && pr.ready ? pr : null;
+    } catch (e) { chartProj = null; }
+  } else {
+    chartProj = null;
+  }
 
   wireChart();
   drawChart();

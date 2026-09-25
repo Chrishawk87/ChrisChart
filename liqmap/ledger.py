@@ -149,6 +149,34 @@ CREATE TABLE IF NOT EXISTS tuning_proposals (
 );
 CREATE INDEX IF NOT EXISTS ix_tp_status ON tuning_proposals(status, created_at);
 
+CREATE TABLE IF NOT EXISTS projections (
+    id           TEXT PRIMARY KEY,
+    made_at      REAL NOT NULL,
+    coin         TEXT NOT NULL,
+    interval     TEXT NOT NULL,
+    candle_ts    REAL NOT NULL,
+    candle_end   REAL NOT NULL,
+    elapsed_frac REAL NOT NULL DEFAULT 0,
+    remaining_s  REAL NOT NULL DEFAULT 0,
+    price        REAL NOT NULL,
+    sigma_bps_s  REAL NOT NULL DEFAULT 0,
+    net          REAL NOT NULL DEFAULT 0,
+    drift_bps_s  REAL NOT NULL DEFAULT 0,
+    -- The two sets of simulated closes, so the outcome can be scored
+    -- against the distribution that was actually claimed at the time.
+    sig_samples  TEXT,
+    null_samples TEXT,
+    bands        TEXT,
+    resolved     INTEGER NOT NULL DEFAULT 0,
+    close_px     REAL,
+    pit_signal   REAL,
+    pit_null     REAL
+);
+CREATE INDEX IF NOT EXISTS ix_pr_open ON projections(resolved, candle_end);
+CREATE INDEX IF NOT EXISTS ix_pr_coin ON projections(coin, interval, made_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ix_pr_slot
+    ON projections(coin, interval, candle_ts, elapsed_frac);
+
 CREATE TABLE IF NOT EXISTS param_overrides (
     param        TEXT PRIMARY KEY,
     value        REAL NOT NULL,
@@ -682,6 +710,98 @@ class Ledger(ThreadedDB):
             })
         return out
 
+    def record_projection(self, *, coin: str, interval: str,
+                          candle_ts: float, candle_end: float,
+                          elapsed_frac: float, out: dict[str, Any],
+                          now: float | None = None) -> str | None:
+        """Store a projection so the bar that follows can grade it.
+
+        The simulated closes are stored, not just the bands: scoring needs
+        the distribution that was claimed at the time, and rebuilding it
+        later from summary statistics would be grading a different
+        forecast.
+
+        Slots are rounded, and unique per bar, so polling every five
+        seconds does not fill the table with near-identical rows.
+        """
+        if not out.get("ready"):
+            return None
+        pid = _uid()
+        slot = round(float(elapsed_frac), 1)
+        try:
+            with self._tx() as conn:
+                conn.execute(
+                    "INSERT INTO projections (id, made_at, coin, interval, "
+                    "candle_ts, candle_end, elapsed_frac, remaining_s, "
+                    "price, sigma_bps_s, net, drift_bps_s, sig_samples, "
+                    "null_samples, bands) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (pid, now if now is not None else time.time(), coin,
+                     interval, candle_ts, candle_end, slot,
+                     float(out.get("remaining_s") or 0.0),
+                     float(out.get("price") or 0.0),
+                     float(out.get("sigma_bps_s") or 0.0),
+                     float(out.get("net") or 0.0),
+                     float(out.get("drift_bps_s") or 0.0),
+                     json.dumps([round(x, 6)
+                                 for x in out.get("_signal_samples", [])]),
+                     json.dumps([round(x, 6)
+                                 for x in out.get("_null_samples", [])]),
+                     json.dumps({"signal": out.get("signal"),
+                                 "null": out.get("null")})))
+        except sqlite3.IntegrityError:
+            return None
+        return pid
+
+    def pending_projections(self, now: float, limit: int = 500
+                            ) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._conn.execute(
+            "SELECT * FROM projections WHERE resolved = 0 AND candle_end <= ? "
+            "ORDER BY candle_end LIMIT ?", (now, limit)).fetchall()]
+
+    def resolve_projection(self, pid: str, close_px: float) -> bool:
+        """Grade one against what the bar actually did."""
+        from . import project as _pj
+        row = self._conn.execute(
+            "SELECT sig_samples, null_samples FROM projections "
+            "WHERE id = ? AND resolved = 0", (pid,)).fetchone()
+        if row is None or close_px <= 0:
+            return False
+        try:
+            sig = json.loads(row["sig_samples"] or "[]")
+            nul = json.loads(row["null_samples"] or "[]")
+        except Exception:
+            return False
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE projections SET resolved = 1, close_px = ?, "
+                "pit_signal = ?, pit_null = ? WHERE id = ? AND resolved = 0",
+                (close_px, _pj.pit(close_px, sig), _pj.pit(close_px, nul),
+                 pid))
+        return True
+
+    def projection_pits(self, coin: str | None = None,
+                        interval: str | None = None,
+                        elapsed_frac: float | None = None
+                        ) -> dict[str, list[float]]:
+        """Every graded projection, as two lists of PIT values."""
+        sql = ("SELECT pit_signal, pit_null, elapsed_frac FROM projections "
+               "WHERE resolved = 1 AND pit_signal IS NOT NULL")
+        args: list[Any] = []
+        if coin:
+            sql += " AND coin = ?"; args.append(coin)
+        if interval:
+            sql += " AND interval = ?"; args.append(interval)
+        if elapsed_frac is not None:
+            sql += " AND elapsed_frac = ?"; args.append(round(elapsed_frac, 1))
+        sig, nul, slots = [], [], {}
+        for r in self._conn.execute(sql, args).fetchall():
+            sig.append(r["pit_signal"])
+            nul.append(r["pit_null"])
+            slots.setdefault(round(r["elapsed_frac"], 1), 0)
+            slots[round(r["elapsed_frac"], 1)] += 1
+        return {"signal": sig, "null": nul, "by_slot": slots}
+
     def counts(self) -> dict[str, int]:
         def one(sql: str, args: Sequence[Any] = ()) -> int:
             return int(self._conn.execute(sql, args).fetchone()[0])
@@ -694,6 +814,9 @@ class Ledger(ThreadedDB):
                           "WHERE status='closed'"),
             "pending_proposals": one("SELECT COUNT(*) FROM tuning_proposals "
                                      "WHERE status='pending'"),
+            "projections": one("SELECT COUNT(*) FROM projections"),
+            "projections_graded": one("SELECT COUNT(*) FROM projections "
+                                      "WHERE resolved=1"),
         }
 
     def clear(self, coin: str | None = None) -> dict[str, int]:
