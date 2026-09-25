@@ -569,6 +569,42 @@ them back on when you want to compare.
 There is a test that settles the same bar through both paths and fails if
 they disagree.
 
+### One panel
+
+Everything the agent does lives on **The call**: the chart with its trades
+drawn on the candles, the take profit and stop loss, the rule, the alert,
+the buttons, the book and the scorecard. Reading the call and setting what
+it does were two jobs in two parts of the page; they are one now.
+
+The separate agent panel is gone, and so are the duplicate candle, size
+and fee selectors that came with it — one control each, driving both the
+reading and the agent.
+
+Three things went with it, and they were all dead weight rather than
+features: the old **take it / ignore it** row (the agent keeps its own
+book and the alert records a fill you took yourself, so there is one
+record instead of two that disagree), the **you-versus-the-tool
+scorecard** it fed, and `paintCompare`, whose two-way row was absorbed
+into the three-way row several changes earlier and had had no call site
+since.
+
+#### The guard that found them
+
+Merging two panels dropped the `aim` selector and a status stamp while the
+script still read both. `$('someId')` on an id that is not in the page
+returns null, and the next property access throws — which took the whole
+poll down, so the chart silently stopped loading.
+
+A test now extracts every `$('id')` literal from the page script and fails
+if the id is not in the markup. It found four more dead references the
+moment it was written, one of which had been there for several rounds.
+Together with the duplicate-name tests, the page's three worst failure
+modes — a dead reference, a shadowed function, a redeclared const — are
+now build failures rather than things you find by watching a panel not
+update.
+
+### One screen at a time
+
 ### One screen at a time
 
 The page had grown to seventeen panels in a single column, which meant the

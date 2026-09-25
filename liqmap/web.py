@@ -4077,21 +4077,24 @@ DASHBOARD = """<!doctype html>
 
     <div class="panel full" id="agentPanel"><h2>The call — take it or leave it
       <span class="stamp" id="sugStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">Two independent readings.
-        The <b>book</b> says where the pressure is; <b>price</b> says whether
-        the pressure is winning. A trade only when they agree — if the book
-        favours buyers and price is falling, somebody is absorbing them and
-        we stand aside. <b>Nothing here places an order.</b></div>
+      <div class="msg" style="margin-bottom:8px">Book, delta and price vote.
+        Whichever way they point is the direction, and the agent takes it
+        only when the conditions below are met — one trade per candle, out
+        before that candle closes. Its trades are drawn on the candles
+        themselves. <b>Nothing here places an order.</b></div>
+
       <div class="conbar">
         <label>candle <select id="sInt" onchange="loadSuggest()">
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></select></label>
-        <label>aim <select id="sMode" onchange="loadSuggest()">
-          <option value="scalp" selected>scalp — nearest that pays</option>
-          <option value="range">range — half the bar</option></select></label>
-        <label>size $<input id="sSize" value="10000" size="8"
+        <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
+        <label><b>stop loss</b> <input id="apSl" value="10" size="3"></label>
+        <label>in <select id="apUnit">
+          <option value="bps" selected>bps</option>
+          <option value="ticks">ticks / pips</option></select></label>
+        <label>size $<input id="sSize" value="10000" size="7"
           onchange="loadSuggest()"></label>
-        <label>round-trip fee <input id="sFee" value="0" size="4"
+        <label>fee <input id="sFee" value="0" size="3"
           onchange="loadSuggest()">bps</label>
         <label><input type="checkbox" id="sAuto" onchange="toggleSuggestAuto()">
           poll 5s</label>
@@ -4099,9 +4102,41 @@ DASHBOARD = """<!doctype html>
         <button onclick="stopFeed()">Stop feed</button>
         <button onclick="loadSuggest()">Ask</button>
       </div>
+
+      <div class="conbar" style="margin-top:-4px">
+        <b style="color:var(--ink)">Only take it when:</b>
+        <label title="Book, delta and price all pointing the same way —
+3-0, never 2-1 and never one column with two quiet."><input type="checkbox"
+          id="apUnan" checked>all three agree</label>
+        <label title="Aggressive volume against what this market normally
+trades for the span. 100% is normal.">volume over
+          <input id="apEffort" value="200" size="3">% of normal</label>
+        <label title="Off keeps the live book identical to the grid, so a
+result from the grid transfers unchanged."><input type="checkbox"
+          id="apInval">also exit when the read flips</label>
+        <label title="Sound, a banner, and a desktop notification the
+moment all three line up."><input type="checkbox" id="apAlert" checked
+          onchange="armAgreeAlert()">alert me the moment they agree</label>
+      </div>
+
+      <div class="conbar" style="margin-top:-4px">
+        <button class="go" id="apToggle" onclick="toggleAutopilot()">Let it
+          decide</button>
+        <button onclick="stepAutopilot()">Decide once</button>
+        <button onclick="backfillBook()" title="Trade every candle already
+recorded, under the rule set above. Settled against real one-minute bars,
+same one-candle hold.">Trade every past candle</button>
+        <button onclick="downloadBook()" title="Every trade, winners and
+losers, as one CSV you can open in a spreadsheet">Download the book</button>
+        <button onclick="loadScorecard()">Refresh score</button>
+        <button onclick="clearBook()" title="Throw the book away and start
+counting from now.">Clear the book</button>
+      </div>
+
+      <div id="apAlertBar" class="alertbar" style="display:none"></div>
       <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
       <div id="sugThree" style="display:none;margin-bottom:10px"></div>
-      <div id="chartWrap" style="display:none;margin-bottom:12px">
+<div id="chartWrap" style="display:none;margin-bottom:12px">
         <div class="chart-tools">
           <button id="tool-cursor" class="on"
             onclick="pickTool('cursor')" title="Crosshair">✛</button>
@@ -4141,68 +4176,8 @@ at normal scale">fit</button>
       </div>
       <div id="sugCard" class="msg">Press <b>Go live</b>, give it ten seconds
         of book pushes, then <b>Ask</b>.</div>
-      <div id="sugActions" style="display:none;margin-top:10px">
-        <button class="go" onclick="decide(true)">Take it</button>
-        <button onclick="decide(false)">Ignore</button>
-        <span id="sugDecided" class="msg" style="margin-left:10px"></span>
-      </div>
-      <div id="sugScore" class="say" style="display:none;margin-top:12px"></div>
-    </div>
 
-    <div class="panel full" id="pilotPanel"><h2>The agent's own book
-      <span class="stamp" id="apStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">Its decisions, not yours.
-        Book, delta and price vote; whichever way they point is the
-        direction, and it takes the trade only when the conditions below
-        are met. Those are <i>your</i> rules with numbers on them — the
-        refusals are still recorded, so the book can tell you later what
-        each one cost. Levels are the ones you set, in the same units the
-        grid tests. <b>Nothing places an order.</b></div>
-
-      <div class="conbar">
-        <label>candle <select id="apInt">
-          <option>1m</option><option>5m</option><option selected>15m</option>
-          <option>30m</option><option>1h</option></select></label>
-        <label>size $<input id="apSize" value="10000" size="8"></label>
-        <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
-        <label><b>stop loss</b> <input id="apSl" value="10" size="3"></label>
-        <label>in <select id="apUnit">
-          <option value="bps" selected>bps</option>
-          <option value="ticks">ticks / pips</option></select></label>
-        <label>round-trip fee <input id="apFee" value="0" size="4">bps</label>
-      </div>
-      <div class="conbar" style="margin-top:-4px">
-        <b style="color:var(--ink)">Only take it when:</b>
-        <label title="Book, delta and price all pointing the same way —
-3-0, never 2-1 and never one column with two quiet."><input type="checkbox"
-          id="apUnan" checked>all three agree</label>
-        <label title="Aggressive volume against what this market normally
-trades for the span. 100% is normal.">and volume is over
-          <input id="apEffort" value="200" size="3">% of normal</label>
-        <label title="Off keeps the live book identical to the grid, so a
-result from the grid transfers unchanged."><input type="checkbox"
-          id="apInval">also exit when the read flips</label>
-        <label title="Sound, a banner, and a desktop notification the
-moment all three line up."><input type="checkbox" id="apAlert" checked
-          onchange="armAgreeAlert()">alert me the moment they agree</label>
-      </div>
-      <div id="apAlertBar" class="alertbar" style="display:none"></div>
-      <div class="conbar" style="margin-top:-4px">
-        <button class="go" id="apToggle" onclick="toggleAutopilot()">Let it
-          decide</button>
-        <button onclick="stepAutopilot()">Decide once</button>
-        <button onclick="loadScorecard()">Refresh score</button>
-        <button class="go" onclick="backfillBook()" title="Trade every
-candle already recorded, under the rule set above. Settled against real
-one-minute bars, same one-candle hold.">Trade every past candle</button>
-        <button onclick="downloadBook()" title="Every trade, winners and
-losers, as one CSV you can open in a spreadsheet">Download the book</button>
-        <button onclick="clearBook()" title="Throw the book away and start
-counting from now. Needed after a bad run has written results that cannot
-be true.">Clear the book</button>
-      </div>
-
-      <div id="apState" class="msg">Off. Turn it on and leave it — a book
+<div id="apState" class="msg">Off. Turn it on and leave it — a book
         that only fills while you are watching measures your attention, not
         the strategy.</div>
       <div id="apPos" style="display:none;margin-top:10px"></div>
@@ -4214,15 +4189,15 @@ be true.">Clear the book</button>
       <div id="apSlices" style="margin-top:10px"></div>
 
       <h3 style="margin:16px 0 6px">Changes it wants to make</h3>
-      <div class="msg" style="margin-bottom:6px">It picks a value on older
-        trades and scores it on newer ones it has never seen. Nothing changes
-        until you say so.
+      <div class="msg" style="margin-bottom:6px">It picks a target and stop
+        on older signals and scores them on newer ones it has never seen.
+        Nothing changes until you say so.
         <button style="margin-left:8px" onclick="scanProposals()">Look
           now</button></div>
       <div id="apProposals"></div>
     </div>
 
-    <div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
+<div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Everything this service knows,
         assembled into one direction on the candle still forming. Absorption
         <b>inverts</b> flow: heavy buying that is not moving price is a bearish
@@ -4897,9 +4872,9 @@ let sugId = null;
 let apOn = false;
 
 function apCfg() {
-  return {coin: coin(), interval: $('apInt').value,
-          notional: parseFloat($('apSize').value || '10000'),
-          fee_bps: parseFloat($('apFee').value || '0'),
+  return {coin: coin(), interval: $('sInt').value,
+          notional: parseFloat($('sSize').value || '10000'),
+          fee_bps: parseFloat($('sFee').value || '0'),
           tp_bps: parseFloat($('apTp').value || '10'),
           sl_bps: parseFloat($('apSl').value || '10'),
           unit: $('apUnit').value,
@@ -4943,8 +4918,12 @@ async function loadAutopilot() {
   catch (e) { $('apState').textContent = e.message; return; }
   apOn = !!(d.autopilot && d.autopilot.on);
   $('apToggle').textContent = apOn ? 'Stop deciding' : 'Let it decide';
-  $('apStamp').textContent = d.autopilot.last_step
-    ? 'decided ' + Math.round(Date.now()/1000 - d.autopilot.last_step) + 's ago'
+  // One panel, one stamp — and `sugStamp` is already spoken for by the
+  // reading. The age of the last decision belongs with the agent's own
+  // status line, which is the sentence describing it.
+  const age = d.autopilot.last_step
+    ? ' <span class="thin">· decided '
+      + Math.round(Date.now() / 1000 - d.autopilot.last_step) + 's ago</span>'
     : '';
 
   const c = d.counts || {};
@@ -4957,6 +4936,7 @@ async function loadAutopilot() {
       + `${c.open || 0} open, ${c.decisions || 0} decisions logged. `
       + (last ? 'Last: ' + esc(last.sentence) : '')
       + (d.autopilot.error ? ` <span class="err">${esc(d.autopilot.error)}</span>` : '')
+      + age
     : `Off. ${c.closed || 0} trades in the book so far. Turn it on and leave `
       + `it — a book that only fills while you are watching measures your `
       + `attention, not the strategy.`;
@@ -5619,7 +5599,10 @@ async function loadSuggest() {
   try {
     d = await api('/api/suggest?' + q({
       coin: coin(), interval: $('sInt').value,
-      mode: $('sMode').value,
+      // The old aim selector is gone. The agent sizes its own trade from
+      // the take-profit and stop you set, so `suggest`'s mode only still
+      // shapes the reading it returns; scalp is the one that matches.
+      mode: 'scalp',
       size: parseFloat($('sSize').value || '10000'),
       fee_bps: parseFloat($('sFee').value || '0')}));
   } catch (e) { $('sugCard').textContent = e.message; return; }
@@ -5631,43 +5614,10 @@ async function loadSuggest() {
 /* Book against price, always on show. This is the most useful thing on the
    panel precisely when there is NO trade, so it is painted before and
    independently of the call itself. */
-function paintCompare(d) {
-  const box = $('sugCompare');
-  const c = d.confirmation;
-  if (!c) { box.style.display = 'none'; return; }
-
-  const cls = v => v === 'up' ? 'long' : v === 'down' ? 'short' : '';
-  const arrow = v => v === 'up' ? '▲' : v === 'down' ? '▼' : '—';
-  const verdictCls = c.verdict === 'confirmed' ? 'long'
-                   : c.verdict === 'conflict' ? 'short' : '';
-
-  // Held time and participation are what separate an agreement you can act
-  // on from one that evaporates while you reach for the mouse.
-  const p = c.participation;
-  const heldCls = c.settled ? 'long' : c.agree ? 'short' : '';
-  const partCls = !p ? '' : p.backed ? 'long' : 'short';
-
-  box.style.display = '';
-  box.innerHTML =
-      '<div class="conrow">'
-    + `<div class="stat"><b class="${cls(c.book)}">${arrow(c.book)} `
-    + `${esc((c.book || '').toUpperCase())}</b><span>order book</span></div>`
-    + `<div class="stat"><b class="${cls(c.candle)}">${arrow(c.candle)} `
-    + `${esc((c.candle || '').toUpperCase())}</b><span>price action</span></div>`
-    + (p ? `<div class="stat"><b class="${partCls}">`
-           + `${(p.effort * 100).toFixed(0)}%</b>`
-           + '<span>paid for</span></div>' : '')
-    + `<div class="stat"><b class="${heldCls}">${(c.held_s || 0).toFixed(0)}s</b>`
-    + `<span>held${c.flips ? ' · ' + c.flips + ' flips' : ''}</span></div>`
-    + `<div class="stat"><b class="${verdictCls}">`
-    + `${esc((c.verdict || '').toUpperCase())}</b><span>verdict</span></div>`
-    + '</div>'
-    + `<div class="msg" style="margin-top:6px">${esc(c.detail || '')}</div>`
-    + (c.instability
-        ? `<div class="msg" style="margin-top:4px;color:var(--down)">`
-          + `<b>Agreeing but not settled</b> — ${esc(c.instability)}.</div>`
-        : '');
-}
+/* `paintCompare` lived here. The two-way row it drew was absorbed into
+   the three-way row; it has had no call site since and no element to
+   write to. Dead UI code is worse than no UI code: it looks maintained.
+*/
 
 /* Three independent columns and a letter. Never blended — averaging three
    directions turns a disagreement into a confident-looking number, and the
@@ -5721,7 +5671,6 @@ function paintThreeWay(d) {
 function paintSuggest(d) {
   if (!d) return;
   sugId = d.id || null;
-  const act = $('sugActions');
   paintThreeWay(d);
   loadChart();
 
@@ -5750,7 +5699,6 @@ function paintSuggest(d) {
       + `<span class="sub">${esc(lean)} · not tradeable`
       + (d.blocked_by ? ` · ${esc(d.blocked_by)}` : '') + '</span></div>'
       + `<div class="msg" style="margin-top:6px">${esc(d.detail || d.sentence || '')}</div>`;
-    act.style.display = 'none';
     stamp('sugStamp', d.feed_age_s == null ? 0 : d.feed_age_s, 5, 30, 'book ');
     return;
   }
@@ -5794,55 +5742,21 @@ function paintSuggest(d) {
            round-trip fee in the box above or every suggestion looks cheaper
            than it is.</div>`);
 
-  act.style.display = '';
-  $('sugDecided').textContent = d.decision && d.decision !== 'pending'
-      ? 'already ' + d.decision + ' for this candle' : '';
   stamp('sugStamp', d.feed_age_s == null ? 0 : d.feed_age_s, 5, 30, 'book ');
 }
 
-async function decide(taken) {
-  if (!sugId) { $('sugDecided').textContent = 'nothing to decide on'; return; }
-  try {
-    const r = await api('/api/decide?' + q({id: sugId, taken: taken}),
-                        {method: 'POST'});
-    // Only claim a decision was stored when the server says it was. It
-    // refuses once the candle has closed, and reporting it anyway would
-    // show a decision that is not in the table.
-    $('sugDecided').textContent = r.ok && r.decision
-        ? 'recorded: ' + r.decision : (r.note || 'could not record');
-  } catch (e) { $('sugDecided').textContent = e.message; }
-  loadDecisions();
-}
+/* `decide()` lived here, writing your take-it / ignore-it choice to the
+   suggestions table. The agent keeps its own book now and the alert
+   records a fill you took yourself, so there is one record instead of
+   two that disagree.
+*/
 
-async function loadDecisions() {
-  let d;
-  try {
-    d = await api('/api/decisions?' + q({coin: coin(),
-                                         interval: $('sInt').value}));
-  } catch (e) { return; }
-  const s = d.stats || {};
-  const box = $('sugScore');
-  const pct = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
-  const o = s.overall || {}, t = s.taken || {}, i = s.ignored || {};
-  box.style.display = '';
-  const bps = v => v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(1) + 'bps';
-  box.innerHTML =
-      `<b>${esc(s.verdict || '')}</b>`
-    + `<div class="msg" style="margin-top:6px">`
-    + `all ${o.n || 0} settled · hit ${pct(o.hit_rate)} · `
-    + `taken ${t.n || 0} (${pct(t.hit_rate)}) · `
-    + `ignored ${i.n || 0} (${pct(i.hit_rate)}) · `
-    + `${s.pending || 0} waiting on a close</div>`
-    // Gross and net side by side. They answer different questions: gross
-    // says whether the book read was right, net says whether the trade made
-    // money, and only one of those pays for anything.
-    + (o.n ? `<div class="msg" style="margin-top:4px">`
-        + `avg per trade ${bps(o.avg_gross_bps)} gross, `
-        + `<b class="${(o.avg_pnl_bps || 0) >= 0 ? 'long' : 'short'}">`
-        + `${bps(o.avg_pnl_bps)} after cost</b> · `
-        + `total ${bps(o.total_pnl_bps)} · `
-        + `cost has taken ${bps(-(o.cost_drag_bps || 0))}</div>` : '');
-}
+/* `loadDecisions()` lived here. It painted the old you-versus-the-tool
+   scorecard into `sugScore`, which went when the take-it / ignore-it row
+   did. The agent's own book is the one record now, and `/api/decisions`
+   is still there for anything that wants the history.
+*/
+async function loadDecisions() { /* retired — see above */ }
 
 function toggleSuggestAuto() {
   if (sugPoll) { clearInterval(sugPoll); sugPoll = null; }

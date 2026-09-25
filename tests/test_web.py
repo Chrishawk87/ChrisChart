@@ -1816,7 +1816,7 @@ def test_the_dashboard_holds_only_the_three_panels_you_watch(client):
     separated by a screenful of things that did not."""
     html = client.get("/").text
     dash = html[html.index('id="tab-dash"'):html.index('id="tab-test"')]
-    for wanted in ("agentPanel", "pilotPanel", "readPanel"):
+    for wanted in ("agentPanel", "readPanel"):
         assert wanted in dash, f"{wanted} should be on the dashboard"
     for elsewhere in ("sweepPanel", "btPanel", "liqPanel", "bookPanel"):
         assert elsewhere not in dash, f"{elsewhere} should be behind a tab"
@@ -1825,7 +1825,7 @@ def test_the_dashboard_holds_only_the_three_panels_you_watch(client):
 def test_every_panel_lives_in_exactly_one_tab(client):
     """A panel left out of the regrouping would silently vanish."""
     html = client.get("/").text
-    for pid in ("agentPanel", "pilotPanel", "readPanel", "sweepPanel",
+    for pid in ("agentPanel", "readPanel", "sweepPanel",
                 "bookPanel", "agreePanel", "btPanel", "conPanel",
                 "liqPanel"):
         assert html.count(f'id="{pid}"') == 1, f"{pid} is duplicated or gone"
@@ -1880,6 +1880,55 @@ def test_drawn_lines_are_kept_per_market_and_timeframe(client):
     key = html[html.index("function chartKey()"):]
     key = key[:key.index("function loadShapes")]
     assert "chartData.coin" in key and "chartData.interval" in key
+
+
+def test_the_call_panel_holds_the_whole_agent(client):
+    """One panel. The chart, the levels, the rule and the book were in two
+    places, which meant reading the call and setting what it does were
+    different jobs in different parts of the page."""
+    html = client.get("/").text
+    i = html.index('id="agentPanel"')
+    j = html.index('id="readPanel"')
+    call = html[i:j]
+    for piece in ('id="sugChart"',        # the chart
+                  'id="apTp"', 'id="apSl"', 'id="apUnit"',   # the levels
+                  'id="apUnan"', 'id="apEffort"',            # the rule
+                  'id="apAlertBar"',      # the alert
+                  'id="apToggle"',        # let it decide
+                  'id="apPos"', 'id="apFeed"',               # what it did
+                  'id="apHead"', 'id="apStats"', 'id="apSlices"',
+                  'id="apProposals"'):
+        assert piece in call, f"{piece} should live on the call panel"
+    assert "pilotPanel" not in html
+
+
+def test_the_agent_reads_the_panels_own_candle_and_size(client):
+    """Two candle selectors on one page is a bug waiting to happen."""
+    html = client.get("/").text
+    fn = html[html.index("function apCfg()"):]
+    fn = fn[:fn.index("async function toggleAutopilot")]
+    assert "$('sInt')" in fn and "$('sSize')" in fn and "$('sFee')" in fn
+    assert "apInt" not in html and "apSize" not in html
+
+
+def test_every_element_the_script_reaches_for_exists(client):
+    """`$('someId')` on an id that is not in the page returns null, and the
+    next property access throws — taking the whole poll with it.
+
+    This shipped twice in one change: merging two panels dropped the `aim`
+    selector and a status stamp while the code still read both. Neither is
+    visible by reading the markup or the script on its own.
+    """
+    import re
+    html = client.get("/").text
+    body = html[html.index("<script>"):]
+    ids = set(re.findall(r"""\$\(\s*['"]([A-Za-z][\w-]*)['"]\s*\)""", body))
+    present = set(re.findall(r'id="([A-Za-z][\w-]*)"', html))
+    # Ids the script builds at runtime, which are checked where they are used.
+    built = {i for i in ids if i.startswith(("tool-", "tab-", "tabbtn-",
+                                             "set_"))}
+    missing = sorted(ids - present - built)
+    assert not missing, f"script reads ids that are not in the page: {missing}"
 
 
 def test_no_two_functions_on_the_page_share_a_name(client):
