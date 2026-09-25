@@ -45,6 +45,7 @@ from .bucket import build_map, render
 from .history import History, render_changes
 from .settings import Settings, SettingsStore, default_db_path
 from .ledger import Ledger
+import bisect
 from dataclasses import replace
 from .autopilot import Autopilot, Knobs, KNOBS
 from . import score as score_mod
@@ -1351,6 +1352,167 @@ class Runtime:
             rows.append(d)
         return rows
 
+    def backfill_book(self, coin: str, interval: str, *,
+                      tp: float = 10.0, sl: float = 10.0, unit: str = "bps",
+                      unanimous: bool = True, min_effort: float = 2.0,
+                      cost_bps: float = 0.0, exit_before_s: float = 5.0,
+                      hours: float = 0.0, limit: int = 5000
+                      ) -> dict[str, Any]:
+        """Trade every candle already recorded, under the rule running now.
+
+        The agent only ever filled its book forward, from the moment it was
+        switched on. But every candle's book, delta and price reading has
+        been stored since the feed first ran, and the rule is a function of
+        those readings -- so the past candles can be traded too, and there
+        is no reason to wait a week to find out what the rule does.
+
+        Each one is settled against real one-minute bars with the same
+        deadline and the same pre-close exit the live agent uses, and
+        written into the same book marked `backfill`. Marked, not blended:
+        a backfilled trade is resolved at one-minute resolution while a
+        live one is managed poll by poll, and averaging the two into a
+        single number describes neither.
+
+        A candle already in the book is skipped, so running this twice
+        cannot double-count anything.
+        """
+        since = (time.time() - hours * 3600.0) if hours else None
+        signals = self.signals_from_history(coin, interval, since=since)
+        if not signals:
+            return {"ok": False, "detail": "no candle readings stored yet",
+                    "written": 0}
+
+        kept = []
+        refused = {"not_unanimous": 0, "not_paid_for": 0, "no_effort_read": 0}
+        for sig in signals:
+            if unanimous and not (sig.agreeing == 3 and sig.against == 0):
+                refused["not_unanimous"] += 1
+                continue
+            if min_effort > 0:
+                if sig.effort is None:
+                    refused["no_effort_read"] += 1
+                    continue
+                if sig.effort < min_effort:
+                    refused["not_paid_for"] += 1
+                    continue
+            kept.append(sig)
+
+        if not kept:
+            return {"ok": False, "written": 0, "considered": len(signals),
+                    "refused": refused,
+                    "detail": ("none of the stored candles met the rule — "
+                               "loosen it, or leave the feed running")}
+
+        lo = min(x.ts for x in kept)
+        hi = max(x.ts for x in kept)
+        try:
+            bars = self.bars_for_sweep(coin, lo, hi)
+        except Exception as exc:
+            return {"ok": False, "written": 0,
+                    "detail": f"could not fetch bars: {exc}"}
+        if not bars:
+            return {"ok": False, "written": 0,
+                    "detail": "no price bars available for that span"}
+
+        stamps = [b.ts for b in bars]
+        written = skipped = unresolved = 0
+        wins = 0
+        net_total = 0.0
+
+        for sig in sorted(kept, key=lambda x: x.ts)[-limit:]:
+            i = bisect.bisect_right(stamps, sig.ts)
+            window = bars[i:i + sweep_mod.DEFAULT_HORIZON]
+            if not window:
+                unresolved += 1
+                continue
+
+            tp_bps, sl_bps = self._unit_bps(tp, sl, unit, sig.entry, coin)
+            sgn = 1.0 if sig.side == "long" else -1.0
+            target = sig.entry * (1 + sgn * tp_bps / 10_000.0)
+            stop = sig.entry * (1 - sgn * sl_bps / 10_000.0)
+            denom = tp_bps + sl_bps
+            breakeven = ((sl_bps + cost_bps) / denom) if denom else 0.0
+
+            pos = self.ledger.open_position(
+                coin=coin, interval=interval, candle_ts=sig.ts,
+                side=sig.side, entry=sig.entry, target_px=target,
+                stop_px=stop, target_bps=tp_bps, risk_bps=sl_bps,
+                cost_bps=cost_bps, breakeven=breakeven,
+                grade=sig.shape, grade_3way=sig.shape,
+                agreeing=sig.agreeing, conviction=abs(sig.net),
+                source="backfill",
+                features={"vote_shape": sig.shape, "vote_book": sig.book,
+                          "vote_delta": sig.delta, "vote_price": sig.price,
+                          "vote_against": sig.against, "vote_net": sig.net,
+                          "effort": sig.effort, "unit": unit,
+                          "tp_bps": tp_bps, "sl_bps": sl_bps},
+                now=sig.ts)
+            if pos is None:
+                skipped += 1        # this candle is already in the book
+                continue
+
+            reason, exit_px, held = sweep_mod.resolve(
+                sig.side, sig.entry, tp_bps, sl_bps, window,
+                sweep_mod.DEFAULT_HORIZON, deadline=sig.deadline,
+                exit_before_s=exit_before_s)
+
+            # The excursions, from the bars the trade actually lived through.
+            lived = window[:max(1, held)]
+            his = max(b.high for b in lived)
+            los = min(b.low for b in lived)
+            pos.mfe_bps = pos.signed_bps(his if sig.side == "long" else los)
+            pos.mae_bps = pos.signed_bps(los if sig.side == "long" else his)
+
+            out = self.ledger.close_position(
+                pos, exit_px=exit_px, reason=reason, now=sig.ts + held * 60.0)
+            if out is None:
+                unresolved += 1
+                continue
+            written += 1
+            net_total += out["net_bps"]
+            wins += 1 if out["net_bps"] > 0 else 0
+
+        self._pilots.pop((coin, interval), None)
+        return {
+            "ok": True, "written": written, "skipped_existing": skipped,
+            "unresolved": unresolved, "considered": len(signals),
+            "matched": len(kept), "refused": refused,
+            "wins": wins, "losses": written - wins,
+            "net_per_trade": round(net_total / written, 2) if written else 0.0,
+            "total_net_bps": round(net_total, 1),
+            "note": (f"{written} past candles traded under the rule you are "
+                     f"running: {wins} winners, {written - wins} losers, "
+                     f"{net_total / written:+.2f}bps a trade."
+                     if written else
+                     "nothing new to write — those candles are already in "
+                     "the book."),
+        }
+
+    def _unit_bps(self, tp: float, sl: float, unit: str, price: float,
+                  coin: str) -> tuple[float, float]:
+        """Targets in basis points, converting from ticks where asked.
+
+        The tick comes from the book NOW, which is the honest limit of a
+        backfill: a stored candle reading does not carry the increment it
+        was taken at. For a market whose tick does not change, that is
+        exact; where it has changed, this says so by being the only tick
+        it can know.
+        """
+        if unit != "ticks" or price <= 0:
+            return (tp, sl)
+        try:
+            feed_now = self.feed_for(coin)
+            bk = feed_now.book if feed_now is not None else None
+            if bk is not None and not bk.empty and bk.mid > 0:
+                from .suggest import infer_tick as _tick
+                t = _tick(bk)
+                if t > 0:
+                    per = t / price * 10_000.0
+                    return (tp * per, sl * per)
+        except Exception:
+            pass
+        return (tp, sl)
+
     def scorecard(self, coin: str | None = None, interval: str | None = None
                   ) -> dict[str, Any]:
         """How the agent has actually done, error bars included."""
@@ -2590,6 +2752,67 @@ def create_app() -> FastAPI:
         rows = rt.ledger.suspect()
         return {"ok": True, "n": len(rows), "rows": rows[:50]}
 
+    @app.post("/api/manual-trade", dependencies=[Depends(require_token)])
+    def api_manual_trade(coin: str, side: str, interval: str = "15m",
+                         tp_bps: float = 10.0, sl_bps: float = 10.0,
+                         unit: str = "bps", fee_bps: float = 0.0,
+                         notional: float = 0.0) -> dict[str, Any]:
+        """Record a trade YOU took, at the current price.
+
+        Kept as its own source. A trade you decided on is not evidence
+        about the agent, and letting it sit inside the agent's score would
+        make that score a measurement of the two of you together -- which
+        is the exact thing the separate book exists to avoid.
+        """
+        if side not in ("long", "short"):
+            return {"ok": False, "detail": "side must be long or short"}
+        c = rt.resolve_symbol(coin)[0]
+        payload = rt.suggest_for(c, interval, record=False)
+        if not payload.get("ok"):
+            return {"ok": False,
+                    "detail": payload.get("detail", "no reading right now")}
+        price = float(payload.get("price") or 0.0)
+        if price <= 0:
+            return {"ok": False, "detail": "no usable price right now"}
+
+        tp, sl = rt._unit_bps(tp_bps, sl_bps, unit, price, c)
+        sgn = 1.0 if side == "long" else -1.0
+        three = payload.get("three_way") or {}
+        pos = rt.ledger.open_position(
+            coin=c, interval=interval,
+            candle_ts=float(payload.get("candle_ts") or 0.0),
+            side=side, entry=price,
+            target_px=price * (1 + sgn * tp / 10_000.0),
+            stop_px=price * (1 - sgn * sl / 10_000.0),
+            target_bps=tp, risk_bps=sl, cost_bps=fee_bps,
+            breakeven=((sl + fee_bps) / (tp + sl)) if (tp + sl) else 0.0,
+            grade=str(three.get("grade") or ""),
+            grade_3way=str(three.get("grade") or ""),
+            agreeing=int(three.get("agreeing") or 0),
+            size_usd=notional, source="manual",
+            features={"vote_shape": f"{three.get('agreeing', 0)}-0",
+                      "taken_by": "you", "unit": unit})
+        if pos is None:
+            return {"ok": False,
+                    "detail": "this candle already has a trade in the book"}
+        return {"ok": True, "position": pos.to_dict(),
+                "note": ("recorded as yours — it is kept out of the "
+                         "agent's own score")}
+
+    @app.post("/api/backfill-book", dependencies=[Depends(require_token)])
+    def api_backfill_book(coin: str, interval: str = "15m",
+                          tp: float = 10.0, sl: float = 10.0,
+                          unit: str = "bps", unanimous: bool = True,
+                          min_effort: float = 2.0, cost_bps: float = 0.0,
+                          exit_before_s: float = 5.0, hours: float = 0.0
+                          ) -> dict[str, Any]:
+        """Trade every candle already recorded, under the rule running now."""
+        c = rt.resolve_symbol(coin)[0]
+        return rt.backfill_book(
+            c, interval, tp=tp, sl=sl, unit=unit, unanimous=unanimous,
+            min_effort=min_effort, cost_bps=cost_bps,
+            exit_before_s=exit_before_s, hours=hours)
+
     @app.get("/api/ledger.csv", dependencies=[Depends(require_token)])
     def api_ledger_csv(coin: str = "", interval: str = ""):
         """Every trade, winners and losers, as one file you can open.
@@ -3707,6 +3930,13 @@ DASHBOARD = """<!doctype html>
   .heat-key{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;
             margin:8px 0;font-size:11px;color:var(--dim)}
   .heat-key i{display:inline-block;height:10px;border-radius:2px}
+  /* The agreement banner reuses the read panel's .alertbar, plus the two
+     side colours and its own buttons. */
+  .alertbar.long{border-left-color:var(--up)}
+  .alertbar.short{border-left-color:var(--down)}
+  .alertbar button{background:transparent;border:1px solid var(--line);
+                   color:var(--ink);padding:3px 9px;border-radius:4px;
+                   cursor:pointer;font-size:12px;font-family:inherit}
   .prop{border:1px solid var(--grid);border-radius:4px;padding:10px 12px;
         margin-bottom:8px}
   .prop pre{white-space:pre-wrap;font-family:var(--mono);font-size:11px;
@@ -3952,10 +4182,19 @@ trades for the span. 100% is normal.">and volume is over
         <label title="Off keeps the live book identical to the grid, so a
 result from the grid transfers unchanged."><input type="checkbox"
           id="apInval">also exit when the read flips</label>
+        <label title="Sound, a banner, and a desktop notification the
+moment all three line up."><input type="checkbox" id="apAlert" checked
+          onchange="armAgreeAlert()">alert me the moment they agree</label>
+      </div>
+      <div id="apAlertBar" class="alertbar" style="display:none"></div>
+      <div class="conbar" style="margin-top:-4px">
         <button class="go" id="apToggle" onclick="toggleAutopilot()">Let it
           decide</button>
         <button onclick="stepAutopilot()">Decide once</button>
         <button onclick="loadScorecard()">Refresh score</button>
+        <button class="go" onclick="backfillBook()" title="Trade every
+candle already recorded, under the rule set above. Settled against real
+one-minute bars, same one-candle hold.">Trade every past candle</button>
         <button onclick="downloadBook()" title="Every trade, winners and
 losers, as one CSV you can open in a spreadsheet">Download the book</button>
         <button onclick="clearBook()" title="Throw the book away and start
@@ -4915,6 +5154,7 @@ async function loadScorecard() {
     + '</tbody></table>';
 
   $('apSlices').innerHTML = BAND_KEY
+    + slice('Where the trade came from', d.by_source || [])
     + slice('By how many columns agreed', d.by_agreeing)
     + slice('By grade', d.by_grade)
     + slice('By how it ended', d.by_exit)
@@ -5219,6 +5459,161 @@ function restoreTab() {
   showTab(TAB_KEYS.includes(k) ? k : 'dash');
 }
 
+/* ---- the alert ---------------------------------------------------------
+   Fires the moment book, delta and price line up and the rule is met.
+
+   Three channels on purpose, because one is never enough: a banner for
+   when you are looking at the page, a sound for when you are not, and a
+   desktop notification for when the tab is behind something else.
+
+   It fires on the EDGE — the poll where agreement appears — not on every
+   poll while it persists. A thing that beeps every five seconds for a
+   minute is a thing you turn off.                                      */
+
+let agreeAlert = {last: null, ctx: null, armed: false};
+
+function armAgreeAlert() {
+  const on = $('apAlert') && $('apAlert').checked;
+  agreeAlert.armed = !!on;
+  if (!on) return;
+  // Both of these need a click to be allowed, which is why this is wired
+  // to the checkbox rather than done on load.
+  try {
+    if (!agreeAlert.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) agreeAlert.ctx = new AC();
+    }
+    if (agreeAlert.ctx && agreeAlert.ctx.state === 'suspended') {
+      agreeAlert.ctx.resume();
+    }
+  } catch (e) {}
+  try {
+    if (window.Notification && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  } catch (e) {}
+}
+
+function agreeBeep(side) {
+  const ctx = agreeAlert.ctx;
+  if (!ctx) return;
+  try {
+    // Two short notes, rising for a long and falling for a short, so the
+    // direction is audible without looking.
+    const now = ctx.currentTime;
+    const pair = side === 'long' ? [660, 990] : [660, 440];
+    pair.forEach((f, i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, now + i * 0.16);
+      g.gain.exponentialRampToValueAtTime(0.22, now + i * 0.16 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.16 + 0.15);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(now + i * 0.16); o.stop(now + i * 0.16 + 0.16);
+    });
+  } catch (e) {}
+}
+
+/* Called on every poll with the current reading. */
+function checkAgreeAlert(d) {
+  if (!agreeAlert.armed) { $('apAlertBar').style.display = 'none'; return; }
+
+  const three = d.three_way || {};
+  const conf = d.confirmation || {};
+  const part = conf.participation || {};
+  const effort = typeof part.effort === 'number' ? part.effort : null;
+  const wantEffort = parseFloat($('apEffort').value || '0') / 100;
+  const wantUnan = $('apUnan').checked;
+
+  const agreed = three.agreeing === 3 && three.direction !== 'flat';
+  const paid = wantEffort <= 0 || (effort !== null && effort >= wantEffort);
+  const live = (!wantUnan || agreed) && paid;
+
+  // One line per candle: the key is the bar, so a rule that stays true
+  // for ten polls sounds once.
+  const key = live ? (d.coin + '|' + d.interval + '|' + d.candle_ts) : null;
+  const bar = $('apAlertBar');
+
+  if (!live) {
+    bar.style.display = 'none';
+    agreeAlert.last = null;
+    return;
+  }
+
+  const side = three.direction === 'up' ? 'long' : 'short';
+  const tp = $('apTp').value, sl = $('apSl').value, unit = $('apUnit').value;
+  const px = d.price || d.entry || 0;
+  const line = `${side.toUpperCase()} ${d.coin} — all three ${three.direction}`
+    + (effort !== null ? `, ${(effort * 100).toFixed(0)}% of normal volume` : '')
+    + `. ${px ? chPx(px) + ' · ' : ''}target ${tp}${unit === 'ticks' ? ' ticks' : 'bps'}`
+    + `, stop ${sl}${unit === 'ticks' ? ' ticks' : 'bps'}`;
+
+  bar.className = 'alertbar ' + side;
+  bar.style.display = '';
+  bar.innerHTML = `<b>${esc(line)}</b>`
+    + '<span class="thin" style="margin-left:10px">'
+    + (d.seconds_left ? fmtLeft(d.seconds_left) + ' left on the candle' : '')
+    + '</span>'
+    + `<button style="margin-left:auto" onclick="tookIt('${esc(side)}')">`
+    + 'I took it</button>'
+    + '<button onclick="$(\\'apAlertBar\\').style.display=\\'none\\'">'
+    + 'dismiss</button>';
+
+  if (key === agreeAlert.last) return;      // same candle, already called
+  agreeAlert.last = key;
+
+  agreeBeep(side);
+  try {
+    if (window.Notification && Notification.permission === 'granted') {
+      new Notification('ChrisChart — all three agree', {
+        body: line, tag: key, renotify: false});
+    }
+  } catch (e) {}
+}
+
+/* Record that YOU took it, by hand. Kept as its own source so a manual
+   fill never sits inside the agent's score. */
+async function tookIt(side) {
+  try {
+    const c = apCfg();
+    await api('/api/manual-trade?' + q({
+      coin: c.coin, interval: c.interval, side: side,
+      tp_bps: c.tp_bps, sl_bps: c.sl_bps, unit: c.unit,
+      fee_bps: c.fee_bps, notional: c.notional}), {method: 'POST'});
+  } catch (e) { $('apState').textContent = e.message; return; }
+  $('apAlertBar').style.display = 'none';
+  loadAutopilot();
+}
+
+async function backfillBook() {
+  const c = apCfg();
+  if (!confirm('Trade every candle already recorded, under the rule set '
+               + 'above? Candles already in the book are skipped.')) return;
+  $('apState').textContent = 'trading the past candles…';
+  let d;
+  try {
+    d = await api('/api/backfill-book?' + q({
+      coin: c.coin, interval: c.interval, tp: c.tp_bps, sl: c.sl_bps,
+      unit: c.unit, unanimous: c.require_unanimous,
+      min_effort: c.min_effort, cost_bps: c.fee_bps,
+      exit_before_s: 5}), {method: 'POST'});
+  } catch (e) { $('apState').textContent = e.message; return; }
+  if (!d.ok) {
+    $('apState').innerHTML = `<b>${esc(d.detail || 'nothing written')}</b>`
+      + (d.refused ? `<div class="thin">of ${d.considered} stored candles: `
+          + Object.entries(d.refused).map(([k, v]) => `${esc(k)} ${v}`)
+            .join(' · ') + '</div>' : '');
+    return;
+  }
+  $('apState').innerHTML = `<b>${esc(d.note)}</b>`
+    + `<div class="thin">${d.considered} candles considered, ${d.matched} `
+    + `met the rule, ${d.skipped_existing} already in the book`
+    + (d.unresolved ? `, ${d.unresolved} had no price after them` : '')
+    + '.</div>';
+  loadChart();
+  loadScorecard();
+}
+
 async function loadSuggest() {
   let d;
   try {
@@ -5229,6 +5624,7 @@ async function loadSuggest() {
       fee_bps: parseFloat($('sFee').value || '0')}));
   } catch (e) { $('sugCard').textContent = e.message; return; }
   paintSuggest(d);
+  checkAgreeAlert(d);
   loadDecisions();
 }
 

@@ -798,3 +798,134 @@ def test_a_graded_call_reports_how_far_it_can_run(client, monkeypatch):
         assert d.get("runway") is not None
         assert d["runway"]["clear_bps"] > 0
         assert d["runway"]["describe"]
+
+
+# ----------------------------------------- trading the candles you have
+
+def _stored_candles(rt, n=40, coin="BTC", interval="15m", start=None):
+    """Candle readings as the recorder would have stored them."""
+    import time as _t
+    base = start if start is not None else _t.time() - n * 900
+    for i in range(n):
+        ts = base + i * 900
+        up = i % 3 != 0
+        d = "up" if up else "down"
+        rt.history.record_state(
+            coin=coin, interval=interval, candle_ts=ts, candle_end=ts + 900,
+            book_dir=d, book_strength=0.6, price_dir=d, price_strength=0.5,
+            verdict="confirmed", price=100.0 + i * 0.05, made_at=ts + 60,
+            features={"delta_score": 0.4 if up else -0.4,
+                      "effort": 3.0 if i % 2 == 0 else 0.5})
+    return base
+
+
+class _Bars:
+    """A price series the backfill can settle against."""
+    INTERVALS = {"1m": 60, "15m": 900}
+
+    def __init__(self, start, n):
+        from liqmap.structure import Candle
+        self.rows = []
+        px = 100.0
+        for i in range(n):
+            o = px
+            c = o * (1 + (0.0004 if i % 3 else -0.0003))
+            self.rows.append(Candle(ts=start + i * 60, open=o,
+                                    high=max(o, c) * 1.0006,
+                                    low=min(o, c) * 0.9994, close=c,
+                                    volume=5.0))
+            px = c
+
+    def candles(self, coin, interval="1m", bars=200):
+        return self.rows[-bars:]
+
+    def all_mids(self):
+        return {}
+
+
+def test_past_candles_can_be_traded_into_the_book(client, monkeypatch):
+    """The agent only ever filled its book forward. Every candle's reading
+    was already stored, and the rule is a function of those readings — so
+    the past candles can be traded too."""
+    rt = web.runtime()
+    base = _stored_candles(rt, n=40)
+    rt._client = _Bars(base, 40 * 15 + 120)
+
+    r = client.post("/api/backfill-book?coin=BTC&interval=15m&tp=10&sl=10"
+                    "&unanimous=true&min_effort=2.0", headers=AUTH).json()
+    assert r["ok"], r.get("detail")
+    assert r["written"] > 0
+    assert r["wins"] + r["losses"] == r["written"]
+
+    rows = rt.ledger.export_rows("BTC")
+    assert rows and all(x["source"] == "backfill" for x in rows)
+    assert {x["result"] for x in rows} <= {"WIN", "LOSS", "open"}
+
+
+def test_running_the_backfill_twice_cannot_double_count(client, monkeypatch):
+    rt = web.runtime()
+    base = _stored_candles(rt, n=30)
+    rt._client = _Bars(base, 30 * 15 + 120)
+    q = ("/api/backfill-book?coin=BTC&interval=15m&tp=10&sl=10"
+         "&unanimous=true&min_effort=2.0")
+    first = client.post(q, headers=AUTH).json()
+    second = client.post(q, headers=AUTH).json()
+    assert first["written"] > 0
+    assert second["written"] == 0
+    assert second["skipped_existing"] >= first["written"]
+    assert len(rt.ledger.export_rows("BTC")) == first["written"]
+
+
+def test_a_backfilled_trade_never_outlives_its_candle(client, monkeypatch):
+    rt = web.runtime()
+    base = _stored_candles(rt, n=30)
+    rt._client = _Bars(base, 30 * 15 + 120)
+    client.post("/api/backfill-book?coin=BTC&interval=15m&tp=900&sl=900"
+                "&unanimous=true&min_effort=2.0", headers=AUTH)
+    rows = [r for r in rt.ledger.export_rows("BTC") if r["result"] != "open"]
+    assert rows
+    # Unreachable levels, so every one must be closed by the candle.
+    assert all(r["exit_reason"] == "candle_end" for r in rows)
+    assert all(r["held_s"] <= 900 for r in rows)
+
+
+def test_the_backfill_reports_what_the_rule_refused(client, monkeypatch):
+    rt = web.runtime()
+    base = _stored_candles(rt, n=30)
+    rt._client = _Bars(base, 30 * 15 + 120)
+    r = client.post("/api/backfill-book?coin=BTC&interval=15m"
+                    "&unanimous=true&min_effort=99", headers=AUTH).json()
+    assert not r["ok"] and r["written"] == 0
+    assert r["refused"]["not_paid_for"] > 0
+
+
+def test_backfilled_and_live_are_scored_apart(client, monkeypatch):
+    """Different resolution, different evidence. Averaging them gives a
+    number that describes neither."""
+    rt = web.runtime()
+    base = _stored_candles(rt, n=30)
+    rt._client = _Bars(base, 30 * 15 + 120)
+    client.post("/api/backfill-book?coin=BTC&interval=15m&tp=10&sl=10"
+                "&unanimous=true&min_effort=2.0", headers=AUTH)
+    card = client.get("/api/scorecard?coin=BTC", headers=AUTH).json()
+    labels = [b["label"] for b in card["by_source"]]
+    assert "backfilled" in labels
+
+
+def test_a_trade_you_took_is_kept_out_of_the_agents_score(client, monkeypatch):
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    r = client.post("/api/manual-trade?coin=BTC&side=long&interval=15m"
+                    "&tp_bps=10&sl_bps=10", headers=AUTH).json()
+    assert r["ok"], r.get("detail")
+    rows = rt.ledger.export_rows("BTC")
+    assert rows and rows[0]["source"] == "manual"
+
+
+def test_a_manual_trade_needs_a_real_side(client):
+    r = client.post("/api/manual-trade?coin=BTC&side=sideways",
+                    headers=AUTH).json()
+    assert not r["ok"] and "long or short" in r["detail"]

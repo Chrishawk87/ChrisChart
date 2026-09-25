@@ -349,6 +349,15 @@ def scorecard(positions: Sequence[dict[str, Any]],
                             lambda k: f"exit: {k}"),
         "by_runway": _grouped(positions, _runway_bucket),
         "by_interval": _grouped(positions, lambda p: p.get("interval") or "?"),
+        # Live, backfilled and hand-taken trades are different evidence.
+        # A backfill is settled at one minute resolution, a live trade is
+        # managed poll by poll, and a manual one is your decision rather
+        # than the agent's -- averaging them gives a number that describes
+        # none of the three.
+        "by_source": _grouped(positions, lambda p: p.get("source") or "live",
+                              lambda k: {"live": "traded live",
+                                         "backfill": "backfilled",
+                                         "manual": "taken by you"}.get(k, k)),
         "by_coin": _grouped(positions, lambda p: p.get("coin") or "?"),
     }
 

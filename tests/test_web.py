@@ -1882,6 +1882,67 @@ def test_drawn_lines_are_kept_per_market_and_timeframe(client):
     assert "chartData.coin" in key and "chartData.interval" in key
 
 
+def test_no_two_functions_on_the_page_share_a_name(client):
+    """The page is one long script, so a second `function foo` silently
+    REPLACES the first.
+
+    This shipped once: a new `checkAlert` was added while the candle-read
+    panel already had one. The new definition won, the old call site kept
+    running, and it was handed a payload with none of the fields it
+    expected — which threw and took the whole poll down with it. Nothing
+    about that is visible by reading either function on its own.
+    """
+    import re
+    html = client.get("/").text
+    body = html[html.index("<script>"):]
+    names = re.findall(r"^\s*function\s+([A-Za-z_$][\w$]*)\s*\(",
+                       body, re.M)
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    assert not dupes, f"declared more than once: {dupes}"
+
+
+def test_no_two_top_level_consts_share_a_name(client):
+    """Same hazard, and this one throws on load rather than silently."""
+    import re
+    html = client.get("/").text
+    body = html[html.index("<script>"):]
+    names = re.findall(r"^(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=",
+                       body, re.M)
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    assert not dupes, f"declared more than once: {dupes}"
+
+
+def test_the_alert_fires_on_the_edge_not_every_poll(client):
+    """A thing that beeps every five seconds for a minute is a thing you
+    turn off."""
+    html = client.get("/").text
+    fn = html[html.index("function checkAgreeAlert(d)"):]
+    fn = fn[:fn.index("async function tookIt")]
+    assert "agreeAlert.last" in fn
+    assert "if (key === agreeAlert.last) return;" in fn
+    # Keyed by the candle, so one call per bar.
+    assert "d.candle_ts" in fn
+
+
+def test_the_alert_has_all_three_channels(client):
+    """Banner for when you are looking, sound for when you are not,
+    notification for when the tab is behind something."""
+    html = client.get("/").text
+    fn = html[html.index("function checkAgreeAlert(d)"):]
+    fn = fn[:fn.index("async function tookIt")]
+    assert "agreeBeep(" in fn
+    assert "new Notification(" in fn
+    assert "apAlertBar" in fn
+
+
+def test_the_alert_respects_the_rule_you_set(client):
+    html = client.get("/").text
+    fn = html[html.index("function checkAgreeAlert(d)"):]
+    fn = fn[:fn.index("async function tookIt")]
+    assert "apEffort" in fn and "apUnan" in fn
+    assert "three.agreeing === 3" in fn
+
+
 def test_the_countdown_actually_ticks(client):
     """A countdown that only moves when new data arrives is a clock that
     lies between polls."""

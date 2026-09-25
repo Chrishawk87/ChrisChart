@@ -451,6 +451,58 @@ contributed nothing and was treated as flat. The screen would have said all
 three agree while the agent stood aside on "only 2 of 3". Strength still
 decides the *side* when columns disagree; direction decides who agrees.
 
+### Trading the candles you already have
+
+**Trade every past candle** on the agent panel. Every candle's book, delta
+and price reading has been stored since the feed first ran, and the rule
+is a function of those readings — so there is no reason to wait a week to
+find out what it does.
+
+Each stored candle that meets the rule is settled against real one-minute
+bars, with the same one-candle deadline and the same pre-close exit the
+live agent uses, and written into the same book marked `backfill`. A
+candle already in the book is skipped, so running it twice cannot
+double-count anything.
+
+Marked, not blended. A backfilled trade is resolved at one-minute
+resolution; a live one is managed poll by poll; a manual one was your
+decision rather than the agent's. The scorecard slices by source, because
+averaging the three gives a number that describes none of them.
+
+### The alert
+
+**Alert me the moment they agree** gives three channels, because one is
+never enough: a banner while you are looking at the page, a two-note sound
+while you are not (rising for a long, falling for a short), and a desktop
+notification when the tab is behind something else.
+
+It fires on the **edge** — the poll where agreement appears — keyed to the
+candle. A rule that stays true for ten polls sounds once. A thing that
+beeps every five seconds for a minute is a thing you turn off.
+
+The banner carries the side, the columns, the volume, the price and your
+levels, with **I took it** beside it. That records the trade as yours,
+`source: manual`, kept out of the agent's own score: a trade you decided
+on is not evidence about the agent, and letting it sit inside that score
+would make it a measurement of the two of you together — the exact thing
+the separate book exists to avoid.
+
+#### A bug worth recording
+
+The first version of this alert never ran at all. The page is one long
+script and the candle-read panel already had a `checkAlert`; a second
+function declaration with the same name silently **replaces** the first.
+So the new one was dead code, the old call site kept firing, and it was
+handed a payload with none of the fields it expected — it threw and took
+the whole poll down with it. Nothing about that is visible by reading
+either function on its own.
+
+Every name in the agreement alert now carries an `agree` prefix, and two
+tests fail the build on any duplicate top-level `function` or `const` in
+the page.
+
+### The book, as one file
+
 ### The book, as one file
 
 **Download the book** on the agent panel gives you a single CSV: a short
@@ -468,6 +520,9 @@ LOSS   |    -0.0 | candle_end  | long  | 3-0   | up   | up    | up    |      225
 Sort by `result` and the winners and losers sit in two blocks, with the
 effort, the shape, the levels and the hold time beside each one. That is
 the file to adjust from.
+
+There is a `source` column — `live`, `backfill` or `manual` — so the three
+kinds of evidence can be separated in the spreadsheet too.
 
 Positions still open are included and marked `open` rather than dropped.
 Leaving them out of a file you are going to count rows in is how a book

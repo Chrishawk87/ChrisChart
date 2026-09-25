@@ -113,7 +113,13 @@ CREATE TABLE IF NOT EXISTS paper_positions (
     r_multiple   REAL,
     mae_bps      REAL DEFAULT 0,
     mfe_bps      REAL DEFAULT 0,
-    held_s       REAL DEFAULT 0
+    held_s       REAL DEFAULT 0,
+    -- 'live' or 'backfill'. A backfilled trade was settled from one
+    -- minute bars after the fact; a live one was managed tick by tick.
+    -- Same rule, different resolution, and the scorecard must be able to
+    -- tell them apart or the two get averaged into a number that
+    -- describes neither.
+    source       TEXT NOT NULL DEFAULT 'live'
 );
 CREATE INDEX IF NOT EXISTS ix_pp_status ON paper_positions(status, coin);
 CREATE INDEX IF NOT EXISTS ix_pp_closed ON paper_positions(closed_at);
@@ -287,6 +293,11 @@ class Ledger(ThreadedDB):
             if col not in have:
                 conn.execute(
                     f"ALTER TABLE tuning_proposals ADD COLUMN {col} {decl}")
+        cols = {r["name"] for r in
+                conn.execute("PRAGMA table_info(paper_positions)")}
+        if "source" not in cols:
+            conn.execute("ALTER TABLE paper_positions ADD COLUMN "
+                         "source TEXT NOT NULL DEFAULT 'live'")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -357,6 +368,7 @@ class Ledger(ThreadedDB):
                       agreeing: int = 0, conviction: float = 0.0,
                       runway_bps: float = 0.0, size_usd: float = 0.0,
                       features: dict[str, Any] | None = None,
+                      source: str = "live",
                       now: float | None = None) -> OpenPosition | None:
         """Open one. Returns None if this candle already has a position.
 
@@ -373,13 +385,13 @@ class Ledger(ThreadedDB):
                     "candle_ts, opened_at, side, entry, target_px, stop_px, "
                     "target_bps, risk_bps, cost_bps, breakeven, grade, "
                     "grade_3way, agreeing, conviction, runway_bps, size_usd, "
-                    "features, status) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+                    "features, source, status) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
                     (pid, coin, interval, candle_ts, ts, side, entry,
                      target_px, stop_px, target_bps, risk_bps, cost_bps,
                      breakeven, grade, grade_3way, int(agreeing),
                      float(conviction), runway_bps, size_usd,
-                     json.dumps(features or {})))
+                     json.dumps(features or {}), source))
         except sqlite3.IntegrityError:
             return None
         return OpenPosition(
@@ -665,6 +677,7 @@ class Ledger(ThreadedDB):
                 "mae_bps": d.get("mae_bps"),
                 "runway_bps": d.get("runway_bps"),
                 "conviction": d.get("conviction"),
+                "source": d.get("source") or "live",
                 "id": d["id"],
             })
         return out
