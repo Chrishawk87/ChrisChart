@@ -132,6 +132,10 @@ KNOBS: dict[str, Knob] = {k.name: k for k in (
     # move. 1.0 is a normal amount; 2.0 is twice normal.
     Knob("min_effort", 0.0, 0.0, 10.0, 0.25, True,
          "how much volume must be behind the move, against normal"),
+    # How early to be flat. Exiting exactly AT the close assumes a fill at
+    # the closing print, which is not a price anyone gets.
+    Knob("exit_before_s", 5.0, 0.0, 120.0, 1.0, True,
+         "how many seconds before the candle closes it gets out"),
 )}
 
 
@@ -148,6 +152,7 @@ class Knobs:
     tp_bps: float = 20.0
     sl_bps: float = 15.0
     min_effort: float = 0.0
+    exit_before_s: float = 5.0
 
     @classmethod
     def from_overrides(cls, overrides: dict[str, float] | None) -> "Knobs":
@@ -446,11 +451,18 @@ class Autopilot:
         # independent test, so a trade that runs into the next one is
         # borrowing a result the next candle's signal should have earned.
         deadline = self._deadline(pos, payload)
-        if deadline and now >= deadline:
+        # Out BEFORE the close, not on it. Exiting at the deadline assumes
+        # a fill at the closing print, which is not a price anyone gets --
+        # and it leaves the position alive into the moment the next
+        # candle's reading starts forming.
+        out_at = deadline - self.knobs.exit_before_s if deadline else 0.0
+        if out_at and now >= out_at:
+            left = max(0.0, deadline - now)
             return self._close(
                 pos, price, "candle_end", now,
-                f"the {self._interval_word(payload)} candle it was opened "
-                f"on has closed — the read it was riding is over")
+                f"{left:.0f}s from the close of the "
+                f"{self._interval_word(payload)} candle it was opened on — "
+                f"out before the bar prints")
 
         quiet = read_dir == "flat"
         held = now - pos.opened_at

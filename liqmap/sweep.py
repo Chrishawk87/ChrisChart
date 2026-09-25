@@ -100,7 +100,8 @@ class Bar:
 
 def resolve(side: Side, entry: float, tp_bps: float, sl_bps: float,
             bars: Sequence[Bar], horizon: int = DEFAULT_HORIZON,
-            deadline: float = 0.0) -> tuple[Reason, float, int]:
+            deadline: float = 0.0, exit_before_s: float = 0.0
+            ) -> tuple[Reason, float, int]:
     """Walk forward until a level is touched, or the candle closes.
 
     `deadline` is when the signal's own candle ends. A trade never outlives
@@ -120,10 +121,12 @@ def resolve(side: Side, entry: float, tp_bps: float, sl_bps: float,
     target = entry * (1 + sgn * tp_bps / 10_000.0)
     stop = entry * (1 - sgn * sl_bps / 10_000.0)
 
+    out_at = (deadline - exit_before_s) if deadline else 0.0
     last_ok = bars[0]
     for i, b in enumerate(bars[:horizon]):
-        # Past the close of its own candle: out at the last price inside it.
-        if deadline and b.ts >= deadline:
+        # Out before the close, matching the live agent. A grid that holds
+        # to the closing print is testing a trade nobody can take.
+        if out_at and b.ts >= out_at:
             return ("candle_end", last_ok.close, max(1, i))
         last_ok = b
         if side == "long":
@@ -254,7 +257,8 @@ def run(signals: Sequence[Signal], bars: Sequence[Bar],
         cost_bps: float = 0.0, horizon: int = DEFAULT_HORIZON,
         min_agreeing: int = 0, max_against: int = 3,
         side: str = "both", min_effort: float = 0.0,
-        unanimous: bool = False) -> dict[str, Any]:
+        unanimous: bool = False, exit_before_s: float = 0.0
+        ) -> dict[str, Any]:
     """Score every pair over every signal.
 
     `min_agreeing` and `max_against` are for asking the question rather than
@@ -316,7 +320,8 @@ def run(signals: Sequence[Signal], bars: Sequence[Bar],
         for s, window in windows:
             reason, exit_px, held = resolve(s.side, s.entry, cell.tp_bps,
                                             cell.sl_bps, window, horizon,
-                                            deadline=s.deadline)
+                                            deadline=s.deadline,
+                                            exit_before_s=exit_before_s)
             raw = (exit_px - s.entry) / s.entry * 10_000.0
             gross = raw if s.side == "long" else -raw
             cell.add(reason, gross - cost_bps, held)

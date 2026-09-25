@@ -1882,6 +1882,25 @@ def test_drawn_lines_are_kept_per_market_and_timeframe(client):
     assert "chartData.coin" in key and "chartData.interval" in key
 
 
+def test_the_countdown_actually_ticks(client):
+    """A countdown that only moves when new data arrives is a clock that
+    lies between polls."""
+    html = client.get("/").text
+    assert "setInterval(() => {" in html
+    blk = html[html.index("/* A countdown that only moves"):]
+    blk = blk[:blk.index("}, 1000);")]
+    assert "drawChart()" in blk
+    # And it stops when nobody can see it.
+    assert "document.hidden" in blk and "pane.hidden" in blk
+
+
+def test_the_countdown_sits_on_the_price_scale(client):
+    html = client.get("/").text
+    assert "fmtLeft(left)" in html
+    draw = html[html.index("function drawChart()"):html.index("function drawCorner")]
+    assert "lastY + 18" in draw
+
+
 def test_hidden_tab_panes_are_actually_hidden(client):
     """`.grid{display:grid}` is an author rule and beats the browser's own
     `[hidden]{display:none}`, so every pane stayed on screen while

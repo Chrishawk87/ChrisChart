@@ -37,7 +37,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import (Depends, FastAPI, File, Header, HTTPException, Query,
                      UploadFile)
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import (HTMLResponse, JSONResponse,
+                               PlainTextResponse, Response)
 
 from . import consensus as consensus_mod
 from .bucket import build_map, render
@@ -93,6 +94,7 @@ class Runtime:
             "raw": True, "exit_on_invalidation": False,
             "tp_bps": 10.0, "sl_bps": 10.0, "unit": "bps",
             "require_unanimous": True, "min_effort": 2.0,
+            "exit_before_s": 5.0,
             "last_step": None, "last_decision": None, "steps": 0,
             "error": None}
         self._last_tune = 0.0
@@ -1184,7 +1186,9 @@ class Runtime:
             self.knobs(),
             tp_bps=float(self.autopilot.get("tp_bps") or 10.0),
             sl_bps=float(self.autopilot.get("sl_bps") or 10.0),
-            min_effort=float(self.autopilot.get("min_effort") or 0.0))
+            min_effort=float(self.autopilot.get("min_effort") or 0.0),
+            exit_before_s=float(
+                self.autopilot.get("exit_before_s") or 5.0))
         pilot.raw = bool(self.autopilot.get("raw", True))
         pilot.exit_on_invalidation = bool(
             self.autopilot.get("exit_on_invalidation", False))
@@ -2459,7 +2463,8 @@ def create_app() -> FastAPI:
                       sl_bps: float = 10.0, raw: bool = True,
                       exit_on_invalidation: bool = False,
                       unit: str = "bps", require_unanimous: bool = True,
-                      min_effort: float = 2.0) -> dict[str, Any]:
+                      min_effort: float = 2.0,
+                      exit_before_s: float = 5.0) -> dict[str, Any]:
         """Turn the agent's own book on or off.
 
         It keeps deciding whether or not anyone is watching. A record that
@@ -2478,6 +2483,7 @@ def create_app() -> FastAPI:
             "unit": unit if unit in ("bps", "ticks") else "bps",
             "require_unanimous": bool(require_unanimous),
             "min_effort": float(min_effort),
+            "exit_before_s": float(exit_before_s),
             "error": None})
         return {"ok": True, "autopilot": rt.autopilot,
                 "knobs": rt.knobs().to_dict(),
@@ -2583,6 +2589,57 @@ def create_app() -> FastAPI:
     def api_ledger_suspect() -> dict[str, Any]:
         rows = rt.ledger.suspect()
         return {"ok": True, "n": len(rows), "rows": rows[:50]}
+
+    @app.get("/api/ledger.csv", dependencies=[Depends(require_token)])
+    def api_ledger_csv(coin: str = "", interval: str = ""):
+        """Every trade, winners and losers, as one file you can open.
+
+        A summary block first, then one row per trade with the conditions
+        that produced it beside the outcome. Sort by `result` and the two
+        populations sit next to each other, which is the whole point.
+        """
+        import csv
+        import io as _io
+
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        rows = rt.ledger.export_rows(c, interval or None)
+        closed = [r for r in rows if r["result"] != "open"]
+        wins = [r for r in closed if r["result"] == "WIN"]
+        net = [r["net_bps"] for r in closed
+               if isinstance(r["net_bps"], (int, float))]
+
+        buf = _io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["ChrisChart — the agent's own book",
+                    datetime.now(timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M:%S UTC")])
+        w.writerow(["trades closed", len(closed)])
+        w.writerow(["winners", len(wins)])
+        w.writerow(["losers", len(closed) - len(wins)])
+        w.writerow(["hit rate",
+                    f"{len(wins) / len(closed):.1%}" if closed else "—"])
+        w.writerow(["net bps per trade",
+                    f"{sum(net) / len(net):+.2f}" if net else "—"])
+        w.writerow(["total net bps", f"{sum(net):+.1f}" if net else "—"])
+        w.writerow(["still open", len(rows) - len(closed)])
+        w.writerow([])
+        w.writerow(["Below: one row per trade. `result` first, then what "
+                    "was true when it was taken."])
+        w.writerow([])
+
+        if rows:
+            head = list(rows[0].keys())
+            w.writerow(head)
+            for r in rows:
+                w.writerow([r.get(k) for k in head])
+        else:
+            w.writerow(["no trades yet"])
+
+        name = f"chrischart-book-{c or 'all'}-" \
+               f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.csv"
+        return Response(
+            content=buf.getvalue(), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
     @app.get("/api/scorecard", dependencies=[Depends(require_token)])
     def api_scorecard(coin: str = "", interval: str = "") -> dict[str, Any]:
@@ -3899,6 +3956,8 @@ result from the grid transfers unchanged."><input type="checkbox"
           decide</button>
         <button onclick="stepAutopilot()">Decide once</button>
         <button onclick="loadScorecard()">Refresh score</button>
+        <button onclick="downloadBook()" title="Every trade, winners and
+losers, as one CSV you can open in a spreadsheet">Download the book</button>
         <button onclick="clearBook()" title="Throw the book away and start
 counting from now. Needed after a bad run has written results that cannot
 be true.">Clear the book</button>
@@ -4693,6 +4752,15 @@ function paintPosition(p) {
     + `${p.runway_bps.toFixed(0)}bps. `
     + `<button style="margin-left:6px" onclick="closePaper('${esc(p.id)}')">`
     + 'Close it by hand</button></div>';
+}
+
+function downloadBook() {
+  // A plain link rather than fetch-and-blob: the browser names the file
+  // from the header and puts it where downloads go.
+  const u = '/api/ledger.csv?' + q({coin: coin(), token: tok()});
+  const a = document.createElement('a');
+  a.href = u; a.download = '';
+  document.body.appendChild(a); a.click(); a.remove();
 }
 
 async function dropSuspect() {
@@ -5777,11 +5845,15 @@ function fmtDay(ts) {
   return d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
 }
 
+/* mm:ss, the way a bar countdown is read. Hours only when there are any. */
 function fmtLeft(sec) {
   const s = Math.max(0, Math.round(sec));
-  return s >= 3600 ? Math.floor(s / 3600) + 'h' + String(Math.floor(s / 60) % 60).padStart(2, '0')
-       : s >= 60 ? Math.floor(s / 60) + 'm' + String(s % 60).padStart(2, '0')
-       : s + 's';
+  const two = n => String(n).padStart(2, '0');
+  if (s >= 3600) {
+    return Math.floor(s / 3600) + ':' + two(Math.floor(s / 60) % 60)
+           + ':' + two(s % 60);
+  }
+  return Math.floor(s / 60) + ':' + two(s % 60);
 }
 
 /* A filled label against a scale, the way a trading chart marks a price.
@@ -5977,6 +6049,18 @@ function drawChart() {
   axisChip(g, CH_PAD.l + plotW + 1, lastY, chPx(last.c),
            lastUp ? up : down, bg, 'left');
 
+  // The bar countdown, on the scale directly under the price, which is
+  // where TradingView puts it and where the eye already is. Under thirty
+  // seconds it turns red: on a chart where every trade is out before the
+  // close, the last half minute is the part you act on.
+  if (last.live && chartData.interval_s) {
+    const left = last.ts + chartData.interval_s - Date.now() / 1000;
+    if (left > -60) {
+      axisChip(g, CH_PAD.l + plotW + 1, lastY + 18, fmtLeft(left),
+               left < 30 ? down : dim, bg, 'left');
+    }
+  }
+
   /* ---- the agent's trades, ON the candle ---------------------------- */
 
   for (const m of (chartData.marks || [])) {
@@ -6100,7 +6184,7 @@ function drawCorner(g, o) {
     const left = b.ts + chartData.interval_s - Date.now() / 1000;
     g.font = '600 11px ui-sans-serif,system-ui,sans-serif';
     g.fillStyle = left < 30 ? o.down : o.accent;
-    g.fillText(fmtLeft(left) + ' left', x, yy);
+    g.fillText(fmtLeft(left) + ' to close', x, yy);
   }
 
   // A trade under the cursor gets a second line, in the same place.
@@ -6337,6 +6421,22 @@ async function loadChart() {
 }
 
 window.addEventListener('resize', () => { if (chartData) drawChart(); });
+
+/* A countdown that only moves when new data arrives is a clock that lies
+   between polls. One redraw a second, and only while the chart is on
+   screen — a hidden canvas has nothing to say and a background tab should
+   not be burning frames. */
+setInterval(() => {
+  if (!chartData || !chartData.interval_s) return;
+  if (document.hidden) return;
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return;
+  const wrap = $('chartWrap');
+  if (!wrap || wrap.style.display === 'none') return;
+  const bars = chartData.bars || [];
+  if (!bars.length || !bars[bars.length - 1].live) return;
+  drawChart();
+}, 1000);
 
 /* ---- book vs price: the table ---------------------------------------- */
 

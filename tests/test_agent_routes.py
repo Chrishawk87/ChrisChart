@@ -650,6 +650,43 @@ def test_the_forming_bar_is_marked_live(client, monkeypatch):
     assert "seeded" in forming[0]
 
 
+def test_the_book_downloads_as_one_csv(client):
+    """One file, winners and losers, openable in a spreadsheet."""
+    rt = web.runtime()
+    pos = rt.ledger.open_position(
+        coin="BTC", interval="15m", candle_ts=1.0, side="long", entry=100.0,
+        target_px=100.1, stop_px=99.9, target_bps=10.0, risk_bps=10.0,
+        cost_bps=2.0, agreeing=3,
+        features={"vote_shape": "3-0", "vote_book": 0.5, "vote_delta": 0.4,
+                  "vote_price": 0.6, "effort": 3.0},
+        now=10.0)
+    rt.ledger.close_position(pos, exit_px=100.1, reason="target", now=20.0)
+
+    r = client.get("/api/ledger.csv", headers=AUTH)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/csv")
+    assert "attachment" in r.headers["content-disposition"]
+    assert ".csv" in r.headers["content-disposition"]
+
+    body = r.text
+    assert "trades closed,1" in body
+    assert "winners,1" in body
+    # The outcome leads, then the conditions that produced it.
+    head = [ln for ln in body.splitlines() if ln.startswith("result,")]
+    assert head, "no header row"
+    cols = head[0].split(",")
+    assert cols[0] == "result" and "net_bps" in cols
+    for needed in ("shape", "book", "delta", "price", "effort_pct",
+                   "exit_reason", "target_bps", "stop_bps"):
+        assert needed in cols, f"{needed} missing from the file"
+    assert "WIN" in body
+
+
+def test_an_empty_book_still_downloads(client):
+    r = client.get("/api/ledger.csv", headers=AUTH)
+    assert r.status_code == 200 and "no trades yet" in r.text
+
+
 def test_the_agents_trades_are_plotted_entry_to_exit(client, monkeypatch):
     """The chart draws the AGENT'S BOOK, not the old suggestion table.
 

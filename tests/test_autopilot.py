@@ -690,3 +690,77 @@ def test_the_refusals_are_still_recorded(ledger):
     p.step(_paid(_unanimous(candle_ts=2.0), 0.5), now=200.0)
     gates = {r["gate"] for r in ledger.decisions(action="stand_aside")}
     assert gates == {"not_unanimous", "not_paid_for"}
+
+
+# -------------------------------------------------- out before the close
+
+def test_it_is_flat_before_the_candle_prints(ledger):
+    """Exiting AT the close assumes a fill at the closing print, which is
+    not a price anyone gets — and it leaves the position alive into the
+    moment the next candle's reading starts forming."""
+    p = Autopilot("ETH", "15m", ledger,
+                  knobs=Knobs(invalidate_s=999.0, exit_before_s=10.0))
+    p.step(payload(candle_ts=9000.0), now=9100.0)
+    assert p.step(payload(candle_ts=9000.0), now=9880.0).action == "hold"
+    d = p.step(payload(candle_ts=9000.0), now=9891.0)     # 9s before 9900
+    assert d.action == "exit" and d.closed["reason"] == "candle_end"
+
+
+def test_the_target_is_what_normally_takes_it_out(ledger):
+    """The candle close is the backstop, not the plan."""
+    p = Autopilot("ETH", "15m", ledger,
+                  knobs=Knobs(tp_bps=10.0, sl_bps=10.0, invalidate_s=999.0))
+    p.step(payload(candle_ts=9000.0, entry=100.0), now=9100.0)
+    tgt = p.position.target_px
+    d = p.step(payload(candle_ts=9000.0, entry=100.0), now=9200.0,
+               high=tgt + 0.01, low=99.99)
+    assert d.action == "exit" and d.closed["reason"] == "target"
+    assert d.closed["net_bps"] > 0
+
+
+def test_a_zero_buffer_still_gets_out_at_the_close(ledger):
+    p = Autopilot("ETH", "15m", ledger,
+                  knobs=Knobs(invalidate_s=999.0, exit_before_s=0.0))
+    p.step(payload(candle_ts=9000.0), now=9100.0)
+    assert p.step(payload(candle_ts=9000.0), now=9899.0).action == "hold"
+    assert p.step(payload(candle_ts=9000.0),
+                  now=9901.0).closed["reason"] == "candle_end"
+
+
+def test_the_export_carries_the_outcome_and_the_conditions(ledger):
+    """One row per trade, result first, then what was true when it was
+    taken — so sorting by result puts the two populations side by side."""
+    pos = ledger.open_position(
+        coin="ETH", interval="15m", candle_ts=9000.0, side="long",
+        entry=100.0, target_px=100.1, stop_px=99.9, target_bps=10.0,
+        risk_bps=10.0, cost_bps=2.0, breakeven=0.6, agreeing=3,
+        features={"vote_shape": "3-0", "vote_book": 0.5, "vote_delta": 0.4,
+                  "vote_price": 0.6, "effort": 3.2, "unit": "bps"},
+        now=9100.0)
+    ledger.close_position(pos, exit_px=100.1, reason="target", now=9200.0)
+    ledger.open_position(coin="ETH", interval="15m", candle_ts=9900.0,
+                         side="short", entry=100.0, target_px=99.9,
+                         stop_px=100.1, target_bps=10.0, risk_bps=10.0,
+                         now=9950.0)
+
+    rows = ledger.export_rows()
+    assert len(rows) == 2
+    done = rows[0]
+    assert done["result"] == "WIN"
+    assert done["net_bps"] == pytest.approx(8.0, abs=0.01)
+    assert done["book"] == "up" and done["delta"] == "up"
+    assert done["effort_pct"] == pytest.approx(320.0)
+    assert done["exit_reason"] == "target"
+    assert done["opened_at"].startswith("1970-")
+    # The one still running is in the file and marked, not quietly dropped.
+    assert rows[1]["result"] == "open" and rows[1]["net_bps"] is None
+
+
+def test_a_loser_is_labelled_a_loser(ledger):
+    pos = ledger.open_position(
+        coin="ETH", interval="15m", candle_ts=1.0, side="long", entry=100.0,
+        target_px=100.1, stop_px=99.9, target_bps=10.0, risk_bps=10.0,
+        cost_bps=2.0, now=10.0)
+    ledger.close_position(pos, exit_px=99.9, reason="stop", now=20.0)
+    r = ledger.export_rows()[0]
+    assert r["result"] == "LOSS" and r["net_bps"] < 0

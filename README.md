@@ -409,6 +409,39 @@ Expect this to trade rarely. That is the point of it, but it means the
 scorecard will say "too few to read" for a good while; the gate audit under
 *What it refused* is the interesting panel in the meantime.
 
+#### How a trade ends
+
+In order of what normally happens:
+
+1. **The target** — 5 or 10, in bps or in the market's own ticks. This is
+   the plan and it is what takes most trades out.
+2. **The stop**, if price goes the other way first. A bar that touches both
+   inside one minute counts as the stop, in the live agent and in the grid
+   alike — nothing in OHLC says which came first.
+3. **The candle close** is the backstop, not the plan. Whatever has not
+   resolved is out `exit_before_s` seconds before the bar prints (5 by
+   default). Exiting exactly AT the close assumes a fill at the closing
+   print, which is not a price anyone gets, and it leaves the position
+   alive into the moment the next candle's reading starts forming.
+
+The grid takes the same buffer, so a result there is a result for the
+trade the agent actually takes.
+
+#### What the arithmetic asks of you
+
+Worth knowing before a week of data arrives, because the tool will report
+it and it is better not to be surprised by it. With a symmetric target and
+stop, breakeven hit rate is `(stop + cost) / (target + stop)`:
+
+    10bps target, 10bps stop, 2bps round trip  ->  needs 60%
+    5bps target,  5bps stop,  2bps round trip  ->  needs 70%
+
+A winner nets +8 and a loser nets −12 on the first line. That is not an
+argument against small targets — it is the number to watch, and it is the
+`needed` column on every row of the scorecard. Two things move it: a lower
+round-trip cost, or a target further than the stop. The grid is there to
+find out which pairs actually clear it on your own candles.
+
 #### One thing this exposed
 
 Agreement is counted from the three **directions**, which is what the panel
@@ -417,6 +450,28 @@ sum — so a column reporting a direction whose strength rounded to zero
 contributed nothing and was treated as flat. The screen would have said all
 three agree while the agent stood aside on "only 2 of 3". Strength still
 decides the *side* when columns disagree; direction decides who agrees.
+
+### The book, as one file
+
+**Download the book** on the agent panel gives you a single CSV: a short
+summary block — trades closed, winners, losers, hit rate, net bps a trade,
+total — then one row per trade with the outcome first and the conditions
+that produced it beside it.
+
+```
+result | net_bps | exit_reason | side  | shape | book | delta | price | effort_pct
+LOSS   |   -12.0 | stop        | short | 3-0   | down | down  | down  |      486.8
+WIN    |    +8.0 | target      | short | 3-0   | down | down  | down  |      400.9
+LOSS   |    -0.0 | candle_end  | long  | 3-0   | up   | up    | up    |      225.5
+```
+
+Sort by `result` and the winners and losers sit in two blocks, with the
+effort, the shape, the levels and the hold time beside each one. That is
+the file to adjust from.
+
+Positions still open are included and marked `open` rather than dropped.
+Leaving them out of a file you are going to count rows in is how a book
+quietly looks better than it is.
 
 ### The grid
 
@@ -529,8 +584,13 @@ Built the way a trading chart is built, because that is what it is for:
 - **Last price** as a dashed line carried to a filled label on the scale.
 - **Crosshair labels on both scales** — price on the right, date and time
   underneath. A crosshair with a price but no time is half a crosshair.
-- **Countdown on the forming bar.** On a chart where every trade dies with
-  its candle, the time left is not decoration.
+- **Countdown on the forming bar**, on the price scale directly under the
+  last-price label, where TradingView puts it. It ticks every second —
+  a countdown that only moves when new data arrives is a clock that lies
+  between polls — and it stops when the tab is hidden or the chart is on
+  another tab. Under thirty seconds it turns red, because on a chart
+  where every trade is out before the close, the last half minute is the
+  part you act on.
 - **Volume in its own pane** under the price pane, coloured by bar, with
   its own scale. This replaced the side-gutter profile, which competed for
   space with the live bar.

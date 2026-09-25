@@ -156,6 +156,26 @@ def _uid() -> str:
     return uuid.uuid4().hex[:16]
 
 
+def _iso(ts: Any) -> str | None:
+    """A timestamp a spreadsheet will sort correctly."""
+    if not isinstance(ts, (int, float)) or ts <= 0:
+        return None
+    from datetime import datetime, timezone
+    return (datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            .strftime("%Y-%m-%d %H:%M:%S"))
+
+
+def _dir(signed: Any, fallback: Any) -> str | None:
+    """A column's direction in words, from whichever field carried it."""
+    if isinstance(signed, (int, float)) and signed:
+        return "up" if signed > 0 else "down"
+    if fallback in ("up", "down", "flat"):
+        return fallback
+    if isinstance(signed, (int, float)):
+        return "flat"
+    return None
+
+
 def _row(r: sqlite3.Row | None) -> dict[str, Any] | None:
     return dict(r) if r is not None else None
 
@@ -582,6 +602,72 @@ class Ledger(ThreadedDB):
             (int(limit),)).fetchall()]
 
     # --------------------------------------------------------------- misc
+
+    def export_rows(self, coin: str | None = None,
+                    interval: str | None = None) -> list[dict[str, Any]]:
+        """Every trade, flattened, newest last. One row, one trade.
+
+        Built to be opened in a spreadsheet and sorted: the outcome is
+        first, then the conditions that produced it. Open positions are
+        included and marked, because leaving them out of a file you are
+        going to count rows in is how a book quietly looks better than it
+        is.
+        """
+        sql = "SELECT * FROM paper_positions WHERE 1=1"
+        args: list[Any] = []
+        if coin:
+            sql += " AND coin = ?"; args.append(coin)
+        if interval:
+            sql += " AND interval = ?"; args.append(interval)
+        sql += " ORDER BY opened_at ASC"
+
+        out = []
+        for r in self._conn.execute(sql, args).fetchall():
+            d = dict(r)
+            f = json.loads(d.get("features") or "{}")
+            net = d.get("net_bps")
+            closed = d["status"] == "closed"
+            out.append({
+                "result": ("open" if not closed
+                           else "WIN" if (net or 0) > 0 else "LOSS"),
+                "net_bps": round(net, 3) if net is not None else None,
+                "gross_bps": (round(d["gross_bps"], 3)
+                              if d.get("gross_bps") is not None else None),
+                "r_multiple": d.get("r_multiple"),
+                "exit_reason": d.get("exit_reason"),
+                "opened_at": _iso(d["opened_at"]),
+                "closed_at": _iso(d.get("closed_at")),
+                "held_s": d.get("held_s"),
+                "coin": d["coin"],
+                "interval": d["interval"],
+                "candle_open": _iso(d["candle_ts"]),
+                "side": d["side"],
+                "shape": f.get("vote_shape") or d.get("grade"),
+                "book": _dir(f.get("vote_book"), f.get("book_dir")),
+                "delta": _dir(f.get("vote_delta"), f.get("delta_dir")),
+                "price": _dir(f.get("vote_price"), f.get("price_dir")),
+                "agreeing": d.get("agreeing"),
+                "against": f.get("vote_against"),
+                "effort_pct": (round(f["effort"] * 100, 1)
+                               if isinstance(f.get("effort"), (int, float))
+                               else None),
+                "entry": d["entry"],
+                "target_px": d["target_px"],
+                "stop_px": d["stop_px"],
+                "exit_px": d.get("exit_px"),
+                "target_bps": round(d["target_bps"], 3),
+                "stop_bps": round(d["risk_bps"], 3),
+                "unit_set": f.get("unit"),
+                "tick": f.get("tick"),
+                "cost_bps": d.get("cost_bps"),
+                "breakeven": d.get("breakeven"),
+                "mfe_bps": d.get("mfe_bps"),
+                "mae_bps": d.get("mae_bps"),
+                "runway_bps": d.get("runway_bps"),
+                "conviction": d.get("conviction"),
+                "id": d["id"],
+            })
+        return out
 
     def counts(self) -> dict[str, int]:
         def one(sql: str, args: Sequence[Any] = ()) -> int:
