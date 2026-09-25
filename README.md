@@ -619,6 +619,23 @@ a market that has not moved makes the ratio undefined rather than infinite.
 The pane draws a gap there, because a line pinned at zero would be a claim
 about a market that has told us nothing.
 
+### Making it bigger
+
+Two independent ways, because they answer different questions:
+
+- **Drag a pane divider.** Each divider carries a grab handle at its
+  centre and the cursor changes to `ns-resize` over it. Dragging up makes
+  the pane below it taller, which is the direction every charting tool
+  uses. The price pane gives up whatever the lower panes take, down to a
+  floor — dragging far enough would otherwise leave the candles a few
+  pixels tall, at which point the chart stops being a chart.
+- **Drag the chart's bottom-right corner** for a taller chart overall.
+  The dividers then split whatever height it has.
+
+Both are remembered per browser. The canvas is redrawn on resize rather
+than left to scale its own bitmap, which would make a taller chart a
+blurrier one instead of a bigger one.
+
 ### Colours
 
 Your blue and orange, nudged into the palette's lightness band:

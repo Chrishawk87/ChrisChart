@@ -4170,9 +4170,15 @@ bars">ppo</button>
           <span class="thin" style="margin-left:6px">lines are kept per
             market and timeframe, in this browser</span>
         </div>
-        <canvas id="sugChart" height="470"
-          style="width:100%;height:470px;display:block;
-                 border:1px solid var(--line);border-radius:4px"></canvas>
+        <!-- The wrapper carries the resize handle, so the whole chart can
+             be dragged taller; the dividers inside then split whatever
+             height it has. -->
+        <div id="chartBox" style="height:470px;min-height:240px;
+             max-height:1400px;resize:vertical;overflow:hidden;
+             border:1px solid var(--line);border-radius:4px">
+          <canvas id="sugChart" height="470"
+            style="width:100%;height:100%;display:block"></canvas>
+        </div>
         <!-- A legend, not a caption. Identity is never carried by colour
              alone: filled vs hollow says taken vs ignored, and the arrow
              direction says which side. -->
@@ -6113,9 +6119,15 @@ let chartShapes = [];       // what has been drawn, for this market+timeframe
 let chartScale = null;      // {hi, lo, top, plotH}
 
 const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
-const CH_VOL = 0.24;        // share of the plot height the volume pane takes
-const CH_PPO = 0.26;        // ... and the indicator pane, when it is on
+/* Pane heights, as a share of the drawing area. Drag either divider to
+   change them: the price pane gives up whatever the other two take, and
+   both are clamped so no pane can be squeezed to nothing or swallow the
+   chart. Kept per browser, because it is a preference about this screen
+   rather than anything the agent reads. */
 const CH_GAP = 8;           // breathing room between panes
+const PANE_MIN = 0.08, PANE_MAX = 0.6, PRICE_MIN = 0.25;
+let volShare = 0.24;
+let ppoShare = 0.26;
 let chartPPO = true;        // Chris's Tick Counter PPO in its own pane
 /* Your blue and orange from the Pine, nudged into the palette's lightness
    band so both sit properly against this surface. Validated: they hold
@@ -6123,6 +6135,37 @@ let chartPPO = true;        // Chris's Tick Counter PPO in its own pane
    small pane need. */
 const PPO_LINE_COL = '#4d8fd1';
 const PPO_SIGNAL_COL = '#c17d33';
+
+/* Which divider the pointer is on, if any. The grab zone is wider than
+   the line: a one pixel target is a line you fight rather than drag. */
+function dividerAt(pt) {
+  const g = chartGeom();
+  if (pt.x < CH_PAD.l || pt.x > CH_PAD.l + g.plotW) return null;
+  if (Math.abs(pt.y - g.volTop) <= 6) return 'vol';
+  if (g.ppoOn && Math.abs(pt.y - g.ppoTop) <= 6) return 'ppo';
+  return null;
+}
+
+function savePanes() {
+  try {
+    localStorage.setItem('liqmap_panes',
+      JSON.stringify({v: volShare, p: ppoShare}));
+  } catch (e) {}
+}
+
+function loadPanes() {
+  try {
+    const raw = localStorage.getItem('liqmap_panes');
+    if (!raw) return;
+    const o = JSON.parse(raw);
+    if (typeof o.v === 'number') {
+      volShare = Math.max(PANE_MIN, Math.min(PANE_MAX, o.v));
+    }
+    if (typeof o.p === 'number') {
+      ppoShare = Math.max(PANE_MIN, Math.min(PANE_MAX, o.p));
+    }
+  } catch (e) {}
+}
 
 function chartKey() {
   return 'liqmap_draw_' + (chartData ? chartData.coin : '?') + '_'
@@ -6157,8 +6200,17 @@ function chartGeom() {
   const inner = h - CH_PAD.t - CH_PAD.b;
   const on = chartPPO && chartData && chartData.tick_ppo
              && chartData.tick_ppo.ready;
-  const volH = Math.round(inner * CH_VOL);
-  const ppoH = on ? Math.round(inner * CH_PPO) : 0;
+  // Whatever the lower panes are set to, the price pane keeps a floor.
+  // Without this, dragging far enough leaves the candles a few pixels
+  // tall and the chart stops being a chart.
+  let v = volShare, pp = on ? ppoShare : 0;
+  const room = 1 - PRICE_MIN;
+  if (v + pp > room) {
+    const k = room / (v + pp);
+    v *= k; pp *= k;
+  }
+  const volH = Math.round(inner * v);
+  const ppoH = Math.round(inner * pp);
   const gaps = on ? CH_GAP * 2 : CH_GAP;
   const plotH = inner - volH - ppoH - gaps;
   const volTop = CH_PAD.t + plotH + CH_GAP;
@@ -6316,12 +6368,26 @@ function drawChart() {
     lastDay = day;
   }
 
-  // The line between the two panes, so the volume reads as its own scale.
-  g.strokeStyle = line; g.globalAlpha = 0.8;
-  g.beginPath();
-  g.moveTo(CH_PAD.l, Math.round(volTop) - 0.5);
-  g.lineTo(CH_PAD.l + plotW, Math.round(volTop) - 0.5);
-  g.stroke(); g.globalAlpha = 1;
+  // The line between panes, so each reads as its own scale — with a grab
+  // handle on it, because a divider you can drag and cannot see is a
+  // feature nobody finds.
+  const divider = yy2 => {
+    g.strokeStyle = line; g.globalAlpha = 0.8;
+    g.beginPath();
+    g.moveTo(CH_PAD.l, Math.round(yy2) - 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(yy2) - 0.5);
+    g.stroke(); g.globalAlpha = 1;
+    const cx = CH_PAD.l + plotW / 2;
+    g.strokeStyle = dim; g.globalAlpha = 0.55; g.lineWidth = 2;
+    for (const off of [-2, 2]) {
+      g.beginPath();
+      g.moveTo(cx - 9, Math.round(yy2) + off + 0.5);
+      g.lineTo(cx + 9, Math.round(yy2) + off + 0.5);
+      g.stroke();
+    }
+    g.lineWidth = 1; g.globalAlpha = 1;
+  };
+  divider(volTop);
 
   /* ---- volume pane -------------------------------------------------- */
 
@@ -6516,11 +6582,7 @@ function drawChart() {
     m = m || 1;
     const py = v => ppoTop + ppoH / 2 - (v / m) * (ppoH / 2 - 2);
 
-    g.strokeStyle = line; g.globalAlpha = 0.8;
-    g.beginPath();
-    g.moveTo(CH_PAD.l, Math.round(ppoTop) - 0.5);
-    g.lineTo(CH_PAD.l + plotW, Math.round(ppoTop) - 0.5);
-    g.stroke(); g.globalAlpha = 1;
+    divider(ppoTop);
 
     // The histogram first, so the lines sit over it.
     const zero = py(0);
@@ -6724,6 +6786,10 @@ function wireChart() {
     const p = chartPoint(ev);
     chartHover = p;
     if (chartDraft) { chartDraft.x2 = p.x; chartDraft.y2 = p.y; }
+    if (!drag) {
+      cv.style.cursor = dividerAt(p) ? 'ns-resize'
+        : chartTool === 'cursor' ? 'crosshair' : 'copy';
+    }
     drawChart();
   });
   cv.addEventListener('mouseleave', () => { chartHover = null; drawChart(); });
@@ -6748,6 +6814,15 @@ function wireChart() {
   const down = ev => {
     const p = chartPoint(ev);
     const {plotW} = chartGeom();
+
+    // A divider grab beats every tool: it is the only thing on that line.
+    const div = dividerAt(p);
+    if (div) {
+      const g = chartGeom();
+      drag = {pane: div, y: p.y, vol: volShare, ppo: ppoShare,
+              inner: Math.max(1, g.h - CH_PAD.t - CH_PAD.b)};
+      return;
+    }
     // Past the plot is the price scale: drag it to squash or stretch.
     if (p.x > CH_PAD.l + plotW) {
       drag = {axis: true, y: p.y, scale: chartView.scale};
@@ -6770,6 +6845,20 @@ function wireChart() {
   const move = ev => {
     if (!drag) return;
     const p = chartPoint(ev);
+    if (drag.pane) {
+      // Dragging a divider UP makes the pane below it taller, which is
+      // the direction every charting tool uses.
+      const d = (drag.y - p.y) / drag.inner;
+      const clamp = x => Math.max(PANE_MIN, Math.min(PANE_MAX, x));
+      if (drag.pane === 'ppo') {
+        ppoShare = clamp(drag.ppo + d);
+      } else {
+        volShare = clamp(drag.vol + d);
+      }
+      savePanes();
+      drawChart();
+      return;
+    }
     if (drag.axis) {
       // Down squashes, up stretches — the direction every chart uses.
       chartView.scale = Math.max(0.15,
@@ -6867,7 +6956,7 @@ async function loadChart() {
   }
   const fresh = !prev || prev.coin !== d.coin || prev.interval !== d.interval;
   chartData = d;
-  if (fresh) { loadShapes(); loadPPOPref(); resetChartView(); }
+  if (fresh) { loadShapes(); loadPPOPref(); loadPanes(); resetChartView(); }
 
   wireChart();
   drawChart();
@@ -6875,10 +6964,31 @@ async function loadChart() {
   $('chartNote').innerHTML =
       `${esc(chartData.source || '')} · ${n} trade${n === 1 ? '' : 's'} · `
     + 'scroll to zoom · drag to pan · drag the price scale to stretch · '
-    + 'double-click to reset';
+    + 'drag a pane divider to resize it · drag the bottom-right corner for '
+    + 'a taller chart · double-click to reset';
 }
 
 window.addEventListener('resize', () => { if (chartData) drawChart(); });
+
+/* Dragging the box's corner changes its height, and the canvas has to be
+   told: a canvas element scales its bitmap to fit unless you redraw it,
+   which turns a taller chart into a blurrier one. */
+(() => {
+  const box = $('chartBox');
+  if (!box || !window.ResizeObserver) return;
+  let last = 0;
+  new ResizeObserver(() => {
+    const h = box.clientHeight;
+    if (h === last) return;
+    last = h;
+    try { localStorage.setItem('liqmap_charth', String(h)); } catch (e) {}
+    if (chartData) drawChart();
+  }).observe(box);
+  try {
+    const saved = parseInt(localStorage.getItem('liqmap_charth') || '0', 10);
+    if (saved >= 240 && saved <= 1400) box.style.height = saved + 'px';
+  } catch (e) {}
+})();
 
 /* A countdown that only moves when new data arrives is a clock that lies
    between polls. One redraw a second, and only while the chart is on

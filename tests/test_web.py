@@ -1853,7 +1853,8 @@ def test_the_chart_carries_both_crosshair_labels(client):
 
 def test_the_chart_has_a_volume_pane_not_a_side_profile(client):
     html = client.get("/").text
-    assert "volTop" in html and "CH_VOL" in html
+    # `CH_VOL` became `volShare` when the panes were made draggable.
+    assert "volTop" in html and "volShare" in html
     # The old side-gutter profile is gone; it competed with the live bar.
     assert "CH_PROF" not in html
 
@@ -1909,6 +1910,48 @@ def test_the_agent_reads_the_panels_own_candle_and_size(client):
     fn = fn[:fn.index("async function toggleAutopilot")]
     assert "$('sInt')" in fn and "$('sSize')" in fn and "$('sFee')" in fn
     assert "apInt" not in html and "apSize" not in html
+
+
+def test_the_panes_can_be_resized_and_the_price_pane_keeps_a_floor(client):
+    """Dragging far enough would otherwise leave the candles a few pixels
+    tall, at which point the chart stops being a chart."""
+    html = client.get("/").text
+    geom = html[html.index("function chartGeom()"):]
+    geom = geom[:geom.index("function chartSlice")]
+    assert "PRICE_MIN" in geom and "const room = 1 - PRICE_MIN" in geom
+    assert "volShare" in geom and "ppoShare" in geom
+
+
+def test_a_divider_has_a_grab_zone_wider_than_its_line(client):
+    """A one pixel target is a line you fight rather than drag."""
+    html = client.get("/").text
+    fn = html[html.index("function dividerAt(pt)"):]
+    fn = fn[:fn.index("function savePanes")]
+    assert "<= 6" in fn
+
+
+def test_dragging_a_divider_beats_the_drawing_tools(client):
+    """It is the only thing on that line, so it cannot be ambiguous."""
+    html = client.get("/").text
+    fn = html[html.index("const down = ev => {"):]
+    fn = fn[:fn.index("const move = ev => {")]
+    i_div = fn.index("dividerAt(p)")
+    assert i_div < fn.index("chartTool === 'hline'")
+
+
+def test_pane_sizes_and_chart_height_are_remembered(client):
+    html = client.get("/").text
+    assert "liqmap_panes" in html and "liqmap_charth" in html
+
+
+def test_the_chart_box_redraws_when_it_is_resized(client):
+    """A canvas scales its bitmap to fit unless you redraw it, which turns
+    a taller chart into a blurrier one."""
+    html = client.get("/").text
+    assert "ResizeObserver" in html
+    blk = html[html.index("const box = $('chartBox');"):]
+    blk = blk[:blk.index("})();")]
+    assert "drawChart()" in blk
 
 
 def test_the_indicator_pane_shares_one_scale(client):
