@@ -92,25 +92,37 @@ def realised_sigma_bps(bars: Sequence[Any], interval_s: float,
     return per_bar / math.sqrt(interval_s) if interval_s > 0 else 0.0
 
 
-def drift_from_read(net: float, sigma_bps_s: float, k: float = 0.15
-                    ) -> float:
-    """Per-second drift the microstructure read implies, in basis points.
+def drift_from_read(net: float, sigma_bps_s: float, remaining_s: float,
+                    k: float = 0.08) -> float:
+    """Per-second drift the read implies, in basis points.
 
-    Expressed as a fraction of one second's volatility rather than as an
-    absolute number, so the same coefficient means the same thing on a
-    quiet market and a busy one.
+    `k` is what the signal claims as a fraction of the REMAINING WINDOW's
+    standard deviation -- not per second. That distinction is the whole
+    thing, and getting it wrong is silent:
 
-    `k` is the one free parameter and it is deliberately small. It is not
-    a guess that has to be right -- calibration measures it. A `k` that is
-    too large shows up immediately as an over-confident, badly calibrated
-    projection, which is exactly the feedback wanted.
+        expected move = k * squash(net) * sigma * sqrt(T)
+
+    A per-second drift accumulates linearly in T while the noise around
+    it only grows as sqrt(T), so the same coefficient claims more and more
+    as the horizon lengthens. At k = 0.15 per second, a fifteen minute bar
+    was being told to expect a 3.4 sigma move -- an assertion no market
+    makes and no calibration could survive. The first version of this
+    shipped that way, and it read as "the signal is actively hurting" on
+    data where the signal was real, because a wildly over-confident drift
+    is worse than no drift whichever way it points.
+
+    Stated this way `k` is dimensionless and horizon-invariant: 0.08 means
+    "about eight percent of a standard deviation", which is roughly what a
+    genuine microstructure edge is worth and small enough that being
+    wrong about it costs little.
     """
-    if sigma_bps_s <= 0:
+    if sigma_bps_s <= 0 or remaining_s <= 0:
         return 0.0
     # The vote's net is roughly [-3, 3]; squash it so a huge reading does
     # not produce a drift the market has never delivered.
     squashed = math.tanh(net / 1.5)
-    return k * squashed * sigma_bps_s
+    move = k * squashed * sigma_bps_s * math.sqrt(remaining_s)
+    return move / remaining_s
 
 
 def _quantiles(xs: list[float], qs: Sequence[float] = QUANTILES
@@ -153,7 +165,7 @@ def _simulate(price: float, high_so_far: float, low_so_far: float,
 
 def project(*, price: float, open_px: float, high_so_far: float,
             low_so_far: float, remaining_s: float, sigma_bps_s: float,
-            net: float = 0.0, k: float = 0.15, paths: int = PATHS,
+            net: float = 0.0, k: float = 0.08, paths: int = PATHS,
             seed: int | None = None) -> dict[str, Any]:
     """Where this bar closes, with the signal and without it.
 
@@ -176,7 +188,7 @@ def project(*, price: float, open_px: float, high_so_far: float,
 
     steps = max(1, min(MAX_STEPS, int(remaining_s)))
     dt = remaining_s / steps
-    drift = drift_from_read(net, sigma_bps_s, k)
+    drift = drift_from_read(net, sigma_bps_s, remaining_s, k)
 
     with_signal = _simulate(price, high_so_far, low_so_far, steps, dt,
                             sigma_bps_s, drift, paths, rng)
@@ -189,8 +201,11 @@ def project(*, price: float, open_px: float, high_so_far: float,
 
     out.update({
         "ready": True,
-        "drift_bps_s": round(drift, 6),
+        "drift_bps_s": round(drift, 8),
         "expected_move_bps": round(drift * remaining_s, 3),
+        "expected_move_sd": round(
+            (drift * remaining_s) / (sigma_bps_s * math.sqrt(remaining_s)), 4)
+        if sigma_bps_s > 0 else 0.0,
         "signal": {k2: v for k2, v in with_signal.items() if k2 != "samples"},
         "null": {k2: v for k2, v in flat.items() if k2 != "samples"},
         "_signal_samples": with_signal["samples"],
@@ -345,3 +360,75 @@ def _f(bar: Any, short: str, long: str) -> float:
         return float(v or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+# --------------------------------------------------------------------------
+# does it predict the direction at all
+# --------------------------------------------------------------------------
+
+def _wilson(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    if n <= 0:
+        return (0.0, 1.0)
+    p = wins / n
+    z2 = z * z
+    den = 1.0 + z2 / n
+    mid = (p + z2 / (2 * n)) / den
+    half = (z / den) * math.sqrt(p * (1 - p) / n + z2 / (4 * n * n))
+    return (max(0.0, mid - half), min(1.0, mid + half))
+
+
+def directional_edge(rows: Sequence[dict]) -> dict[str, Any]:
+    """When the read leans one way, does the bar finish that way?
+
+    A separate question from whether the bands are honest, and the one
+    actually being asked. PIT calibration grades the SHAPE of the
+    forecast, so a small directional edge barely moves it -- a drift of a
+    few percent of a standard deviation leaves the histogram almost
+    exactly as flat as it was. Measuring the bands and concluding the
+    signal is worthless would be a mistake of instrument, not of data.
+
+    This is a plain binomial on the sign, which is far more powerful for
+    the purpose: of the bars where the read leaned, how many closed that
+    way? Fifty percent is a coin. The interval says whether the gap from
+    fifty is real.
+
+    `rows` need `net`, `price` and `close_px`.
+    """
+    used = [r for r in rows
+            if r.get("close_px") and r.get("price")
+            and abs(float(r.get("net") or 0.0)) > 1e-9]
+    n = len(used)
+    if n < 30:
+        return {"n": n, "ready": False,
+                "note": f"{n} bars where the read leaned — too few. "
+                        f"Thirty is the floor and a few hundred is a "
+                        f"finding."}
+
+    right = 0
+    for r in used:
+        up = float(r["net"]) > 0
+        moved_up = float(r["close_px"]) > float(r["price"])
+        right += 1 if up == moved_up else 0
+
+    rate = right / n
+    lo, hi = _wilson(right, n)
+    real = lo > 0.5 or hi < 0.5
+
+    if not real:
+        verdict = (f"{rate:.1%} of {n} bars finished the way the read "
+                   f"leaned. The honest range is {lo:.1%}–{hi:.1%}, which "
+                   f"contains 50% — on this evidence the read does not "
+                   f"call direction at this horizon.")
+    elif lo > 0.5:
+        verdict = (f"{rate:.1%} of {n} bars finished the way the read "
+                   f"leaned, and the whole {lo:.1%}–{hi:.1%} range is "
+                   f"above a coin. The read carries direction.")
+    else:
+        verdict = (f"{rate:.1%} of {n} bars finished the way the read "
+                   f"leaned — the whole {lo:.1%}–{hi:.1%} range is BELOW "
+                   f"a coin. It is predicting, with the sign inverted.")
+
+    return {"n": n, "ready": True, "rate": round(rate, 4),
+            "ci_low": round(lo, 4), "ci_high": round(hi, 4),
+            "real": real, "edge_pts": round((rate - 0.5) * 100, 2),
+            "verdict": verdict}

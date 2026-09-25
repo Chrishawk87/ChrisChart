@@ -607,6 +607,74 @@ If the drifted projection is not better calibrated than the null, the read
 carries nothing at that horizon, and no amount of position sizing rescues
 it. That is a finding about the signal, not about the projection.
 
+### Getting the answer today
+
+**Test the signal now** on the call panel replays the projection over
+every candle already recorded and grades it in one pass. The readings are
+in `agreement_states`, the bar-so-far is reconstructable exactly from
+one-minute bars, so weeks of labelled outcomes can be produced in minutes
+instead of arriving one bar at a time.
+
+Each stored candle is projected at four points through its own bar — 20%,
+40%, 60% and 80% of the way in — because the useful question is not
+whether it is calibrated at ninety percent of the way through, when
+almost nothing is left to be wrong about, but whether it is calibrated
+**early**, while there is still a trade in it.
+
+### Two questions, two instruments
+
+**Does it call direction?** A plain binomial on the sign: of the bars
+where the read leaned, how many closed that way? Fifty percent is a coin,
+and a Wilson interval says whether the gap from fifty is real. This is the
+headline, because it is the question.
+
+**Are the bands honest?** The PIT calibration below it.
+
+Keeping these apart matters, and the first version did not. Grading only
+the band shape and concluding from it is a mistake of instrument: a real
+directional edge barely moves the PIT histogram, because a drift of a few
+percent of a standard deviation leaves it almost exactly as flat as it
+was. Run against synthetic data with a known ±0.30 sigma tilt, the band
+gap could not tell the three cases apart — all three sat within ±0.003 of
+each other — while the binomial separated them cleanly:
+
+```
+true tilt   direction            band gap
+  +0.30     86.7% (82–90%)        +0.001
+   0.00     52.3% (47–58%)        -0.001
+  -0.30     13.3% (10–18%)        +0.003
+```
+
+An inverted signal is reported as inverted rather than as noise, because
+predicting with the sign backwards is information and calling it "no
+edge" throws it away.
+
+### One bar, one observation
+
+Ten projections on one candle are ten looks at the same outcome. Pooling
+them multiplies the apparent sample by ten and shrinks every interval by
+root-ten, which would let a few dozen bars masquerade as a finding. The
+scoring keeps one row per bar — the earliest look, since the latest is
+nearly free — and reports bars separately from rows.
+
+### The drift bug worth recording
+
+The signal's claim is expressed as a fraction of the **remaining
+window's** standard deviation, not as a per-second drift:
+
+```
+expected move = k * squash(net) * sigma * sqrt(T)
+```
+
+A per-second drift accumulates linearly in T while the noise around it
+grows only as sqrt(T), so the same coefficient claims more and more as the
+horizon lengthens. The first version had `k = 0.15` per second, which on a
+fifteen minute bar asserted a **3.4 sigma** move — and it read as "the
+signal is actively hurting" on data where the signal was real, because a
+wildly over-confident drift is worse than no drift whichever way it
+points. Stated as a fraction of the window, `k` is dimensionless and means
+the same thing at every horizon.
+
 ### How it is scored
 
 Not by counting hits. By the **probability integral transform**: where the

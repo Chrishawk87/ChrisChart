@@ -48,27 +48,50 @@ def test_too_little_history_is_no_reading_not_a_guess():
 # ----------------------------------------------------------------- drift
 
 def test_no_read_means_no_drift():
-    assert pj.drift_from_read(0.0, 2.0) == 0.0
+    assert pj.drift_from_read(0.0, 2.0, 900.0) == 0.0
 
 
 def test_drift_takes_its_sign_from_the_read():
-    assert pj.drift_from_read(1.0, 2.0) > 0
-    assert pj.drift_from_read(-1.0, 2.0) < 0
+    assert pj.drift_from_read(1.0, 2.0, 900.0) > 0
+    assert pj.drift_from_read(-1.0, 2.0, 900.0) < 0
 
 
 def test_drift_is_squashed_so_a_huge_read_stays_sane():
-    small = pj.drift_from_read(1.0, 2.0)
-    huge = pj.drift_from_read(50.0, 2.0)
+    small = pj.drift_from_read(1.0, 2.0, 900.0)
+    huge = pj.drift_from_read(50.0, 2.0, 900.0)
     assert huge < small * 3          # tanh, not linear
-    assert huge <= 0.15 * 2.0 * 1.0001
 
 
 def test_drift_is_relative_to_volatility():
     """The same coefficient must mean the same thing in a quiet market
     and a busy one."""
-    quiet = pj.drift_from_read(1.0, 1.0)
-    busy = pj.drift_from_read(1.0, 4.0)
+    quiet = pj.drift_from_read(1.0, 1.0, 900.0)
+    busy = pj.drift_from_read(1.0, 4.0, 900.0)
     assert busy == pytest.approx(quiet * 4, rel=1e-9)
+
+
+def test_the_claim_is_the_same_size_at_every_horizon():
+    """The bug that shipped: a per-second drift accumulates linearly in T
+    while the noise around it grows only as sqrt(T), so the same
+    coefficient claims more and more as the horizon lengthens.
+
+    On a 15m bar it was asserting a 3.4 sigma move — which read as "the
+    signal is hurting" even on data where the signal was real, because a
+    wildly over-confident drift is worse than none whichever way it
+    points.
+    """
+    k, sigma = 0.08, 2.0
+    for T in (60.0, 300.0, 900.0, 3600.0):
+        d = pj.drift_from_read(1.5, sigma, T, k)
+        in_sd = (d * T) / (sigma * math.sqrt(T))
+        assert in_sd == pytest.approx(k * math.tanh(1.0), rel=1e-6), T
+
+
+def test_the_projection_reports_its_claim_in_sigma():
+    out = pj.project(price=100, open_px=100, high_so_far=100,
+                     low_so_far=100, remaining_s=600, sigma_bps_s=2.0,
+                     net=1.5, seed=3)
+    assert abs(out["expected_move_sd"]) < 0.1
 
 
 # ------------------------------------------------------------ projecting
@@ -233,3 +256,61 @@ def test_a_signal_that_hurts_is_named_as_hurting():
 def test_comparing_without_enough_bars_refuses_to_conclude():
     out = pj.compare([0.5] * 5, [0.5] * 5)
     assert out["ready"] is False
+
+
+# ------------------------------------------------ does it call direction
+
+def _rows(n, right_rate, seed=1):
+    import random
+    rng = random.Random(seed)
+    out = []
+    for i in range(n):
+        up = rng.random() < 0.5
+        correct = rng.random() < right_rate
+        moved_up = up if correct else not up
+        out.append({"net": 1.0 if up else -1.0, "price": 100.0,
+                    "close_px": 100.5 if moved_up else 99.5})
+    return out
+
+
+def test_a_coin_reads_as_a_coin():
+    out = pj.directional_edge(_rows(400, 0.5, seed=2))
+    assert out["ready"] and out["real"] is False
+    assert "does not call direction" in out["verdict"]
+
+
+def test_a_real_edge_is_found():
+    out = pj.directional_edge(_rows(400, 0.62, seed=3))
+    assert out["real"] is True and out["ci_low"] > 0.5
+    assert "carries direction" in out["verdict"]
+
+
+def test_an_inverted_signal_is_named_as_inverted():
+    """Predicting with the sign backwards is information, not noise, and
+    saying 'no edge' would throw it away."""
+    out = pj.directional_edge(_rows(400, 0.35, seed=4))
+    assert out["real"] is True and out["ci_high"] < 0.5
+    assert "sign inverted" in out["verdict"]
+
+
+def test_a_thin_sample_refuses_to_conclude():
+    out = pj.directional_edge(_rows(10, 0.9))
+    assert out["ready"] is False and "too few" in out["note"]
+
+
+def test_bars_where_the_read_was_flat_are_not_counted():
+    rows = _rows(100, 0.9) + [{"net": 0.0, "price": 100.0,
+                               "close_px": 101.0}] * 500
+    out = pj.directional_edge(rows)
+    assert out["n"] == 100
+
+
+def test_direction_is_far_more_sensitive_than_band_shape():
+    """The reason both tests are reported.
+
+    A small directional drift barely moves the PIT histogram, so grading
+    only the bands and concluding the signal is worthless would be a
+    mistake of instrument rather than of data.
+    """
+    out = pj.directional_edge(_rows(400, 0.58, seed=5))
+    assert out["real"] is True          # binomial catches it easily

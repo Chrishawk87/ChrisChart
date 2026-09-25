@@ -47,6 +47,7 @@ from .settings import Settings, SettingsStore, default_db_path
 from .ledger import Ledger
 import bisect
 from dataclasses import replace
+from typing import Sequence
 from .autopilot import Autopilot, Knobs, KNOBS
 from . import score as score_mod
 from . import tuner as tuner_mod
@@ -1596,6 +1597,104 @@ class Runtime:
                     "describe": ballot.describe()})
         return out
 
+    def backfill_projections(self, coin: str, interval: str, *,
+                             hours: float = 0.0, slots: Sequence[float] =
+                             (0.2, 0.4, 0.6, 0.8),
+                             limit: int = 4000) -> dict[str, Any]:
+        """Replay the projection over candles already recorded, and grade
+        it against what those candles actually did.
+
+        This is the whole answer to "how fast can we know". The projection
+        is a function of the bar so far and the reading taken on it, and
+        both are already stored -- the readings in `agreement_states`, the
+        bar so far reconstructable exactly from one-minute bars. So weeks
+        of labelled outcomes can be produced in one pass instead of
+        waiting for them to arrive one bar at a time.
+
+        Each stored reading is projected at several points through its own
+        bar, because the useful question is not whether it is calibrated
+        at ninety percent of the way through -- almost nothing is left to
+        be wrong about by then -- but whether it is calibrated early.
+        """
+        since = (time.time() - hours * 3600.0) if hours else None
+        states = self.history.states_for_sweep(coin, interval, since=since)
+        if not states:
+            return {"ok": False, "written": 0,
+                    "detail": "no candle readings stored yet"}
+
+        try:
+            bars15 = self.client().candles(coin, interval, bars=500)
+            lo = min(float(r["candle_ts"]) for r in states)
+            hi = max(float(r["candle_end"]) for r in states)
+            mins = self.bars_for_sweep(coin, lo, hi)
+        except Exception as exc:
+            return {"ok": False, "written": 0,
+                    "detail": f"could not fetch bars: {exc}"}
+        if not mins:
+            return {"ok": False, "written": 0,
+                    "detail": "no one-minute bars for that span"}
+
+        interval_s = float(self.client().INTERVALS.get(interval, 900))
+        sigma = pj_mod.realised_sigma_bps(bars15, interval_s)
+        if sigma <= 0:
+            return {"ok": False, "written": 0,
+                    "detail": "could not measure volatility"}
+
+        stamps = [b.ts for b in mins]
+        written = graded = skipped = 0
+
+        for row in states[-limit:]:
+            start = float(row["candle_ts"])
+            end = float(row["candle_end"])
+            if end <= start:
+                continue
+            v = vote_mod.from_state(row)
+            net = v.net
+
+            i0 = bisect.bisect_left(stamps, start)
+            i1 = bisect.bisect_left(stamps, end)
+            inside = mins[i0:i1]
+            if len(inside) < 3:
+                skipped += 1
+                continue
+            actual_close = inside[-1].close
+
+            for frac in slots:
+                cut = start + (end - start) * frac
+                j = bisect.bisect_left(stamps, cut)
+                seen = mins[i0:max(i0 + 1, j)]
+                if not seen:
+                    continue
+                # The bar as it stood at that moment — exactly, not
+                # approximately. This is what makes the replay honest.
+                out = pj_mod.project(
+                    price=seen[-1].close, open_px=seen[0].open,
+                    high_so_far=max(b.high for b in seen),
+                    low_so_far=min(b.low for b in seen),
+                    remaining_s=(end - cut), sigma_bps_s=sigma, net=net,
+                    paths=400, seed=int(start) + int(frac * 10))
+                if not out.get("ready"):
+                    continue
+                pid = self.ledger.record_projection(
+                    coin=coin, interval=interval, candle_ts=start,
+                    candle_end=end, elapsed_frac=frac, out=out, now=cut)
+                if pid is None:
+                    skipped += 1
+                    continue
+                written += 1
+                if self.ledger.resolve_projection(pid, actual_close):
+                    graded += 1
+
+        cal = self.projection_calibration(coin, interval)
+        return {"ok": True, "written": written, "graded": graded,
+                "skipped_existing": skipped, "candles": len(states),
+                "slots": list(slots), "sigma_bps_s": round(sigma, 5),
+                "calibration": cal,
+                "note": (f"{graded} projections graded across "
+                         f"{len(states)} stored candles — "
+                         f"{cal.get('verdict', 'not enough yet')}"
+                         if graded else "nothing new to grade")}
+
     def resolve_projections(self, limit: int = 300) -> dict[str, Any]:
         """Grade every projection whose bar has closed."""
         done = failed = 0
@@ -1626,11 +1725,38 @@ class Runtime:
         definition simply replaces the earlier one. No error, no warning;
         the first is just gone.
         """
-        pits = self.ledger.projection_pits(coin, interval)
+        # One row per bar: ten looks at one candle are ten looks at the
+        # same outcome, and pooling them would shrink every interval by
+        # root-ten for free.
+        pits = self.ledger.projection_pits(coin, interval, one_per_bar=True)
         out = pj_mod.compare(pits["signal"], pits["null"])
         out["ok"] = True
+        out["bars"] = pits["bars"]
+        out["rows"] = pits["rows"]
         out["by_slot"] = pits["by_slot"]
         out["counts"] = self.ledger.counts()
+
+        # And the same question asked at each point through the bar,
+        # because "is it calibrated early" is the one that decides
+        # whether there is a trade in it.
+        per = []
+        for frac, d in sorted(
+                self.ledger.projection_slot_pits(coin, interval).items()):
+            sc = pj_mod.calibration_score(d["signal"])
+            nu = pj_mod.calibration_score(d["null"])
+            per.append({
+                "elapsed": frac, "n": len(d["signal"]),
+                "signal_dev": sc.get("deviation"),
+                "null_dev": nu.get("deviation"),
+                "gap": (round(nu["deviation"] - sc["deviation"], 4)
+                        if sc.get("ready") and nu.get("ready") else None),
+                "ready": bool(sc.get("ready") and nu.get("ready"))})
+        out["by_elapsed"] = per
+        # The question actually being asked. Kept separate from the band
+        # calibration above, because they are different questions and the
+        # bands are the blunter instrument for this one.
+        out["direction"] = pj_mod.directional_edge(
+            self.ledger.projection_outcomes(coin, interval))
         return out
 
     def scorecard(self, coin: str | None = None, interval: str | None = None
@@ -2995,6 +3121,17 @@ def create_app() -> FastAPI:
         c = rt.resolve_symbol(coin)[0]
         return rt.project_now(c, interval, record=record)
 
+    @app.post("/api/backfill-projections",
+              dependencies=[Depends(require_token)])
+    def api_backfill_projections(coin: str, interval: str = "15m",
+                                 hours: float = 0.0) -> dict[str, Any]:
+        """Grade the projection against every candle already recorded.
+
+        The answer in one pass instead of one bar at a time.
+        """
+        c = rt.resolve_symbol(coin)[0]
+        return rt.backfill_projections(c, interval, hours=hours)
+
     @app.get("/api/projection-calibration",
              dependencies=[Depends(require_token)])
     def api_projection_calibration(coin: str = "", interval: str = ""
@@ -4300,6 +4437,7 @@ counting from now.">Clear the book</button>
       </div>
 
       <div id="apAlertBar" class="alertbar" style="display:none"></div>
+      <div id="apCal" class="say" style="display:none;margin-bottom:8px"></div>
       <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
       <div id="sugThree" style="display:none;margin-bottom:10px"></div>
 <div id="chartWrap" style="display:none;margin-bottom:12px">
@@ -5127,6 +5265,7 @@ async function loadAutopilot() {
 
   paintPosition((d.open || [])[0]);
   paintDecisionFeed(d.recent || []);
+  loadCalibration();
   loadScorecard();
 }
 
@@ -5747,6 +5886,85 @@ async function tookIt(side) {
   } catch (e) { $('apState').textContent = e.message; return; }
   $('apAlertBar').style.display = 'none';
   loadAutopilot();
+}
+
+async function testProjection() {
+  const c = apCfg();
+  $('apCal').style.display = '';
+  $('apCal').textContent = 'replaying the projection over every stored '
+    + 'candle…';
+  let d;
+  try {
+    d = await api('/api/backfill-projections?' + q({
+      coin: c.coin, interval: c.interval}), {method: 'POST'});
+  } catch (e) { $('apCal').textContent = e.message; return; }
+  if (!d.ok) { $('apCal').innerHTML = `<b>${esc(d.detail || '')}</b>`; return; }
+  paintCalibration(d.calibration, d);
+}
+
+async function loadCalibration() {
+  let d;
+  try {
+    d = await api('/api/projection-calibration?' + q({
+      coin: coin(), interval: $('sInt').value}));
+  } catch (e) { return; }
+  if (d && d.ok) paintCalibration(d, null);
+}
+
+function paintCalibration(cal, run) {
+  const el = $('apCal');
+  if (!cal) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  if (!cal.ready) {
+    el.innerHTML = `<b>${esc(cal.note || 'not enough graded bars yet')}</b>`
+      + (cal.bars ? `<div class="thin">${cal.bars} bars graded so far.</div>`
+                  : '');
+    return;
+  }
+  const s2 = cal.signal, n2 = cal.null;
+  const dir = cal.direction || {};
+  const slots = (cal.by_elapsed || []).filter(r => r.ready);
+
+  // Direction leads. Whether the bands are honest is a different and
+  // blunter question — a real directional edge barely moves the band
+  // shape, so leading with that would bury the answer.
+  const dirBlock = !dir.ready
+    ? `<div class="msg">${esc(dir.note || '')}</div>`
+    : `<div class="verdict-big ${dir.real && dir.ci_low > 0.5 ? 'long'
+        : dir.real ? 'short' : 'split'}">`
+      + `${(dir.rate * 100).toFixed(1)}% `
+      + `<span style="font-size:13px;font-weight:400">of ${dir.n} bars `
+      + `finished the way the read leaned</span></div>`
+      + `<div class="msg">${esc(dir.verdict)}</div>`;
+
+  el.innerHTML = dirBlock
+    + '<div class="thin" style="margin:10px 0 2px">And whether the bands '
+    + 'themselves are honest — a separate, blunter question:</div>'
+    + `<b>${esc(cal.verdict)}</b>`
+    + `<div class="conrow" style="margin-top:8px">`
+    + `<div class="stat"><b>${cal.bars}</b><span>bars graded</span></div>`
+    + `<div class="stat"><b>${s2.deviation}</b>`
+      + '<span>signal, off flat</span></div>'
+    + `<div class="stat"><b>${n2.deviation}</b>`
+      + '<span>null, off flat</span></div>'
+    + `<div class="stat"><b class="${cal.gap > 0 ? 'long' : 'short'}">`
+      + `${cal.gap >= 0 ? '+' : ''}${cal.gap}</b>`
+      + '<span>signal minus null</span></div>'
+    + `<div class="stat"><b>${(s2.coverage_50 * 100).toFixed(0)}%</b>`
+      + '<span>in the 50% band</span></div>'
+    + '</div>'
+    + `<div class="msg">${esc(s2.verdict)}</div>`
+    + (slots.length
+        ? '<div class="thin" style="margin-top:6px">By how far into the '
+          + 'bar it was made — early is the one that matters, because late '
+          + 'has almost nothing left to be wrong about: '
+          + slots.map(r => `${(r.elapsed * 100).toFixed(0)}% `
+              + `<b class="${r.gap > 0 ? 'long' : 'short'}">`
+              + `${r.gap >= 0 ? '+' : ''}${r.gap}</b> (n=${r.n})`).join(' · ')
+          + '</div>'
+        : '')
+    + (run ? `<div class="thin">${run.graded} graded from `
+             + `${run.candles} stored candles.</div>` : '');
 }
 
 async function backfillBook() {

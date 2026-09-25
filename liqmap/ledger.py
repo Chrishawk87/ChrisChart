@@ -782,10 +782,23 @@ class Ledger(ThreadedDB):
 
     def projection_pits(self, coin: str | None = None,
                         interval: str | None = None,
-                        elapsed_frac: float | None = None
-                        ) -> dict[str, list[float]]:
-        """Every graded projection, as two lists of PIT values."""
-        sql = ("SELECT pit_signal, pit_null, elapsed_frac FROM projections "
+                        elapsed_frac: float | None = None,
+                        one_per_bar: bool = True
+                        ) -> dict[str, Any]:
+        """Graded projections as two lists of PIT values.
+
+        `one_per_bar` by default, and this matters more than it looks.
+        Ten projections on one candle are ten looks at the SAME outcome,
+        not ten observations. Pooling them multiplies the apparent sample
+        by ten and shrinks every confidence interval by root-ten, which
+        would let a few dozen bars masquerade as a finding.
+
+        So the default keeps one row per bar. The pooled view is still
+        available for drawing the per-slot picture, where the correlation
+        is the point rather than a problem.
+        """
+        sql = ("SELECT coin, interval, candle_ts, elapsed_frac, "
+               "pit_signal, pit_null FROM projections "
                "WHERE resolved = 1 AND pit_signal IS NOT NULL")
         args: list[Any] = []
         if coin:
@@ -794,13 +807,80 @@ class Ledger(ThreadedDB):
             sql += " AND interval = ?"; args.append(interval)
         if elapsed_frac is not None:
             sql += " AND elapsed_frac = ?"; args.append(round(elapsed_frac, 1))
-        sig, nul, slots = [], [], {}
+        sql += " ORDER BY candle_ts, elapsed_frac"
+
+        rows = [dict(r) for r in self._conn.execute(sql, args).fetchall()]
+        slots: dict[float, int] = {}
+        for r in rows:
+            k = round(r["elapsed_frac"], 1)
+            slots[k] = slots.get(k, 0) + 1
+
+        if one_per_bar:
+            # The EARLIEST look at each bar: the latest is nearly free,
+            # because by then most of the bar has already happened.
+            picked: dict[tuple, dict] = {}
+            for r in rows:
+                key = (r["coin"], r["interval"], r["candle_ts"])
+                if key not in picked:
+                    picked[key] = r
+            use = list(picked.values())
+        else:
+            use = rows
+
+        bars = len({(r["coin"], r["interval"], r["candle_ts"])
+                    for r in rows})
+        return {"signal": [r["pit_signal"] for r in use],
+                "null": [r["pit_null"] for r in use],
+                "by_slot": slots, "rows": len(rows), "bars": bars}
+
+    def projection_outcomes(self, coin: str | None = None,
+                            interval: str | None = None
+                            ) -> list[dict[str, Any]]:
+        """One row per graded bar: what the read leaned, and what happened.
+
+        The earliest look at each bar, because the latest is nearly free.
+        """
+        sql = ("SELECT coin, interval, candle_ts, elapsed_frac, net, price, "
+               "close_px FROM projections WHERE resolved = 1 "
+               "AND close_px IS NOT NULL")
+        args: list[Any] = []
+        if coin:
+            sql += " AND coin = ?"; args.append(coin)
+        if interval:
+            sql += " AND interval = ?"; args.append(interval)
+        sql += " ORDER BY candle_ts, elapsed_frac"
+        seen: dict[tuple, dict] = {}
         for r in self._conn.execute(sql, args).fetchall():
-            sig.append(r["pit_signal"])
-            nul.append(r["pit_null"])
-            slots.setdefault(round(r["elapsed_frac"], 1), 0)
-            slots[round(r["elapsed_frac"], 1)] += 1
-        return {"signal": sig, "null": nul, "by_slot": slots}
+            d = dict(r)
+            key = (d["coin"], d["interval"], d["candle_ts"])
+            if key not in seen:
+                seen[key] = d
+        return list(seen.values())
+
+    def projection_slot_pits(self, coin: str | None = None,
+                             interval: str | None = None
+                             ) -> dict[float, dict[str, list[float]]]:
+        """Split by how far into the bar the projection was made.
+
+        The interesting question is not whether it is calibrated at 90% of
+        the way through -- almost nothing is left to be wrong about by
+        then -- but whether it is calibrated EARLY, when there is still a
+        trade in it.
+        """
+        sql = ("SELECT elapsed_frac, pit_signal, pit_null FROM projections "
+               "WHERE resolved = 1 AND pit_signal IS NOT NULL")
+        args: list[Any] = []
+        if coin:
+            sql += " AND coin = ?"; args.append(coin)
+        if interval:
+            sql += " AND interval = ?"; args.append(interval)
+        out: dict[float, dict[str, list[float]]] = {}
+        for r in self._conn.execute(sql, args).fetchall():
+            k = round(r["elapsed_frac"], 1)
+            d = out.setdefault(k, {"signal": [], "null": []})
+            d["signal"].append(r["pit_signal"])
+            d["null"].append(r["pit_null"])
+        return out
 
     def counts(self) -> dict[str, int]:
         def one(sql: str, args: Sequence[Any] = ()) -> int:
