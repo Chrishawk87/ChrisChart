@@ -1077,3 +1077,26 @@ def test_polling_the_same_slot_does_not_fill_the_table(client, monkeypatch):
     before = rt.ledger.counts()["projections"]
     rt.project_now("BTC", "15m", record=True)
     assert rt.ledger.counts()["projections"] == before
+
+
+def test_the_projection_carries_its_own_track_record(client, monkeypatch):
+    """`p_up` is a model output, not a hit rate.
+
+    Its value is decided by the drift coefficient and the volatility
+    estimate — on a market with no real edge it still reads 55-60%
+    whenever the vote leans. Shown alone it is indistinguishable from a
+    measured number, which is the most expensive confusion this panel
+    could cause.
+    """
+    rt = web.runtime()
+    feed = _live_feed()
+    monkeypatch.setattr(rt, "feed", feed, raising=False)
+    monkeypatch.setattr(type(feed), "running", property(lambda self: True))
+
+    out = rt.project_now("BTC", "15m", record=False)
+    if not out.get("ok") or not out.get("ready"):
+        pytest.skip(out.get("detail", "no projection from this fixture"))
+    assert "measured" in out
+    # Nothing graded yet, so it must say so rather than imply a number.
+    assert out["measured"]["ready"] is False
+    assert out["measured"].get("rate") in (None, 0)

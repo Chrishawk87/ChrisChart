@@ -1589,6 +1589,29 @@ class Runtime:
             except Exception as exc:
                 self.last_error = f"projection: {exc}"
 
+        # The measured track record travels WITH the claim.
+        #
+        # `p_up` is the share of simulated paths that finished higher. It
+        # is a model output, not a hit rate, and its value is decided by
+        # the drift coefficient and the volatility estimate -- on a market
+        # with no real edge at all it still reads 55-60% whenever the vote
+        # leans. Shown on its own it is indistinguishable from a measured
+        # number, which is the most expensive confusion this panel could
+        # cause.
+        try:
+            cal = self.projection_calibration(coin, interval)
+            d = cal.get("direction") or {}
+            out["measured"] = {
+                "ready": bool(d.get("ready")),
+                "rate": d.get("rate"), "n": d.get("n"),
+                "ci_low": d.get("ci_low"), "ci_high": d.get("ci_high"),
+                "real": d.get("real"),
+                "note": d.get("note") or d.get("verdict"),
+            }
+        except Exception:
+            out["measured"] = {"ready": False,
+                               "note": "track record unavailable"}
+
         out = {k: v for k, v in out.items() if not k.startswith("_")}
         out.update({"ok": True, "coin": coin, "interval": interval,
                     "candle_ts": live.start_ts, "candle_end": candle_end,
@@ -4488,6 +4511,9 @@ bars">ppo</button>
             in the corner</span>
           <span>shaded block right of the live bar = where this candle is
             projected to close, darker is the middle half</span>
+          <span><b>% up</b> is what the model claims; <b>% measured</b> is
+            how often bars actually finished that way — press <b>Test the
+            signal now</b> to fill it in</span>
           <span><i style="width:14px;height:2px;background:#4d8fd1;
             display:inline-block"></i>tick PPO</span>
           <span><i style="width:14px;height:2px;background:#c17d33;
@@ -6884,9 +6910,30 @@ function drawChart() {
     // What it is claiming, in one line nobody has to decode.
     g.font = '600 10px ui-sans-serif,system-ui,sans-serif';
     g.fillStyle = c; g.textAlign = 'left';
+    // The model's claim and its measured track record, together. The
+    // claim alone reads like a hit rate and is not one.
     const pu = chartProj.signal.p_up;
-    g.fillText(`${(pu * 100).toFixed(0)}% up`, px + 8, y(q.q50) - 4);
+    const m = chartProj.measured || {};
+    const claim = `${(pu * 100).toFixed(0)}% up`;
+    const track = m.ready
+      ? `${(m.rate * 100).toFixed(0)}% measured · n=${m.n}`
+      : 'not yet measured';
+
+    // The block sits hard against the price scale, so the labels go to
+    // its LEFT unless there is genuinely room on the right.
+    g.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+    const wNeed = Math.max(g.measureText(claim).width,
+                           g.measureText(track).width) + 10;
+    const fits = px + 8 + wNeed < CH_PAD.l + plotW;
+    const lx = fits ? px + 8 : px - 8 - wNeed;
+    g.textAlign = 'left';
+
+    g.fillStyle = c;
+    g.fillText(claim, lx, y(q.q50) - 4);
     g.font = '10px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = m.ready ? (m.real ? (m.ci_low > 0.5 ? up : down) : dim)
+                          : dim;
+    g.fillText(track, lx, y(q.q50) + 9);
   }
 
   /* ---- last price, carried to the axis ------------------------------ */

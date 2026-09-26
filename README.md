@@ -621,6 +621,28 @@ whether it is calibrated at ninety percent of the way through, when
 almost nothing is left to be wrong about, but whether it is calibrated
 **early**, while there is still a trade in it.
 
+### The claim and the track record, never apart
+
+The chart prints two numbers beside the projected block, and confusing
+them is the most expensive mistake this panel could cause:
+
+```
+63% up              what the MODEL claims
+52% measured n=300  how often bars actually finished that way
+```
+
+`p_up` is the share of simulated paths that finished higher. It is a model
+output, and its value is decided by the drift coefficient and the
+volatility estimate — **not** by whether the signal works. On synthetic
+data with a known zero edge it still printed 55–60% whenever the vote
+leaned, and was right 52% of the time. On its own it is indistinguishable
+from a measured hit rate and reads far more convincingly than it deserves.
+
+So the measured rate travels with it always, and says `not yet measured`
+until something has been graded. It is coloured by whether the gap from a
+coin is real: green above, red below, grey when the interval still
+contains 50%.
+
 ### Two questions, two instruments
 
 **Does it call direction?** A plain binomial on the sign: of the bars
