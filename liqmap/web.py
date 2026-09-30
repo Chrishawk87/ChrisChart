@@ -3275,14 +3275,24 @@ def create_app() -> FastAPI:
 
     @app.get("/api/profile", dependencies=[Depends(require_token)])
     def api_profile(coin: str = "BTC", interval: str = "5m",
-                    bars: int = 400) -> dict[str, Any]:
-        """The volume profile, and what price is doing against it now.
+                    bars: int = 400, svp_min: float = 60.0,
+                    mvp_min: float = 10.0, base: str = "1m"
+                    ) -> dict[str, Any]:
+        """The volume profiles, and what price is doing against them now.
 
-        Two profiles are returned and they are NOT interchangeable:
+        Four profiles are returned and they are NOT interchangeable:
 
           session     built from the bars in view. The shape being made.
           reference   the completed shape BEFORE this session's bars, which
                       is what price is reacting to.
+          svp         structural: a trailing `svp_min` minute window.
+          mvp         micro: a trailing `mvp_min` minute window, which is
+                      the tail of the SVP's own bars.
+
+        SVP and MVP are two nested balance areas -- one auction inside
+        another -- and `nested` reports where the small one sits in the big
+        one. Both are binned on ONE shared row size, because levels that
+        were quantised differently cannot be compared.
 
         The structural read is taken against the reference, because reading
         today's own POC as a level price is bouncing off is circular -- the
@@ -3341,6 +3351,58 @@ def create_app() -> FastAPI:
         session = _pf.final(rows)
         read = _ms.read(rows[cut:], reference)
 
+        # ---------------------------------------------------- the pair
+        #
+        # Two independent trailing windows -- structural and micro -- each
+        # a complete auction with its own POC, VAH, VAL and nodes, plus
+        # where the small one sits inside the big one.
+        #
+        # They are built from the FINEST bars available rather than the
+        # chart's own interval. A ten minute window of five minute bars is
+        # two bars, and a value area over two bars is a number, not an
+        # auction. The chart can show 15m candles while the profiles are
+        # accumulated from 1m; the shape of volume-by-price barely depends
+        # on the bar size anyway, only on the window.
+        from .live import INTERVALS as _IV
+        from . import nested as _nd
+
+        svp_m = max(1.0, min(float(svp_min), 1440.0))
+        mvp_m = max(0.5, min(float(mvp_min), svp_m))
+        step = float(_IV.get(interval, 300))
+        base_step = float(_IV.get(base, 60))
+        fine = rows
+
+        if base_step < step:
+            need = int(svp_m * 60.0 / base_step) + 20
+            got: list[Any] = []
+            fine_feed = rt.feed_for(coin)
+            if fine_feed is not None:
+                hist = fine_feed.history(base)
+                if len(hist) >= 10:
+                    got = list(hist[-need:])
+            if not got:
+                try:
+                    got = rt.client().candles(coin, base,
+                                              bars=min(need, 5000))
+                except Exception:
+                    got = []
+            if len(got) >= 10:
+                fine = got
+            else:
+                base_step = step
+        else:
+            base_step = step
+
+        svp, mvp, rel = _nd.study(fine, svp_m, mvp_m)
+
+        # How thin the micro window actually is, said out loud. A profile
+        # over three bars will still return a POC, and the reader deserves
+        # to know that is what they are looking at.
+        thin = None
+        if mvp.n_bars and mvp.n_bars < 10:
+            thin = (f"the {mvp_m:g} minute window holds {mvp.n_bars} "
+                    f"{base} bars -- too few to read a value area from")
+
         return {
             "ok": True, "coin": coin, "interval": interval,
             "bars": len(rows),
@@ -3352,12 +3414,26 @@ def create_app() -> FastAPI:
                 **session.to_dict(),
                 "rows": _ms.histogram_rows(session, max_rows=140),
             },
+            "svp": {
+                **svp.to_dict(),
+                "rows": _ms.histogram_rows(svp, max_rows=140),
+                "minutes": svp_m,
+            },
+            "mvp": {
+                **mvp.to_dict(),
+                "rows": _ms.histogram_rows(mvp, max_rows=140),
+                "minutes": mvp_m,
+            },
+            "nested": rel.to_dict(),
             "read": read.to_dict(),
+            "base": base, "bar_seconds": base_step, "thin": thin,
             "conventions": {
                 "value_area": _pf.VALUE_AREA,
                 "row_ticks": _pf.ROW_TICKS,
                 "accept_closes": _ms.ACCEPT_CLOSES,
                 "at_ticks": _ms.AT_TICKS,
+                "migrate_ticks": _nd.MIGRATE_TICKS,
+                "fading_ratio": _nd.FADING_RATIO,
             },
         }
 
@@ -4586,6 +4662,10 @@ counting from now.">Clear the book</button>
           color:var(--dim);margin-bottom:4px;min-height:14px"
           title="Where price sits against the profile, and what it is doing
 there. Facts about closed bars — no forecast, no trade."></div>
+        <div id="nestRead" style="font:11px ui-monospace,monospace;
+          color:var(--dim);margin-bottom:5px;min-height:14px"
+          title="Where the micro volume profile sits inside the structural
+one. Hover for the rule."></div>
         <div class="chart-tools">
           <button id="tool-cursor" class="on"
             onclick="pickTool('cursor')" title="Crosshair">✛</button>
@@ -4600,8 +4680,18 @@ drawn on this market and timeframe">clear</button>
           <button onclick="resetChartView()" title="Back to the last 90 bars
 at normal scale">fit</button>
           <button id="tool-prof" class="on" onclick="cycleProfile()"
-            title="Volume profile — click to cycle: prior shape (what price
-is reacting to), this session's shape, off">prof</button>
+            title="Volume profile — click to cycle: both profiles
+(structural + micro), prior session's shape, this session's shape,
+off">prof·2</button>
+          <span class="thin" style="margin-left:4px">SVP</span>
+          <input id="svpMin" type="number" min="1" max="1440" step="1"
+            value="60" onchange="setWindows()" style="width:44px"
+            title="Structural profile — how many minutes back it looks">
+          <span class="thin">MVP</span>
+          <input id="mvpMin" type="number" min="1" max="1440" step="1"
+            value="10" onchange="setWindows()" style="width:44px"
+            title="Micro profile — how many minutes back it looks. It is the
+tail of the structural window, binned on the same grid.">
           <button id="tool-proj" class="on" onclick="toggleProj()"
             title="Projected close — where this bar lands, given what has
 already printed">proj</button>
@@ -6701,7 +6791,42 @@ let chartShapes = [];       // what has been drawn, for this market+timeframe
    wrong place. */
 let chartScale = null;      // {hi, lo, top, plotH}
 let profileData = null;     // /api/profile payload
-let profileShow = 'reference';  // reference | session | off
+let profileShow = 'dual';   // dual | reference | session | off
+
+/* Which profiles each view draws, and how each one is painted.
+   KEYED, not prefixed globals. A parallel set of svp_* / mvp_* variables
+   is the copy-paste failure this project has already been bitten by twice
+   -- a duplicate checkAlert that silently replaced the original, and a
+   loop variable that shadowed an argparse namespace. One structure means
+   one place to be wrong.
+
+   The two live layers are deliberately NOT painted alike. Drawn at the
+   same width and hue the narrow micro profile disappears inside the wide
+   structural one, and seeing one inside the other is the entire reason
+   there are two. So the structural profile is wide and faint, the micro
+   profile is narrow, opaque and a different hue, and it sits inside the
+   structural footprint rather than beside it. */
+const PROFILE_LAYERS = {
+  dual: [
+    {key: 'svp', tag: 'S', maxShare: 0.22, cap: 150, alpha: 0.26,
+     hue: '#4d8fd1', out: '#5c6470', edge: '#c17d33', poc: '#d14d4d',
+     nodes: true, side: 'left'},
+    {key: 'mvp', tag: 'M', maxShare: 0.13, cap: 92, alpha: 0.72,
+     hue: '#8b6fd0', out: '#6b5a86', edge: '#a982e0', poc: '#e0679b',
+     nodes: false, side: 'right'},
+  ],
+  reference: [
+    {key: 'reference', tag: '', maxShare: 0.22, cap: 150, alpha: 0.30,
+     hue: '#4d8fd1', out: '#7b8794', edge: '#c17d33', poc: '#d14d4d',
+     nodes: true, side: 'left'},
+  ],
+  session: [
+    {key: 'session', tag: '', maxShare: 0.22, cap: 150, alpha: 0.30,
+     hue: '#4d8fd1', out: '#7b8794', edge: '#c17d33', poc: '#d14d4d',
+     nodes: true, side: 'left'},
+  ],
+  off: [],
+};
 let chartProj = null;       // the projection for the bar still forming
 
 const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
@@ -6885,76 +7010,197 @@ function axisChip(g, x, y, text, bg, fg, align) {
    a reader acts on and a level rounded to a drawing bucket is a level in
    the wrong place. */
 function drawProfile(g, hi, lo, plotW, plotH) {
-  if (!profileData || profileShow === 'off') return;
-  const p = profileData[profileShow];
-  if (!p || !p.rows || !p.rows.length) return;
+  if (!profileData) return;
+  const layers = PROFILE_LAYERS[profileShow] || [];
+  if (!layers.length) return;
 
   const y = v => CH_PAD.t + (hi - v) / (hi - lo) * plotH;
-  const maxW = Math.min(150, plotW * 0.22);
   const right = CH_PAD.l + plotW;
 
   g.save();
-  for (const r of p.rows) {
-    const yTop = y(r.hi), yBot = y(r.lo);
-    const h = Math.max(1, yBot - yTop);
-    if (yBot < CH_PAD.t || yTop > CH_PAD.t + plotH) continue;
-    const w = Math.max(1, (r.share || 0) * maxW);
-    const inVA = r.lo >= p.val && r.hi <= p.vah;
-    g.globalAlpha = inVA ? 0.30 : 0.16;
-    g.fillStyle = inVA ? '#4d8fd1' : '#7b8794';
-    g.fillRect(right - w, yTop, w, Math.max(1, h - 0.6));
-  }
-  g.globalAlpha = 1;
+  /* TWO PASSES, and the reason is not cosmetic: every level line spans
+     the full width, so a one-pass loop lets the second layer's lines
+     paint straight through the first layer's labels. Bars and lines for
+     every layer first, then all the text on top of all of it.
 
-  /* Exact levels, unmerged. */
-  const mark = (px, label, colour, dash) => {
-    if (px <= lo || px >= hi) return;
-    const yy = Math.round(y(px)) + 0.5;
-    g.strokeStyle = colour; g.lineWidth = 1;
-    g.setLineDash(dash || []);
-    g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(right, yy); g.stroke();
-    g.setLineDash([]);
-    g.fillStyle = colour; g.textAlign = 'left';
-    g.font = '10px ui-monospace, monospace';
-    g.fillText(label, CH_PAD.l + 3, yy - 3);
-  };
-  mark(p.vah, 'VAH ' + chPx(p.vah), '#c17d33', [4, 3]);
-  mark(p.val, 'VAL ' + chPx(p.val), '#c17d33', [4, 3]);
-  mark(p.poc, 'POC ' + chPx(p.poc), '#d14d4d', []);
-  for (const h of (p.hvn || [])) mark(h, 'HVN', '#4d8fd1', [2, 4]);
-  for (const l of (p.lvn || [])) mark(l, 'LVN', '#7b8794', [1, 5]);
+     Widest layer first within each pass, so the narrow opaque profile
+     lands on top of the wide faint one rather than under it. */
+  const labels = [];
+
+  for (const L of layers) {
+    const p = profileData[L.key];
+    if (!p || !p.rows || !p.rows.length) continue;
+    const maxW = Math.min(L.cap, plotW * L.maxShare);
+
+    for (const r of p.rows) {
+      const yTop = y(r.hi), yBot = y(r.lo);
+      const h = Math.max(1, yBot - yTop);
+      if (yBot < CH_PAD.t || yTop > CH_PAD.t + plotH) continue;
+      const w = Math.max(1, (r.share || 0) * maxW);
+      const inVA = r.lo >= p.val && r.hi <= p.vah;
+      g.globalAlpha = inVA ? L.alpha : L.alpha * 0.55;
+      g.fillStyle = inVA ? L.hue : L.out;
+      g.fillRect(right - w, yTop, w, Math.max(1, h - 0.6));
+    }
+    g.globalAlpha = 1;
+
+    /* Exact levels, unmerged. The histogram rows are merged for drawing;
+       these are not, because a level rounded to a drawing bucket is a
+       level in the wrong place and it is the levels a reader acts on. */
+    const pre = L.tag ? L.tag + '·' : '';
+    const mark = (px, label, colour, dash) => {
+      if (px <= lo || px >= hi) return;
+      const yy = Math.round(y(px)) + 0.5;
+      g.strokeStyle = colour; g.lineWidth = 1;
+      g.setLineDash(dash || []);
+      g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(right, yy); g.stroke();
+      g.setLineDash([]);
+      labels.push({y: yy, text: pre + label, colour: colour, L: L});
+    };
+    /* POC FIRST. Where the two auctions are tight the micro value area is
+       a couple of points wide and all three of its levels land inside one
+       label height -- whichever is queued first keeps the slot, and the
+       POC is the one worth reading. */
+    mark(p.poc, 'POC ' + chPx(p.poc), L.poc, []);
+    mark(p.vah, 'VAH ' + chPx(p.vah), L.edge, [4, 3]);
+    mark(p.val, 'VAL ' + chPx(p.val), L.edge, [4, 3]);
+    if (L.nodes) {
+      for (const h of (p.hvn || [])) mark(h, 'HVN', L.hue, [2, 4]);
+      for (const l of (p.lvn || [])) mark(l, 'LVN', L.out, [1, 5]);
+    }
+  }
+
+  /* Pass two: the text, over every layer's bars and lines.
+
+     Dropped where it would overprint. The POC is very often also an HVN,
+     and a broad shelf can put several nodes within a few ticks of each
+     other; stacked at the same height they smear into something nobody
+     can read. The LINE is always drawn -- only the duplicate label goes.
+     Each side keeps its own occupied list, because the two layers label
+     on opposite edges and cannot collide with each other. */
+  g.font = '10px ui-monospace, monospace';
+  g.textAlign = 'left';
+  const used = {left: [], right: []};
+  for (const t of labels) {
+    const seat = used[t.L.side === 'right' ? 'right' : 'left'];
+    if (seat.some(u => Math.abs(u - t.y) < 11)) continue;
+    seat.push(t.y);
+    const w = g.measureText(t.text).width;
+    const x = (t.L.side === 'right') ? right - 3 - w : CH_PAD.l + 3;
+    g.globalAlpha = 0.92;
+    g.fillStyle = '#12151a';
+    g.fillRect(x - 2, t.y - 12, w + 4, 12);
+    g.globalAlpha = 1;
+    g.fillStyle = t.colour;
+    g.fillText(t.text, x, t.y - 3);
+  }
   g.restore();
+}
+
+/* Where the micro auction sits inside the structural one.
+
+   The state is a classification of two shapes that already exist. The
+   second line is the rule YOU stated for that state -- it is shown so the
+   panel can suggest; nothing here sizes, times or places anything. */
+const NEST_COLOUR = {
+  NESTED: '#7b8794', MIGRATING_UP: '#4d8fd1', MIGRATING_DOWN: '#4d8fd1',
+  TESTING_SVP_VAH: '#c17d33', TESTING_SVP_VAL: '#c17d33',
+  BREAKOUT_UP: '#3f9e6a', BREAKOUT_DOWN: '#d14d4d',
+  ENGULFING: '#8b6fd0', UNKNOWN: '#7b8794',
+};
+
+function drawNested(d) {
+  const el = $('nestRead');
+  if (!el) return;
+  el.style.display = profileShow === 'dual' ? '' : 'none';
+  const n = d.nested, s = d.svp, m = d.mvp;
+  if (!n || !s || !m) { el.textContent = ''; return; }
+
+  const vol = n.has_history ? ' · MVP volume ' + n.volume_trend : '';
+  const thin = d.thin ? ' · ' + d.thin : '';
+  el.innerHTML =
+    '<b style="color:' + (NEST_COLOUR[n.state] || '#7b8794') + '">'
+    + n.state.replace(/_/g, ' ') + '</b>'
+    + '  MVP ' + m.minutes + 'm ' + chPx(m.val) + '–' + chPx(m.vah)
+    + ' (POC ' + chPx(m.poc) + ')'
+    + '  in  SVP ' + s.minutes + 'm ' + chPx(s.val) + '–' + chPx(s.vah)
+    + ' (POC ' + chPx(s.poc) + ')' + vol
+    + '<span style="color:var(--dim)">' + thin + '</span>';
+  el.title = n.note + '\\n\\n' + n.playbook;
 }
 
 /* One sentence of structure, refreshed with the chart. No trade, no stop,
    no direction -- what price is doing against the profile, right now. */
 function cycleProfile() {
-  /* Prior shape -> this session -> off. The prior shape is the default
-     because it is what price is REACTING to; today's own profile is still
-     being made by the very move you are reading. */
-  profileShow = profileShow === 'reference' ? 'session'
-              : profileShow === 'session' ? 'off' : 'reference';
+  /* Both -> prior shape -> this session -> off.
+
+     The dual view is the default because the pair is the point: one
+     auction inside another, each with its own levels. The single views
+     are kept because the prior session's shape is a different object
+     from a trailing hour -- it is what was on the chart at the open --
+     and it stays reachable. */
+  const order = ['dual', 'reference', 'session', 'off'];
+  profileShow = order[(order.indexOf(profileShow) + 1) % order.length];
   const b = $('tool-prof');
   if (b) {
     b.classList.toggle('on', profileShow !== 'off');
-    b.textContent = profileShow === 'session' ? 'prof·now'
-                  : profileShow === 'off' ? 'prof' : 'prof';
+    b.textContent = profileShow === 'dual' ? 'prof·2'
+                  : profileShow === 'reference' ? 'prof·prior'
+                  : profileShow === 'session' ? 'prof·now' : 'prof';
   }
+  const n = $('nestRead');
+  if (n) n.style.display = profileShow === 'dual' ? '' : 'none';
   drawChart();
+}
+
+/* The two windows are independent inputs. Changing either refetches, so
+   the profile on screen is always the one the numbers describe. */
+function profileWindows() {
+  const num = (id, dflt) => {
+    const v = parseFloat(($(id) || {}).value);
+    return (isFinite(v) && v > 0) ? v : dflt;
+  };
+  const svp = num('svpMin', 60);
+  return {svp_min: svp, mvp_min: Math.min(num('mvpMin', 10), svp)};
+}
+
+function setWindows() {
+  try {
+    localStorage.setItem('profWin', JSON.stringify(profileWindows()));
+  } catch (e) {}
+  loadProfile();
+}
+
+/* Kept per browser, like the drawn lines and the pane heights: which two
+   windows you read is a preference about this screen, not anything the
+   agent acts on. */
+function restoreProfileWindows() {
+  try {
+    const raw = localStorage.getItem('profWin');
+    if (!raw) return;
+    const w = JSON.parse(raw);
+    if (w && w.svp_min && $('svpMin')) $('svpMin').value = w.svp_min;
+    if (w && w.mvp_min && $('mvpMin')) $('mvpMin').value = w.mvp_min;
+  } catch (e) {}
 }
 
 async function loadProfile() {
   const el = $('profRead');
   try {
+    const w = profileWindows();
     const d = await api('/api/profile?' + q({
-      coin: coin(), interval: $('sInt').value, bars: 400}));
+      coin: coin(), interval: $('sInt').value, bars: 400,
+      svp_min: w.svp_min, mvp_min: w.mvp_min}));
     if (!d || !d.ok) {
       profileData = null;
       if (el) el.textContent = (d && d.why) || 'no profile';
+      const n0 = $('nestRead');
+      if (n0) n0.textContent = '';
       drawChart();
       return;
     }
     profileData = d;
+    drawNested(d);
     const r = d.read;
     if (el) {
       const where = r.at_node
@@ -8539,6 +8785,7 @@ async function doResolve() {
 
 // Last thing on the page: pick up whichever tab was open last time.
 restoreTab();
+restoreProfileWindows();
 </script></body></html>
 """
 
