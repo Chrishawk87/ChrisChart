@@ -643,14 +643,17 @@ until something has been graded. It is coloured by whether the gap from a
 coin is real: green above, red below, grey when the interval still
 contains 50%.
 
-### Two questions, two instruments
+### Three questions, three instruments
 
 **Does it call direction?** A plain binomial on the sign: of the bars
 where the read leaned, how many closed that way? Fifty percent is a coin,
 and a Wilson interval says whether the gap from fifty is real. This is the
 headline, because it is the question.
 
-**Are the bands honest?** The PIT calibration below it.
+**Does it get there first?** The reach test, below — the one that decides
+whether a scalp survives.
+
+**Are the bands honest?** The PIT calibration below that.
 
 Keeping these apart matters, and the first version did not. Grading only
 the band shape and concluding from it is a mistake of instrument: a real
@@ -670,6 +673,58 @@ true tilt   direction            band gap
 An inverted signal is reported as inverted rather than as noise, because
 predicting with the sign backwards is information and calling it "no
 edge" throws it away.
+
+### The reach test — direction is not enough
+
+A projection that calls the sign correctly and only pays out at the close
+is not a scalp. What a scalp needs is the favourable side reached
+**first**, before the adverse one, and a close-only test cannot see that.
+The two questions come apart, so they are asked separately.
+
+Every resolved projection stores a `path`: the minute-by-minute high and
+low after the read, in bps from the price the read was taken at. Reach
+walks that path in order and returns whichever side was touched first:
+
+```python
+for hi, lo in path:
+    fav = hi if side > 0 else -lo
+    adv = -lo if side > 0 else hi
+    if adv >= stop:        return "stop"
+    if fav >= target_bps:  return "target"
+return "neither"
+```
+
+A minute touching **both** levels counts as the adverse one — a one-minute
+bar does not record the order of ticks inside itself, and guessing in the
+tester's favour is exactly how a backtest gets flattering. Every ambiguous
+bar costs. The ordering cannot be recovered from a summary afterwards,
+which is why the path is captured at resolution rather than reconstructed.
+
+Run against synthetic data with known truth, the two instruments separate
+a signal that pays from one that does not:
+
+```
+                                  direction      reach @3bps
+calls sign AND gets there first     59.8%     63.2%  (59–67%)
+calls sign, does NOT get there      59.4%     38.6%  (34–43%)
+pure coin                           51.2%     50.6%  (46–55%)
+```
+
+The middle row is the point of the whole test. A genuine 59.4%
+directional edge — comfortably real, interval well clear of a coin —
+reaches a three-basis-point target first only 38.6% of the time. Traded as
+a scalp it loses, and direction alone would have passed it.
+
+The panel's table prints, per target, the reach rate with its Wilson
+interval beside the rate that target **needs** at the current cost:
+
+```
+needs = (target + cost) / (2 * target)
+```
+
+Green only when the measured interval clears the requirement. Anything
+else is grey, including a rate that beats the bar with an interval that
+still straddles it.
 
 ### One bar, one observation
 
@@ -712,6 +767,30 @@ the wrong sign.
 
 Nothing is concluded under 20 graded bars, and the comparison against the
 null needs both sides ready.
+
+### Distance, and what the call now says
+
+Alongside reach, `distance()` reports the median favourable excursion, the
+median adverse one, and the median close — all in bps, all signed by the
+call's own direction. Reach says whether a fixed target is hit; distance
+says how far the move typically runs, which is what picks the target in
+the first place.
+
+The call's headline had a bug worth recording. It read the probability
+straight off the upper tail, so a projection leaning **down** printed
+`52% up` in red — the arrow, the colour and the number disagreeing on one
+line. The probability is now quoted in the direction of the call, and the
+call is named:
+
+```
+SELL  -1.4bps  3.7 ticks
+48% of paths · 61% measured n=214
+```
+
+Direction as a word, size as both bps and instrument ticks (`tick_bps`
+travels with the chart data, so the conversion is the live instrument's,
+not a constant), and the probability always describing the side actually
+being called.
 
 ### What it will not do
 

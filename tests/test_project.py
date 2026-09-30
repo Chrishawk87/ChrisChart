@@ -314,3 +314,83 @@ def test_direction_is_far_more_sensitive_than_band_shape():
     """
     out = pj.directional_edge(_rows(400, 0.58, seed=5))
     assert out["real"] is True          # binomial catches it easily
+
+
+# ------------------------------------------------ did it get there first
+
+def test_reach_finds_the_favourable_side():
+    path = [[1.0, -1.0], [2.0, -1.0], [6.0, -2.0]]
+    assert pj.reach(path, +1, 5.0) == "target"
+
+
+def test_reach_finds_the_adverse_side():
+    path = [[1.0, -1.0], [1.0, -6.0]]
+    assert pj.reach(path, +1, 5.0) == "stop"
+
+
+def test_a_minute_touching_both_counts_against_you():
+    """One-minute bars cannot order two touches inside themselves.
+
+    Assuming the good one is exactly how a scalping study produces a hit
+    rate that evaporates on contact with a real fill — and on a
+    three-tick target that assumption is most of the answer.
+    """
+    path = [[6.0, -6.0]]
+    assert pj.reach(path, +1, 5.0) == "stop"
+    assert pj.reach(path, -1, 5.0) == "stop"
+
+
+def test_a_down_call_reads_the_path_upside_down():
+    path = [[1.0, -6.0]]
+    assert pj.reach(path, -1, 5.0) == "target"
+    assert pj.reach(path, +1, 5.0) == "stop"
+
+
+def test_neither_side_reached_is_its_own_answer():
+    path = [[1.0, -1.0]] * 5
+    assert pj.reach(path, +1, 5.0) == "neither"
+
+
+def _reach_rows(n, rate, run=8.0, seed=1):
+    import random
+    rng = random.Random(seed)
+    rows = []
+    for _ in range(n):
+        up = rng.random() < 0.5
+        good = rng.random() < rate
+        # A path that goes the called way, or against it.
+        fav = run if good else 0.5
+        adv = 0.5 if good else run
+        path = ([[fav, -adv]] if up else [[adv, -fav]])
+        rows.append({"net": 1.0 if up else -1.0, "price": 100.0,
+                     "close_px": 100.0, "path": path})
+    return rows
+
+
+def test_the_reach_test_measures_each_target_separately():
+    rows = _reach_rows(400, 0.62, run=8.0)
+    out = pj.reach_test(rows, [3.0, 6.0, 20.0])
+    assert [r["target_bps"] for r in out] == [3.0, 6.0, 20.0]
+    # A target inside the run is reached; one beyond it is not.
+    assert out[0]["rate"] == pytest.approx(0.62, abs=0.06)
+    assert out[2]["resolved"] == 0 or out[2]["rate"] in (None, 0.0)
+
+
+def test_the_reach_test_reports_when_it_cannot_conclude():
+    out = pj.reach_test(_reach_rows(10, 0.9), [3.0])
+    assert out[0]["ready"] is False
+
+
+def test_distance_reports_both_sides_of_the_move():
+    """Direction says the sign is right. This says whether the move is
+    big enough to be worth anything after costs."""
+    rows = _reach_rows(200, 1.0, run=9.0)
+    out = pj.distance(rows)
+    assert out["ready"]
+    assert out["median_favourable_bps"] == pytest.approx(9.0, abs=0.1)
+    assert out["median_adverse_bps"] == pytest.approx(0.5, abs=0.1)
+
+
+def test_distance_needs_a_path():
+    out = pj.distance([{"net": 1.0, "price": 100.0}] * 50)
+    assert out["ready"] is False

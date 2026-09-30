@@ -11,3 +11,9 @@ venv/
 wallets.json
 *.npy
 .DS_Store
+
+# Market data. DBN files run to gigabytes; a single accidental commit of one
+# is permanent in git history and effectively unremovable from a shared repo.
+data/
+*.dbn
+*.dbn.zst

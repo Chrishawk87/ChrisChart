@@ -170,7 +170,13 @@ CREATE TABLE IF NOT EXISTS projections (
     resolved     INTEGER NOT NULL DEFAULT 0,
     close_px     REAL,
     pit_signal   REAL,
-    pit_null     REAL
+    pit_null     REAL,
+    -- Minute-by-minute [high, low] in bps from the projection's own
+    -- price, for the whole of the rest of the bar. Stored as the PATH
+    -- rather than as a summary because "did it reach +3 ticks before
+    -- -3 ticks" cannot be recovered from a high and a low -- ordering is
+    -- the whole question, and a summary has thrown it away.
+    path         TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_pr_open ON projections(resolved, candle_end);
 CREATE INDEX IF NOT EXISTS ix_pr_coin ON projections(coin, interval, made_at);
@@ -326,6 +332,10 @@ class Ledger(ThreadedDB):
         if "source" not in cols:
             conn.execute("ALTER TABLE paper_positions ADD COLUMN "
                          "source TEXT NOT NULL DEFAULT 'live'")
+        pc = {r["name"] for r in
+              conn.execute("PRAGMA table_info(projections)")}
+        if pc and "path" not in pc:
+            conn.execute("ALTER TABLE projections ADD COLUMN path TEXT")
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
@@ -759,8 +769,15 @@ class Ledger(ThreadedDB):
             "SELECT * FROM projections WHERE resolved = 0 AND candle_end <= ? "
             "ORDER BY candle_end LIMIT ?", (now, limit)).fetchall()]
 
-    def resolve_projection(self, pid: str, close_px: float) -> bool:
-        """Grade one against what the bar actually did."""
+    def resolve_projection(self, pid: str, close_px: float,
+                           path: Sequence[Sequence[float]] | None = None
+                           ) -> bool:
+        """Grade one against what the bar actually did.
+
+        `path` is the minute-by-minute [high, low] in bps from the
+        projection's own price. It is what makes the reach test possible
+        later at any threshold, without re-fetching bars.
+        """
         from . import project as _pj
         row = self._conn.execute(
             "SELECT sig_samples, null_samples FROM projections "
@@ -775,9 +792,10 @@ class Ledger(ThreadedDB):
         with self._tx() as conn:
             conn.execute(
                 "UPDATE projections SET resolved = 1, close_px = ?, "
-                "pit_signal = ?, pit_null = ? WHERE id = ? AND resolved = 0",
+                "pit_signal = ?, pit_null = ?, path = ? "
+                "WHERE id = ? AND resolved = 0",
                 (close_px, _pj.pit(close_px, sig), _pj.pit(close_px, nul),
-                 pid))
+                 json.dumps(path) if path else None, pid))
         return True
 
     def projection_pits(self, coin: str | None = None,
@@ -841,7 +859,7 @@ class Ledger(ThreadedDB):
         The earliest look at each bar, because the latest is nearly free.
         """
         sql = ("SELECT coin, interval, candle_ts, elapsed_frac, net, price, "
-               "close_px FROM projections WHERE resolved = 1 "
+               "close_px, path FROM projections WHERE resolved = 1 "
                "AND close_px IS NOT NULL")
         args: list[Any] = []
         if coin:
@@ -852,6 +870,10 @@ class Ledger(ThreadedDB):
         seen: dict[tuple, dict] = {}
         for r in self._conn.execute(sql, args).fetchall():
             d = dict(r)
+            try:
+                d["path"] = json.loads(d.get("path") or "[]")
+            except Exception:
+                d["path"] = []
             key = (d["coin"], d["interval"], d["candle_ts"])
             if key not in seen:
                 seen[key] = d

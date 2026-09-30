@@ -432,3 +432,118 @@ def directional_edge(rows: Sequence[dict]) -> dict[str, Any]:
             "ci_low": round(lo, 4), "ci_high": round(hi, 4),
             "real": real, "edge_pts": round((rate - 0.5) * 100, 2),
             "verdict": verdict}
+
+
+# --------------------------------------------------------------------------
+# did it get there, and how far
+# --------------------------------------------------------------------------
+
+def reach(path: Sequence[Sequence[float]], side: int, target_bps: float,
+          stop_bps: float | None = None) -> str:
+    """Walk the minutes forward. Did the favourable side come first?
+
+    `path` is [[high_bps, low_bps], ...] from the projection's own price,
+    one entry per minute. `side` is +1 for a projected up, -1 for down.
+
+    A minute that touches BOTH counts as the adverse side. One-minute
+    bars cannot order two touches inside themselves, and assuming the
+    good one is exactly how a scalping study produces a hit rate that
+    evaporates on contact with a real fill. For a three-tick target that
+    assumption is not a rounding error -- it is most of the answer.
+    """
+    stop = target_bps if stop_bps is None else stop_bps
+    for hi, lo in path:
+        fav = (hi if side > 0 else -lo)
+        adv = (-lo if side > 0 else hi)
+        if adv >= stop:
+            return "stop"
+        if fav >= target_bps:
+            return "target"
+    return "neither"
+
+
+def reach_test(rows: Sequence[dict], targets: Sequence[float],
+               stop_bps: float | None = None) -> list[dict[str, Any]]:
+    """For each target distance, how often the call got there first.
+
+    This is the scalper's question, and it is not the same as the
+    direction question. A read can call the sign correctly and still lose
+    on a three-tick target, because getting there FIRST is what pays --
+    the close being higher is no use if it went four ticks against you on
+    the way.
+
+    `rows` need `net`, `price` and `path`.
+    """
+    used = [r for r in rows
+            if r.get("path") and abs(float(r.get("net") or 0.0)) > 1e-9]
+    out = []
+    for t in targets:
+        hit = miss = flat = 0
+        for r in used:
+            side = 1 if float(r["net"]) > 0 else -1
+            res = reach(r["path"], side, t, stop_bps)
+            if res == "target":
+                hit += 1
+            elif res == "stop":
+                miss += 1
+            else:
+                flat += 1
+        n = hit + miss
+        lo, hi = _wilson(hit, n) if n else (0.0, 1.0)
+        out.append({
+            "target_bps": round(t, 3), "n": len(used), "resolved": n,
+            "hit": hit, "miss": miss, "neither": flat,
+            "rate": round(hit / n, 4) if n else None,
+            "ci_low": round(lo, 4), "ci_high": round(hi, 4),
+            "real": bool(n >= 30 and (lo > 0.5 or hi < 0.5)),
+            "ready": n >= 30,
+        })
+    return out
+
+
+def distance(rows: Sequence[dict]) -> dict[str, Any]:
+    """How far it went the called way, and how far against, before the
+    bar ended.
+
+    The direction test says whether the sign is right. This says whether
+    the move is big enough to be worth anything after costs -- a signal
+    that calls direction perfectly and moves two basis points is not a
+    trade at a two basis point round trip.
+    """
+    used = [r for r in rows
+            if r.get("path") and abs(float(r.get("net") or 0.0)) > 1e-9]
+    if len(used) < 20:
+        return {"n": len(used), "ready": False,
+                "note": f"{len(used)} bars with a path — too few."}
+
+    favs, advs, closes = [], [], []
+    for r in used:
+        side = 1 if float(r["net"]) > 0 else -1
+        hi = max((p[0] if side > 0 else -p[1]) for p in r["path"])
+        lo = max((-p[1] if side > 0 else p[0]) for p in r["path"])
+        favs.append(hi)
+        advs.append(lo)
+        if r.get("close_px") and r.get("price"):
+            mv = (float(r["close_px"]) - float(r["price"])) / float(
+                r["price"]) * 10_000.0
+            closes.append(mv * side)
+
+    def med(xs):
+        if not xs:
+            return None
+        v = sorted(xs)
+        m = len(v) // 2
+        return round(v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2, 2)
+
+    return {
+        "n": len(used), "ready": True,
+        "median_favourable_bps": med(favs),
+        "median_adverse_bps": med(advs),
+        "median_close_bps": med(closes),
+        "mean_close_bps": round(sum(closes) / len(closes), 2)
+        if closes else None,
+        "note": (f"Called the right way, the median bar ran "
+                 f"{med(favs)}bps in your favour and {med(advs)}bps "
+                 f"against before it closed. The close itself landed "
+                 f"{med(closes)}bps the called way."),
+    }

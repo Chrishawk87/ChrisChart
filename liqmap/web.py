@@ -1705,7 +1705,17 @@ class Runtime:
                     skipped += 1
                     continue
                 written += 1
-                if self.ledger.resolve_projection(pid, actual_close):
+                # The rest of the bar, minute by minute, in bps from the
+                # price the projection was made at. Ordering is the whole
+                # question for a reach test, so the path is kept rather
+                # than a high and a low.
+                p0 = seen[-1].close
+                fwd = mins[max(i0, j):i1]
+                path = [[round((b.high - p0) / p0 * 10_000.0, 3),
+                         round((b.low - p0) / p0 * 10_000.0, 3)]
+                        for b in fwd] if p0 > 0 else []
+                if self.ledger.resolve_projection(pid, actual_close,
+                                                  path=path):
                     graded += 1
 
         cal = self.projection_calibration(coin, interval)
@@ -1778,8 +1788,14 @@ class Runtime:
         # The question actually being asked. Kept separate from the band
         # calibration above, because they are different questions and the
         # bands are the blunter instrument for this one.
-        out["direction"] = pj_mod.directional_edge(
-            self.ledger.projection_outcomes(coin, interval))
+        rows = self.ledger.projection_outcomes(coin, interval)
+        out["direction"] = pj_mod.directional_edge(rows)
+        out["distance"] = pj_mod.distance(rows)
+        # Targets a scalper actually uses. Expressed in basis points
+        # because that is the only unit every market shares; the panel
+        # converts to ticks for the instrument in front of you.
+        out["reach"] = pj_mod.reach_test(
+            rows, [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0])
         return out
 
     def scorecard(self, coin: str | None = None, interval: str | None = None
@@ -3257,6 +3273,72 @@ def create_app() -> FastAPI:
                               if rt.autopilot.get("raw", True)
                               else tuner_mod.readiness(rt.ledger, coin))}
 
+    @app.get("/api/profile", dependencies=[Depends(require_token)])
+    def api_profile(coin: str = "BTC", interval: str = "5m",
+                    bars: int = 400) -> dict[str, Any]:
+        """The volume profile, and what price is doing against it now.
+
+        Two profiles are returned and they are NOT interchangeable:
+
+          session     built from the bars in view. The shape being made.
+          reference   the completed shape BEFORE this session's bars, which
+                      is what price is reacting to.
+
+        The structural read is taken against the reference, because reading
+        today's own POC as a level price is bouncing off is circular -- the
+        bounce is part of what put the POC there.
+
+        Nothing here predicts, suggests a trade, or carries a stop.
+        """
+        from . import marketstate as _ms, profile as _pf
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        n = max(40, min(bars, 800))
+
+        # Same fetch chain the chart route uses: the websocket-built history
+        # when the live feed is running, the venue's candles otherwise. Two
+        # routes that disagree about where bars come from would draw a
+        # profile that does not match the candles beside it.
+        rows: list[Any] = []
+        feed = rt.feed_for(coin)
+        if feed is not None:
+            hist = feed.history(interval)
+            if len(hist) >= 10:
+                rows = list(hist[-n:])
+        if not rows:
+            try:
+                rows = rt.client().candles(coin, interval, bars=n)
+            except Exception as exc:
+                return {"ok": False, "why": f"candles unavailable: {exc}"}
+        if not rows:
+            return {"ok": False, "why": "no candles for that market yet"}
+
+        # Split: the older portion builds the reference, the rest is today.
+        cut = max(20, len(rows) // 2)
+        reference = _pf.final(rows[:cut])
+        session = _pf.final(rows)
+        read = _ms.read(rows[cut:], reference)
+
+        return {
+            "ok": True, "coin": coin, "interval": interval,
+            "bars": len(rows),
+            "reference": {
+                **reference.to_dict(),
+                "rows": _ms.histogram_rows(reference, max_rows=140),
+            },
+            "session": {
+                **session.to_dict(),
+                "rows": _ms.histogram_rows(session, max_rows=140),
+            },
+            "read": read.to_dict(),
+            "conventions": {
+                "value_area": _pf.VALUE_AREA,
+                "row_ticks": _pf.ROW_TICKS,
+                "accept_closes": _ms.ACCEPT_CLOSES,
+                "at_ticks": _ms.AT_TICKS,
+            },
+        }
+
     @app.get("/api/chart", dependencies=[Depends(require_token)])
     def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120,
                   ppo_smooth: int = 1, ppo_signal: int = 9,
@@ -3375,8 +3457,22 @@ def create_app() -> FastAPI:
             tick = {"ppo": [], "signal": [], "hist": [], "ready": False,
                     "error": str(exc)}
 
+        # What one tick is worth here, so a projected distance can be
+        # read in the unit the instrument actually trades in.
+        tick_bps = None
+        try:
+            fd = rt.feed_for(coin)
+            bk = fd.book if fd is not None else None
+            if bk is not None and not bk.empty and bk.mid > 0:
+                from .suggest import infer_tick as _tk
+                t = _tk(bk)
+                if t > 0:
+                    tick_bps = round(t / bk.mid * 10_000.0, 5)
+        except Exception:
+            tick_bps = None
+
         return {**out, "source": source, "bars": rows, "marks": marks,
-                "profile": profile, "tick_ppo": tick,
+                "profile": profile, "tick_ppo": tick, "tick_bps": tick_bps,
                 "interval_s": rt.client().INTERVALS.get(interval, 900)}
 
     @app.get("/api/agreement", dependencies=[Depends(require_token)])
@@ -4464,6 +4560,10 @@ counting from now.">Clear the book</button>
       <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
       <div id="sugThree" style="display:none;margin-bottom:10px"></div>
 <div id="chartWrap" style="display:none;margin-bottom:12px">
+        <div id="profRead" style="font:11px ui-monospace,monospace;
+          color:var(--dim);margin-bottom:4px;min-height:14px"
+          title="Where price sits against the profile, and what it is doing
+there. Facts about closed bars — no forecast, no trade."></div>
         <div class="chart-tools">
           <button id="tool-cursor" class="on"
             onclick="pickTool('cursor')" title="Crosshair">✛</button>
@@ -4477,6 +4577,9 @@ counting from now.">Clear the book</button>
 drawn on this market and timeframe">clear</button>
           <button onclick="resetChartView()" title="Back to the last 90 bars
 at normal scale">fit</button>
+          <button id="tool-prof" class="on" onclick="cycleProfile()"
+            title="Volume profile — click to cycle: prior shape (what price
+is reacting to), this session's shape, off">prof</button>
           <button id="tool-proj" class="on" onclick="toggleProj()"
             title="Projected close — where this bar lands, given what has
 already printed">proj</button>
@@ -4511,9 +4614,9 @@ bars">ppo</button>
             in the corner</span>
           <span>shaded block right of the live bar = where this candle is
             projected to close, darker is the middle half</span>
-          <span><b>% up</b> is what the model claims; <b>% measured</b> is
-            how often bars actually finished that way — press <b>Test the
-            signal now</b> to fill it in</span>
+          <span><b>BUY/SELL and the distance</b> are what the model
+            claims; <b>% measured</b> is how often bars actually finished
+            that way — press <b>Test the signal now</b> to fill it in</span>
           <span><i style="width:14px;height:2px;background:#4d8fd1;
             display:inline-block"></i>tick PPO</span>
           <span><i style="width:14px;height:2px;background:#c17d33;
@@ -5989,8 +6092,62 @@ function paintCalibration(cal, run) {
               + `${r.gap >= 0 ? '+' : ''}${r.gap}</b> (n=${r.n})`).join(' · ')
           + '</div>'
         : '')
+    + reachTable(cal)
     + (run ? `<div class="thin">${run.graded} graded from `
              + `${run.candles} stored candles.</div>` : '');
+}
+
+/* The scalper's table: for each target distance, how often the call got
+   there BEFORE it went the same distance against.
+
+   Not the same question as direction. A read can call the sign right and
+   still lose a three-tick target, because getting there first is what
+   pays — a higher close is no use if it went four ticks against you on
+   the way. */
+function reachTable(cal) {
+  const rows = (cal.reach || []).filter(r => r.ready);
+  const d = cal.distance || {};
+  if (!rows.length) {
+    return '<div class="thin" style="margin-top:8px">Not enough graded '
+      + 'bars yet to say how far it gets.</div>';
+  }
+  const tb = chartData && chartData.tick_bps ? chartData.tick_bps : 0;
+  const cost = parseFloat($('sFee').value || '0');
+
+  return '<h3 style="margin:14px 0 4px;font-size:13px">How often it gets '
+    + 'there first</h3>'
+    + '<div class="thin" style="margin-bottom:6px">Target reached before '
+    + 'the same distance went against, walking one-minute bars. A minute '
+    + 'that touches both counts against you — nothing in a bar says which '
+    + 'came first.</div>'
+    + '<table><thead><tr><th>target</th>'
+    + (tb ? '<th>ticks</th>' : '')
+    + '<th>n</th><th>got there first</th><th>needs</th>'
+    + '<th>reads as</th></tr></thead><tbody>'
+    + rows.map(r => {
+        // Symmetric target and stop, so breakeven is the cost term alone.
+        const need = (r.target_bps + cost) / (2 * r.target_bps);
+        const clear = r.ci_low > need;
+        const dead = r.ci_high < need;
+        return `<tr><td>${r.target_bps}bps</td>`
+          + (tb ? `<td>${(r.target_bps / tb).toFixed(1)}</td>` : '')
+          + `<td>${r.resolved}</td>`
+          + `<td><b class="${r.ci_low > 0.5 ? 'long'
+              : r.ci_high < 0.5 ? 'short' : ''}">`
+          + `${(r.rate * 100).toFixed(1)}%</b> `
+          + `<span class="thin">${(r.ci_low * 100).toFixed(0)}–`
+          + `${(r.ci_high * 100).toFixed(0)}%</span></td>`
+          + `<td>${need >= 1 ? '<b>impossible</b>'
+              : (need * 100).toFixed(0) + '%'}</td>`
+          + `<td class="thin">${need >= 1 ? 'the target does not cover the '
+              + 'round trip' : clear ? 'clears it' : dead
+              ? 'does not clear it' : 'too close to call'}</td></tr>`;
+      }).join('')
+    + '</tbody></table>'
+    + (d.ready ? `<div class="msg" style="margin-top:6px">${esc(d.note)}</div>`
+               : '')
+    + `<div class="thin">"Needs" is (target + cost) / (2 x target) at the `
+    + `${cost}bps round trip in the fee box — change it and these move.</div>`;
 }
 
 async function backfillBook() {
@@ -6101,6 +6258,9 @@ function paintSuggest(d) {
   sugId = d.id || null;
   paintThreeWay(d);
   loadChart();
+  // Profile follows the same refresh as the call. Two clocks would let the
+  // levels drift out of step with the candles they are drawn over.
+  loadProfile();
 
   // The feed rate decides whether anything below it is worth reading. Every
   // book signal measures CHANGE, so the rate change arrives at IS the
@@ -6518,6 +6678,8 @@ let chartShapes = [];       // what has been drawn, for this market+timeframe
    two copies of this arithmetic drift and drawn lines quietly land in the
    wrong place. */
 let chartScale = null;      // {hi, lo, top, plotH}
+let profileData = null;     // /api/profile payload
+let profileShow = 'reference';  // reference | session | off
 let chartProj = null;       // the projection for the bar still forming
 
 const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
@@ -6691,6 +6853,104 @@ function axisChip(g, x, y, text, bg, fg, align) {
   return w;
 }
 
+
+/* ---- volume profile -------------------------------------------------
+   Drawn BEFORE the candles so it sits behind them. A profile painted over
+   the price action hides the thing it is meant to explain.
+
+   Rows come from the server already merged for display; the levels do not.
+   POC, VAH and VAL are drawn at their exact prices, because those are what
+   a reader acts on and a level rounded to a drawing bucket is a level in
+   the wrong place. */
+function drawProfile(g, hi, lo, plotW, plotH) {
+  if (!profileData || profileShow === 'off') return;
+  const p = profileData[profileShow];
+  if (!p || !p.rows || !p.rows.length) return;
+
+  const y = v => CH_PAD.t + (hi - v) / (hi - lo) * plotH;
+  const maxW = Math.min(150, plotW * 0.22);
+  const right = CH_PAD.l + plotW;
+
+  g.save();
+  for (const r of p.rows) {
+    const yTop = y(r.hi), yBot = y(r.lo);
+    const h = Math.max(1, yBot - yTop);
+    if (yBot < CH_PAD.t || yTop > CH_PAD.t + plotH) continue;
+    const w = Math.max(1, (r.share || 0) * maxW);
+    const inVA = r.lo >= p.val && r.hi <= p.vah;
+    g.globalAlpha = inVA ? 0.30 : 0.16;
+    g.fillStyle = inVA ? '#4d8fd1' : '#7b8794';
+    g.fillRect(right - w, yTop, w, Math.max(1, h - 0.6));
+  }
+  g.globalAlpha = 1;
+
+  /* Exact levels, unmerged. */
+  const mark = (px, label, colour, dash) => {
+    if (px <= lo || px >= hi) return;
+    const yy = Math.round(y(px)) + 0.5;
+    g.strokeStyle = colour; g.lineWidth = 1;
+    g.setLineDash(dash || []);
+    g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(right, yy); g.stroke();
+    g.setLineDash([]);
+    g.fillStyle = colour; g.textAlign = 'left';
+    g.font = '10px ui-monospace, monospace';
+    g.fillText(label, CH_PAD.l + 3, yy - 3);
+  };
+  mark(p.vah, 'VAH ' + chPx(p.vah), '#c17d33', [4, 3]);
+  mark(p.val, 'VAL ' + chPx(p.val), '#c17d33', [4, 3]);
+  mark(p.poc, 'POC ' + chPx(p.poc), '#d14d4d', []);
+  for (const h of (p.hvn || [])) mark(h, 'HVN', '#4d8fd1', [2, 4]);
+  for (const l of (p.lvn || [])) mark(l, 'LVN', '#7b8794', [1, 5]);
+  g.restore();
+}
+
+/* One sentence of structure, refreshed with the chart. No trade, no stop,
+   no direction -- what price is doing against the profile, right now. */
+function cycleProfile() {
+  /* Prior shape -> this session -> off. The prior shape is the default
+     because it is what price is REACTING to; today's own profile is still
+     being made by the very move you are reading. */
+  profileShow = profileShow === 'reference' ? 'session'
+              : profileShow === 'session' ? 'off' : 'reference';
+  const b = $('tool-prof');
+  if (b) {
+    b.classList.toggle('on', profileShow !== 'off');
+    b.textContent = profileShow === 'session' ? 'prof·now'
+                  : profileShow === 'off' ? 'prof' : 'prof';
+  }
+  drawChart();
+}
+
+async function loadProfile() {
+  const el = $('profRead');
+  try {
+    const d = await api('/api/profile?' + q({
+      coin: coin(), interval: $('sInt').value, bars: 400}));
+    if (!d || !d.ok) {
+      profileData = null;
+      if (el) el.textContent = (d && d.why) || 'no profile';
+      drawChart();
+      return;
+    }
+    profileData = d;
+    const r = d.read;
+    if (el) {
+      const where = r.at_node
+        ? `at the ${r.at_node} ${chPx(r.node_price)} (${r.ticks_from_node > 0 ? '+' : ''}${r.ticks_from_node}t)`
+        : r.zone;
+      const acc = r.accepted === 'no'
+        ? 'not accepted beyond value'
+        : `accepted ${r.accepted} value`;
+      el.textContent = `${chPx(r.price)} — ${where} · ${r.doing} · ${acc}`;
+      el.title = r.note;
+    }
+    drawChart();
+  } catch (e) {
+    profileData = null;
+    if (el) el.textContent = 'profile unavailable';
+  }
+}
+
 function drawChart() {
   const s = chartSlice();
   const bars = s.bars;
@@ -6747,6 +7007,7 @@ function drawChart() {
   hi = mid + span; lo = mid - span;
 
   chartScale = {hi, lo, top: CH_PAD.t, plotH};
+  drawProfile(g, hi, lo, plotW, plotH);
   const y = p => CH_PAD.t + (hi - p) / (hi - lo) * plotH;
   const pxAt = priceAt;
   const step = chartStep(plotW, bars.length);
@@ -6914,10 +7175,25 @@ function drawChart() {
     // claim alone reads like a hit rate and is not one.
     const pu = chartProj.signal.p_up;
     const m = chartProj.measured || {};
-    const claim = `${(pu * 100).toFixed(0)}% up`;
+
+    // BUY or SELL, not "% up".
+    //
+    // Phrasing every projection as a probability of UP meant a short read
+    // printed "37% up" on a red block — the number and the colour saying
+    // opposite-looking things at the moment you most need one glance to
+    // be enough. The probability is now quoted in the direction of the
+    // call, and the distance beside it.
+    const moveBps = ((q.q50 - now) / now) * 10_000;
+    const conf = rising ? pu : 1 - pu;
+    const tickBps = chartData.tick_bps || 0;
+    const inTicks = tickBps > 0
+      ? `  ${(Math.abs(moveBps) / tickBps).toFixed(1)} ticks` : '';
+    const claim = `${rising ? 'BUY' : 'SELL'}  `
+      + `${moveBps >= 0 ? '+' : ''}${moveBps.toFixed(1)}bps${inTicks}`;
     const track = m.ready
-      ? `${(m.rate * 100).toFixed(0)}% measured · n=${m.n}`
-      : 'not yet measured';
+      ? `${(conf * 100).toFixed(0)}% of paths · ${(m.rate * 100).toFixed(0)}%`
+        + ` measured n=${m.n}`
+      : `${(conf * 100).toFixed(0)}% of paths · not yet measured`;
 
     // The block sits hard against the price scale, so the labels go to
     // its LEFT unless there is genuinely room on the right.
