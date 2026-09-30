@@ -270,3 +270,25 @@ def test_the_read_is_taken_against_the_reference_not_the_session():
     route = src[src.index('@app.get("/api/profile"'):
                 src.index('@app.get("/api/chart"')]
     assert "_ms.read(rows[cut:], reference)" in route
+
+
+def test_the_reference_splits_on_a_session_boundary_where_one_exists():
+    """A rolling half-and-half split mixes part of today into the shape
+    price is supposedly reacting to, which makes today's own structure a
+    level. Where the market has sessions, the boundary is the last one."""
+    src = open("liqmap/web.py").read()
+    route = src[src.index('@app.get("/api/profile"'):
+                src.index('@app.get("/api/chart"')]
+    assert "trade_date" in route
+    assert "_td(stamps[-1])" in route
+
+
+def test_the_rolling_split_survives_as_a_fallback():
+    """Crypto has no session boundary. The fallback is a real limitation
+    of the reference on a 24/7 market, so it stays visible rather than
+    pretending every market has an open."""
+    src = open("liqmap/web.py").read()
+    route = src[src.index('@app.get("/api/profile"'):
+                src.index('@app.get("/api/chart"')]
+    assert "cut = max(20, len(rows) // 2)" in route
+    assert "Crypto has no session boundary" in route

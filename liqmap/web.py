@@ -3313,8 +3313,30 @@ def create_app() -> FastAPI:
         if not rows:
             return {"ok": False, "why": "no candles for that market yet"}
 
-        # Split: the older portion builds the reference, the rest is today.
-        cut = max(20, len(rows) // 2)
+        # Split into "what price is reacting to" and "what is being made
+        # now". Where the market HAS sessions, that boundary is the last
+        # one -- the prior RTH profile is the shape on the chart at the
+        # open. A rolling half-and-half split would mix part of today into
+        # the reference and read today's own structure as a level.
+        #
+        # Crypto has no session boundary, so there the split IS arbitrary
+        # and falls back to half the window. That is a real limitation of
+        # the reference on a 24/7 market, not a choice worth hiding.
+        from .levels import Phase as _Ph, phase as _phase, trade_date as _td
+
+        cut = 0
+        try:
+            stamps = [float(getattr(b, "ts", 0) or 0) for b in rows]
+            today = _td(stamps[-1]) if stamps else None
+            if today is not None and _phase(stamps[-1]) is not _Ph.CLOSED:
+                for i, t in enumerate(stamps):
+                    if _td(t) == today:
+                        cut = i
+                        break
+        except Exception:
+            cut = 0
+        if cut < 20 or cut > len(rows) - 10:
+            cut = max(20, len(rows) // 2)
         reference = _pf.final(rows[:cut])
         session = _pf.final(rows)
         read = _ms.read(rows[cut:], reference)
