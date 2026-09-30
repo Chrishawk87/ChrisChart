@@ -6963,8 +6963,24 @@ async function loadProfile() {
       const acc = r.accepted === 'no'
         ? 'not accepted beyond value'
         : `accepted ${r.accepted} value`;
-      el.textContent = `${chPx(r.price)} — ${where} · ${r.doing} · ${acc}`;
-      el.title = r.note;
+
+      /* The travel: which node is next each way, and whether the ground
+         between here and it is thin. This is the "where does it go from
+         here" part -- not a forecast, just the structure ahead. */
+      const up = r.nearest_above
+        ? `↑ ${chPx(r.nearest_above)}${r.thin_above ? ' (thin)' : ''}`
+        : '↑ clear';
+      const dn = r.nearest_below
+        ? `↓ ${chPx(r.nearest_below)}${r.thin_below ? ' (thin)' : ''}`
+        : '↓ clear';
+
+      el.textContent =
+        `${chPx(r.price)} — ${where} · ${r.doing} · ${acc}   ${up}   ${dn}`;
+      el.title = r.note
+        + (r.thin_above || r.thin_below
+           ? '  |  "thin" = a low-volume node sits between here and that '
+             + 'level, so price has less to trade against on the way.'
+           : '');
     }
     drawChart();
   } catch (e) {

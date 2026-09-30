@@ -141,7 +141,7 @@ def test_a_broad_shelf_does_not_report_as_many_adjacent_nodes():
     one HVN per row, and an extractor would fire twenty times on one
     feature."""
     bars = [flat(i, 7000.0 + (i % 12) * 0.25, 100.0) for i in range(1200)]
-    p = pf.final(bars)
+    p = pf.final(bars, tick=0.25)
     assert len(p.hvn) <= 4
 
 
@@ -193,7 +193,7 @@ def test_an_untouched_gap_beside_a_valley_does_not_disqualify_it():
     bars += [flat(2000 + i, 7803.0 + (i % 2) * 0.25, 20.0) for i in range(20)]
     bars += [flat(4000 + i, 7805.0 + (i % 8) * 0.25, 300.0)
              for i in range(1200)]
-    p = pf.final(bars)
+    p = pf.final(bars, tick=0.25)
     assert len(p.lvn) == 1
     assert abs(p.lvn[0] - 7803.0) < 0.5
 
@@ -225,8 +225,8 @@ def test_the_developing_profile_cannot_see_later_bars():
     """THE test. The developing profile partway through must be identical
     whether or not the displaced second half exists in the input."""
     a, b = _two_halves()
-    only_first = pf.developing(a, stride=50, warmup=60)
-    both = pf.developing(a + b, stride=50, warmup=60)
+    only_first = pf.developing(a, stride=50, warmup=60, tick=0.25)
+    both = pf.developing(a + b, stride=50, warmup=60, tick=0.25)
 
     for (i, p), (j, q) in zip(only_first, both[:len(only_first)]):
         assert i == j
@@ -305,3 +305,73 @@ def test_the_dict_carries_every_reported_level():
     d = p.to_dict()
     for k in ("poc", "vah", "val", "va_width_ticks", "total", "hvn", "lvn"):
         assert k in d
+
+
+# ------------------------------------------- the row size is not ES's tick
+
+def test_the_row_size_is_read_from_the_bars_not_pinned_to_es():
+    """A fixed 0.25 row is right for exactly one instrument.
+
+    On BTC at 105,000 a 3,000-dollar range became 12,000 rows twenty-five
+    cents wide, and the node window of +/- 4 rows spanned one dollar -- it
+    detected nothing. On a sub-penny token the whole range was smaller than
+    a single row, so there was no profile at all.
+    """
+    import random
+
+    def synth(px, rng, tick, n=500, seed=1):
+        r = random.Random(seed)
+        out = []
+        for _ in range(n):
+            a = round((px + r.uniform(-rng / 2, rng / 2)) / tick) * tick
+            out.append(Bar(0.0, a, a + tick, a - tick, a, 100.0))
+        return out
+
+    for price, rng, tick in ((7800, 90, 0.25),        # ES
+                             (105_000, 3000, 1.0),    # BTC
+                             (0.38, 0.03, 0.00001)):  # a sub-penny token
+        bars = synth(price, rng, tick)
+        rows = rng / pf.row_size(bars)
+        assert 150 <= rows <= 900, f"{price}: {rows:.0f} rows"
+
+
+def test_es_still_gets_exactly_one_tick_per_row():
+    """Snapping up to the instrument's own tick keeps ES at one tick a row
+    rather than some fraction of one."""
+    import random
+    r = random.Random(1)
+    bars = []
+    for _ in range(500):
+        a = round((7800 + r.uniform(-45, 45)) * 4) / 4
+        bars.append(Bar(0.0, a, a + 0.25, a - 0.25, a, 100.0))
+    assert pf.row_size(bars) == pytest.approx(0.25)
+
+
+def test_a_row_boundary_is_always_a_price_the_market_can_print():
+    import random
+    r = random.Random(3)
+    bars = []
+    for _ in range(400):
+        a = round((105_000 + r.uniform(-1500, 1500)) / 1.0) * 1.0
+        bars.append(Bar(0.0, a, a + 1, a - 1, a, 100.0))
+    row = pf.row_size(bars)
+    assert abs(row / pf.infer_tick(bars) - round(row / pf.infer_tick(bars))) < 1e-6
+
+
+def test_sparse_prices_fall_back_rather_than_inferring_a_huge_tick():
+    """Three bars five points apart would otherwise 'infer' a five point
+    tick and give a three-row profile."""
+    bars = [Bar(0.0, 7000.0, 7000.0, 7000.0, 7000.0, 10.0),
+            Bar(1.0, 7005.0, 7005.0, 7005.0, 7005.0, 900.0),
+            Bar(2.0, 7010.0, 7010.0, 7010.0, 7010.0, 10.0)]
+    assert pf.infer_tick(bars) < 1.0
+
+
+def test_an_explicit_tick_still_wins():
+    import random
+    r = random.Random(2)
+    bars = [Bar(0.0, 105_000 + r.uniform(-1500, 1500), 0, 0, 0, 100.0)
+            for _ in range(50)]
+    for b in bars:
+        b.high = b.open + 1; b.low = b.open - 1; b.close = b.open
+    assert pf.final(bars, tick=0.25).tick == pytest.approx(0.25)

@@ -93,6 +93,81 @@ VALLEY_WINDOW = 12
 ROLLING_SECONDS = 3600.0
 
 
+# How many rows a profile should have, whatever the instrument.
+#
+# THE ROW SIZE CANNOT BE A CONSTANT
+#
+# It was one tick of ES -- 0.25 -- which is correct for ES and nonsense
+# everywhere else. On BTC at 105,000 a 3,000-dollar range became 12,000 rows
+# twenty-five cents wide, and the node window of +/- 4 rows spanned one
+# dollar: it detected nothing. On a sub-penny token the whole session range
+# was smaller than a single row, so there was no profile at all.
+#
+# Targeting a ROW COUNT instead makes the shape mean the same thing on every
+# market, and snapping up to the instrument's own tick keeps ES at exactly
+# one tick per row rather than some fraction of one.
+TARGET_ROWS = 400
+
+# Distinct traded prices needed before an inferred tick is trustworthy.
+MIN_PRICES_FOR_TICK = 20
+
+
+def _relative_step(price: float) -> float:
+    """About one basis point of price, snapped to a clean power of ten.
+
+    The fallback when the bars are too sparse to show their own increment.
+    Scale-correct everywhere, exact nowhere -- which is the right trade for
+    a guess that only applies when the real answer is unavailable.
+    """
+    import math
+    if price <= 0:
+        return TICK
+    return 10.0 ** math.floor(math.log10(price * 1e-4))
+
+
+def infer_tick(bars: Sequence, floor: float = 1e-9) -> float:
+    """The instrument's own price increment, read off the bars.
+
+    The smallest positive gap between distinct traded prices. Taken from the
+    data rather than configured, because the chart serves a thousand markets
+    and a per-market tick table is a thousand chances to be wrong about one.
+    """
+    seen = set()
+    for b in bars[:4000]:
+        for v in (b.open, b.high, b.low, b.close):
+            if v > 0:
+                seen.add(round(float(v), 10))
+
+    # Too few distinct prices to read an increment from. Three bars priced
+    # five points apart would otherwise "infer" a five point tick, and the
+    # profile would be three rows wide. Fall back to a fraction of price,
+    # which is at least scale-correct on any instrument.
+    if len(seen) < MIN_PRICES_FOR_TICK:
+        mid = (max(seen) + min(seen)) / 2 if seen else 0.0
+        return _relative_step(mid) if mid > 0 else floor
+
+    ordered = sorted(seen)
+    gaps = [b - a for a, b in zip(ordered, ordered[1:]) if b - a > floor]
+    return min(gaps) if gaps else floor
+
+
+def row_size(bars: Sequence, target_rows: int = TARGET_ROWS) -> float:
+    """Row height for these bars: about `target_rows` rows, tick-aligned."""
+    if not bars:
+        return TICK
+    hi = max(b.high for b in bars)
+    lo = min(b.low for b in bars)
+    tick = infer_tick(bars)
+    span = hi - lo
+    if span <= 0 or tick <= 0:
+        return max(tick, TICK)
+    ideal = span / max(1, target_rows)
+    # Never finer than the instrument trades, and always a whole number of
+    # ticks so a row boundary is a price the market can actually print.
+    steps = max(1, int(ideal / tick + 0.999999))
+    return steps * tick
+
+
 @dataclass
 class Profile:
     """A completed or in-progress volume profile."""
@@ -285,13 +360,19 @@ def _nodes(vol: np.ndarray, lo_row: int, tick: float
     return _cluster(hi_rows), _cluster(lo_rows)
 
 
-def final(bars: Sequence, tick: float = TICK,
+def final(bars: Sequence, tick: float | None = None,
           share: float = VALUE_AREA) -> Profile:
     """The completed profile over `bars`.
+
+    `tick` None means "work it out from the bars", which is what every
+    caller should want -- a fixed row size is correct for exactly one
+    instrument. Pass a value only to pin it deliberately.
 
     DISPLAY AND PRIOR SESSIONS ONLY. Using this for the session being traded
     is look-ahead -- see the module docstring.
     """
+    if tick is None:
+        tick = row_size(bars)
     lo_row, vol = accumulate(bars, tick)
     p = Profile(lo_row=lo_row, volumes=vol, tick=tick, n_bars=len(bars))
     if vol.size == 0 or vol.sum() <= 0:
@@ -306,7 +387,7 @@ def final(bars: Sequence, tick: float = TICK,
 
 
 def developing(bars: Sequence, stride: int = 1, warmup: int = 60,
-               tick: float = TICK, share: float = VALUE_AREA
+               tick: float | None = None, share: float = VALUE_AREA
                ) -> list[tuple[int, Profile]]:
     """The profile as it stood at each bar, causally.
 
@@ -324,6 +405,8 @@ def developing(bars: Sequence, stride: int = 1, warmup: int = 60,
     out: list[tuple[int, Profile]] = []
     if not bars:
         return out
+    if tick is None:
+        tick = row_size(bars)
 
     lo_row, _ = _rows_for(bars, tick)
     hi_row = max(int(np.floor(b.high / tick)) for b in bars)
@@ -352,7 +435,7 @@ def developing(bars: Sequence, stride: int = 1, warmup: int = 60,
 
 
 def rolling(bars: Sequence, seconds: float = ROLLING_SECONDS,
-            stride: int = 1, tick: float = TICK,
+            stride: int = 1, tick: float | None = None,
             share: float = VALUE_AREA) -> list[tuple[int, Profile]]:
     """Profile over a trailing window ending at each reported bar.
 

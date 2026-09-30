@@ -6,10 +6,15 @@ requests>=2.31
 fastapi>=0.110
 uvicorn[standard]>=0.27
 
-# Required for the chart-history upload endpoint. FastAPI's UploadFile needs
-# it, and without it that one route fails at request time while everything
-# else keeps working -- which makes the failure look like a bug in the
-# parser rather than a missing dependency.
+# Required for the chart-history upload endpoint, and NOT optional.
+#
+# This comment used to say the route "fails at request time while everything
+# else keeps working". That is no longer true and was the more comfortable
+# of the two possibilities: current FastAPI validates form parameters when
+# the route is DECLARED, so a missing python-multipart raises inside
+# create_app() and the whole service fails to import. Every test that
+# touches the app errors at collection with a message about one upload
+# endpoint, which reads like a broken parser rather than an absent package.
 python-multipart>=0.0.9
 
 # Reading Hyperliquid's own historical book archive
