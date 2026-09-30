@@ -4684,14 +4684,33 @@ at normal scale">fit</button>
 (structural + micro), prior session's shape, this session's shape,
 off">prof·2</button>
           <span class="thin" style="margin-left:4px">SVP</span>
-          <input id="svpMin" type="number" min="1" max="1440" step="1"
-            value="60" onchange="setWindows()" style="width:44px"
-            title="Structural profile — how many minutes back it looks">
+          <select id="svpMin" onchange="setWindows()"
+            title="Structural profile — how far back it looks. This is the
+auction you are reading context from.">
+            <option value="15">15m</option>
+            <option value="30">30m</option>
+            <option value="60" selected>1H</option>
+            <option value="120">2H</option>
+            <option value="240">4H</option>
+            <option value="480">8H</option>
+            <option value="720">12H</option>
+            <option value="1440">1D</option>
+          </select>
           <span class="thin">MVP</span>
-          <input id="mvpMin" type="number" min="1" max="1440" step="1"
-            value="10" onchange="setWindows()" style="width:44px"
-            title="Micro profile — how many minutes back it looks. It is the
-tail of the structural window, binned on the same grid.">
+          <select id="mvpMin" onchange="setWindows()"
+            title="Micro profile — how far back it looks. It is the tail of
+the structural window, binned on the same grid, so the two sets of levels
+are comparable. Must be shorter than the SVP.">
+            <option value="1">1m</option>
+            <option value="2">2m</option>
+            <option value="3">3m</option>
+            <option value="5">5m</option>
+            <option value="10" selected>10m</option>
+            <option value="15">15m</option>
+            <option value="30">30m</option>
+            <option value="60">1H</option>
+            <option value="120">2H</option>
+          </select>
           <button id="tool-proj" class="on" onclick="toggleProj()"
             title="Projected close — where this bar lands, given what has
 already printed">proj</button>
@@ -6780,7 +6799,7 @@ let chartData = null;
 /* Viewport over the bar array. `count` is how many bars are visible and
    `offset` is how many are hidden off the right edge, so offset 0 always
    means "pinned to the live bar". */
-let chartView = {count: 90, offset: 0, scale: 1.0};
+let chartView = {count: 90, offset: 0, scale: 1.0, shift: 0};
 let chartHover = null;      // {x, y} in CSS pixels, or null
 let chartTool = 'cursor';   // cursor | hline | trend | erase
 let chartDraft = null;      // a trendline being dragged out
@@ -6827,6 +6846,10 @@ const PROFILE_LAYERS = {
   ],
   off: [],
 };
+
+/* How many HVN/LVN tags a layer may print. The value area levels are
+   always labelled; these are the extras. */
+const NODE_LABELS = 4;
 let chartProj = null;       // the projection for the bar still forming
 
 const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
@@ -6941,16 +6964,35 @@ function chartGeom() {
           ppoTop: volTop + volH + CH_GAP};
 }
 
+/* How far past the newest bar you may scroll, as a share of the window.
+
+   Without this the last candle is welded to the price axis: you can zoom
+   in as far as you like and the thing you are trying to look at is always
+   jammed against the right edge with nothing in front of it. Every chart
+   worth using lets you pull the live bar into the middle of the screen,
+   because that is where you read what is happening next to it. */
+const RIGHT_ROOM = 0.45;
+
+/* How far the price window may be dragged off the bars, in half-spans.
+   Far enough to bring a profile level sitting above or below the candles
+   into view; not so far that the chart can be lost off-screen. */
+const SHIFT_LIMIT = 3.0;
+
 function chartSlice() {
   const all = (chartData && chartData.bars) || [];
   const n = all.length;
-  const count = Math.max(10, Math.min(chartView.count, n));
+  const count = Math.max(5, Math.min(chartView.count, n));
   const maxOff = Math.max(0, n - count);
-  const off = Math.max(0, Math.min(chartView.offset, maxOff));
+  /* A NEGATIVE offset scrolls past the newest bar. The slice then returns
+     fewer bars than `count`, and because everything that converts an index
+     to an x uses `count` rather than the bar total, the shortfall renders
+     as empty chart on the right instead of fatter candles. */
+  const minOff = -Math.round(count * RIGHT_ROOM);
+  const off = Math.max(minOff, Math.min(chartView.offset, maxOff));
   chartView.offset = off;
   const endIdx = n - off;
-  return {bars: all.slice(Math.max(0, endIdx - count), endIdx),
-          all, count, offset: off, maxOff, atRight: off === 0};
+  return {bars: all.slice(Math.max(0, endIdx - count), Math.max(0, endIdx)),
+          all, count, offset: off, maxOff, minOff, atRight: off <= 0};
 }
 
 /* Decimals from the size of the number, so a $4,275 gold print and a
@@ -7048,14 +7090,15 @@ function drawProfile(g, hi, lo, plotW, plotH) {
        these are not, because a level rounded to a drawing bucket is a
        level in the wrong place and it is the levels a reader acts on. */
     const pre = L.tag ? L.tag + '·' : '';
-    const mark = (px, label, colour, dash) => {
+    const mark = (px, label, colour, dash, quiet) => {
       if (px <= lo || px >= hi) return;
       const yy = Math.round(y(px)) + 0.5;
       g.strokeStyle = colour; g.lineWidth = 1;
       g.setLineDash(dash || []);
       g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(right, yy); g.stroke();
       g.setLineDash([]);
-      labels.push({y: yy, text: pre + label, colour: colour, L: L});
+      if (!quiet) labels.push({y: yy, text: pre + label, colour: colour,
+                               L: L});
     };
     /* POC FIRST. Where the two auctions are tight the micro value area is
        a couple of points wide and all three of its levels land inside one
@@ -7065,8 +7108,20 @@ function drawProfile(g, hi, lo, plotW, plotH) {
     mark(p.vah, 'VAH ' + chPx(p.vah), L.edge, [4, 3]);
     mark(p.val, 'VAL ' + chPx(p.val), L.edge, [4, 3]);
     if (L.nodes) {
-      for (const h of (p.hvn || [])) mark(h, 'HVN', L.hue, [2, 4]);
-      for (const l of (p.lvn || [])) mark(l, 'LVN', L.out, [1, 5]);
+      /* Every node gets a LINE. Only the few nearest the middle of the
+         view get a LABEL: zoomed in on a busy profile there can be a
+         dozen in frame, and a stack of tags reading 'HVN' with no price
+         on it is noise that buries the three levels you came to read. */
+      const mid = (hi + lo) / 2;
+      const near = [].concat((p.hvn || []).map(x => ['HVN', x, L.hue,
+                                                    [2, 4]]),
+                             (p.lvn || []).map(x => ['LVN', x, L.out,
+                                                     [1, 5]]))
+        .filter(nd => nd[1] > lo && nd[1] < hi)
+        .sort((a, b) => Math.abs(a[1] - mid) - Math.abs(b[1] - mid));
+      near.forEach((nd, i) =>
+        mark(nd[1], nd[0] + ' ' + chPx(nd[1]), nd[2], nd[3],
+             i >= NODE_LABELS));
     }
   }
 
@@ -7083,7 +7138,9 @@ function drawProfile(g, hi, lo, plotW, plotH) {
   const used = {left: [], right: []};
   for (const t of labels) {
     const seat = used[t.L.side === 'right' ? 'right' : 'left'];
-    if (seat.some(u => Math.abs(u - t.y) < 11)) continue;
+    /* The plate is 12px tall, so the guard has to exceed 12 or two
+       labels can still clip each other by a pixel. */
+    if (seat.some(u => Math.abs(u - t.y) < 13)) continue;
     seat.push(t.y);
     const w = g.measureText(t.text).width;
     const x = (t.L.side === 'right') ? right - 3 - w : CH_PAD.l + 3;
@@ -7164,7 +7221,27 @@ function profileWindows() {
   return {svp_min: svp, mvp_min: Math.min(num('mvpMin', 10), svp)};
 }
 
+/* A micro window as long as the structural one is not a hierarchy -- it
+   is the same profile drawn twice. Rather than silently clamping it (and
+   leaving the dropdown showing a number that is not what you get), the
+   impossible choices are greyed out and a selection that has become
+   impossible falls back to the longest one that still fits. */
+function syncWindowOptions() {
+  const sv = $('svpMin'), mv = $('mvpMin');
+  if (!sv || !mv) return;
+  const svp = parseFloat(sv.value) || 60;
+  let best = null;
+  for (const o of mv.options) {
+    o.disabled = parseFloat(o.value) >= svp;
+    if (!o.disabled) best = o.value;
+  }
+  if (mv.selectedOptions[0] && mv.selectedOptions[0].disabled && best) {
+    mv.value = best;
+  }
+}
+
 function setWindows() {
+  syncWindowOptions();
   try {
     localStorage.setItem('profWin', JSON.stringify(profileWindows()));
   } catch (e) {}
@@ -7182,6 +7259,7 @@ function restoreProfileWindows() {
     if (w && w.svp_min && $('svpMin')) $('svpMin').value = w.svp_min;
     if (w && w.mvp_min && $('mvpMin')) $('mvpMin').value = w.mvp_min;
   } catch (e) {}
+  syncWindowOptions();
 }
 
 async function loadProfile() {
@@ -7288,13 +7366,24 @@ function drawChart() {
   const mid = (hi + lo) / 2, half = (hi - lo) / 2;
   // The price axis can be dragged to squash or stretch; 1.0 is a 6% cushion.
   const span = half * 1.06 / Math.max(0.15, chartView.scale);
-  hi = mid + span; lo = mid - span;
+  /* And the whole price window can be dragged up or down. Auto-fitting to
+     the candles alone means anything drawn outside their range -- a value
+     area high above the last hour's bars, a node below them -- is simply
+     not on the chart, with nothing you can do about it. */
+  const push = span * Math.max(-SHIFT_LIMIT,
+                               Math.min(SHIFT_LIMIT, chartView.shift || 0));
+  hi = mid + span + push; lo = mid - span + push;
 
   chartScale = {hi, lo, top: CH_PAD.t, plotH};
   drawProfile(g, hi, lo, plotW, plotH);
   const y = p => CH_PAD.t + (hi - p) / (hi - lo) * plotH;
   const pxAt = priceAt;
-  const step = chartStep(plotW, bars.length);
+  /* `count`, NOT `bars.length`. The two are the same until you scroll past
+     the newest bar; after that, using the bar total would stretch the
+     candles to fill the width instead of leaving the room you asked for --
+     and it would put the drawing out of step with the hit-testing, which
+     already uses count. */
+  const step = chartStep(plotW, s.count);
   const xOf = i => CH_PAD.l + i * step + step / 2;
   const bw = Math.max(1, Math.min(step * 0.74, 14));
   const vy = v => volTop + volH - (vMax > 0 ? (v / vMax) * (volH - 2) : 0);
@@ -7854,10 +7943,14 @@ function wireChart() {
     const frac = Math.max(0, Math.min(1, (chartPoint(ev).x - CH_PAD.l) / plotW));
     const before = chartView.count;
     const next = Math.round(before * (ev.deltaY > 0 ? 1.15 : 0.87));
-    chartView.count = Math.max(15, Math.min(next, s.all.length));
+    /* Five bars, not fifteen. Reading an interaction with a node means
+       looking at the individual candles that made it. */
+    chartView.count = Math.max(5, Math.min(next, s.all.length));
     const grew = chartView.count - before;
-    chartView.offset = Math.max(0, chartView.offset
-                                   - Math.round(grew * (1 - frac)));
+    /* No clamp at zero here -- chartSlice owns the bounds, and clamping
+       twice is how the right-hand room gets quietly taken back on the
+       next scroll. */
+    chartView.offset = chartView.offset - Math.round(grew * (1 - frac));
     drawChart();
   }, {passive: false});
 
@@ -7891,7 +7984,11 @@ function wireChart() {
     if (chartTool === 'erase') {
       eraseNear(p); pickTool('cursor'); drawChart(); return;
     }
-    drag = {x: p.x, offset: chartView.offset};
+    /* Pan. Both axes in one gesture: grab the chart and move it wherever
+       you need it, the way every charting tool works. */
+    drag = {x: p.x, offset: chartView.offset,
+            y: p.y, shift: chartView.shift || 0};
+    cv.style.cursor = 'grabbing';
   };
   const move = ev => {
     if (!drag) return;
@@ -7918,9 +8015,19 @@ function wireChart() {
       return;
     }
     const s = chartSlice();
-    const step = chartStep(chartGeom().plotW, s.count);
-    chartView.offset = Math.max(0, Math.min(s.all.length - s.count,
+    const geo = chartGeom();
+    const step = chartStep(geo.plotW, s.count);
+    /* The lower bound is chartSlice's, not zero, or the scroll-past room
+       is unreachable by dragging -- which is the only way most people
+       ever move a chart. */
+    chartView.offset = Math.max(s.minOff, Math.min(s.all.length - s.count,
       Math.round(drag.offset + (p.x - drag.x) / step)));
+    /* Vertical, in half-spans, so the drag keeps up with the pointer at
+       any zoom: a full plot height is two spans. Dragging DOWN raises the
+       price window, so the candle under your hand follows your hand. */
+    const inner = Math.max(1, geo.plotH);
+    chartView.shift = Math.max(-SHIFT_LIMIT, Math.min(SHIFT_LIMIT,
+      drag.shift + (p.y - drag.y) / inner * 2));
     drawChart();
   };
   const upEv = ev => {
@@ -7937,6 +8044,7 @@ function wireChart() {
       }
       chartDraft = null; pickTool('cursor'); drawChart();
     }
+    if (drag) cv.style.cursor = chartTool === 'cursor' ? 'crosshair' : 'copy';
     drag = null;
   };
 
@@ -7984,7 +8092,10 @@ function eraseNear(p) {
 }
 
 function resetChartView() {
-  chartView = {count: 90, offset: 0, scale: 1.0};
+  /* Everything back, including the vertical shift -- a chart dragged off
+     its own candles with no one-click way home is a chart you have to
+     reload the page to recover. */
+  chartView = {count: 90, offset: 0, scale: 1.0, shift: 0};
   drawChart();
 }
 
