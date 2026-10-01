@@ -3437,6 +3437,61 @@ def create_app() -> FastAPI:
             },
         }
 
+    @app.get("/api/mtf", dependencies=[Depends(require_token)])
+    def api_mtf(coin: str = "BTC", bars: int = 1200,
+                target_ticks: float = 10.0,
+                cost_ticks: float = 1.4) -> dict[str, Any]:
+        """The 4H / 15m / 1m setups, as marks for the chart.
+
+        ALWAYS FROM 1-MINUTE BARS, whatever the chart is showing. The 15m
+        and 4H series are resampled from them inside the engine, so the
+        three timeframes cannot disagree about where their boundaries are.
+        Asking the venue for each separately is three chances for a 15m
+        bar whose open is not the open of the 1m bar at its start.
+
+        Every signal carries a status. `provisional` means its 15m bar is
+        still forming and it may yet be withdrawn -- that is what was on
+        the screen at the time, and hiding it would make the chart's
+        history tidier than the past.
+
+        Nothing here places, sizes or times an order.
+        """
+        from . import mtf as _mtf
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        n = max(120, min(bars, 5000))
+
+        rows: list[Any] = []
+        feed = rt.feed_for(coin)
+        if feed is not None:
+            hist = feed.history("1m")
+            if len(hist) >= 60:
+                rows = list(hist[-n:])
+        if not rows:
+            try:
+                rows = rt.client().candles(coin, "1m", bars=n)
+            except Exception as exc:
+                return {"ok": False, "why": f"candles unavailable: {exc}"}
+        if len(rows) < 60:
+            return {"ok": False, "why": "not enough 1m history yet"}
+
+        found = _mtf.scan(rows, cost_ticks=float(cost_ticks),
+                          target_ticks=float(target_ticks))
+        return {
+            "ok": True, "coin": coin, "bars": len(rows),
+            "signals": [s.to_dict() for s in found[-120:]],
+            "survival": _mtf.survival(found),
+            "conventions": {
+                "target_ticks": float(target_ticks),
+                "cost_ticks": float(cost_ticks),
+                "state_buffer_ticks": _mtf.STATE_BUFFER_TICKS,
+                "state_hold_bars": _mtf.STATE_HOLD_BARS,
+                "skip_15m_bars": _mtf.SKIP_15M_BARS,
+                "stop_lookback_15m": _mtf.STOP_LOOKBACK_15M,
+                "min_stop_ticks": _mtf.MIN_STOP_TICKS,
+            },
+        }
+
     @app.get("/api/chart", dependencies=[Depends(require_token)])
     def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120,
                   ppo_smooth: int = 1, ppo_signal: int = 9,
@@ -4666,6 +4721,10 @@ there. Facts about closed bars — no forecast, no trade."></div>
           color:var(--dim);margin-bottom:5px;min-height:14px"
           title="Where the micro volume profile sits inside the structural
 one. Hover for the rule."></div>
+        <div id="mtfRead" style="font:11px ui-monospace,monospace;
+          color:var(--dim);margin-bottom:5px;min-height:14px"
+          title="The most recent 4H/15m/1m setup, and what it has to beat.
+A suggestion \u2014 nothing here places an order."></div>
         <div class="chart-tools">
           <button id="tool-cursor" class="on"
             onclick="pickTool('cursor')" title="Crosshair">✛</button>
@@ -4714,6 +4773,10 @@ are comparable. Must be shorter than the SVP.">
           <button id="tool-proj" class="on" onclick="toggleProj()"
             title="Projected close — where this bar lands, given what has
 already printed">proj</button>
+          <button id="tool-mtf" class="on" onclick="toggleMTF()"
+            title="4H / 15m / 1m setups \u2014 filled bubble means the 15m
+bar closed the way the setup needed, hollow means it is still forming,
+faint means it was withdrawn">mtf</button>
           <button id="tool-ppo" class="on" onclick="togglePPO()"
             title="Tick Counter PPO — your indicator, computed from these
 bars">ppo</button>
@@ -6392,6 +6455,7 @@ function paintSuggest(d) {
   // Profile follows the same refresh as the call. Two clocks would let the
   // levels drift out of step with the candles they are drawn over.
   loadProfile();
+  loadMTF();
 
   // The feed rate decides whether anything below it is worth reading. Every
   // book signal measures CHANGE, so the rate change arrives at IS the
@@ -6850,6 +6914,14 @@ const PROFILE_LAYERS = {
 /* How many HVN/LVN tags a layer may print. The value area levels are
    always labelled; these are the extras. */
 const NODE_LABELS = 4;
+
+let mtfData = null;         // /api/mtf payload
+let mtfShow = true;         // the 4H/15m/1m setup bubbles
+
+/* Provisional setups are drawn hollow and withdrawn ones are drawn faint
+   rather than deleted. A chart that erases the signals that did not hold
+   shows you a past that is tidier than the one you traded. */
+const MTF_ALPHA = {provisional: 0.95, confirmed: 1.0, withdrawn: 0.30};
 let chartProj = null;       // the projection for the bar still forming
 
 const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
@@ -7262,6 +7334,65 @@ function restoreProfileWindows() {
   syncWindowOptions();
 }
 
+function toggleMTF() {
+  mtfShow = !mtfShow;
+  const b = $('tool-mtf');
+  if (b) b.classList.toggle('on', mtfShow);
+  const r = $('mtfRead');
+  if (r) r.style.display = mtfShow ? '' : 'none';
+  drawChart();
+}
+
+async function loadMTF() {
+  const el = $('mtfRead');
+  try {
+    const d = await api('/api/mtf?' + q({coin: coin(), bars: 1200}));
+    if (!d || !d.ok) {
+      mtfData = null;
+      if (el) el.textContent = (d && d.why) || '';
+      drawChart();
+      return;
+    }
+    mtfData = d;
+    const sv = d.survival || {};
+    const last = (d.signals || []).filter(x => x.status !== 'withdrawn')
+                                  .slice(-1)[0];
+    if (el) {
+      el.style.display = mtfShow ? '' : 'none';
+      if (!last) {
+        el.textContent = `no 4H/15m/1m setup in the last ${d.bars} minutes`;
+        el.title = '';
+      } else {
+        /* The break-even rate is printed BESIDE the setup, not buried in
+           a tooltip. A 10 tick target against a wide stop wins most of
+           the time by construction, and the number that says how much of
+           that is geometry belongs where you read the signal. */
+        el.innerHTML =
+          `<b style="color:${last.side === 'long'
+            ? 'var(--up)' : 'var(--down)'}">${last.side.toUpperCase()}`
+          + `</b> ${last.status}  ·  trigger ${chPx(last.trigger)}`
+          + `  TP ${chPx(last.target)} (${last.target_ticks}t)`
+          + `  SL ${chPx(last.stop)} (${last.stop_ticks}t)`
+          + `  <span style="color:var(--dim)">needs `
+          + `${(last.breakeven * 100).toFixed(1)}% to break even, `
+          + `${(last.driftless * 100).toFixed(1)}% on a coin</span>`
+          + (sv.survival != null
+             ? `  <span style="color:var(--dim)">· ${sv.confirmed}/`
+               + `${sv.resolved} provisional held</span>` : '');
+        el.title = last.note
+          + '\\n\\n"needs X% to break even" is the hit rate this target '
+          + 'and stop require once cost is paid. "Y% on a coin" is what a '
+          + 'driftless random walk scores on the same two distances -- '
+          + 'the gap between them is what the setup has to supply.';
+      }
+    }
+    drawChart();
+  } catch (e) {
+    mtfData = null;
+    if (el) el.textContent = '';
+  }
+}
+
 async function loadProfile() {
   const el = $('profRead');
   try {
@@ -7663,6 +7794,8 @@ function drawChart() {
     g.font = '10px ui-sans-serif,system-ui,sans-serif';
   }
 
+  drawMTF(g, s, xOf, step, y, hi, lo, plotW, up, down, panel);
+
   /* ---- crosshair ---------------------------------------------------- */
 
   let readBar = last, readMark = null;
@@ -7851,6 +7984,85 @@ function drawCorner(g, o) {
 
 /* Which visible slot a mark belongs in, from timestamps rather than a
    stored index, so it stays correct while panning. */
+/* The 4H/15m/1m setups, over the candles.
+
+   Signal timestamps are 1-MINUTE, whatever the chart is showing, because
+   the engine always reads 1m bars. tsX converts by the chart's own
+   interval, so a 1m signal inside a 15m candle lands at a fractional bar
+   index -- which is where it actually happened, not the start of the
+   candle that contains it. */
+function drawMTF(g, s, xOf, step, y, hi, lo, plotW, up, down, panel) {
+  if (!mtfShow || !mtfData || !mtfData.signals || !s.bars.length) return;
+  const right = CH_PAD.l + plotW;
+  const inView = p => p > lo && p < hi;
+
+  g.save();
+  let live = null;
+  for (const sig of mtfData.signals) {
+    const x = tsX(sig.ts, s, xOf, step);
+    if (x < CH_PAD.l - 20 || x > right + 20) continue;
+    if (!inView(sig.trigger)) continue;
+    if (sig.status !== 'withdrawn') live = sig;
+
+    const long = sig.side === 'long';
+    const c = long ? up : down;
+    const yy = y(sig.trigger) + (long ? 14 : -14);
+
+    g.globalAlpha = MTF_ALPHA[sig.status] != null
+      ? MTF_ALPHA[sig.status] : 0.9;
+    g.beginPath();
+    g.arc(x, yy, 5.5, 0, Math.PI * 2);
+    /* Filled means the 15m bar closed the way the setup needed. Hollow
+       means it has not closed yet. Identity never rides on colour alone:
+       the fill says confirmed, the position says which side. */
+    if (sig.status === 'confirmed') {
+      g.fillStyle = c; g.fill();
+      g.strokeStyle = panel; g.lineWidth = 1.5; g.stroke();
+    } else {
+      g.fillStyle = panel; g.fill();
+      g.strokeStyle = c; g.lineWidth = 1.5; g.stroke();
+    }
+    g.lineWidth = 1;
+    g.fillStyle = c;
+    g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+    g.textAlign = 'center';
+    g.fillText(long ? 'L' : 'S', x, yy + 3);
+    g.textAlign = 'left';
+  }
+  g.globalAlpha = 1;
+
+  /* Target and invalidation for the most recent setup that has not been
+     withdrawn. Drawing them for every signal in view turns the chart into
+     a ladder of lines nobody can read. */
+  if (live) {
+    const band = (px, colour, dash, label) => {
+      if (!inView(px)) return;
+      const yy = Math.round(y(px)) + 0.5;
+      g.strokeStyle = colour; g.lineWidth = 1;
+      g.setLineDash(dash);
+      g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(right, yy); g.stroke();
+      g.setLineDash([]);
+      /* Labelled down the MIDDLE of the plot, not at either edge. The
+         structural profile already owns the left margin and the micro
+         profile owns the right; a third family stacked on top of either
+         overprints exactly when the levels are close together, which is
+         when you need to read them. These lines span the full width, so
+         the centre is as true a place to label them as an edge. */
+      g.font = '10px ui-monospace, monospace';
+      const w = g.measureText(label).width;
+      const x = CH_PAD.l + plotW * 0.5 - w / 2;
+      g.globalAlpha = 0.92; g.fillStyle = '#12151a';
+      g.fillRect(x - 3, yy - 12, w + 6, 12);
+      g.globalAlpha = 1; g.fillStyle = colour;
+      g.fillText(label, x, yy - 3);
+    };
+    const c = live.side === 'long' ? up : down;
+    band(live.target, c, [2, 3], 'TP ' + chPx(live.target));
+    band(live.stop, '#a33', [], 'SL ' + chPx(live.stop));
+  }
+  g.restore();
+}
+
 function markIndex(m, s) {
   const iv = chartData.interval_s || 900;
   return Math.round(((m.entry_ts || m.ts) - s.bars[0].ts) / iv);
