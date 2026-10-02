@@ -66,10 +66,13 @@ from . import profile as pf
 # ---------------------------------------------------------------------------
 
 H4_SECONDS = 14400.0
+H1_SECONDS = 3600.0
 M15_SECONDS = 900.0
 
-# How far past the 4H open price must be before the block is called, and how
-# many 1m closes it must hold there. Without both, the state flips on noise.
+# How far past the block's own open price must be before that block is
+# called, and how many 1m closes it must hold there. Applied to BOTH the 4H
+# and the 1H. Without the pair of them the state flips on noise, which is
+# most of what price does near an open it has just left.
 STATE_BUFFER_TICKS = 4.0
 STATE_HOLD_BARS = 2
 
@@ -86,6 +89,11 @@ TARGET_TICKS = 10.0
 # here rather than left to the reader.
 STOP_LOOKBACK_15M = 2
 
+# Smallest distance from the trigger back to the 15m open that still
+# describes a trade. Below this, price is effectively AT the open and the
+# premise has gone before the trigger printed.
+MIN_STOP_TICKS_FLOOR = 1.0
+
 # A round trip's cost in ticks. ES: $17.50 against $12.50 a tick. Only
 # meaningful on a tick-denominated instrument; pass your own elsewhere.
 COST_TICKS = 1.4
@@ -93,7 +101,7 @@ COST_TICKS = 1.4
 # Minimum distance from trigger to stop. A stop a tick away is not a
 # structural stop, it is a rounding error, and the breakeven rate it
 # implies is a fantasy.
-MIN_STOP_TICKS = 2.0
+MIN_STOP_TICKS = MIN_STOP_TICKS_FLOOR
 
 BULLISH = "BULLISH"
 BEARISH = "BEARISH"
@@ -116,7 +124,11 @@ class Signal:
 
     status: str = PROVISIONAL
     m15_start: float = 0.0
+    m15_open: float = 0.0        # the stop, and the trade's premise
+    minutes_in: float = 0.0      # how far into the 15m candle it fired
+    expires: float = 0.0         # no trade outlives its own 15m candle
     h4_open: float = 0.0
+    h1_open: float = 0.0
     bar_15_index: int = 0
 
     target_ticks: float = 0.0
@@ -131,7 +143,11 @@ class Signal:
                 "target": round(self.target, 6),
                 "stop": round(self.stop, 6),
                 "status": self.status, "m15_start": self.m15_start,
+                "m15_open": round(self.m15_open, 6),
+                "minutes_in": round(self.minutes_in, 1),
+                "expires": self.expires,
                 "h4_open": round(self.h4_open, 6),
+                "h1_open": round(self.h1_open, 6),
                 "bar_15_index": self.bar_15_index,
                 "target_ticks": round(self.target_ticks, 1),
                 "stop_ticks": round(self.stop_ticks, 1),
@@ -205,14 +221,52 @@ class _Forming:
 
 def scan(bars: Sequence, tick: float | None = None,
          cost_ticks: float = COST_TICKS,
-         target_ticks: float = TARGET_TICKS) -> list[Signal]:
+         target_ticks: float = TARGET_TICKS,
+         max_minutes_in: float | None = None,
+         require_1h: bool = False,
+         block_s: float = H4_SECONDS,
+         trade_s: float = M15_SECONDS,
+         trigger_s: float = 60.0) -> list[Signal]:
     """Every setup in these 1-minute bars, oldest first.
+
+    `require_1h` adds the hour to the agreement. The rule as finally
+    stated is that the 4H and the 15m agree and the minute is trending
+    with them; the hour was an earlier version of it. It is kept as a
+    switch rather than deleted, because which of the two is better is a
+    question with an answer and guessing at it is not.
+
+    `max_minutes_in` refuses a trigger that prints more than that many
+    minutes into its own 15-minute candle. The stop is the candle's open,
+    so a late trigger is a long way from it -- on a random walk the whole
+    population averages twenty ticks of stop, which is not the trade. A
+    tighter window is a tighter stop by construction, and it also throws
+    away signals, so it is a parameter to be SEARCHED on one half of the
+    data and judged on the other, never chosen by looking at the answer.
+
+    THE THREE TIMEFRAMES ARE PARAMETERS
+
+    `block_s` sets the direction, `trade_s` is the candle being traded --
+    it supplies the stop, which is its open, and the clock, which is its
+    close -- and `trigger_s` is the bar the continuation is read on. The
+    defaults are the 4H / 15m / 1m the rule was written in.
+
+    They are parameters because the choice has an answer and guessing at
+    it is not the same as knowing. Be careful what the answer costs,
+    though: a coarser trigger enters further from the traded candle's
+    open, so it widens the stop, and a smaller target makes the fixed
+    cost a larger share of what is being won. Both raise the hit rate
+    required. Neither is visible in a win rate on its own.
 
     Each signal is decided using only bars at or before its own timestamp.
     Status is resolved afterwards, from the close of its 15m bar, which is
     a later fact about an earlier signal -- not an input to it.
     """
     rows = _norm(bars)
+    # The whole read happens on the TRIGGER grid. Aggregating first means
+    # the forming trade candle, the block opens and the continuation bar
+    # all come off one series and cannot disagree about a boundary.
+    if trigger_s > 0:
+        rows = bars_mod.resample_stream(iter(rows), trigger_s)
     if len(rows) < 4:
         return []
     if tick is None:
@@ -222,10 +276,13 @@ def scan(bars: Sequence, tick: float | None = None,
 
     out: list[Signal] = []
 
-    h4_start = -1.0
-    h4_open = 0.0
-    state = UNDECIDED
-    run_up = run_down = 0
+    # Two independent block states, tracked the same way. The 15m only
+    # counts when BOTH agree: the 4H says which way the day is leaning and
+    # the 1H says the hour has not turned against it.
+    h4_start = h1_start = -1.0
+    h4_open = h1_open = 0.0
+    state4 = state1 = UNDECIDED
+    up4 = dn4 = up1 = dn1 = 0
 
     cur15: _Forming | None = None
     closed15: list[_Forming] = []       # most recent last
@@ -237,15 +294,25 @@ def scan(bars: Sequence, tick: float | None = None,
         # -- 4H block. The open is the open of the first 1m bar in it, so
         #    it is known the moment the block starts and reading it is not
         #    look-ahead. Nothing else about the 4H bar is touched.
-        start4 = ts - (ts % H4_SECONDS)
+        start4 = ts - (ts % block_s)
         if start4 != h4_start:
             h4_start = start4
             h4_open = float(b.open)
-            state = UNDECIDED
-            run_up = run_down = 0
+            state4 = UNDECIDED
+            up4 = dn4 = 0
+
+        # The hour, read exactly the same way. A new hour starts undecided
+        # too -- carrying the last hour's lean into a fresh one is reading
+        # a filter about a period that has ended.
+        start1 = ts - (ts % H1_SECONDS)
+        if start1 != h1_start:
+            h1_start = start1
+            h1_open = float(b.open)
+            state1 = UNDECIDED
+            up1 = dn1 = 0
 
         # -- 15m bar, accumulated rather than looked up.
-        start15 = ts - (ts % M15_SECONDS)
+        start15 = ts - (ts % trade_s)
         if cur15 is None or start15 != cur15.start:
             if cur15 is not None:
                 closed15.append(cur15)
@@ -255,40 +322,84 @@ def scan(bars: Sequence, tick: float | None = None,
         else:
             cur15.add(b)
 
-        # -- the 4H state, with a buffer and a hold.
-        dist = (float(b.close) - h4_open) / tick
-        if dist >= STATE_BUFFER_TICKS:
-            run_up += 1
-            run_down = 0
-        elif dist <= -STATE_BUFFER_TICKS:
-            run_down += 1
-            run_up = 0
-        else:
-            run_up = run_down = 0
-        if run_up >= STATE_HOLD_BARS:
-            state = BULLISH
-        elif run_down >= STATE_HOLD_BARS:
-            state = BEARISH
+        # -- both states, each with a buffer and a hold.
+        px_now = float(b.close)
 
-        if i == 0 or state == UNDECIDED:
+        d4 = (px_now - h4_open) / tick
+        if d4 >= STATE_BUFFER_TICKS:
+            up4, dn4 = up4 + 1, 0
+        elif d4 <= -STATE_BUFFER_TICKS:
+            dn4, up4 = dn4 + 1, 0
+        else:
+            up4 = dn4 = 0
+        if up4 >= STATE_HOLD_BARS:
+            state4 = BULLISH
+        elif dn4 >= STATE_HOLD_BARS:
+            state4 = BEARISH
+
+        d1 = (px_now - h1_open) / tick
+        if d1 >= STATE_BUFFER_TICKS:
+            up1, dn1 = up1 + 1, 0
+        elif d1 <= -STATE_BUFFER_TICKS:
+            dn1, up1 = dn1 + 1, 0
+        else:
+            up1 = dn1 = 0
+        if up1 >= STATE_HOLD_BARS:
+            state1 = BULLISH
+        elif dn1 >= STATE_HOLD_BARS:
+            state1 = BEARISH
+
+        # THE AGREEMENT. The four hours set the direction; the fifteen
+        # has to lean the same way (checked below, where the candle is
+        # known); the minute has to be trending with them.
+        #
+        # The hour is OPTIONAL. It was in an earlier statement of the rule
+        # and not in the final one, and rather than pick, both are
+        # measurable.
+        if i == 0 or state4 == UNDECIDED:
+            continue
+        if require_1h and state1 != state4:
+            continue
+        state = state4
+
+        idx15 = int((ts - h4_start) // trade_s)
+        if idx15 < SKIP_15M_BARS:
             continue
 
-        idx15 = int((ts - h4_start) // M15_SECONDS)
-        if idx15 < SKIP_15M_BARS:
+        minutes_in = (ts - cur15.start) / 60.0
+        if max_minutes_in is not None and minutes_in > max_minutes_in:
             continue
         if not closed15:
             continue
 
         prior15 = closed15[-1]
+        upto15 = [b for b in rows[max(0, i - 15):i + 1]
+                  if float(b.ts) >= cur15.start]
         prev1 = rows[i - 1]
         px = float(b.close)
 
+        # CONTINUATION, not a breakout print. The bar must make a higher
+        # high AND a higher low than the one before it -- structure moving
+        # up, rather than one spike through a prior extreme that closes
+        # back inside the last bar's range.
+        up = (float(b.high) > float(prev1.high)
+              and float(b.low) > float(prev1.low))
+        down = (float(b.low) < float(prev1.low)
+                and float(b.high) < float(prev1.high))
+
         side = None
-        if (state == BULLISH and prior15.red and cur15.green
-                and px > float(prev1.high)):
+        # ALL FOUR STATES THE SAME.
+        #
+        # The earlier rule wanted the PREVIOUS 15m to be the opposite
+        # colour -- a reversal condition, and the wrong shape entirely.
+        # What is being traded is agreement: the four hours, the hour and
+        # the fifteen all leaning the same way, with the minute
+        # continuing. The prior bar's colour is not part of that.
+        m15_bull = cur15.green
+        m15_bear = cur15.red
+        if state == BULLISH and m15_bull and up:
             side = "long"
-        elif (state == BEARISH and prior15.green and cur15.red
-                and px < float(prev1.low)):
+        elif state == BEARISH and m15_bear and down:
             side = "short"
         if side is None:
             continue
@@ -300,19 +411,27 @@ def scan(bars: Sequence, tick: float | None = None,
         if key in fired:
             continue
 
-        window = closed15[-STOP_LOOKBACK_15M:]
+        # THE STOP IS THE 15m CANDLE'S OWN OPEN.
+        #
+        # Not a structural low two bars back. The trade's premise is that
+        # this candle is leaning with everything above it; price trading
+        # back through the candle's open says the premise is gone, and
+        # there is nothing left to wait for.
+        #
+        # It is also what makes the arithmetic workable. A structural low
+        # sat 27 ticks away and demanded a 76.6% hit rate against a ten
+        # tick target. This stop is the distance from the entry back to
+        # the open -- usually single digits -- which is a different trade.
+        stop = cur15.open
         if side == "long":
-            stop = min([cur15.low] + [w.low for w in window])
             target = px + target_ticks * tick
             stop_t = (px - stop) / tick
         else:
-            stop = max([cur15.high] + [w.high for w in window])
             target = px - target_ticks * tick
             stop_t = (stop - px) / tick
 
-        # A stop on the wrong side of the trigger, or close enough to be a
-        # rounding error, describes no trade at all. Plotting it would put
-        # a line on the chart that means nothing.
+        # Price is already back at or through the open, so the premise has
+        # gone before the trigger even printed.
         if stop_t < MIN_STOP_TICKS:
             continue
 
@@ -320,20 +439,25 @@ def scan(bars: Sequence, tick: float | None = None,
         drift, be = rates(target_ticks, stop_t, cost_ticks)
         out.append(Signal(
             ts=ts, side=side, trigger=px, target=target, stop=stop,
-            m15_start=cur15.start, h4_open=h4_open, bar_15_index=idx15,
+            m15_start=cur15.start, m15_open=cur15.open,
+            minutes_in=minutes_in,
+            expires=cur15.start + trade_s,
+            h4_open=h4_open, h1_open=h1_open, bar_15_index=idx15,
             target_ticks=target_ticks, stop_ticks=stop_t,
             driftless=drift, breakeven=be,
-            note=(f"4H {state.lower()} from {h4_open:,.2f}; 15m bar "
-                  f"{idx15} of the block flipped "
-                  f"{'red to green' if side == 'long' else 'green to red'}; "
-                  f"1m {'broke' if side == 'long' else 'lost'} the prior "
-                  f"bar's {'high' if side == 'long' else 'low'}")))
+            note=(f"4H and 15m {state.lower()}"
+                  f"{' with the 1H' if require_1h else ''} "
+                  f"({h4_open:,.2f} / {cur15.open:,.2f}); "
+                  f"bar {idx15} of the block, {minutes_in:.0f} min in; 1m made "
+                  f"a {'higher high and higher low' if side == 'long' else 'lower low and lower high'}"
+                  f"; out at the 15m open or its close, whichever first")))
 
-    _resolve(out, rows)
+    _resolve(out, rows, trade_s)
     return out
 
 
-def _resolve(signals: list[Signal], rows: list) -> None:
+def _resolve(signals: list[Signal], rows: list,
+             trade_s: float = M15_SECONDS) -> None:
     """Mark each signal confirmed or withdrawn once its 15m bar has closed.
 
     This is a LATER fact about an EARLIER signal. It never feeds back into
@@ -343,11 +467,11 @@ def _resolve(signals: list[Signal], rows: list) -> None:
     """
     if not signals or not rows:
         return
-    final = {b.ts: b for b in bars_mod.resample(rows, M15_SECONDS)}
+    final = {b.ts: b for b in bars_mod.resample(rows, trade_s)}
     last_ts = float(rows[-1].ts)
     for s in signals:
         bar = final.get(s.m15_start)
-        if bar is None or last_ts < s.m15_start + M15_SECONDS - 1e-9:
+        if bar is None or last_ts < s.m15_start + trade_s - 1e-9:
             s.status = PROVISIONAL        # still forming
             continue
         green = float(bar.close) > float(bar.open)

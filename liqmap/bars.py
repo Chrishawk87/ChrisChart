@@ -235,7 +235,43 @@ def sessions(bars: Sequence[Bar], rth_only: bool = True,
     return out
 
 
+def resample_stream(records: Iterable[Bar], seconds: float) -> list[Bar]:
+    """Aggregate an ITERABLE to a coarser grid, holding only the result.
+
+    Identical arithmetic to `resample`, and the difference is memory
+    rather than numbers. Two years of one-second ES is about twenty
+    million records; materialising those as Python objects before
+    aggregating costs something like 2.5GB and is pure waste when the
+    five-second result is a fifth the size. The records go in a bar at a
+    time and only the aggregate is kept.
+
+    Requires ascending timestamps, which is how a DBN file arrives.
+    """
+    out: list[Bar] = []
+    cur: Bar | None = None
+    end = 0.0
+    for b in records:
+        if seconds <= 0:
+            out.append(b)
+            continue
+        start = b.ts - (b.ts % seconds)
+        if cur is None or start >= end:
+            if cur is not None:
+                out.append(cur)
+            cur = Bar(ts=start, open=b.open, high=b.high, low=b.low,
+                      close=b.close, volume=b.volume)
+            end = start + seconds
+        else:
+            cur.high = max(cur.high, b.high)
+            cur.low = min(cur.low, b.low)
+            cur.close = b.close
+            cur.volume += b.volume
+    if cur is not None:
+        out.append(cur)
+    return out
+
+
 def load(path: str, seconds: float = 5.0) -> list[Bar]:
-    """Read a .dbn.zst OHLCV file and resample."""
+    """Read a .dbn.zst OHLCV file and resample as it reads."""
     store = dbn.open_file(path)
-    return resample(list(from_records(store)), seconds)
+    return resample_stream(from_records(store), seconds)

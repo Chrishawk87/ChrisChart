@@ -7,6 +7,7 @@ open" are behavioural requirements, not preferences.
 """
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -1883,24 +1884,76 @@ def test_drawn_lines_are_kept_per_market_and_timeframe(client):
     assert "chartData.coin" in key and "chartData.interval" in key
 
 
-def test_the_call_panel_holds_the_whole_agent(client):
-    """One panel. The chart, the levels, the rule and the book were in two
-    places, which meant reading the call and setting what it does were
-    different jobs in different parts of the page."""
+def test_the_read_sits_directly_under_the_chart(client):
+    """The chart panel ends at the chart, and the candle read is the very
+    next thing on the page. It is what a trade is taken from, so reading
+    it must not mean scrolling past the agent's own paperwork."""
     html = client.get("/").text
     i = html.index('id="agentPanel"')
     j = html.index('id="readPanel"')
-    call = html[i:j]
-    for piece in ('id="sugChart"',        # the chart
-                  'id="apTp"', 'id="apSl"', 'id="apUnit"',   # the levels
-                  'id="apUnan"', 'id="apEffort"',            # the rule
-                  'id="apAlertBar"',      # the alert
-                  'id="apToggle"',        # let it decide
-                  'id="apPos"', 'id="apFeed"',               # what it did
-                  'id="apHead"', 'id="apStats"', 'id="apSlices"',
-                  'id="apProposals"'):
-        assert piece in call, f"{piece} should live on the call panel"
-    assert "pilotPanel" not in html
+    panel = html[i:j]
+    assert 'id="sugChart"' in panel, "the chart left its own panel"
+    # Between the chart's own note and the read there is nothing but
+    # closing tags: no heading, no control, no leftover block.
+    tail = panel[panel.index(">", panel.rindex('id="chartNote"')) + 1:]
+    tail = tail[:tail.rindex("<div")]          # drop the read panel's opener
+    assert re.fullmatch(r"(\s|</div>)*", tail), (
+        f"something still sits between the chart and the read: {tail!r}")
+    assert "take it or leave it" not in panel
+
+
+def test_the_calls_own_readout_is_off_the_page(client):
+    """The decision log, the scorecard and the proposals are gone from
+    the dashboard."""
+    html = client.get("/").text
+    i = html.index('id="agentPanel"')
+    j = html.index('id="readPanel"')
+    panel = html[i:j]
+    for gone in ('id="apPos"', 'id="apFeed"', 'id="apHead"',
+                 'id="apStats"', 'id="apSlices"', 'id="apProposals"',
+                 'id="sugCard"', 'id="sugThree"'):
+        assert gone not in panel, f"{gone} is still on the chart panel"
+    assert "How it is doing" not in html
+    assert "Changes it wants to make" not in html
+
+
+def test_the_retired_elements_still_exist_somewhere(client):
+    """A dozen working functions write to those ids. Deleting the markup
+    alone would turn each of them into a null dereference the first time
+    it ran -- which is a crash on a page that merely looks tidier."""
+    html = client.get("/").text
+    assert 'id="retiredCallPanel"' in html
+    block = html[html.index('id="retiredCallPanel"'):]
+    block = block[:block.index("</div>\n\n</div>")]
+    for kept in ('id="apState"', 'id="apPos"', 'id="apFeed"',
+                 'id="apHead"', 'id="apStats"', 'id="apSlices"',
+                 'id="apProposals"', 'id="sugCard"', 'id="sugThree"'):
+        assert kept in block, f"{kept} was deleted rather than retired"
+    assert "display:none" in html[
+        html.index('id="retiredCallPanel"') - 60:
+        html.index('id="retiredCallPanel"') + 60]
+
+
+def test_every_id_is_still_defined_exactly_once(client):
+    """Retiring an element by copying it leaves two, and the second
+    silently wins every lookup."""
+    html = client.get("/").text
+    for one in ("apState", "apPos", "apFeed", "apHead", "apStats",
+                "apSlices", "apProposals", "sugCard", "sugThree",
+                "readPanel", "sugChart", "tfLadder"):
+        assert html.count(f'id="{one}"') == 1, f"{one} appears twice"
+
+
+def test_the_ladder_includes_the_minute(client):
+    """The entry trigger is read on the 1m. A ladder that stops at five
+    minutes shows every timeframe in the decision except the one that
+    fires it."""
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.create_app)
+    i = src.index("tf_list = [higher")
+    assert '"1m"' in src[i:i + 120]
 
 
 def test_the_agent_reads_the_panels_own_candle_and_size(client):

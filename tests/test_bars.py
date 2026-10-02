@@ -236,3 +236,50 @@ def test_the_session_range_is_reported_in_ticks():
 
 def test_an_empty_input_gives_no_sessions():
     assert B.sessions([]) == []
+
+
+# ------------------------------------------------------- streaming load
+
+def test_streaming_resample_matches_the_list_version_exactly():
+    """Same arithmetic, less memory. If the two ever disagree the loader
+    is quietly producing different bars from the same file."""
+    import random
+    rng = random.Random(4)
+    px = 5000.0
+    rows = []
+    for i in range(4000):
+        o = px
+        px = round(px + rng.gauss(0, 0.5), 4)
+        rows.append(B.Bar(ts=1_700_000_000 + i, open=o,
+                             high=max(o, px) + 0.25, low=min(o, px) - 0.25,
+                             close=px, volume=float(rng.randint(1, 50))))
+    for step in (5.0, 60.0, 900.0):
+        a = B.resample(rows, step)
+        b = B.resample_stream(iter(rows), step)
+        assert len(a) == len(b)
+        for x, y in zip(a, b):
+            assert (x.ts, x.open, x.high, x.low, x.close, x.volume) == \
+                   (y.ts, y.open, y.high, y.low, y.close, y.volume)
+
+
+def test_streaming_resample_never_holds_the_input():
+    """The whole point. Feeding it a generator that cannot be re-read
+    fails if anything inside materialises the input."""
+    def gen():
+        for i in range(1000):
+            yield B.Bar(ts=1_700_000_000 + i, open=100.0, high=100.5,
+                           low=99.5, close=100.2, volume=1.0)
+    out = B.resample_stream(gen(), 60.0)
+    assert 16 <= len(out) <= 18
+    assert sum(b.volume for b in out) == 1000.0   # nothing dropped
+
+
+def test_the_loader_streams_rather_than_listing():
+    import inspect
+    src = inspect.getsource(B.load)
+    assert "resample_stream" in src
+    assert "list(from_records" not in src
+
+
+def test_streaming_an_empty_file_is_empty_not_a_crash():
+    assert B.resample_stream(iter([]), 5.0) == []

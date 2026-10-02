@@ -205,13 +205,15 @@ def test_the_state_needs_to_hold_not_just_touch():
     assert mtf.STATE_BUFFER_TICKS > 0
 
 
-def test_a_new_4h_block_resets_the_state_to_undecided():
+def test_a_new_block_resets_its_own_state_to_undecided():
     """Carrying the old block's direction into a new one is reading a
     filter that is about a period that has ended."""
     import inspect
     src = inspect.getsource(mtf.scan)
     i = src.index("if start4 != h4_start:")
-    assert "state = UNDECIDED" in src[i:i + 400]
+    assert "state4 = UNDECIDED" in src[i:i + 400]
+    j = src.index("if start1 != h1_start:")
+    assert "state1 = UNDECIDED" in src[j:j + 400]
 
 
 # --------------------------------------------------- the opening filter
@@ -226,7 +228,7 @@ def test_the_bar_index_is_arithmetic_not_a_counter():
     single 4H block."""
     import inspect
     src = inspect.getsource(mtf.scan)
-    assert "idx15 = int((ts - h4_start) // M15_SECONDS)" in src
+    assert "idx15 = int((ts - h4_start) // trade_s)" in src
     assert "counter" not in src.lower()
 
 
@@ -261,10 +263,11 @@ def test_the_stop_is_defined_and_sits_on_the_losing_side():
     assert s.stop_ticks >= mtf.MIN_STOP_TICKS
 
 
-def test_a_stop_too_close_to_the_trigger_is_not_a_signal():
-    """A stop a tick away is a rounding error, and the break-even rate it
-    implies is a fantasy."""
-    assert mtf.MIN_STOP_TICKS >= 2.0
+def test_a_trigger_already_back_at_the_open_is_not_a_signal():
+    """The stop IS the 15m open now, so a trigger sitting on it describes
+    a trade with no room in it -- the premise went before the trigger
+    printed."""
+    assert mtf.MIN_STOP_TICKS >= 1.0
     import inspect
     assert "if stop_t < MIN_STOP_TICKS:" in inspect.getsource(mtf.scan)
 
@@ -482,3 +485,334 @@ def test_the_setups_refresh_with_the_chart():
     src = _src()
     i = src.index("  loadProfile();\n  loadMTF();")
     assert i > 0
+
+
+
+# ------------------------------------------------- the 1H agreement
+
+def _four_up_hour_down():
+    """4H bullish, the HOUR bearish, and a 15m bounce inside it.
+
+    Hour one rises clean, so both blocks turn bullish. Hour two opens at
+    the top and falls away: price is well below the hour's own open while
+    still well above the four-hour one. The bounce at the end is a valid
+    red-to-green 15m with a 1m higher-high-and-higher-low -- everything
+    the trade asks for EXCEPT the hour.
+    """
+    bars = [m1(T0, 100.0, 100.0)]
+    for i in range(1, 60):
+        o = 100.0 + (i - 1) * 0.2
+        bars.append(m1(T0 + i * 60, o, o + 0.2))
+    base = bars[-1].close
+    t2 = T0 + mtf.H1_SECONDS
+    for i in range(30):
+        o = base - i * 0.25
+        bars.append(m1(t2 + i * 60, o, o - 0.25))
+    t3 = t2 + 30 * 60
+    lo = bars[-1].close
+    for i in range(4):
+        o = lo + i * 0.5
+        bars.append(m1(t3 + i * 60, o, o + 0.5, hi=o + 0.5, lo=o - 0.05))
+    return bars
+
+
+def test_the_hour_is_not_required_by_default():
+    """The rule as finally stated is 4H + 15m + a trending minute. The
+    hour was an earlier version of it, and the default follows the final
+    statement rather than the first."""
+    import inspect
+    assert inspect.signature(mtf.scan).parameters["require_1h"].default \
+        is False
+
+
+def test_asking_for_the_hour_blocks_a_trade_the_hour_disagrees_with():
+    """Kept as a switch because which version is better has an answer.
+    The fixture is built so the two settings DISAGREE on these bars -- a
+    fixture that produced nothing either way would pass while testing
+    nothing, which an earlier version of this test did."""
+    bars = _four_up_hour_down()
+    cut = T0 + mtf.H1_SECONDS
+    with_hour = [g for g in mtf.scan(bars, tick=0.25, require_1h=True)
+                 if g.ts >= cut]
+    without = [g for g in mtf.scan(bars, tick=0.25, require_1h=False)
+               if g.ts >= cut]
+    assert without, "the fixture stopped exercising the hour filter"
+    assert with_hour == [], "traded while the hour disagreed"
+
+
+def test_the_signal_records_both_opens():
+    px = 100.0
+    bars = _bullish_runup(px)
+    t = T0 + mtf.M15_SECONDS
+    bars += [m1(t + i * 60, 103.0 - i * 0.1, 102.9 - i * 0.1)
+             for i in range(15)]
+    t2 = t + mtf.M15_SECONDS
+    bars += [m1(t2, 101.5, 102.0), m1(t2 + 60, 102.0, 102.6),
+             m1(t2 + 120, 102.6, 103.4)]
+    sigs = mtf.scan(bars, tick=0.25)
+    assert sigs
+    assert sigs[0].h4_open > 0 and sigs[0].h1_open > 0
+    assert "h1_open" in sigs[0].to_dict()
+
+
+def test_an_hour_is_a_quarter_of_a_block():
+    assert mtf.H4_SECONDS / mtf.H1_SECONDS == 4
+    assert mtf.H1_SECONDS / mtf.M15_SECONDS == 4
+
+
+# ------------------------------------------- the continuation trigger
+
+def test_a_spike_that_closes_back_inside_is_not_a_continuation():
+    """A bar that pokes above the prior high but makes a LOWER low is one
+    spike, not structure moving up. The old rule took it."""
+    px = 100.0
+    bars = _bullish_runup(px)
+    t = T0 + mtf.M15_SECONDS
+    bars += [m1(t + i * 60, 103.0 - i * 0.1, 102.9 - i * 0.1)
+             for i in range(15)]
+    t2 = t + mtf.M15_SECONDS
+    # Inside bars: no continuation, so nothing fires before the spike.
+    bars += [m1(t2, 101.5, 102.0, hi=102.4, lo=101.4),
+             m1(t2 + 60, 102.0, 102.1, hi=102.2, lo=101.9)]
+    # Higher high, but a LOWER low: one wide spike, not structure moving.
+    bars += [m1(t2 + 120, 102.0, 103.0, hi=103.4, lo=101.0)]
+    assert [s for s in mtf.scan(bars, tick=0.25)
+            if s.m15_start == t2] == []
+
+
+def test_a_higher_high_and_higher_low_is_a_continuation():
+    px = 100.0
+    bars = _bullish_runup(px)
+    t = T0 + mtf.M15_SECONDS
+    bars += [m1(t + i * 60, 103.0 - i * 0.1, 102.9 - i * 0.1)
+             for i in range(15)]
+    t2 = t + mtf.M15_SECONDS
+    bars += [m1(t2, 101.5, 102.0), m1(t2 + 60, 102.0, 102.6),
+             m1(t2 + 120, 102.8, 103.4, hi=103.4, lo=102.7)]
+    assert [s for s in mtf.scan(bars, tick=0.25) if s.m15_start == t2]
+
+
+def test_the_trigger_reads_the_bars_extremes_not_just_its_close():
+    import inspect
+    src = inspect.getsource(mtf.scan)
+    assert "float(b.high) > float(prev1.high)" in src
+    assert "float(b.low) > float(prev1.low)" in src
+
+
+# --------------------------------------- the 15m must agree too
+
+def test_no_long_is_ever_taken_below_its_own_15m_open():
+    """The invariant Chris flagged: the 15m being traded has to lean the
+    same way as the blocks above it.
+
+    Asserted as a PROPERTY over a whole random series rather than on one
+    hand-built bar, because two separate rules enforce it -- the explicit
+    state check, and the stop being the 15m open (which for a long in a
+    red candle would sit above the entry and is rejected). A fixture
+    aimed at one of them passes while the other does the work.
+    """
+    import random
+    rng = random.Random(21)
+    px = 5000.0
+    rows = []
+    for i in range(20000):
+        o = px
+        px = round((px + rng.gauss(0, 0.6)) * 4) / 4
+        rows.append(m1(T0 + i * 60, o, px,
+                       hi=max(o, px) + 0.25 * rng.randint(0, 2),
+                       lo=min(o, px) - 0.25 * rng.randint(0, 2)))
+    sigs = mtf.scan(rows, tick=0.25)
+    assert len(sigs) > 50, "fixture produced too few signals to judge"
+    for s in sigs:
+        if s.side == "long":
+            assert s.trigger > s.m15_open, (
+                f"long at {s.trigger} below its 15m open {s.m15_open}")
+        else:
+            assert s.trigger < s.m15_open, (
+                f"short at {s.trigger} above its 15m open {s.m15_open}")
+
+
+def test_the_state_check_names_the_15m_explicitly():
+    """Weak on its own -- the property test above is what has teeth -- but
+    it catches the rule being deleted silently on the assumption that the
+    stop covers it."""
+    import inspect
+    src = inspect.getsource(mtf.scan)
+    assert "m15_bull = cur15.green" in src
+    assert "m15_bear = cur15.red" in src
+
+
+def test_the_prior_15m_colour_is_no_longer_required():
+    """It was a reversal condition and the wrong shape: what is traded is
+    agreement, not a flip."""
+    import inspect
+    src = inspect.getsource(mtf.scan)
+    assert "prior15.red" not in src and "prior15.green" not in src
+
+
+# ------------------------------------------ the stop and the clock
+
+def test_the_stop_is_the_15m_candles_own_open():
+    import random
+    rng = random.Random(8)
+    px, rows = 5000.0, []
+    for i in range(12000):
+        o = px
+        px = round((px + rng.gauss(0, 0.6)) * 4) / 4
+        rows.append(m1(T0 + i * 60, o, px,
+                       hi=max(o, px) + 0.25, lo=min(o, px) - 0.25))
+    sigs = mtf.scan(rows, tick=0.25)
+    assert sigs
+    for s in sigs:
+        assert s.stop == s.m15_open
+
+
+def test_every_signal_expires_at_its_own_15m_close():
+    """No trade outlives the candle it was taken on."""
+    import random
+    rng = random.Random(9)
+    px, rows = 5000.0, []
+    for i in range(12000):
+        o = px
+        px = round((px + rng.gauss(0, 0.6)) * 4) / 4
+        rows.append(m1(T0 + i * 60, o, px,
+                       hi=max(o, px) + 0.25, lo=min(o, px) - 0.25))
+    sigs = mtf.scan(rows, tick=0.25)
+    assert sigs
+    for s in sigs:
+        assert s.expires == s.m15_start + mtf.M15_SECONDS
+        assert s.ts < s.expires
+
+
+def test_the_stop_is_much_closer_than_the_structural_one_was():
+    """The whole point of the change. The old stop averaged 27 ticks and
+    demanded 76.6% against a ten tick target; this one is the distance
+    back to the candle's open."""
+    import random
+    rng = random.Random(10)
+    px, rows = 5000.0, []
+    for i in range(20000):
+        o = px
+        px = round((px + rng.gauss(0, 0.6)) * 4) / 4
+        rows.append(m1(T0 + i * 60, o, px,
+                       hi=max(o, px) + 0.25, lo=min(o, px) - 0.25))
+    sigs = mtf.scan(rows, tick=0.25)
+    avg = sum(s.stop_ticks for s in sigs) / len(sigs)
+    assert avg < 20, f"stops averaging {avg:.0f} ticks is not the open"
+
+
+# ------------------------------------------- the entry window
+
+def _noise(n=20000, seed=33):
+    import random
+    rng = random.Random(seed)
+    px, rows = 5000.0, []
+    for i in range(n):
+        o = px
+        px = round((px + rng.gauss(0, 0.6)) * 4) / 4
+        rows.append(m1(T0 + i * 60, o, px,
+                       hi=max(o, px) + 0.25 * rng.randint(0, 2),
+                       lo=min(o, px) - 0.25 * rng.randint(0, 2)))
+    return rows
+
+
+def test_a_late_trigger_is_refused_when_a_window_is_set():
+    rows = _noise()
+    for cap in (2.0, 5.0, 10.0):
+        sigs = mtf.scan(rows, tick=0.25, max_minutes_in=cap)
+        assert sigs, f"no signals at all within {cap} minutes"
+        assert max(s.minutes_in for s in sigs) <= cap
+
+
+def test_no_window_means_the_whole_candle_is_fair_game():
+    sigs = mtf.scan(_noise(), tick=0.25)
+    assert max(s.minutes_in for s in sigs) > 10
+
+
+def test_a_tighter_window_means_a_tighter_stop():
+    """The mechanism, not a preference. The stop IS the candle's open, so
+    a trigger that fires two minutes in is near it and one that fires at
+    minute thirteen is a long way from it."""
+    rows = _noise()
+    tight = mtf.scan(rows, tick=0.25, max_minutes_in=3.0)
+    loose = mtf.scan(rows, tick=0.25)
+    assert tight and loose
+    a = sum(s.stop_ticks for s in tight) / len(tight)
+    b = sum(s.stop_ticks for s in loose) / len(loose)
+    assert a < b, f"tight window gave {a:.1f}t, loose gave {b:.1f}t"
+
+
+def test_a_tighter_window_also_throws_signals_away():
+    """Which is the cost, and the reason it has to be searched on one half
+    of the data and judged on the other."""
+    rows = _noise()
+    assert len(mtf.scan(rows, tick=0.25, max_minutes_in=3.0)) < \
+        len(mtf.scan(rows, tick=0.25))
+
+
+def test_the_window_never_changes_a_signal_it_keeps():
+    """Filtering must drop signals, never alter the ones it allows. If it
+    moved a trigger or a stop, every comparison across windows would be
+    comparing two different strategies."""
+    rows = _noise()
+    loose = {s.ts: s for s in mtf.scan(rows, tick=0.25)}
+    for s in mtf.scan(rows, tick=0.25, max_minutes_in=4.0):
+        o = loose.get(s.ts)
+        assert o is not None
+        assert (s.trigger, s.stop, s.side) == (o.trigger, o.stop, o.side)
+
+
+# ------------------------------------------- the timeframes as inputs
+
+def test_the_three_timeframes_are_parameters_with_the_stated_defaults():
+    import inspect
+    pr = inspect.signature(mtf.scan).parameters
+    assert pr["block_s"].default == mtf.H4_SECONDS
+    assert pr["trade_s"].default == mtf.M15_SECONDS
+    assert pr["trigger_s"].default == 60.0
+
+
+def test_a_different_trade_candle_moves_the_stop_and_the_clock():
+    """The traded candle supplies both: its open is the stop and its
+    close is the clock. Changing it has to change both or the two have
+    drifted apart."""
+    rows = _noise()
+    for trade_s in (900.0, 1800.0):
+        sigs = mtf.scan(rows, tick=0.25, block_s=14400.0, trade_s=trade_s)
+        assert sigs
+        for s in sigs:
+            assert s.expires == s.m15_start + trade_s
+            assert s.stop == s.m15_open
+            assert s.m15_start % trade_s == 0
+
+
+def test_a_coarser_trigger_widens_the_stop():
+    """The arithmetic Chris asked about, as a test rather than a claim.
+    The stop is the distance back to the traded candle's open, so reading
+    the continuation on a bigger bar enters further from it."""
+    rows = _noise(n=40000)
+    fine = mtf.scan(rows, tick=0.25, trigger_s=60.0)
+    coarse = mtf.scan(rows, tick=0.25, trigger_s=300.0)
+    assert fine and coarse
+    a = sum(s.stop_ticks for s in fine) / len(fine)
+    b = sum(s.stop_ticks for s in coarse) / len(coarse)
+    assert b > a, f"1m trigger gave {a:.1f}t, 5m trigger gave {b:.1f}t"
+
+
+def test_a_smaller_target_needs_a_higher_hit_rate():
+    """The other half of the same answer. Cost is fixed, so the smaller
+    the target the bigger a share of it the fee is."""
+    for stop in (8.0, 14.5, 25.0):
+        _, five = mtf.rates(5.0, stop)
+        _, ten = mtf.rates(10.0, stop)
+        _, twenty = mtf.rates(20.0, stop)
+        assert five > ten > twenty
+
+
+def test_a_15m_block_with_a_5m_trigger_is_buildable():
+    """The configuration Chris proposed, end to end."""
+    sigs = mtf.scan(_noise(n=40000), tick=0.25,
+                    block_s=3600.0, trade_s=900.0, trigger_s=300.0)
+    assert sigs
+    for s in sigs:
+        assert s.m15_start % 900.0 == 0

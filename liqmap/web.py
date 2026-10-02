@@ -4087,7 +4087,11 @@ def create_app() -> FastAPI:
 
             tf_list = [t.strip() for t in (timeframes or "").split(",") if t.strip()]
             if not tf_list:
-                tf_list = [higher, "1h", interval, "5m"]
+                # The minute is on the ladder because the entry trigger
+                # is read there. A ladder that stops at five minutes shows
+                # every timeframe in the decision except the one that
+                # actually fires it.
+                tf_list = [higher, "1h", interval, "5m", "1m"]
             seen, want = set(), []
             for t in tf_list:
                 if t in client.INTERVALS and t not in seen:
@@ -4647,13 +4651,11 @@ DASHBOARD = """<!doctype html>
 
   <div class="grid tabpane" id="tab-dash">
 
-    <div class="panel full" id="agentPanel"><h2>The call — take it or leave it
+    <div class="panel full" id="agentPanel"><h2>Chart
       <span class="stamp" id="sugStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">Book, delta and price vote.
-        Whichever way they point is the direction, and the agent takes it
-        only when the conditions below are met — one trade per candle, out
-        before that candle closes. Its trades are drawn on the candles
-        themselves. <b>Nothing here places an order.</b></div>
+      <div class="msg" style="margin-bottom:8px">Candles, the two volume
+        profiles and the 4H/15m/1m setups. The read beneath it is the one
+        to trade from. <b>Nothing here places an order.</b></div>
 
       <div class="conbar">
         <label>candle <select id="sInt" onchange="loadSuggest()">
@@ -4711,7 +4713,6 @@ counting from now.">Clear the book</button>
       <div id="apAlertBar" class="alertbar" style="display:none"></div>
       <div id="apCal" class="say" style="display:none;margin-bottom:8px"></div>
       <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
-      <div id="sugThree" style="display:none;margin-bottom:10px"></div>
 <div id="chartWrap" style="display:none;margin-bottom:12px">
         <div id="profRead" style="font:11px ui-monospace,monospace;
           color:var(--dim);margin-bottom:4px;min-height:14px"
@@ -4819,27 +4820,6 @@ bars">ppo</button>
         </div>
         <div id="chartNote" class="msg" style="margin-top:4px"></div>
       </div>
-      <div id="sugCard" class="msg">Press <b>Go live</b>, give it ten seconds
-        of book pushes, then <b>Ask</b>.</div>
-
-<div id="apState" class="msg">Off. Turn it on and leave it — a book
-        that only fills while you are watching measures your attention, not
-        the strategy.</div>
-      <div id="apPos" style="display:none;margin-top:10px"></div>
-      <div id="apFeed" style="display:none;margin-top:10px"></div>
-
-      <h3 style="margin:16px 0 6px">How it is doing</h3>
-      <div id="apHead" class="say">Nothing settled yet.</div>
-      <div id="apStats" style="margin-top:10px"></div>
-      <div id="apSlices" style="margin-top:10px"></div>
-
-      <h3 style="margin:16px 0 6px">Changes it wants to make</h3>
-      <div class="msg" style="margin-bottom:6px">It picks a target and stop
-        on older signals and scores them on newer ones it has never seen.
-        Nothing changes until you say so.
-        <button style="margin-left:8px" onclick="scanProposals()">Look
-          now</button></div>
-      <div id="apProposals"></div>
     </div>
 
 <div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
@@ -5131,6 +5111,27 @@ quiet.">volume over <input id="swEffort" value="200" size="3">% of
 
     <div class="panel full"><h2>Validation report</h2><pre id="report">—</pre></div>
   </div>
+
+<!-- The call's own readout, taken off the page.
+
+     The chart panel now ends at the chart and the candle read sits
+     directly beneath it. These elements stay in the document, hidden,
+     because a dozen working functions write to them and deleting the
+     markup alone would turn each of those into a null dereference the
+     first time it ran. The agent keeps recording; only its panel is
+     gone. Deleting the code behind them is a separate job and a bigger
+     one. -->
+<div id="retiredCallPanel" style="display:none" aria-hidden="true">
+  <div id="sugThree"></div>
+  <div id="sugCard"></div>
+  <div id="apState"></div>
+  <div id="apPos"></div>
+  <div id="apFeed"></div>
+  <div id="apHead"></div>
+  <div id="apStats"></div>
+  <div id="apSlices"></div>
+  <div id="apProposals"></div>
+</div>
 
 </div>
 <script>
