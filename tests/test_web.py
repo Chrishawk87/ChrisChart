@@ -2279,3 +2279,51 @@ def test_no_colour_is_painted_onto_the_canvas_as_a_dark_hex(client):
     assert "'#12151a'" not in script.replace(
         "getPropertyValue('--panel').trim() || '#12151a'", "")
     assert "function plateColour(" in html
+
+
+# ------------------------------------------- switching instruments
+
+def test_changing_instrument_refreshes_every_per_market_panel(client):
+    """The chart, the two volume profiles and the setup markers used to
+    reload only from paintSuggest -- when the CALL ran, not when you
+    changed market. Switching left one instrument's candles and value
+    areas on screen under another's name, with a third instrument's
+    candle read underneath. Two markets on one screen, nothing saying
+    so."""
+    html = client.get("/").text
+    fn = html[html.index("function onCoinChange() {"):]
+    fn = fn[:fn.index("\n}\n")]
+    for loader in ("loadNow()", "loadRead()", "loadChart()",
+                   "loadProfile()", "loadMTF()", "loadBookCall()"):
+        assert loader in fn, f"{loader} does not run on a market change"
+
+
+def test_the_old_markets_data_is_cleared_before_the_new_fetch(client):
+    """After the fetch is a second too late: a stale chart drawn under
+    the new symbol for the second the request takes is the same bug in
+    miniature, and it is the second you are looking at."""
+    html = client.get("/").text
+    fn = html[html.index("function onCoinChange() {"):]
+    fn = fn[:fn.index("\n}\n")]
+    for state in ("chartData = null", "profileData = null",
+                  "mtfData = null", "chartProj = null"):
+        assert state in fn, f"{state} is not cleared on a market change"
+    assert fn.index("chartData = null") < fn.index("loadChart()")
+
+
+def test_the_readouts_are_cleared_too(client):
+    """Text left behind describes the market you just left."""
+    html = client.get("/").text
+    fn = html[html.index("function onCoinChange() {"):]
+    fn = fn[:fn.index("\n}\n")]
+    for el in ("nestRead", "profRead", "mtfRead"):
+        assert el in fn, f"{el} still shows the previous market"
+
+
+def test_the_feed_is_stopped_before_anything_reloads(client):
+    """A feed is bound to one market; leaving it running serves its
+    candles under the new symbol's name."""
+    html = client.get("/").text
+    fn = html[html.index("function onCoinChange() {"):]
+    fn = fn[:fn.index("\n}\n")]
+    assert fn.index("stopFeed()") < fn.index("loadRead()")

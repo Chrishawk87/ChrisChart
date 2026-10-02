@@ -5621,8 +5621,34 @@ function onCoinChange() {
   try { localStorage.setItem('liqmap_coin', lastCoin); } catch (e) {}
   alertedFor = null;            // a new market starts its own alert history
   showVenueNote();
+
+  /* EVERY per-market panel, not just the ones that used to be here.
+
+     The chart, the two volume profiles and the setup markers were only
+     refreshed from paintSuggest -- so they reloaded when the call ran,
+     and not when you changed instrument. Switching markets left BTC's
+     candles and BTC's value areas on screen under ETH's name, with an
+     ETH candle read underneath them. Two markets on one screen, nothing
+     saying so.
+
+     Cleared BEFORE the fetches rather than after: a stale chart drawn
+     under the new symbol for the second the request takes is the same
+     bug in miniature, and it is the second you would be looking at. */
+  chartData = null;
+  profileData = null;
+  mtfData = null;
+  chartProj = null;
+  const nest = $('nestRead'); if (nest) nest.innerHTML = '';
+  const prof = $('profRead'); if (prof) prof.textContent = '';
+  const mtf = $('mtfRead'); if (mtf) mtf.innerHTML = '';
+  resetChartView();            // redraws, which now hides an empty chart
+
   loadNow();
-  loadRead();
+  loadRead();                  // pulls the order-flow ladder with it
+  loadChart();
+  loadProfile();
+  loadMTF();
+  loadBookCall();
 }
 
 let bookPoll = null;
