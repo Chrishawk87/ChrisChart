@@ -3444,6 +3444,64 @@ def create_app() -> FastAPI:
             },
         }
 
+    @app.get("/api/flow", dependencies=[Depends(require_token)])
+    def api_flow(coin: str = "BTC", target_ticks: float = 10.0,
+                 spec: str = "", spike: float = 2.0) -> dict[str, Any]:
+        """Order flow on every timeframe, and the book at the touch.
+
+        TWO FEEDS, TWO JOBS. The book says whether the trade is worth
+        taking -- how wide the spread is against the target. The tape
+        says whether what is happening is real: delta that is actually
+        printing, at a velocity above what this market has been doing.
+        Resting size can be pulled the moment you lean on it; a print
+        cannot be taken back.
+
+        Both arrive on the same websocket this service already runs, so
+        this needs no feed it does not have. It needs the feed to be ON:
+        polled candles carry no aggressor and no book, so without the
+        socket there is nothing here to read.
+
+        `tradeable` means nothing is currently refusing. It is not a
+        direction and not a suggestion.
+        """
+        from . import flowladder as _fl
+        from . import orderflow as _of
+        from .live import INTERVALS as _IV
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        feed = rt.feed_for(coin)
+        if feed is None:
+            return {"ok": False, "coin": coin,
+                    "why": "no live feed on this market -- press Go live. "
+                           "Polled candles carry no aggressor and no book."}
+
+        sp = _of.SPECS.get((spec or "").upper())
+        if sp is None:
+            # Infer the tick from what the book is actually quoting rather
+            # than assuming ES. The same panel serves a $4 token and a
+            # $100k one, and a per-market table is a chance to be wrong
+            # about every market not in it.
+            tick = 0.25
+            bk = feed.book
+            if bk is not None and not bk.empty and bk.bids and bk.asks:
+                gap = abs(float(bk.asks[0].px) - float(bk.bids[0].px))
+                if gap > 0:
+                    tick = gap
+            sp = _of.Spec(coin, tick_size=tick, tick_value=tick,
+                          commission=0.0, typical_spread_ticks=1.0)
+
+        want = [(n, float(_IV[n])) for n in
+                ("1m", "5m", "15m", "30m", "1h", "4h") if n in _IV]
+        lad = _fl.build(feed.tape, feed.book, want, sp,
+                        target_ticks=float(target_ticks),
+                        spike=float(spike))
+        return {"ok": True, "coin": coin,
+                "spec": {"symbol": sp.symbol, "tick_size": sp.tick_size,
+                         "tick_value": sp.tick_value,
+                         "cost_ticks": round(sp.cost_ticks(), 2)},
+                "feed_age_s": round(max(0.0, feed.age), 1),
+                **lad.to_dict()}
+
     @app.get("/api/mtf", dependencies=[Depends(require_token)])
     def api_mtf(coin: str = "BTC", bars: int = 1200,
                 target_ticks: float = 10.0,
@@ -4400,7 +4458,21 @@ DASHBOARD = """<!doctype html>
 <title>liqmap</title>
 <style>
   :root{--bg:#0f1216;--panel:#171b21;--line:#262c34;--ink:#e6e4df;--dim:#8b939d;
-        --up:#4eae80;--down:#d9685c;--accent:#d5a340;--mono:ui-monospace,"SF Mono",Menlo,monospace}
+        --up:#4eae80;--down:#d9685c;--accent:#d5a340;--mono:ui-monospace,"SF Mono",Menlo,monospace;
+        /* --long and --short are used in sixteen places and were never
+           defined, so every one of them resolved to nothing: the
+           timeframe ladder's bars, the status dot, the alert bar and the
+           comparison meters have all been rendering colourless. They are
+           the same two colours under a different name, so they are
+           aliased rather than duplicated -- two hex values that drift
+           apart is how a green and a slightly different green end up on
+           one page. */
+        --long:var(--up);--short:var(--down);
+        /* Same again: --fg is the ink colour and --grid is the line
+           colour, under names something was written against and nothing
+           ever declared. The big price on the ticker and the bands have
+           been painting with the inherited default. */
+        --fg:var(--ink);--grid:var(--line)}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:14px/1.5 system-ui,-apple-system,sans-serif}
@@ -4600,6 +4672,11 @@ DASHBOARD = """<!doctype html>
   .tf .bar i.buyers{left:50%;background:var(--long)}
   .tf .bar i.sellers{right:50%;background:var(--short)}
   .tf .meta{font-size:11px;color:var(--dim);text-align:right}
+  /* The flow ladder carries delta, CVD and a print count rather than one
+     short phrase, so it gets a wider last column. At 88px the same markup
+     wrapped every row to four lines. */
+  .tf.flow{grid-template-columns:62px 92px 1fr 200px}
+  .tf.flow .meta{font-variant-numeric:tabular-nums}
   .call{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
     padding:10px 0 4px}
   .call b{font-size:44px;letter-spacing:.02em;line-height:1}
@@ -4880,6 +4957,22 @@ bars">ppo</button>
       <div id="readHead" class="msg">—</div>
       <div id="readSignals"></div>
       <div id="readSay" class="say" style="display:none"></div>
+
+      <h3 style="margin:16px 0 6px">Order flow — the book gates, the tape
+        fires<span class="stamp" id="flowStamp"></span></h3>
+      <div class="msg" style="margin-bottom:8px">Delta and CVD on every
+        timeframe, the spread against your target, and how fast the tape
+        is running against its own recent baseline. <b>Tradeable</b> means
+        nothing is refusing — it is not a direction.
+        <label style="margin-left:10px">target
+          <input id="flowTgt" type="number" min="1" max="200" step="1"
+            value="10" onchange="loadFlow()" style="width:52px"> ticks</label>
+        <label style="margin-left:8px">spike
+          <input id="flowSpike" type="number" min="1" max="10" step="0.5"
+            value="2" onchange="loadFlow()" style="width:48px">x</label>
+      </div>
+      <div id="flowGate" class="say" style="margin-bottom:8px">—</div>
+      <div id="flowLadder"></div>
     </div>
   </div>
 
@@ -6803,6 +6896,79 @@ function toggleReadAuto() {
   if ($('rAuto').checked) { readPoll = setInterval(loadRead, 10000); loadRead(); }
 }
 
+/* The order-flow ladder.
+
+   An UNCOVERED rung is not a flat one. The rolling tape holds an hour,
+   so a four-hour rung has seen a fraction of its own bar; printing a
+   delta for it would describe fifteen minutes as though it were the
+   candle. Those rungs are drawn greyed with their coverage, and they do
+   not vote on agreement. */
+async function loadFlow() {
+  const gate = $('flowGate'), lad = $('flowLadder');
+  let d;
+  try {
+    d = await api('/api/flow?' + q({
+      coin: coin(),
+      target_ticks: parseFloat(($('flowTgt') || {}).value) || 10,
+      spike: parseFloat(($('flowSpike') || {}).value) || 2}));
+  } catch (e) {
+    if (gate) gate.textContent = e.message;
+    return;
+  }
+  if (!d || !d.ok) {
+    if (gate) gate.textContent = (d && d.why) || 'order flow unavailable';
+    if (lad) lad.innerHTML = '';
+    return;
+  }
+
+  const b = d.book, v = d.velocity;
+  if (gate) {
+    gate.innerHTML =
+        '<span class="flag' + (d.tradeable ? '' : ' late') + '">'
+      + (d.tradeable ? 'NOTHING REFUSING' : 'HELD') + '</span>'
+      + '<b>' + d.aligned.toUpperCase() + '</b> across the covered '
+      + 'timeframes &nbsp;·&nbsp; spread ' + b.spread_ticks.toFixed(1)
+      + 't of ' + d.target_ticks + 't &nbsp;·&nbsp; tape '
+      + v.ratio.toFixed(1) + 'x (' + v.now_hz.toFixed(1) + '/s vs '
+      + v.base_hz.toFixed(1) + '/s)'
+      + '<div class="thin" style="margin-top:4px">' + esc(d.why) + '</div>';
+  }
+
+  if (lad) {
+    lad.innerHTML = (d.rungs || []).map(r => {
+      const w = Math.round(Math.abs(r.lean) * 50);
+      const cls = r.side === 'buyers' ? 'buyers'
+                : r.side === 'sellers' ? 'sellers' : '';
+      if (!r.covered) {
+        return '<div class="tf flow" style="opacity:.45"><b>' + r.timeframe
+             + '</b><span class="who">NOT COVERED</span>'
+             + '<span class="bar"></span><span class="meta thin">tape has '
+             + Math.round(r.coverage * 100) + '% of this bar</span></div>';
+      }
+      return '<div class="tf flow ' + cls + '" title="'
+           + r.trades + ' prints · CVD ' + flowNum(r.cvd) + ' over '
+           + r.bars + ' completed bars"><b>' + r.timeframe + '</b>'
+           + '<span class="who ' + (r.side === 'buyers' ? 'long'
+               : r.side === 'sellers' ? 'short' : '') + '">'
+           + r.side.toUpperCase() + '</span>'
+           + '<span class="bar"><i class="' + cls + '" style="width:'
+           + w + '%"></i></span>'
+           + '<span class="meta">\u0394 ' + flowNum(r.delta)
+           + ' · cvd ' + flowNum(r.cvd) + ' · ' + r.trades + 'p</span></div>';
+    }).join('');
+  }
+  const st = $('flowStamp');
+  if (st) st.textContent = 'feed ' + d.feed_age_s + 's';
+}
+
+function flowNum(n) {
+  const a = Math.abs(n);
+  const s = a >= 1e6 ? (n / 1e6).toFixed(1) + 'M'
+          : a >= 1e3 ? (n / 1e3).toFixed(0) + 'k'
+          : n.toFixed(0);
+  return (n > 0 ? '+' : '') + s;
+}
+
 async function loadRead() {
   let d;
   try {
@@ -6811,6 +6977,9 @@ async function loadRead() {
                   size: parseFloat($('liqSize').value || '0') || 0}));
   } catch (e) { $('readHead').textContent = e.message; return; }
   paintRead(d);
+  // Same refresh as the read: two clocks would let the ladder drift out
+  // of step with the panel it sits under.
+  loadFlow();
 }
 
 // Split out so the websocket stream can paint without a fetch of its own.
