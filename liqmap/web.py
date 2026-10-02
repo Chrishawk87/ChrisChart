@@ -4473,6 +4473,20 @@ DASHBOARD = """<!doctype html>
            ever declared. The big price on the ticker and the bands have
            been painting with the inherited default. */
         --fg:var(--ink);--grid:var(--line)}
+
+  /* Day. The same seven tokens, re-pointed -- every rule in the sheet and
+     every colour the canvas reads goes through them, so the whole page
+     and the chart follow from here without a second stylesheet to keep
+     in step.
+
+     The up and down greens and reds are DARKENED rather than reused.
+     #4eae80 on near-black clears contrast comfortably; the same green on
+     white does not, and a signal colour you cannot read is worse than no
+     colour. */
+  :root[data-theme="light"]{
+        --bg:#f4f5f7;--panel:#ffffff;--line:#d8dce2;--ink:#1b1f25;
+        --dim:#5d656f;--up:#1f8352;--down:#bb3c2f;--accent:#9a6b05}
+  :root[data-theme="light"] .flag{background:rgba(0,0,0,.05)}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:14px/1.5 system-ui,-apple-system,sans-serif}
@@ -4705,6 +4719,8 @@ DASHBOARD = """<!doctype html>
     background worker re-sweeps on its own every 30 minutes.</div>
 
   <div class="bar">
+    <button id="themeBtn" onclick="toggleTheme()" title="Day or night"
+      style="min-width:74px">night</button>
     <input type="password" id="tok" placeholder="access token">
     <select id="klass" onchange="renderCoins()" style="min-width:110px"
             title="asset class"><option value="">all classes</option></select>
@@ -5251,6 +5267,47 @@ quiet.">volume over <input id="swEffort" value="200" size="3">% of
 </div>
 <script>
 const $ = id => document.getElementById(id);
+
+/* Day or night.
+
+   One attribute on <html>, which re-points the same seven colour tokens.
+   Every CSS rule and every colour the canvas reads goes through those
+   tokens, so the chart follows the page without a second palette to keep
+   in step -- and the one place that did NOT go through them, the plate
+   behind the chart's price labels, is why `plateColour` exists. */
+function plateColour() {
+  return getComputedStyle(document.documentElement)
+           .getPropertyValue('--panel').trim() || '#12151a';
+}
+
+function applyTheme(name) {
+  const light = name === 'light';
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  const b = $('themeBtn');
+  if (b) b.textContent = light ? 'day' : 'night';
+  try { localStorage.setItem('liqmap_theme', light ? 'light' : 'dark'); }
+  catch (e) {}
+  // The canvas does not restyle itself: it is pixels, drawn once.
+  if (typeof drawChart === 'function' && typeof chartData !== 'undefined'
+      && chartData) drawChart();
+}
+
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === 'light'
+             ? 'dark' : 'light');
+}
+
+function restoreTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('liqmap_theme'); } catch (e) {}
+  if (!saved) {
+    // No choice stored: follow the machine rather than imposing one.
+    saved = (window.matchMedia
+             && window.matchMedia('(prefers-color-scheme: light)').matches)
+            ? 'light' : 'dark';
+  }
+  applyTheme(saved);
+}
 const tok = () => $('tok').value.trim();
 
 // Do NOT upper-case the whole symbol. HIP-3 DEX prefixes are lowercase and
@@ -7423,7 +7480,7 @@ function drawProfile(g, hi, lo, plotW, plotH) {
     const w = g.measureText(t.text).width;
     const x = (t.L.side === 'right') ? right - 3 - w : CH_PAD.l + 3;
     g.globalAlpha = 0.92;
-    g.fillStyle = '#12151a';
+    g.fillStyle = plateColour();
     g.fillRect(x - 2, t.y - 12, w + 4, 12);
     g.globalAlpha = 1;
     g.fillStyle = t.colour;
@@ -8257,7 +8314,7 @@ function drawMTF(g, s, xOf, step, y, hi, lo, plotW, up, down, panel) {
       g.font = '10px ui-monospace, monospace';
       const w = g.measureText(label).width;
       const x = CH_PAD.l + plotW * 0.5 - w / 2;
-      g.globalAlpha = 0.92; g.fillStyle = '#12151a';
+      g.globalAlpha = 0.92; g.fillStyle = plateColour();
       g.fillRect(x - 3, yy - 12, w + 6, 12);
       g.globalAlpha = 1; g.fillStyle = colour;
       g.fillText(label, x, yy - 3);
@@ -9313,6 +9370,7 @@ async function doResolve() {
 }
 
 // Last thing on the page: pick up whichever tab was open last time.
+restoreTheme();
 restoreTab();
 restoreProfileWindows();
 </script></body></html>

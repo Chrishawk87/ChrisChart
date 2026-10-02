@@ -2221,3 +2221,61 @@ def test_the_feed_builds_every_timeframe_on_the_ladder(client):
     head = src[i:i + 160]
     for tf in ('"1m"', '"5m"', '"15m"', '"1h"', '"4h"'):
         assert tf in head, f"the feed does not build {tf}"
+
+
+# ------------------------------------------------------- day and night
+
+def test_the_page_has_both_palettes(client):
+    html = client.get("/").text
+    assert ':root[data-theme="light"]' in html
+    css = html[html.index("<style>"):html.index("</style>")]
+    light = css[css.index(':root[data-theme="light"]'):]
+    light = light[:light.index("}") + 1]
+    for token in ("--bg", "--panel", "--line", "--ink", "--dim",
+                  "--up", "--down", "--accent"):
+        assert token in light, f"day mode never re-points {token}"
+
+
+def test_day_mode_darkens_the_signal_colours(client):
+    """#4eae80 on near-black clears contrast comfortably; the same green
+    on white does not, and a signal colour you cannot read is worse than
+    no colour."""
+    html = client.get("/").text
+    css = html[html.index("<style>"):html.index("</style>")]
+    light = css[css.index(':root[data-theme="light"]'):]
+    light = light[:light.index("}") + 1]
+    assert "#4eae80" not in light and "#d9685c" not in light
+
+
+def test_the_toggle_is_wired_and_remembered(client):
+    html = client.get("/").text
+    assert 'id="themeBtn"' in html and "toggleTheme()" in html
+    for fn in ("applyTheme", "toggleTheme", "restoreTheme"):
+        assert f"function {fn}(" in html
+    fn = html[html.index("function applyTheme("):]
+    fn = fn[:fn.index("\n}\n")]
+    assert "localStorage.setItem('liqmap_theme'" in fn
+
+
+def test_the_theme_is_restored_before_anything_paints(client):
+    html = client.get("/").text
+    assert html.index("restoreTheme();") < html.index("restoreTab();")
+
+
+def test_switching_redraws_the_canvas(client):
+    """The chart is pixels, drawn once. CSS cannot restyle it."""
+    html = client.get("/").text
+    fn = html[html.index("function applyTheme("):]
+    fn = fn[:fn.index("\n}\n")]
+    assert "drawChart()" in fn
+
+
+def test_no_colour_is_painted_onto_the_canvas_as_a_dark_hex(client):
+    """The plate behind the chart's price labels was a hardcoded
+    near-black, which on a white page is a smear. Canvas colours have to
+    come through the same tokens the stylesheet uses."""
+    html = client.get("/").text
+    script = html[html.rindex("<script>"):]
+    assert "'#12151a'" not in script.replace(
+        "getPropertyValue('--panel').trim() || '#12151a'", "")
+    assert "function plateColour(" in html
