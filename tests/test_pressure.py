@@ -375,3 +375,54 @@ def test_too_few_bars_is_safe():
 def test_the_combined_score_is_bounded():
     bars = flat_bars() + [bar(100.0, 200.0, 99.9, 100.1, ts=9)]
     assert -1.0 <= price_action(bars).signed <= 1.0
+
+
+from liqmap import pressure as P    # noqa: E402
+
+
+# --------------------------------------- the window scales with the bar
+
+def test_a_fast_bar_is_read_on_its_own():
+    """A one-minute bar fills up on its own. Averaging it with the two
+    minutes before it means a reversal inside the current minute is
+    outvoted by history -- the row keeps reading UP while price is already
+    coming down, which looks exactly like feed lag and is not."""
+    assert P.lookback_for(60.0) == 1
+    assert P.lookback_for(300.0) == 1
+
+
+def test_a_slow_bar_still_aggregates():
+    """Two minutes into a four-hour candle there is nothing in it. That is
+    the argument for the window and it is a good one -- about four-hour
+    bars."""
+    assert P.lookback_for(3600.0) == 3
+    assert P.lookback_for(14400.0) == 3
+
+
+def test_the_boundary_is_stated_not_hidden():
+    assert P.FAST_S == 300.0
+
+
+def test_a_reversal_in_the_current_minute_is_not_outvoted():
+    """The behaviour, not the constant. Two rising minutes then a falling
+    one: read as a single bar the row is down, read over three it is up."""
+    bars = [Candle(ts=0.0, open=100.0, high=101.0, low=100.0, close=101.0,
+                   volume=10.0),
+            Candle(ts=60.0, open=101.0, high=102.0, low=101.0, close=102.0,
+                   volume=10.0),
+            Candle(ts=120.0, open=102.0, high=102.0, low=100.5, close=100.5,
+                   volume=10.0)]
+    now = P.from_candles("1m", 60.0, bars)
+    wide = P.from_candles("1m", 60.0, bars, lookback=3)
+    assert now is not None and wide is not None
+    assert now.move_bps < 0, "the current minute is falling"
+    assert wide.move_bps > 0, "three minutes together are still rising"
+
+
+def test_an_explicit_lookback_still_wins():
+    """The scaling is a default, not a lock -- a caller that knows what it
+    wants is not overridden."""
+    bars = [Candle(ts=i * 60.0, open=100.0 + i, high=101.0 + i,
+                   low=99.0 + i, close=100.5 + i, volume=5.0)
+            for i in range(5)]
+    assert P.from_candles("1m", 60.0, bars, lookback=4).trades is not None

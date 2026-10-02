@@ -319,8 +319,31 @@ def from_candle(timeframe: str, interval_s: float, candle: Candle,
         elapsed_s=elapsed_s, coverage=1.0)
 
 
+# How many bars a polled reading aggregates, by how long the bar is.
+#
+# THE THREE BAR WINDOW IS RIGHT FOR SLOW TIMEFRAMES AND WRONG FOR FAST ONES
+#
+# Two minutes into a four-hour candle there is nothing in it, so reading
+# only the bar in progress makes the higher timeframe go silent exactly
+# when it matters. That is the argument for the window, and it is a good
+# one -- about four-hour bars.
+#
+# Applied to a one-minute bar it does the opposite. A reversal inside the
+# current minute gets averaged with the two minutes before it, so the row
+# keeps reading UP while price is already coming down. That is not a lag
+# in the feed; it is the window outvoting the present.
+#
+# So the window scales. A bar short enough to fill up on its own is read
+# on its own.
+FAST_S = 300.0        # bars this long or shorter are read one at a time
+
+
+def lookback_for(interval_s: float, slow: int = 3) -> int:
+    return 1 if interval_s <= FAST_S else slow
+
+
 def from_candles(timeframe: str, interval_s: float, bars: Sequence[Candle],
-                 lookback: int = 3, book: Book | None = None,
+                 lookback: int | None = None, book: Book | None = None,
                  elapsed_s: float = 0.0) -> Pressure | None:
     """Who has been winning over the last few bars of this timeframe.
 
@@ -334,6 +357,8 @@ def from_candles(timeframe: str, interval_s: float, bars: Sequence[Candle],
     high and low across it, close from the last, and the inferred buy/sell
     split accumulated bar by bar rather than taken from the final one.
     """
+    if lookback is None:
+        lookback = lookback_for(interval_s)
     window = [b for b in bars[-max(1, lookback):] if b.high >= b.low]
     if not window:
         return None

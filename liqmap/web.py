@@ -478,7 +478,8 @@ class Runtime:
     # -- the live feed -----------------------------------------------------
 
     def start_feed(self, coin: str,
-                   intervals: Sequence[str] = ("1m", "5m", "15m", "30m")
+                   intervals: Sequence[str] = ("1m", "5m", "15m", "30m",
+                                               "1h", "4h")
                    ) -> dict[str, Any]:
         """Open a persistent socket for one market and build its candles.
 
@@ -487,6 +488,12 @@ class Runtime:
         builder is seeded once from `candleSnapshot` so the open of the bar
         already in progress is real rather than whatever price happened to be
         trading when the socket connected.
+
+        Every timeframe on the ladder is built, including the slow ones.
+        They cost nothing extra -- the same fills feed all of them -- and
+        leaving the hour and the four hours out meant those two rows were
+        always polled while the fast ones were live, so the ladder mixed
+        two different ages without saying so.
 
         One market at a time. A second feed doubles the socket traffic for a
         market you are not looking at.
@@ -2612,7 +2619,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/feed", dependencies=[Depends(require_token)])
     def api_feed(coin: str = "BTC", stop: bool = False,
-                 intervals: str = "1m,5m,15m,30m") -> dict[str, Any]:
+                 intervals: str = "1m,5m,15m,30m,1h,4h") -> dict[str, Any]:
         """Start or stop the WebSocket feed for one market."""
         if stop:
             return rt.stop_feed()
@@ -4099,6 +4106,11 @@ def create_app() -> FastAPI:
                     want.append(t)
 
             readings = []
+            # How old the data behind each row is, and where it came from.
+            # A row that is a minute stale looks exactly like a row that
+            # disagrees with you, and the two call for opposite reactions.
+            ages: dict[str, float] = {}
+            srcs: dict[str, str] = {}
             for tf in want:
                 iv = float(client.INTERVALS[tf])
                 bar = feed.candle(tf) if (use_feed and feed) else None
@@ -4107,6 +4119,8 @@ def create_app() -> FastAPI:
                            if feed.started_at else 0.0)
                     readings.append(pr.from_live(tf, iv, bar, book,
                                                  coverage=max(cov, 0.05)))
+                    ages[tf] = round(max(0.0, feed.age), 1)
+                    srcs[tf] = "tape"
                     continue
                 try:
                     tf_bars = (bars if tf == interval
@@ -4115,6 +4129,11 @@ def create_app() -> FastAPI:
                     continue
                 if not tf_bars:
                     continue
+                # A polled bar is as old as the moment it was last written,
+                # which for a closed bar is however long ago it closed.
+                last_ts = float(getattr(tf_bars[-1], "ts", 0.0) or 0.0)
+                ages[tf] = round(max(0.0, now_s - last_ts), 1)
+                srcs[tf] = "polled"
                 # Aggregate the recent bars rather than reading only the one
                 # in progress: two minutes into a 4-hour candle there is
                 # nothing in it, and the higher timeframe would go silent
@@ -4135,6 +4154,9 @@ def create_app() -> FastAPI:
                 "sell_notional": r.sell_notional,
                 "measured": r.measured, "trades": r.trades,
                 "position_in_range": r.position_in_range,
+                "age_s": ages.get(r.timeframe),
+                "source": srcs.get(r.timeframe, "polled"),
+                "bars_used": pr.lookback_for(r.interval_s),
                 "describe": r.describe(),
             } for r in conf.ordered]
             out["confrontation"] = {
@@ -6561,6 +6583,20 @@ function inputFlags(d) {
   return out;
 }
 
+/* How old a ladder row is, and where it came from.
+
+   A row that is a minute stale looks exactly like a row that disagrees
+   with you, and the two call for opposite reactions: one is information,
+   the other is a clock. Rows older than their own bar is long are called
+   out, because by then the row is describing a bar that has closed. */
+function tfAge(t) {
+  if (t.age_s == null) return '';
+  const old = t.source !== 'tape' && t.age_s >= 20;
+  const txt = t.age_s < 1 ? 'now' : Math.round(t.age_s) + 's';
+  return ' · <span class="' + (old ? 'flag late' : 'thin') + '">'
+       + (t.source === 'tape' ? 'tape ' : 'polled ') + txt + '</span>';
+}
+
 function paintLadder(d) {
   const tfs = d.timeframes || [];
   const el = $('tfLadder'), say = $('tfSay');
@@ -6580,7 +6616,7 @@ function paintLadder(d) {
       <span class="bar"><i class="${t.winner}" style="width:${w}%"></i></span>
       <span class="meta">${t.move_bps >= 0 ? '+' : ''}${t.move_bps.toFixed(1)}bps
         ${t.absorbing ? '· absorbed' : ''}
-        ${t.measured ? '' : '· inferred'}</span>
+        ${t.measured ? '' : '· inferred'}${tfAge(t)}</span>
     </div>`;
   }).join('');
 
@@ -6684,7 +6720,7 @@ async function startFeed() {
   $('feedBtn').disabled = true;
   try {
     const r = await api('/api/feed?' + q({coin: coin(),
-                        intervals: '1m,5m,15m,30m'}), {method: 'POST'});
+                        intervals: '1m,5m,15m,30m,1h,4h'}), {method: 'POST'});
     if (!r.ok) { note(r.error || 'could not start feed', true); return; }
     note(`feed starting on ${coin()} — seeding from history…`);
     openStream();

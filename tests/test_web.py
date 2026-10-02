@@ -2185,3 +2185,39 @@ def test_no_module_defines_a_function_twice():
                     problems.append(f"{path.name}:{item.name}")
                 seen[item.name] = True
     assert not problems, f"defined twice: {problems}"
+
+
+def test_every_ladder_row_reports_its_age_and_source(client, monkeypatch):
+    """A row that is a minute stale looks exactly like a row that
+    disagrees with you, and the two call for opposite reactions. One is
+    information; the other is a clock."""
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.create_app)
+    i = src.index('out["timeframes"] = [{')
+    block = src[i:i + 900]
+    assert '"age_s"' in block and '"source"' in block
+    assert '"bars_used"' in block
+
+
+def test_the_ladder_paints_the_age_it_is_given(client):
+    html = client.get("/").text
+    assert "function tfAge(" in html
+    fn = html[html.index("function tfAge("):]
+    fn = fn[:fn.index("\n}\n")]
+    assert "t.age_s" in fn and "t.source" in fn
+
+
+def test_the_feed_builds_every_timeframe_on_the_ladder(client):
+    """The hour and the four hours were never built from the tape, so
+    those two rows were always polled while the fast ones were live --
+    a ladder mixing two ages without saying which was which."""
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.Runtime.start_feed)
+    i = src.index("intervals: Sequence[str]")
+    head = src[i:i + 160]
+    for tf in ('"1m"', '"5m"', '"15m"', '"1h"', '"4h"'):
+        assert tf in head, f"the feed does not build {tf}"
