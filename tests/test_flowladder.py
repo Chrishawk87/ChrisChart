@@ -292,13 +292,59 @@ def test_the_panel_never_calls_the_gate_a_direction():
     assert "not a direction" in block
 
 
-def test_the_ladder_refreshes_with_the_read():
-    """Two clocks would let it drift out of step with the panel it sits
-    under."""
+def test_the_ladder_refreshes_from_the_paint_not_the_fetch():
+    """THE stuck-ladder bug.
+
+    When the socket is live the stream calls paintRead DIRECTLY -- that is
+    why it is split out, so a push costs no fetch. Hanging the flow
+    refresh off loadRead meant it only ran on the HTTP path: the candle
+    read updated from the socket while the ladder sat frozen on whatever
+    the last poll returned. Dead-looking data that was really stale data.
+    """
     src = _src()
-    fn = src[src.index("async function loadRead("):]
-    fn = fn[:fn.index("function paintRead(")]
-    assert "loadFlow()" in fn
+    paint = src[src.index("function paintRead(d) {"):]
+    paint = paint[:paint.index("\n}\n")]
+    assert "loadFlow()" in paint, "the ladder does not refresh on a push"
+
+    fetch = src[src.index("async function loadRead("):]
+    fetch = fetch[:fetch.index("function paintRead(")]
+    assert "loadFlow()" not in fetch, (
+        "the ladder refreshes twice on the HTTP path")
+
+
+def test_the_ladder_refresh_is_throttled():
+    """paintRead fires many times a second on a busy socket and each flow
+    read walks the whole tape."""
+    src = _src()
+    assert "FLOW_EVERY_MS" in src
+    paint = src[src.index("function paintRead(d) {"):]
+    paint = paint[:paint.index("\n}\n")]
+    assert "FLOW_EVERY_MS" in paint
+
+
+def test_one_measured_rung_is_not_a_consensus():
+    """A panel saying 'every covered timeframe agrees' over a single row
+    is making a claim about a stack it cannot see. On a freshly connected
+    feed that is the normal state for the first few minutes."""
+    rs = [fl.Rung("1m", 60.0, buy=100.0, covered=True),
+          fl.Rung("5m", 300.0, covered=False)]
+    assert fl.agreement(rs) == "unknown"
+    assert len(fl.voters(rs)) == 1
+
+
+def test_two_measured_rungs_agreeing_is_a_consensus():
+    rs = [fl.Rung("1m", 60.0, buy=100.0, covered=True),
+          fl.Rung("5m", 300.0, buy=100.0, covered=True)]
+    assert fl.agreement(rs) == "buyers"
+
+
+def test_the_gate_says_when_it_has_only_one_timeframe():
+    trades = [tr(i * 1.0, side="buy", sz=5.0) for i in range(600)]
+    trades += [tr(600.0 + i / 10.0, side="buy", sz=5.0) for i in range(150)]
+    lad = fl.build(tape_of(trades), book_at(6000.00, 6000.25),
+                   (("1m", 60.0), ("4h", 14400.0)), of.ES, now=615.0)
+    assert not lad.tradeable
+    assert "measured" in lad.why
 
 
 def test_every_function_the_markup_calls_is_defined():

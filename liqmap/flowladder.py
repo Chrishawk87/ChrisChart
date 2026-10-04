@@ -55,6 +55,15 @@ RUNGS_BACK = 6
 # delta that describes a fraction of its own bar.
 MIN_COVERAGE = 0.25
 
+# Covered rungs needed before "they agree" means anything.
+#
+# One rung agreeing with itself is not a consensus, and a panel that says
+# "every covered timeframe agrees" over a single measured row is making a
+# claim about a stack it cannot see. On a freshly connected feed that is
+# the normal state for the first few minutes, so it has to be said rather
+# than papered over.
+MIN_VOTERS = 2
+
 
 @dataclass
 class Rung:
@@ -70,7 +79,7 @@ class Rung:
     cvd: float = 0.0            # accumulated over the bars the tape covers
     bars: int = 0               # completed bars contributing to that cvd
     coverage: float = 0.0       # share of the CURRENT bar the tape has seen
-    covered: bool = False
+    covered: bool = False       # the tape actually measured this one
 
     @property
     def delta(self) -> float:
@@ -223,14 +232,27 @@ def rungs(tape, intervals: Sequence[tuple[str, float]],
     return out
 
 
+def voters(rungs_: Sequence[Rung]) -> list[Rung]:
+    """The rungs entitled to an opinion: the MEASURED ones.
+
+    A rung the rolling tape has not held long enough to fill has no
+    opinion. It is shown, because a blank row tells you the feed is still
+    warming up, but it does not vote.
+    """
+    return [r for r in rungs_ if r.covered and r.side != "unknown"]
+
+
 def agreement(rungs_: Sequence[Rung]) -> str:
-    """Do the covered timeframes all lean the same way.
+    """Do the measured timeframes all lean the same way.
 
     Only the covered ones vote. A rung the tape cannot see has no opinion,
     and counting it as "even" would let silence outvote the rungs that
     actually measured something.
     """
-    sides = {r.side for r in rungs_ if r.covered and r.side != "unknown"}
+    vs = voters(rungs_)
+    if len(vs) < MIN_VOTERS:
+        return "unknown"
+    sides = {r.side for r in vs}
     if not sides:
         return "unknown"
     if sides == {"buyers"}:
@@ -262,11 +284,16 @@ def build(tape, book, intervals: Sequence[tuple[str, float]],
         refusals.append(
             f"tape at {out.velocity.ratio:.1f}x its baseline, wants "
             f"{spike:g}x" if out.velocity.confident else out.velocity.note)
-    if out.aligned in ("mixed", "unknown"):
+    n = len(voters(out.rungs))
+    if n < MIN_VOTERS:
+        refusals.append(
+            f"only {n} timeframe{'' if n == 1 else 's'} measured -- the tape "
+            f"has not held long enough to read the rest")
+    elif out.aligned in ("mixed", "unknown"):
         refusals.append(f"timeframes {out.aligned}")
 
     out.tradeable = not refusals
     out.why = ("; ".join(refusals) if refusals
-               else f"spread, tape and every covered timeframe agree "
-                    f"({out.aligned})")
+               else f"spread, tape and all {len(voters(out.rungs))} measured "
+                    f"timeframes agree ({out.aligned})")
     return out

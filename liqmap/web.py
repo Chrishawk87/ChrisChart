@@ -7060,14 +7060,30 @@ async function loadRead() {
                   size: parseFloat($('liqSize').value || '0') || 0}));
   } catch (e) { $('readHead').textContent = e.message; return; }
   paintRead(d);
-  // Same refresh as the read: two clocks would let the ladder drift out
-  // of step with the panel it sits under.
-  loadFlow();
 }
 
 // Split out so the websocket stream can paint without a fetch of its own.
+/* Never oftener than this. On a busy socket paintRead fires many times a
+   second and each flow read walks the whole tape. */
+const FLOW_EVERY_MS = 2000;
+let flowAt = 0;
+
 function paintRead(d) {
   if (!d) return;
+
+  /* THE LADDER REFRESHES FROM HERE, NOT FROM loadRead.
+     
+     When the websocket is live the stream calls paintRead DIRECTLY --
+     that is the whole point of it being split out, so a push does not
+     cost a fetch. Hanging the flow refresh off loadRead therefore meant
+     it only ran on the HTTP path: the candle read updated from the
+     socket while the ladder sat frozen on whatever the last poll
+     returned. It looked like dead data and it was stale data. */
+  const t = Date.now();
+  if (t - flowAt >= FLOW_EVERY_MS) {
+    flowAt = t;
+    loadFlow();
+  }
   if (d.error) {
     $('readHead').textContent = d.error;
     $('readSignals').innerHTML = ''; $('readSay').style.display = 'none'; return;
