@@ -238,3 +238,110 @@ def test_the_clear_factor_is_stated_and_not_below_one():
     assumes nothing joined behind it. Below one would be inventing
     priority."""
     assert of.CLEAR_FACTOR >= 1.0
+
+
+# ----------------------------------------------- a bar's pace, per timeframe
+#
+# A second velocity with the same units and a different question. The one
+# above asks whether anything is happening right now; this asks whether
+# the bar in progress is busier than the bars behind it, which is the
+# shape the delta and CVD beside it on the row already have.
+
+
+def test_a_bar_is_measured_against_the_bars_before_it():
+    """Six quiet minutes, then thirty seconds at four times the rate."""
+    stamps = even(0.0, 360, 1.0) + even(360.0, 120, 4.0)
+    v = of.velocity_for(stamps, 60.0, now=390.0)
+    assert v.confident
+    assert v.ratio == pytest.approx(4.0, rel=0.05)
+
+
+def test_the_bar_being_measured_is_not_in_its_own_baseline():
+    """THE pace test, and the same trap as the one above it.
+
+    If the bar in progress is allowed into the window it is compared
+    against, it raises its own benchmark -- and the busiest bars, the
+    ones worth noticing, are the ones that gets understated most. Here a
+    contaminated baseline reads 3.3x against a true 4.0x, so the test
+    fails the moment the current bar leaks in.
+    """
+    stamps = even(0.0, 360, 1.0) + even(360.0, 120, 4.0)
+    v = of.velocity_for(stamps, 60.0, now=390.0)
+    # Everything before this bar opened, and nothing after.
+    assert v.base_prints == 360
+    assert v.prints == pytest.approx(120, abs=1)
+    assert v.base_hz == pytest.approx(1.0, rel=0.05)
+
+
+def test_a_timeframe_the_tape_has_not_held_two_bars_of_has_no_pace():
+    """An hour of tape has not seen two completed four-hour bars, so
+    there is no 'lately' for that rung. Dividing by whatever fraction
+    happens to be in memory would print a ratio that means nothing."""
+    v = of.velocity_for(even(0.0, 3600, 1.0), 14400.0, now=3600.0)
+    assert not v.confident
+    assert not v.spiking(2.0)
+    assert "completed bars" in v.note
+
+
+def test_the_first_seconds_of_a_bar_are_not_a_pace():
+    """One print two seconds in is 0.5/s and means nothing."""
+    stamps = even(0.0, 600, 1.0) + [601.0, 601.5]
+    v = of.velocity_for(stamps, 60.0, now=601.5)
+    assert not v.confident
+    assert "too early" in v.note
+
+
+def test_a_handful_of_prints_is_not_a_pace_however_long_the_bar_is():
+    """Five minutes into a fifteen with three prints in it is not a rung
+    running at 0.01x its baseline, it is a rung with nothing on it. The
+    seconds floor does not catch this one -- the bar is old enough."""
+    stamps = even(0.0, 2700, 1.0) + [2750.0, 2800.0, 2900.0]
+    v = of.velocity_for(stamps, 900.0, now=3000.0)
+    assert not v.confident
+    assert "too early" in v.note
+
+
+def test_a_timeframe_with_history_but_no_prints_in_it_says_so():
+    stamps = [i * 30.0 for i in range(20)] + even(600.0, 40, 4.0)
+    v = of.velocity_for(stamps, 60.0, now=610.0)
+    assert not v.confident
+    assert "not enough" in v.note
+
+
+def test_two_timeframes_read_the_same_tape_differently():
+    """The whole reason the pace is per rung.
+
+    One tape, one moment. The minute compares the burst against six
+    minutes that already contain most of it and reads 3x; the fifteen
+    compares it against an hour that barely notices it and reads nearly
+    5x. One number on every row would have been a different claim.
+    """
+    stamps = even(0.0, 3540, 1.0) + even(3540.0, 450, 5.0)
+    m1 = of.velocity_for(stamps, 60.0, now=3630.0)
+    m15 = of.velocity_for(stamps, 900.0, now=3630.0)
+    assert m1.confident and m15.confident
+    assert m1.ratio == pytest.approx(3.0, rel=0.1)
+    assert m15.ratio == pytest.approx(4.7, rel=0.1)
+    assert m15.ratio > m1.ratio + 1.0
+
+
+def test_the_bar_pace_is_not_the_markets_velocity():
+    """Same tape again, and the market-wide number agrees with neither.
+    Fifteen seconds against ten minutes is a different question from this
+    bar against the bars before it, and they are reported separately
+    because they answer differently."""
+    stamps = even(0.0, 3540, 1.0) + even(3540.0, 450, 5.0)
+    now = of.velocity(stamps, now=3630.0)
+    bar = of.velocity_for(stamps, 900.0, now=3630.0)
+    assert now.confident and bar.confident
+    assert abs(now.ratio - bar.ratio) > 0.5
+
+
+def test_no_prints_and_no_interval_are_not_crashes():
+    assert not of.velocity_for([], 60.0).confident
+    assert not of.velocity_for([1.0, 2.0], 0.0).confident
+
+
+def test_the_pace_floors_are_stated():
+    assert of.MIN_BASE_BARS >= 2
+    assert of.MIN_BURST_PRINTS >= 5 and of.MIN_BURST_S >= 5.0

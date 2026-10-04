@@ -7,9 +7,12 @@ delta makes an hour of missing data look like an hour of balance, and
 then letting it vote makes silence outweigh the rungs that actually
 measured something.
 
-And velocity is a rate, not a quantity. There is no four-hour version of
-"prints per second in the last fifteen seconds", so printing one per rung
-would be the same number five times pretending to be five measurements.
+And the two velocities are not the same number. The ladder's is the
+market in the last fifteen seconds, one figure belonging to the moment.
+A rung's pace is its own bar against its own completed bars. Printing
+the first on every row would be one measurement pretending to be five;
+printing the second without checking the tape holds those bars would be
+a ratio built from whatever happens to be in memory.
 """
 
 from __future__ import annotations
@@ -208,15 +211,58 @@ def test_the_refusal_says_which_gate_said_no():
     assert len(lad.why) > 10
 
 
-def test_velocity_is_one_number_not_one_per_rung():
-    """A rate belongs to the moment, not to a bar. Printing it per
-    timeframe would be the same figure five times pretending to be five
-    measurements."""
+def test_the_markets_velocity_is_one_number_not_one_per_rung():
+    """The ladder's velocity is the last fifteen seconds against the last
+    ten minutes. That belongs to the moment, not to a bar, so it is
+    reported once -- repeating it on every row would be one measurement
+    pretending to be five."""
     lad = fl.build(tape_of(busy()), book_at(6000.00, 6000.25), IV,
                    of.ES, now=615.0)
     d = lad.to_dict()
     assert "velocity" in d
     assert all("velocity" not in r for r in d["rungs"])
+
+
+def test_every_rung_carries_its_own_bar_pace():
+    """And a rung's pace IS per timeframe, because it is a different
+    measurement: this bar against the completed bars of this timeframe,
+    the same shape as the delta and CVD beside it on the row."""
+    lad = fl.build(tape_of(busy()), book_at(6000.00, 6000.25), IV,
+                   of.ES, now=615.0)
+    d = lad.to_dict()
+    assert all("pace" in r for r in d["rungs"])
+    assert all("ratio" in r["pace"] and "note" in r["pace"]
+               for r in d["rungs"])
+
+
+def test_the_rungs_paces_are_not_all_the_same_figure():
+    """The test that fails if the per-rung pace is quietly the market
+    velocity copied down the column.
+
+    Ten minutes at 1/s then a minute at 5/s: the one-minute rung is
+    comparing against six minutes that already contain most of the
+    burst, the fifteen against an hour that barely notices it. Equal
+    numbers here would mean one measurement wearing five labels.
+    """
+    trades = [tr(i * 1.0) for i in range(3540)]
+    trades += [tr(3540.0 + i / 5.0) for i in range(450)]
+    lad = fl.build(tape_of(trades), book_at(6000.00, 6000.25),
+                   (("1m", 60.0), ("15m", 900.0)), of.ES, now=3630.0)
+    m1, m15 = lad.rungs[0].pace, lad.rungs[1].pace
+    assert m1.confident and m15.confident
+    assert abs(m15.ratio - m1.ratio) > 1.0
+    assert abs(m1.ratio - lad.velocity.ratio) > 0.1
+
+
+def test_a_rung_whose_history_the_tape_lacks_reports_no_pace():
+    """Coverage and pace are different refusals: coverage is about the
+    bar in progress, pace is about the bars behind it. An hour of tape
+    can cover a 15-minute bar and still have no four-hour history."""
+    lad = fl.build(tape_of(busy()), book_at(6000.00, 6000.25),
+                   (("1m", 60.0), ("4h", 14400.0)), of.ES, now=615.0)
+    four = [r for r in lad.rungs if r.timeframe == "4h"][0]
+    assert not four.pace.confident
+    assert four.pace.note
 
 
 def test_tradeable_is_not_a_direction():
@@ -261,11 +307,14 @@ def test_the_route_refuses_without_a_live_feed():
 
 
 def test_the_route_reads_every_timeframe_on_the_ladder():
+    """The route no longer carries its own list -- it hands the ask to
+    `wanted`, which falls back to this one."""
     src = _src()
     route = src[src.index('@app.get("/api/flow"'):
                 src.index('@app.get("/api/mtf"')]
-    for tf in ('"1m"', '"5m"', '"15m"', '"30m"', '"1h"', '"4h"'):
-        assert tf in route
+    assert "_fl.wanted(asked, _IV)" in route
+    for tf in ("1m", "5m", "15m", "30m", "1h", "4h"):
+        assert tf in fl.DEFAULT_TIMEFRAMES
 
 
 def test_the_tick_is_inferred_rather_than_assumed():
@@ -279,10 +328,15 @@ def test_the_tick_is_inferred_rather_than_assumed():
 
 def test_an_uncovered_rung_is_drawn_differently_not_as_flat():
     src = _src()
-    fn = src[src.index("async function loadFlow("):]
-    fn = fn[:fn.index("\nfunction flowNum(")]
+    fn = src[src.index("function flowHalf(r) {"):]
+    fn = fn[:fn.index("\nfunction renderLadder(")]
     assert "NOT COVERED" in fn
     assert "r.coverage" in fn
+    # And the refusal is actually wired to coverage, not merely spelled
+    # out nearby: a greyed row nobody can reach is a row that reads flat.
+    assert "if (!r.covered)" in fn
+    assert fn.index("if (!r.covered)") < fn.index("NOT COVERED")
+    assert fn.index("NOT COVERED") < fn.index("r.lean")
 
 
 def test_the_panel_never_calls_the_gate_a_direction():
@@ -355,7 +409,7 @@ def test_every_function_the_markup_calls_is_defined():
 
 def test_the_elements_the_script_writes_to_exist():
     src = _src()
-    for el in ("flowGate", "flowLadder", "flowStamp", "flowTgt",
+    for el in ("flowGate", "tfLadder", "flowStamp", "flowTgt",
                "flowSpike"):
         assert f'id="{el}"' in src, f"{el} is missing from the markup"
         assert src.count(f'id="{el}"') == 1
@@ -378,3 +432,151 @@ def test_every_css_variable_the_stylesheet_uses_is_defined():
     declared = set(re.findall(r"(--[a-z0-9-]+)\s*:", css))
     missing = sorted(used - declared)
     assert not missing, f"used but never defined: {missing}"
+
+
+# --------------------------------------------- the two ladders, merged
+#
+# The candle read and the order flow measure the same bar from different
+# feeds, and the whole value is in whether they agree. Two ladders a
+# screen apart made that a memory test. Merged, they must stay two
+# measurements: one row, two halves, neither blended into the other.
+
+
+def test_one_row_carries_both_readings():
+    src = _src()
+    row = src[src.index("function renderLadder() {"):]
+    row = row[:row.index("\nfunction paintLadder(")]
+    assert "readHalf(t)" in row and "flowHalf(r)" in row
+    assert "tf2" in row
+
+
+def test_the_halves_are_matched_by_timeframe_not_by_position():
+    """Two lists in the same order today is not the same thing as two
+    lists in the same order. A row pairing a 15m read with a 5m delta
+    would be worse than no row."""
+    src = _src()
+    row = src[src.index("function renderLadder() {"):]
+    row = row[:row.index("\nfunction paintLadder(")]
+    assert "r.timeframe" in row and "t.timeframe" in row
+    assert "read[n]" in row and "flow[n]" in row
+
+
+def test_the_flow_is_asked_for_the_rows_the_read_is_showing():
+    """Same reason. The page builds the read's timeframe list, then asks
+    the flow route for exactly those."""
+    src = _src()
+    fn = src[src.index("async function loadFlow("):]
+    fn = fn[:fn.index("\nfunction flowNum(")]
+    assert "timeframes: readTfList()" in fn
+
+    route = src[src.index('@app.get("/api/flow"'):
+                src.index('@app.get("/api/mtf"')]
+    assert "timeframes: str" in route
+
+
+def test_the_rows_asked_for_are_the_rows_built():
+    IVS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+    assert fl.wanted(["15m", "1m"], IVS) == [("15m", 900.0), ("1m", 60.0)]
+
+
+def test_a_timeframe_this_feed_does_not_have_is_dropped_not_guessed():
+    assert fl.wanted(["15m", "7m"], {"15m": 900}) == [("15m", 900.0)]
+
+
+def test_asking_twice_for_a_row_does_not_draw_it_twice():
+    assert fl.wanted(["1m", "1m"], {"1m": 60}) == [("1m", 60.0)]
+
+
+def test_an_empty_ask_is_no_opinion_not_no_rows():
+    """The panel can be asked for nothing -- by an old client, or before
+    the read has chosen its timeframes. That is a caller with no opinion,
+    and a blank ladder would read as a dead feed."""
+    got = [n for n, _ in fl.wanted([], {k: 1 for k in fl.DEFAULT_TIMEFRAMES})]
+    assert got == list(fl.DEFAULT_TIMEFRAMES)
+    assert "4h" in got
+
+
+def test_the_page_builds_the_same_list_the_route_does():
+    """The read route's default ladder and the page's copy of it have to
+    stay the same list, or the halves drift apart the first time either
+    is edited."""
+    import inspect
+
+    from liqmap import web as w
+    route = inspect.getsource(w.create_app)
+    i = route.index("tf_list = [higher")
+    server = route[i:i + 80]
+    src = _src()
+    page = src[src.index("function readTfList() {"):]
+    page = page[:page.index("\n}")]
+    for tf in ('"1h"', '"5m"', '"1m"'):
+        assert tf in server
+        assert tf.replace('"', "'") in page
+    assert "rHigh" in page and "rInt" in page
+
+
+def test_a_half_with_nothing_behind_it_says_so_rather_than_reading_flat():
+    """The two feeds arrive on their own schedules and either can be
+    missing. A silent half looks exactly like a balanced one."""
+    src = _src()
+    read = src[src.index("function readHalf(t) {"):]
+    read = read[:read.index("\nfunction flowHalf(")]
+    assert "NO READ" in read
+
+    flow = src[src.index("function flowHalf(r) {"):]
+    flow = flow[:flow.index("\nfunction renderLadder(")]
+    assert "NO TAPE" in flow
+
+
+def test_each_rungs_own_pace_is_on_its_row():
+    src = _src()
+    flow = src[src.index("function flowHalf(r) {"):]
+    flow = flow[:flow.index("\nfunction renderLadder(")]
+    assert "r.pace" in flow
+    assert "p.confident" in flow, "an unmeasured pace must not print a ratio"
+
+
+def test_the_merged_row_has_a_style_of_its_own():
+    from liqmap.web import DASHBOARD as page
+    css = page[page.index("<style>"):page.index("</style>")]
+    assert ".tf2{" in css
+    assert ".tf2 .half{" in css
+    # Each half carries its own left edge, so a row where the read and
+    # the flow disagree is visible without reading a word.
+    assert ".tf2 .half.buyers{" in css and ".tf2 .half.sellers{" in css
+
+
+def test_the_old_second_ladder_is_gone():
+    src = _src()
+    assert 'id="flowLadder"' not in src
+    assert "Order flow — the book gates" not in src
+
+
+def test_the_two_halves_of_a_row_cannot_be_different_bars():
+    """The guarantee the merge rests on, exercised rather than grepped.
+
+    The page builds the read's timeframe list and asks the flow route for
+    exactly it, so every rung that comes back belongs to a row the read
+    is drawing -- in the same order, which is what lets the halves be
+    matched by name without one of them silently sliding a row.
+    """
+    IVS = {"1m": 60, "5m": 300, "15m": 900, "1h": 3600, "4h": 14400}
+    asked = ["4h", "1h", "15m", "5m", "1m"]          # as the read orders them
+    lad = fl.build(tape_of(busy()), book_at(6000.00, 6000.25),
+                   fl.wanted(asked, IVS), of.ES, now=615.0)
+    assert [r.timeframe for r in lad.rungs] == asked
+
+
+def test_the_meta_line_does_not_clip_the_age_off_a_stale_row():
+    """The row that wraps is always the stale one -- the row you most
+    need to read straight. Side by side it is held to one line; stacked,
+    where nothing misaligns, it is allowed to wrap rather than ellipsis
+    the age away."""
+    from liqmap.web import DASHBOARD as page
+    css = page[page.index("<style>"):page.index("</style>")]
+    wide = css[css.index(".tf2 .meta{"):]
+    wide = wide[:wide.index("}")]
+    assert "nowrap" in wide
+    narrow = css[css.index("@media (max-width:980px)"):]
+    narrow = narrow[:narrow.index("\n  }")]
+    assert ".tf2 .meta{white-space:normal}" in narrow

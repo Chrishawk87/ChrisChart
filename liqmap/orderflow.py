@@ -8,7 +8,10 @@ carries aggression-versus-impact; `VolumeProfile` carries per-price delta.
 This module adds the three pieces that were missing:
 
     Velocity      prints per second, against a baseline that does not
-                  include the spike it is being compared to.
+                  include the spike it is being compared to. Two of
+                  them: one for the market right now (`velocity`), and
+                  one per timeframe for the bar in progress against the
+                  bars before it (`velocity_for`).
 
     Spec          tick size, tick value and commission per instrument,
                   and the arithmetic that says whether a target of N
@@ -200,6 +203,94 @@ def velocity(stamps: Sequence[float], now: float | None = None,
     out.ratio = (out.now_hz / out.base_hz) if out.base_hz > 0 else 1.0
     out.note = (f"{out.now_hz:.1f}/s against a {out.base_hz:.1f}/s baseline "
                 f"({out.ratio:.1f}x)")
+    return out
+
+
+# Completed bars of its own timeframe a rung's pace is measured against.
+BASE_BARS = 6
+
+# Below this many completed bars in the tape there is no "lately" for this
+# timeframe, and comparing a 4-hour bar against twenty minutes of history
+# would just be the 15-second burst wearing a different label.
+MIN_BASE_BARS = 2
+
+# Floors on the bar in progress. One print two seconds in is not a pace.
+MIN_BURST_S = 5.0
+MIN_BURST_PRINTS = 5
+
+
+def velocity_for(stamps: Sequence[float], interval_s: float,
+                 now: float | None = None,
+                 back: int = BASE_BARS) -> Velocity:
+    """How fast THIS bar is printing, against the bars before it.
+
+    A different measurement from `velocity` above, and they answer
+    different questions. `velocity` asks whether something is happening
+    RIGHT NOW: fifteen seconds against ten minutes, one number for the
+    whole market. This asks whether the bar in progress is busier than
+    its own recent neighbours -- the current 15-minute bar against the
+    last six 15-minute bars -- which is the same shape as the delta and
+    the CVD sitting beside it on the row, and can be read with them.
+
+    The two genuinely diverge, and the divergence is the point: a burst
+    that is loud against ten minutes can still leave a 4-hour bar
+    running slower than the four before it.
+
+    THE BASELINE IS COMPLETED BARS ONLY. The bar being measured is never
+    in its own benchmark, for the same reason the burst window is not in
+    the baseline above: it would raise the bar it is being compared to
+    and understate exactly the bars worth noticing.
+
+    WHEN THE TAPE CANNOT ANSWER, IT SAYS SO. A rolling tape that holds an
+    hour has not seen two completed 4-hour bars, so there is no pace for
+    that rung -- `confident` stays false and `note` says why, rather than
+    dividing by whatever fraction happens to be in memory and printing a
+    ratio that means nothing.
+    """
+    out = Velocity()
+    if interval_s <= 0:
+        out.note = "no interval"
+        return out
+    if not stamps:
+        out.note = "no prints"
+        return out
+
+    end = float(now) if now is not None else float(stamps[-1])
+    start = end - (end % interval_s)        # this bar's open
+    elapsed = max(0.0, end - start)
+    floor = start - back * interval_s
+    held_from = max(floor, float(stamps[0]))
+    span = max(0.0, start - held_from)       # baseline seconds actually held
+
+    burst = [t for t in stamps if start < t <= end]
+    base = [t for t in stamps if held_from <= t < start]
+
+    out.prints = len(burst)
+    out.base_prints = len(base)
+    out.now_hz = (len(burst) / elapsed) if elapsed > 0 else 0.0
+    out.base_hz = (len(base) / span) if span > 0 else 0.0
+
+    bars = span / interval_s
+    if bars < MIN_BASE_BARS:
+        out.ratio = 1.0
+        out.note = (f"the tape holds {bars:.1f} completed bars of this "
+                    f"timeframe -- not enough to say what normal is here")
+        return out
+    if elapsed < MIN_BURST_S or len(burst) < MIN_BURST_PRINTS:
+        out.ratio = 1.0
+        out.note = (f"{len(burst)} print{'' if len(burst) == 1 else 's'} "
+                    f"{elapsed:.0f}s into the bar -- too early to call a pace")
+        return out
+    if len(base) < MIN_BASE_PRINTS:
+        out.ratio = 1.0
+        out.note = (f"only {len(base)} prints across the last "
+                    f"{bars:.0f} bars -- not enough to call anything a spike")
+        return out
+
+    out.confident = True
+    out.ratio = (out.now_hz / out.base_hz) if out.base_hz > 0 else 1.0
+    out.note = (f"{out.now_hz:.1f}/s this bar against {out.base_hz:.1f}/s "
+                f"over the last {bars:.0f} ({out.ratio:.1f}x)")
     return out
 
 

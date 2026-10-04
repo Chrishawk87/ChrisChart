@@ -3446,7 +3446,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/flow", dependencies=[Depends(require_token)])
     def api_flow(coin: str = "BTC", target_ticks: float = 10.0,
-                 spec: str = "", spike: float = 2.0) -> dict[str, Any]:
+                 spec: str = "", spike: float = 2.0,
+                 timeframes: str = "") -> dict[str, Any]:
         """Order flow on every timeframe, and the book at the touch.
 
         TWO FEEDS, TWO JOBS. The book says whether the trade is worth
@@ -3490,8 +3491,12 @@ def create_app() -> FastAPI:
             sp = _of.Spec(coin, tick_size=tick, tick_value=tick,
                           commission=0.0, typical_spread_ticks=1.0)
 
-        want = [(n, float(_IV[n])) for n in
-                ("1m", "5m", "15m", "30m", "1h", "4h") if n in _IV]
+        # The rows are asked for by name so the page can request exactly
+        # the timeframes the candle read is showing. The two ladders are
+        # drawn as one row per timeframe, and a row whose halves are
+        # measuring different bars would be worse than no row at all.
+        asked = [t.strip() for t in (timeframes or "").split(",") if t.strip()]
+        want = _fl.wanted(asked, _IV)
         lad = _fl.build(feed.tape, feed.book, want, sp,
                         target_ticks=float(target_ticks),
                         spike=float(spike))
@@ -4674,23 +4679,57 @@ DASHBOARD = """<!doctype html>
     letter-spacing:.06em;color:var(--dim)}
   .bt-col.held{border-color:var(--accent)}
   .bt-big{font-size:26px;font-variant-numeric:tabular-nums}
-  .tf{display:grid;grid-template-columns:62px 92px 1fr 88px;gap:10px;
-    align-items:center;padding:7px 10px;border-radius:4px;margin-bottom:4px;
-    background:var(--bg);border-left:3px solid var(--line);font-size:13px}
-  .tf.buyers{border-left-color:var(--long)}
-  .tf.sellers{border-left-color:var(--short)}
-  .tf b{font-variant-numeric:tabular-nums}
-  .tf .who{font-weight:600;letter-spacing:.03em}
-  .tf .bar{height:6px;background:var(--line);border-radius:3px;position:relative}
-  .tf .bar i{position:absolute;top:0;bottom:0;border-radius:3px}
-  .tf .bar i.buyers{left:50%;background:var(--long)}
-  .tf .bar i.sellers{right:50%;background:var(--short)}
-  .tf .meta{font-size:11px;color:var(--dim);text-align:right}
-  /* The flow ladder carries delta, CVD and a print count rather than one
-     short phrase, so it gets a wider last column. At 88px the same markup
-     wrapped every row to four lines. */
-  .tf.flow{grid-template-columns:62px 92px 1fr 200px}
-  .tf.flow .meta{font-variant-numeric:tabular-nums}
+  /* The merged ladder: timeframe once, then the two readings of it side
+     by side. Each half carries its own left edge colour, so a row where
+     the read and the flow disagree is visible without reading a word.
+
+     It replaced two single-sided ladders, and their `.tf` rule went with
+     them rather than being left behind as dead styling for the next
+     person to half-remember. */
+  .tf2{display:grid;grid-template-columns:46px 1fr 1fr;gap:10px;
+    align-items:stretch;margin-bottom:4px;font-size:13px}
+  .tf2>b{align-self:center;font-variant-numeric:tabular-nums;
+    text-align:right;color:var(--dim)}
+  .tf2 .half{display:grid;grid-template-columns:72px 1fr 250px;gap:8px;
+    align-items:center;padding:7px 10px;border-radius:4px;
+    background:var(--bg);border-left:3px solid var(--line);min-width:0}
+  .tf2 .half.buyers{border-left-color:var(--long)}
+  .tf2 .half.sellers{border-left-color:var(--short)}
+  .tf2 .who{font-weight:600;letter-spacing:.03em}
+  /* A half with no reading behind it has no bar to draw, so its label
+     takes that room rather than wrapping "NOT COVERED" onto two lines
+     and making the empty row the tallest one on the ladder. */
+  .tf2 .who.wide{grid-column:1/3;white-space:nowrap}
+  .tf2 .bar{height:6px;background:var(--line);border-radius:3px;
+    position:relative}
+  .tf2 .bar i{position:absolute;top:0;bottom:0;border-radius:3px}
+  .tf2 .bar i.buyers{left:50%;background:var(--long)}
+  .tf2 .bar i.sellers{right:50%;background:var(--short)}
+  .tf2 .meta{font-size:11px;color:var(--dim);text-align:right;
+    font-variant-numeric:tabular-nums;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  /* The age badge rides inside the meta line, so it is sized to sit in
+     it rather than to stand alone. A row that wrapped to two lines put
+     its two halves on different baselines, and the row that wrapped was
+     always the stale one -- the row you most need to read straight. */
+  .tf2 .meta .flag{padding:1px 5px;margin:0 0 0 2px;font-size:10px;
+    letter-spacing:.03em}
+  .tf2.ladhead{margin-bottom:6px;font-size:11px;text-transform:uppercase;
+    letter-spacing:.06em;color:var(--dim)}
+  .tf2.ladhead i{display:block;font-style:normal;text-transform:none;
+    letter-spacing:0;font-size:11px;color:var(--dim);opacity:.75}
+  /* Narrow screens stack the two halves under the timeframe rather than
+     squeezing both: a delta that has wrapped to three lines is worse than
+     a delta on the next row. */
+  @media (max-width:980px){
+    .tf2{grid-template-columns:46px 1fr;row-gap:2px;margin-bottom:10px}
+    .tf2>span,.tf2 .half{grid-column:2}
+    .tf2 .half{grid-template-columns:72px 1fr 200px}
+    /* Stacked, the halves are no longer side by side, so a wrapped line
+       misaligns nothing -- and wrapping beats clipping the age off the
+       end of the one row whose age matters. */
+    .tf2 .meta{white-space:normal}
+  }
   .call{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
     padding:10px 0 4px}
   .call b{font-size:44px;letter-spacing:.02em;line-height:1}
@@ -4960,6 +4999,14 @@ bars">ppo</button>
           <option value="5">5s</option><option value="10">10s</option>
           <option value="20" selected>20s</option><option value="60">60s</option>
         </select></label>
+        <label title="The spread is judged against this: the same one tick
+is trivial against forty and fatal against five.">target
+          <input id="flowTgt" type="number" min="1" max="200" step="1"
+            value="10" onchange="loadFlow()" style="width:52px">ticks</label>
+        <label title="How far above its own ten-minute baseline the tape
+has to be running before the gate stops refusing.">spike
+          <input id="flowSpike" type="number" min="1" max="10" step="0.5"
+            value="2" onchange="loadFlow()" style="width:48px">x</label>
         <button onclick="startFeed()" id="feedBtn">Go live (websocket)</button>
         <button onclick="stopFeed()">Stop feed</button>
         <button onclick="loadRead()">Read now</button>
@@ -4968,27 +5015,32 @@ bars">ppo</button>
       <div id="feedBar" class="msg" style="margin-bottom:8px">Feed off — the
         current candle is being polled. Go live to build it from the tape instead.</div>
       <div id="alertBar" class="alertbar" style="display:none"></div>
+      <!-- ONE ROW PER TIMEFRAME, TWO READINGS ON IT.
+           The candle read and the order flow measure the same bar from
+           different feeds, and the whole value is in whether they agree.
+           Two ladders a screen apart made that a memory test. They stay
+           independent measurements: each half keeps its own side, its own
+           staleness and its own refusal, and neither is averaged into the
+           other. -->
+      <div class="tf2 ladhead">
+        <b>tf</b>
+        <span>candle read<i>who is winning the bar, and whether the move
+          is being absorbed</i></span>
+        <span>order flow<i>delta and CVD on this bar, and how fast it is
+          printing against the bars before it<span class="stamp"
+          id="flowStamp"></span></i></span>
+      </div>
       <div id="tfLadder"></div>
+      <div class="msg" style="margin-top:8px"><b>Tradeable</b> below means
+        nothing is refusing: the spread is small against your target, the
+        tape is running above its own baseline, and the measured
+        timeframes lean the same way. It is not a direction.</div>
+      <div id="flowGate" class="say" style="margin:6px 0 10px">—</div>
       <div id="tfSay" class="say" style="display:none;margin-bottom:12px"></div>
       <div id="readHead" class="msg">—</div>
       <div id="readSignals"></div>
       <div id="readSay" class="say" style="display:none"></div>
 
-      <h3 style="margin:16px 0 6px">Order flow — the book gates, the tape
-        fires<span class="stamp" id="flowStamp"></span></h3>
-      <div class="msg" style="margin-bottom:8px">Delta and CVD on every
-        timeframe, the spread against your target, and how fast the tape
-        is running against its own recent baseline. <b>Tradeable</b> means
-        nothing is refusing — it is not a direction.
-        <label style="margin-left:10px">target
-          <input id="flowTgt" type="number" min="1" max="200" step="1"
-            value="10" onchange="loadFlow()" style="width:52px"> ticks</label>
-        <label style="margin-left:8px">spike
-          <input id="flowSpike" type="number" min="1" max="10" step="0.5"
-            value="2" onchange="loadFlow()" style="width:48px">x</label>
-      </div>
-      <div id="flowGate" class="say" style="margin-bottom:8px">—</div>
-      <div id="flowLadder"></div>
     </div>
   </div>
 
@@ -6773,28 +6825,109 @@ function tfAge(t) {
        + (t.source === 'tape' ? 'tape ' : 'polled ') + txt + '</span>';
 }
 
+/* ---- the merged ladder ---------------------------------------------------
+
+   Two measurements of the same bar, from two feeds, on one row: the
+   candle read on the left and the order flow on the right. They are kept
+   INDEPENDENT -- neither is averaged into the other, each keeps its own
+   side, its own age and its own refusal -- because the information is in
+   whether they agree, and a blend destroys exactly that.
+
+   They are drawn together because they were unreadable apart: comparing
+   the 15m read with the 15m flow meant scrolling between two ladders and
+   holding one in your head.
+
+   Each arrives on its own schedule, so each is stashed and the row is
+   redrawn from whatever is currently known. A half with nothing behind
+   it says so rather than leaving the row to look flat.             */
+
+let ladderRead = [], ladderFlow = null, ladderErr = '';
+
+/* The timeframes the read is showing, built the same way the route builds
+   them. The flow is then asked for exactly these, so the two halves of a
+   row can never be measuring different bars. */
+function readTfList() {
+  const out = [];
+  [($('rHigh') || {}).value, '1h', ($('rInt') || {}).value, '5m', '1m']
+    .forEach(t => { if (t && out.indexOf(t) < 0) out.push(t); });
+  return out;
+}
+
+function readHalf(t) {
+  if (!t) return '<span class="who wide thin">NO READ</span>'
+              + '<span class="meta thin">this timeframe was not read</span>';
+  const w = Math.round(Math.abs(t.signed) * 50);
+  return '<span class="who ' + (t.winner === 'buyers' ? 'long'
+            : t.winner === 'sellers' ? 'short' : '') + '">'
+       + t.winner.toUpperCase() + '</span>'
+       + '<span class="bar"><i class="' + t.winner + '" style="width:'
+       + w + '%"></i></span>'
+       + '<span class="meta">' + (t.move_bps >= 0 ? '+' : '')
+       + t.move_bps.toFixed(1) + 'bps'
+       + (t.absorbing ? ' · absorbed' : '')
+       + (t.measured ? '' : ' · inferred') + tfAge(t) + '</span>';
+}
+
+function flowHalf(r) {
+  if (!r) return '<span class="who wide thin">NO TAPE</span>'
+              + '<span class="meta thin">the socket is not running</span>';
+  if (!r.covered)
+    return '<span class="who wide thin">NOT COVERED</span>'
+         + '<span class="meta thin">tape has '
+         + Math.round(r.coverage * 100) + '% of this bar</span>';
+  const cls = r.side === 'buyers' ? 'buyers'
+            : r.side === 'sellers' ? 'sellers' : '';
+  const w = Math.round(Math.abs(r.lean) * 50);
+  /* This rung's OWN pace: the bar in progress against the completed bars
+     of this timeframe. Not the gate's velocity below, which is the market
+     in the last fifteen seconds. A rung that has not seen two of its own
+     bars prints no ratio at all. */
+  const p = r.pace || {};
+  return '<span class="who ' + (cls === 'buyers' ? 'long'
+            : cls === 'sellers' ? 'short' : '') + '">'
+       + r.side.toUpperCase() + '</span>'
+       + '<span class="bar"><i class="' + cls + '" style="width:'
+       + w + '%"></i></span>'
+       + '<span class="meta">Δ ' + flowNum(r.delta)
+       + ' · cvd ' + flowNum(r.cvd) + ' · ' + r.trades + 'p'
+       + (p.confident ? ' · ' + p.ratio.toFixed(1) + 'x'
+                      : ' · <span class="thin">pace —</span>')
+       + '</span>';
+}
+
+function renderLadder() {
+  const el = $('tfLadder');
+  if (!el) return;
+  const flow = {}, read = {}, names = [];
+  ladderRead.forEach(t => {
+    read[t.timeframe] = t;
+    if (names.indexOf(t.timeframe) < 0) names.push(t.timeframe);
+  });
+  (ladderFlow || []).forEach(r => {
+    flow[r.timeframe] = r;
+    if (names.indexOf(r.timeframe) < 0) names.push(r.timeframe);
+  });
+  const err = ladderErr
+    ? '<div class="msg err">' + esc(ladderErr) + '</div>' : '';
+  el.innerHTML = err + names.map(n => {
+    const t = read[n], r = flow[n], p = (r && r.pace) || {};
+    return '<div class="tf2"><b>' + esc(n) + '</b>'
+         + '<div class="half ' + (t ? t.winner : '') + '" title="'
+         + esc((t && t.describe) || 'no candle read on this timeframe')
+         + '">' + readHalf(t) + '</div>'
+         + '<div class="half ' + (r && r.covered ? r.side : '')
+         + '" title="' + esc(p.note || 'no order flow on this timeframe')
+         + '">' + flowHalf(r) + '</div></div>';
+  }).join('');
+}
+
 function paintLadder(d) {
   const tfs = d.timeframes || [];
-  const el = $('tfLadder'), say = $('tfSay');
-  if (!tfs.length) {
-    el.innerHTML = '';
-    say.style.display = 'none';
-    if (d.pressure_error) el.innerHTML = '<div class="msg err">' + d.pressure_error + '</div>';
-    return;
-  }
-
-  el.innerHTML = tfs.map(t => {
-    const w = Math.round(Math.abs(t.signed) * 50);
-    return `<div class="tf ${t.winner}">
-      <b>${t.timeframe}</b>
-      <span class="who ${t.winner === 'buyers' ? 'long' : t.winner === 'sellers' ? 'short' : ''}">
-        ${t.winner.toUpperCase()}</span>
-      <span class="bar"><i class="${t.winner}" style="width:${w}%"></i></span>
-      <span class="meta">${t.move_bps >= 0 ? '+' : ''}${t.move_bps.toFixed(1)}bps
-        ${t.absorbing ? '· absorbed' : ''}
-        ${t.measured ? '' : '· inferred'}${tfAge(t)}</span>
-    </div>`;
-  }).join('');
+  const say = $('tfSay');
+  ladderRead = tfs;
+  ladderErr = d.pressure_error || '';
+  renderLadder();
+  if (!tfs.length) { say.style.display = 'none'; return; }
 
   const c = d.confrontation;
   if (!c) { say.style.display = 'none'; return; }
@@ -6987,22 +7120,28 @@ function toggleReadAuto() {
    candle. Those rungs are drawn greyed with their coverage, and they do
    not vote on agreement. */
 async function loadFlow() {
-  const gate = $('flowGate'), lad = $('flowLadder');
+  const gate = $('flowGate');
   let d;
   try {
     d = await api('/api/flow?' + q({
       coin: coin(),
       target_ticks: parseFloat(($('flowTgt') || {}).value) || 10,
-      spike: parseFloat(($('flowSpike') || {}).value) || 2}));
+      spike: parseFloat(($('flowSpike') || {}).value) || 2,
+      // Exactly the rows the read is showing, so no row ever pairs a 15m
+      // read with a 5m delta.
+      timeframes: readTfList().join(',')}));
   } catch (e) {
+    ladderFlow = null; renderLadder();
     if (gate) gate.textContent = e.message;
     return;
   }
   if (!d || !d.ok) {
+    ladderFlow = null; renderLadder();
     if (gate) gate.textContent = (d && d.why) || 'order flow unavailable';
-    if (lad) lad.innerHTML = '';
     return;
   }
+  ladderFlow = d.rungs || [];
+  renderLadder();
 
   const b = d.book, v = d.velocity;
   if (gate) {
@@ -7017,29 +7156,6 @@ async function loadFlow() {
       + '<div class="thin" style="margin-top:4px">' + esc(d.why) + '</div>';
   }
 
-  if (lad) {
-    lad.innerHTML = (d.rungs || []).map(r => {
-      const w = Math.round(Math.abs(r.lean) * 50);
-      const cls = r.side === 'buyers' ? 'buyers'
-                : r.side === 'sellers' ? 'sellers' : '';
-      if (!r.covered) {
-        return '<div class="tf flow" style="opacity:.45"><b>' + r.timeframe
-             + '</b><span class="who">NOT COVERED</span>'
-             + '<span class="bar"></span><span class="meta thin">tape has '
-             + Math.round(r.coverage * 100) + '% of this bar</span></div>';
-      }
-      return '<div class="tf flow ' + cls + '" title="'
-           + r.trades + ' prints · CVD ' + flowNum(r.cvd) + ' over '
-           + r.bars + ' completed bars"><b>' + r.timeframe + '</b>'
-           + '<span class="who ' + (r.side === 'buyers' ? 'long'
-               : r.side === 'sellers' ? 'short' : '') + '">'
-           + r.side.toUpperCase() + '</span>'
-           + '<span class="bar"><i class="' + cls + '" style="width:'
-           + w + '%"></i></span>'
-           + '<span class="meta">\u0394 ' + flowNum(r.delta)
-           + ' · cvd ' + flowNum(r.cvd) + ' · ' + r.trades + 'p</span></div>';
-    }).join('');
-  }
   const st = $('flowStamp');
   if (st) st.textContent = 'feed ' + d.feed_age_s + 's';
 }

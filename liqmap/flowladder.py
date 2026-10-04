@@ -17,17 +17,25 @@ Two different jobs, from two different feeds, read together:
 So the book gates and the tape triggers, and neither is asked to do the
 other's job.
 
-WHY DELTA IS PER TIMEFRAME AND VELOCITY IS NOT
+THE TWO VELOCITIES, AND WHY THEY ARE NOT THE SAME NUMBER
 
 Delta is a quantity accumulated over a bar, so every timeframe has its
 own and they can disagree -- that disagreement is most of the value. The
 fifteen can be positive while the one is already negative, and that is
 the turn.
 
-Velocity is a rate measured right now. There is no 4-hour version of
-"prints per second in the last fifteen seconds"; there is one number and
-it belongs to the moment, not to a bar. Reporting it per timeframe would
-be printing the same figure five times and implying five measurements.
+Velocity splits in two, and the split matters. The LADDER's velocity is
+the market right now: fifteen seconds against ten minutes, one number,
+belonging to the moment rather than to any bar. Printing that same
+figure on every rung would imply five measurements where there is one.
+
+Each RUNG's pace is a different measurement with the same units: the
+bar in progress against the completed bars of its own timeframe, which
+is the shape the delta and CVD beside it already have. A tape running
+3x against ten minutes can still leave the current 4-hour bar slower
+than the four before it, and a rung that cannot see two completed bars
+of itself reports no pace at all rather than a ratio built from
+whatever fraction is in memory.
 
 WHAT THE TAPE CANNOT COVER
 
@@ -65,6 +73,37 @@ MIN_COVERAGE = 0.25
 MIN_VOTERS = 2
 
 
+# The rows the panel asks for when it asks for nothing in particular.
+DEFAULT_TIMEFRAMES = ("1m", "5m", "15m", "30m", "1h", "4h")
+
+
+def wanted(asked: Sequence[str], intervals: dict,
+           default: Sequence[str] = DEFAULT_TIMEFRAMES
+           ) -> list[tuple[str, float]]:
+    """The (name, seconds) pairs to build rungs for.
+
+    The panel draws one row per timeframe with the candle read on one
+    side and the flow on the other, so it asks for rungs BY NAME rather
+    than taking whatever list this module felt like. A row pairing a
+    15-minute read with a 5-minute delta would be worse than no row,
+    and two lists that happen to be in the same order today are not a
+    guarantee that they will be tomorrow.
+
+    Names this feed does not have are dropped rather than guessed at,
+    duplicates collapse, and an empty ask gets the default set -- an
+    empty list is a caller with no opinion, not a caller asking for
+    nothing.
+    """
+    names = [a.strip() for a in asked if str(a).strip()] or list(default)
+    seen: set[str] = set()
+    out: list[tuple[str, float]] = []
+    for n in names:
+        if n in intervals and n not in seen:
+            seen.add(n)
+            out.append((n, float(intervals[n])))
+    return out
+
+
 @dataclass
 class Rung:
     """One timeframe's order flow, as far as the tape can see it."""
@@ -80,6 +119,11 @@ class Rung:
     bars: int = 0               # completed bars contributing to that cvd
     coverage: float = 0.0       # share of the CURRENT bar the tape has seen
     covered: bool = False       # the tape actually measured this one
+
+    # This bar's print rate against the completed bars of THIS timeframe.
+    # Not the ladder's velocity, which is the market in the last fifteen
+    # seconds; see the module docstring for why they differ.
+    pace: of.Velocity = field(default_factory=of.Velocity)
 
     @property
     def delta(self) -> float:
@@ -109,7 +153,8 @@ class Rung:
                 "cvd": round(self.cvd, 2), "bars": self.bars,
                 "trades": self.trades,
                 "coverage": round(self.coverage, 3),
-                "covered": self.covered, "side": self.side}
+                "covered": self.covered, "side": self.side,
+                "pace": self.pace.to_dict()}
 
 
 @dataclass
@@ -195,6 +240,7 @@ def rungs(tape, intervals: Sequence[tuple[str, float]],
     end = float(now) if now is not None else float(trades[-1].ts)
     first = float(trades[0].ts)
     held = max(0.0, end - first)
+    stamps = [float(t.ts) for t in trades]
 
     for name, iv in intervals:
         r = Rung(timeframe=name, interval_s=iv)
@@ -228,6 +274,12 @@ def rungs(tape, intervals: Sequence[tuple[str, float]],
                       else -float(t.notional))
         r.bars = len(seen)
         r.cvd += r.delta          # include the bar in progress
+
+        # Its own pace, on its own bars. Measured even on an uncovered
+        # rung, because the two refusals are different: coverage is about
+        # the bar in progress, pace is about the bars behind it, and a
+        # rung can have one without the other.
+        r.pace = of.velocity_for(stamps, iv, now=end, back=back)
         out.append(r)
     return out
 
