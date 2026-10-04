@@ -54,8 +54,48 @@ Aggressor = Literal["buy", "sell", "balanced"]
 
 # Below this share of one-sided aggression, nobody is really pressing.
 BALANCED_BAND = 0.10
-# A move smaller than this is "price did not go anywhere", in basis points.
-FLAT_BPS = 2.0
+
+# "PRICE DID NOT GO ANYWHERE" IS NOT A FIXED NUMBER OF BASIS POINTS
+#
+# This was a flat 2bps on every timeframe in every market, and that single
+# constant inverted most of the ladder. A four-hour bar that moved 2bps has
+# genuinely gone nowhere. A one-minute bar that moved 2bps has had a large
+# minute. Judging both by the same number means nearly every fast row comes
+# back "flat", and a flat row with one side aggressing is reported as the
+# OTHER side winning by absorption -- so the minute reads UP while price is
+# coming down, which is exactly the complaint.
+#
+# So the band is relative to what bars of this length actually do in this
+# market. `typical_bps` is the median absolute move of recent completed
+# bars; a move well inside that has not gone anywhere, and a move outside it
+# has. When there are no recent bars to learn from, the reference below is
+# scaled by the square root of the interval, which is how a random walk's
+# range grows -- a rough prior, and better than one number for everything.
+# The prior is stated as a TYPICAL MOVE rather than as a band, so that the
+# learned path and the fallback path are the same calculation with a
+# different input. The old constant was a band, which made the two
+# inconsistent: a measured 4-hour band came out near 9bps while the
+# constant insisted on 2.
+#
+# 25bps over four hours is a rough middle across liquid markets and it is a
+# placeholder, not a measurement. Every reading carries `learned`, so a row
+# standing on the prior can say so instead of being mistaken for one that
+# counted.
+PRIOR_TYPICAL_BPS = 25.0  # median absolute move of a bar at the reference ...
+FLAT_REF_S = 14400.0      # ... which is this long
+FLAT_SHARE = 0.35         # share of a typical move that still counts as flat
+MIN_FLAT_BPS = 0.05       # below this it is quoting noise as a threshold
+
+# ABSORPTION HAS TO HAVE SOMETHING TO ABSORB
+#
+# The inverting branch says: this side is paying the spread and not being
+# rewarded, so the other side is quietly taking it. That reading is only
+# worth anything when there is real size being taken. A bar with four fills
+# in it that happen to be 60% one-sided has not been absorbed, it has been
+# quiet -- and calling that absorption hands the row a confident, inverted
+# direction built on nothing.
+PRESSING_SHARE = 0.40     # of what this timeframe normally trades by now
+MIN_TRADES = 3            # fills below which a measured bar says nothing
 
 
 @dataclass
@@ -80,6 +120,23 @@ class Pressure:
 
     elapsed_s: float = 0.0
     coverage: float = 1.0     # share of the bar the tape actually saw
+
+    # What bars of this length normally do in this market, learned from the
+    # recent completed ones. Zero means nothing was available to learn from
+    # and the fallbacks below take over.
+    typical_bps: float = 0.0
+    typical_notional: float = 0.0
+
+    # Whether this bar's OPEN was actually observed. A bar adopted mid-flight
+    # has an open that is really "the first price we happened to see", and
+    # every bps figure derived from it is measured from the wrong place.
+    seeded: bool = True
+
+    # How many bars of this timeframe this reading spans. A polled slow
+    # timeframe aggregates several, and a normal move ACROSS three bars is
+    # larger than a normal move within one, so every threshold below has to
+    # know which it is looking at.
+    span_bars: float = 1.0
 
     # -- the raw facts -----------------------------------------------------
 
@@ -110,6 +167,86 @@ class Pressure:
         return "buy" if self.lean > 0 else "sell"
 
     @property
+    def range_bps(self) -> float:
+        if self.open_px <= 0:
+            return 0.0
+        return (self.high_px - self.low_px) / self.open_px * 10_000.0
+
+    @property
+    def elapsed_share(self) -> float:
+        """How much of this bar has run, never zero.
+
+        A bar one second old is not a bar that should be judged against a
+        whole bar's worth of movement or volume.
+        """
+        if self.interval_s <= 0:
+            return 1.0
+        span = max(1.0, self.span_bars)
+        done = (span - 1.0) + min(1.0, self.elapsed_s / self.interval_s)
+        return min(1.0, max(0.02, done / span))
+
+    @property
+    def flat_band(self) -> float:
+        """How small a move counts as "nowhere" on THIS bar, in bps.
+
+        Scaled three ways, in order of how much each is worth knowing:
+        by what this market's bars of this length actually do, by how much
+        of the bar has run so far, and -- with no history to learn from --
+        by the square root of the interval against a reference.
+
+        The elapsed term uses a square root because that is how far a
+        random walk gets in a fraction of the time. Scaling it linearly
+        would call the first tenth of a bar flat when it has already made
+        a third of a normal bar's move.
+        """
+        span = max(1.0, self.span_bars)
+        if self.typical_bps > 0:
+            normal = self.typical_bps * (span ** 0.5)
+        else:
+            normal = PRIOR_TYPICAL_BPS * (
+                self.interval_s * span / FLAT_REF_S) ** 0.5
+        return max(MIN_FLAT_BPS,
+                   normal * FLAT_SHARE * (self.elapsed_share ** 0.5))
+
+    @property
+    def learned(self) -> bool:
+        """Is the band a measurement of this market or a stand-in prior."""
+        return self.typical_bps > 0
+
+    @property
+    def pressing(self) -> bool:
+        """Is there enough business here for "absorbed" to mean anything.
+
+        Compared against what this timeframe normally trades by this point
+        in a bar, not against an absolute size -- the same notional is
+        enormous at 3am and unremarkable at the open.
+        """
+        if self.measured and self.trades < MIN_TRADES:
+            return False
+        if self.typical_notional <= 0:
+            # Nothing to compare against. Fall back to the only other
+            # evidence of real activity there is.
+            return self.total_notional > 0 and (
+                not self.measured or self.trades >= MIN_TRADES)
+        expected = (self.typical_notional * max(1.0, self.span_bars)
+                    * self.elapsed_share)
+        return self.total_notional >= PRESSING_SHARE * expected
+
+    @property
+    def forming(self) -> bool:
+        """This bar cannot support a reading yet, and should not pretend to.
+
+        Either its open was never observed -- so every bps figure is
+        measured from a price that is not the open -- or there is not
+        enough in it yet to tell a quiet bar from an absorbed one.
+        """
+        if not self.seeded:
+            return True
+        if self.measured and self.trades < MIN_TRADES:
+            return True
+        return self.range_bps < self.flat_band and not self.pressing
+
+    @property
     def position_in_range(self) -> float:
         rng = self.high_px - self.low_px
         if rng <= 0:
@@ -129,32 +266,50 @@ class Pressure:
 
         Aggressors pay the spread. If price is not moving their way, the
         passive side is absorbing them and the passive side is winning.
+
+        TWO GUARDS ON THE INVERTING BRANCH, both learned the hard way.
+
+        "Not moving their way" is judged against `flat_band`, which knows
+        how far bars of this length actually travel here. A fixed number of
+        basis points called every fast bar flat and inverted it.
+
+        And absorption requires `pressing`: somebody has to be taking real
+        size for the passive side to be taking it. A quiet bar that happens
+        to lean one way is contested, not absorbed.
         """
+        if self.forming:
+            return "contested"
+
         move = self.move_bps
+        band = self.flat_band
         agg = self.aggressor
 
         if agg == "balanced":
             # Nobody is pressing, so the only evidence is the move itself.
-            if abs(move) < FLAT_BPS:
+            if abs(move) < band:
                 return "contested"
             return "buyers" if move > 0 else "sellers"
 
         if agg == "buy":
-            if move > FLAT_BPS:
+            if move > band:
                 return "buyers"           # paying up and being rewarded
+            if not self.pressing:
+                return "contested"        # too quiet to call it absorption
             return "sellers"              # paying up and going nowhere
-        if move < -FLAT_BPS:
+        if move < -band:
             return "sellers"
+        if not self.pressing:
+            return "contested"
         return "buyers"
 
     @property
     def absorbing(self) -> bool:
         """The aggressor is pressing and not getting paid."""
-        if self.aggressor == "balanced":
+        if self.forming or self.aggressor == "balanced" or not self.pressing:
             return False
         if self.aggressor == "buy":
-            return self.move_bps <= FLAT_BPS
-        return self.move_bps >= -FLAT_BPS
+            return self.move_bps <= self.flat_band
+        return self.move_bps >= -self.flat_band
 
     @property
     def strength(self) -> float:
@@ -164,12 +319,20 @@ class Pressure:
         aggressing, enough of it to matter, and price responding (or
         conspicuously refusing to).
         """
+        if self.forming:
+            return 0.0
         one_sided = min(abs(self.lean) / 0.6, 1.0)
-        responded = min(abs(self.move_bps) / 20.0, 1.0)
+        # A decisive move is one that is large FOR THIS BAR. Against a fixed
+        # 20bps every fast timeframe reads weak however hard it ran, which
+        # is the same mistake the flat band was making at the other end.
+        big = (self.typical_bps * (max(1.0, self.span_bars) ** 0.5) * 2.0
+               if self.typical_bps > 0 else 20.0)
+        moved = min(abs(self.move_bps) / max(big, MIN_FLAT_BPS), 1.0)
+        responded = moved
         if self.absorbing:
             # Absorption is strong when aggression is heavy and price is
             # STILL. Reward the stillness rather than the move.
-            responded = 1.0 - min(abs(self.move_bps) / 20.0, 1.0)
+            responded = 1.0 - moved
         base = (one_sided * 0.5 + responded * 0.5)
         if not self.measured:
             base *= 0.6          # inferred, so discounted rather than trusted
@@ -185,6 +348,15 @@ class Pressure:
     def describe(self) -> str:
         who = {"buyers": "BUYERS", "sellers": "SELLERS",
                "contested": "CONTESTED"}[self.winner]
+        if self.forming:
+            if not self.seeded:
+                return (f"{self.timeframe}: forming — this bar's open was "
+                        f"never seen, so its move is measured from the first "
+                        f"price that arrived, not from the open")
+            return (f"{self.timeframe}: forming — {self.trades} fills and a "
+                    f"{self.range_bps:.2f}bps range against a "
+                    f"{self.flat_band:.2f}bps band. Too little has happened "
+                    f"to tell a quiet bar from an absorbed one.")
         if self.winner == "contested":
             return f"{self.timeframe}: contested — no side is pressing"
 
@@ -193,7 +365,9 @@ class Pressure:
         if self.absorbing and self.aggressor != "balanced":
             return (f"{self.timeframe}: {who} winning — {agg} are aggressing "
                     f"${self.total_notional:,.0f} and price has moved "
-                    f"{self.move_bps:+.1f}bps. They are being absorbed.")
+                    f"{self.move_bps:+.2f}bps, inside the "
+                    f"{self.flat_band:.2f}bps this bar calls flat. They are "
+                    f"being absorbed.")
         return (f"{self.timeframe}: {who} winning — {agg} aggressing into a "
                 f"{self.move_bps:+.1f}bps move.")
 
@@ -279,15 +453,60 @@ class Confrontation:
 # building a reading
 # --------------------------------------------------------------------------
 
+# How many completed bars the "what is normal here" figures are learned
+# from, and the fewest that make a median worth having.
+TYPICAL_BARS = 20
+MIN_TYPICAL_BARS = 4
+
+
+def _median(xs: Sequence[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if not n:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def typical(bars: Sequence[Candle],
+            back: int = TYPICAL_BARS) -> tuple[float, float]:
+    """What a bar of this timeframe normally does here: (bps, notional).
+
+    The MEDIAN, not the mean. One news bar in twenty would drag a mean far
+    enough to make every ordinary bar afterwards look flat, which is the
+    failure this whole figure exists to prevent.
+
+    Returns (0, 0) when there are too few bars to learn from, and the
+    callers fall back to a scaled prior rather than to a number built from
+    three samples.
+    """
+    window = [b for b in bars[-max(1, back):] if b.open > 0]
+    if len(window) < MIN_TYPICAL_BARS:
+        return 0.0, 0.0
+    moves = [abs(b.close - b.open) / b.open * 10_000.0 for b in window]
+    notional = [b.volume * b.close if b.close > 0 else b.volume
+                for b in window]
+    return _median(moves), _median(notional)
+
+
 def from_live(timeframe: str, interval_s: float, candle, book: Book | None,
-              coverage: float = 1.0) -> Pressure:
-    """From a `live.LiveCandle`, where the buy/sell split is counted."""
+              coverage: float = 1.0, history: Sequence[Candle] = ()
+              ) -> Pressure:
+    """From a `live.LiveCandle`, where the buy/sell split is counted.
+
+    `history` is this timeframe's recent completed bars, used only to learn
+    what a normal bar does here -- how far it travels and how much it
+    trades. Without it the reading falls back to scaled priors and says so.
+    """
+    t_bps, t_notional = typical(history)
     return Pressure(
         timeframe=timeframe, interval_s=interval_s,
         open_px=candle.open, last_px=candle.close,
         high_px=candle.high, low_px=candle.low,
         buy_notional=candle.buy_notional, sell_notional=candle.sell_notional,
         measured=True, trades=candle.trades,
+        typical_bps=t_bps, typical_notional=t_notional,
+        seeded=bool(getattr(candle, "seeded", True)),
         bid_depth=(book.depth(25.0, "buy") if book and not book.empty else 0.0),
         ask_depth=(book.depth(25.0, "sell") if book and not book.empty else 0.0),
         elapsed_s=candle.elapsed(), coverage=coverage)
@@ -362,6 +581,9 @@ def from_candles(timeframe: str, interval_s: float, bars: Sequence[Candle],
     window = [b for b in bars[-max(1, lookback):] if b.high >= b.low]
     if not window:
         return None
+    # Learned from the bars BEFORE the window being read, so the window
+    # does not help set the threshold it is about to be judged against.
+    t_bps, t_notional = typical(bars[:-len(window)] or bars)
 
     buy = sell = 0.0
     trades = 0
@@ -380,6 +602,8 @@ def from_candles(timeframe: str, interval_s: float, bars: Sequence[Candle],
         low_px=min(b.low for b in window),
         buy_notional=buy, sell_notional=sell,
         measured=False, trades=trades,
+        typical_bps=t_bps, typical_notional=t_notional,
+        span_bars=float(len(window)),
         bid_depth=(book.depth(25.0, "buy") if book and not book.empty else 0.0),
         ask_depth=(book.depth(25.0, "sell") if book and not book.empty else 0.0),
         elapsed_s=elapsed_s, coverage=1.0)

@@ -89,6 +89,11 @@ class LiveCandle:
     buy_notional: float = 0.0
     sell_notional: float = 0.0
     seeded: bool = True          # False when the open was never observed
+    # False when this bar was adopted from a fetched OHLCV candle, which
+    # carries no aggressor at all. Its buy and sell are zero because nothing
+    # counted them -- NOT because the bar was balanced, and a CVD that adds
+    # it in cannot tell the difference.
+    flow_measured: bool = True
     # Where inside this bar the business was done. Built from the same
     # fills that build the OHLC, which were previously being discarded
     # after their four prices had been extracted.
@@ -127,7 +132,8 @@ class LiveCandle:
         return cls(interval_s=interval_s,
                    start_ts=grid_start(c.ts, interval_s),
                    open=c.open, high=c.high, low=c.low, close=c.close,
-                   volume=c.volume, trades=c.trades, seeded=True)
+                   volume=c.volume, trades=c.trades, seeded=True,
+                   flow_measured=False)
 
 
 class CandleBuilder:
@@ -153,7 +159,10 @@ class CandleBuilder:
         self.current = LiveCandle(
             interval_s=self.interval_s, start_ts=start, open=candle.open,
             high=candle.high, low=candle.low, close=candle.close,
-            volume=candle.volume, trades=candle.trades, seeded=True)
+            volume=candle.volume, trades=candle.trades, seeded=True,
+            # The fills that built this bar before we connected were never
+            # seen, so its delta starts at zero without being zero.
+            flow_measured=False)
 
     # -- ingest -----------------------------------------------------------
 
@@ -258,8 +267,14 @@ class LiveFeed:
         self.ws_url = ws_url
         self.buy_codes = set(buy_codes) if buy_codes else None
 
+        # Told when any builder closes a bar, so the bar's buy/sell split
+        # can be kept. It is the only moment that split exists in a form
+        # small enough to keep: the fills behind it fall out of the rolling
+        # tape within the hour, and after that the delta is unrecoverable.
+        self.on_bar_close: Callable[[str, LiveCandle], None] | None = None
+
         self.builders: dict[str, CandleBuilder] = {
-            name: CandleBuilder(INTERVALS[name])
+            name: self._builder(name)
             for name in intervals if name in INTERVALS}
         self.tape = FlowTape(max_age=tape_seconds)
         self.book: Book | None = None
@@ -300,6 +315,14 @@ class LiveFeed:
         self._listeners: list[Callable[[str], None]] = []
 
     # -- lifecycle ---------------------------------------------------------
+
+    def _builder(self, name: str) -> CandleBuilder:
+        def closed(candle: LiveCandle, tf: str = name) -> None:
+            cb = self.on_bar_close
+            if cb is None:
+                return
+            cb(tf, candle)
+        return CandleBuilder(INTERVALS[name], on_close=closed)
 
     def seed(self, interval: str, candles: Sequence[Candle]) -> None:
         """Give a builder the open of the bar already in progress."""
@@ -616,7 +639,7 @@ class LiveFeed:
             return False
         if name not in INTERVALS:
             return False
-        self.builders[name] = CandleBuilder(INTERVALS[name])
+        self.builders[name] = self._builder(name)
         if seed_bars:
             self.seed(name, seed_bars)
         return True
@@ -628,6 +651,19 @@ class LiveFeed:
     def history(self, interval: str) -> list[Candle]:
         b = self.builders.get(interval)
         return b.history() if b else []
+
+    def closed_candles(self, interval: str, back: int = 6) -> list[LiveCandle]:
+        """This timeframe's completed bars, newest last, with their flow.
+
+        `history` returns plain OHLCV candles, which have had the buy/sell
+        split stripped off them -- the one thing a CVD is made of. This
+        returns the bars themselves, each still carrying whether its flow
+        was counted or merely adopted.
+        """
+        b = self.builders.get(interval)
+        if not b:
+            return []
+        return list(b.closed[-max(1, int(back)):])
 
     @property
     def age(self) -> float | None:

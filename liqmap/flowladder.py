@@ -115,8 +115,10 @@ class Rung:
     sell: float = 0.0
     trades: int = 0
 
-    cvd: float = 0.0            # accumulated over the bars the tape covers
+    cvd: float = 0.0            # accumulated over the bars behind this one
     bars: int = 0               # completed bars contributing to that cvd
+    asked: int = 0              # completed bars wanted
+    cvd_source: str = "tape"    # tape | stored | memory | both | none
     coverage: float = 0.0       # share of the CURRENT bar the tape has seen
     covered: bool = False       # the tape actually measured this one
 
@@ -151,6 +153,8 @@ class Rung:
                 "buy": round(self.buy, 2), "sell": round(self.sell, 2),
                 "delta": round(self.delta, 2), "lean": round(self.lean, 4),
                 "cvd": round(self.cvd, 2), "bars": self.bars,
+                "asked": self.asked, "cvd_source": self.cvd_source,
+                "cvd_complete": self.bars >= self.asked > 0,
                 "trades": self.trades,
                 "coverage": round(self.coverage, 3),
                 "covered": self.covered, "side": self.side,
@@ -224,13 +228,21 @@ def read_book(book, spec: of.Spec, target_ticks: float) -> BookRead:
 
 
 def rungs(tape, intervals: Sequence[tuple[str, float]],
-          now: float | None = None, back: int = RUNGS_BACK) -> list[Rung]:
-    """Delta and CVD per timeframe, built from the rolling tape.
+          now: float | None = None, back: int = RUNGS_BACK,
+          cvd_for=None) -> list[Rung]:
+    """Delta and CVD per timeframe.
 
     `intervals` are (name, seconds) pairs. Each rung reports the CURRENT
-    bar's delta and a CVD accumulated over the completed bars the tape
-    still holds -- with the coverage it had, so a rung the tape cannot
-    see is not mistaken for a flat one.
+    bar's delta, counted off the tape, and a CVD over the completed bars
+    behind it -- with the coverage it had, so a rung the tape cannot see is
+    not mistaken for a flat one.
+
+    `cvd_for(timeframe, interval_s, bar_open, bars)` supplies the completed
+    bars' CVD from wherever they are kept. WITHOUT IT THE CVD IS CAPPED BY
+    THE TAPE, which holds about an hour: a 4-hour rung then has no
+    completed bars to add up and reports none rather than inventing one
+    from the fragment it can see. That is the whole reason the closed-bar
+    store exists, and why the slow rows used to sit at NOT COVERED forever.
     """
     out: list[Rung] = []
     trades = list(getattr(tape, "_trades", []) or [])
@@ -262,18 +274,30 @@ def rungs(tape, intervals: Sequence[tuple[str, float]],
                 r.sell += float(t.notional)
             r.trades += 1
 
-        # CVD over whichever completed bars the tape still reaches.
-        floor = start - back * iv
-        seen: set[float] = set()
-        for t in trades:
-            ts = float(t.ts)
-            if ts < max(floor, first) or ts >= start:
-                continue
-            seen.add(ts - (ts % iv))
-            r.cvd += (float(t.notional) if t.aggressor == "buy"
-                      else -float(t.notional))
-        r.bars = len(seen)
-        r.cvd += r.delta          # include the bar in progress
+        r.asked = int(max(1, back))
+        kept = cvd_for(name, iv, start, r.asked) if cvd_for else None
+        if kept is not None:
+            # Completed bars as they were counted when they closed, which
+            # reaches back further than the tape does and survives a
+            # restart. The bar in progress is still the tape's.
+            r.cvd = float(kept.cvd) + r.delta
+            r.bars = int(kept.bars)
+            r.cvd_source = kept.source
+        else:
+            # Fallback: whatever completed bars the tape itself still
+            # reaches. Fine for a minute, nothing at all for four hours.
+            floor = start - back * iv
+            seen: set[float] = set()
+            for t in trades:
+                ts = float(t.ts)
+                if ts < max(floor, first) or ts >= start:
+                    continue
+                seen.add(ts - (ts % iv))
+                r.cvd += (float(t.notional) if t.aggressor == "buy"
+                          else -float(t.notional))
+            r.bars = len(seen)
+            r.cvd += r.delta      # include the bar in progress
+            r.cvd_source = "tape"
 
         # Its own pace, on its own bars. Measured even on an uncovered
         # rung, because the two refusals are different: coverage is about
@@ -316,14 +340,15 @@ def agreement(rungs_: Sequence[Rung]) -> str:
 
 def build(tape, book, intervals: Sequence[tuple[str, float]],
           spec: of.Spec, target_ticks: float = 10.0,
-          now: float | None = None, spike: float = 2.0) -> Ladder:
+          now: float | None = None, spike: float = 2.0,
+          cvd_for=None) -> Ladder:
     """The whole read: book gate, tape trigger, timeframe agreement.
 
     `tradeable` means all three said yes. It is not a direction and not a
     suggestion -- it is the statement that nothing is currently refusing.
     """
     out = Ladder(target_ticks=target_ticks)
-    out.rungs = rungs(tape, intervals, now=now)
+    out.rungs = rungs(tape, intervals, now=now, cvd_for=cvd_for)
     stamps = [float(t.ts) for t in getattr(tape, "_trades", []) or []]
     out.velocity = of.velocity(stamps, now=now)
     out.book = read_book(book, spec, target_ticks)

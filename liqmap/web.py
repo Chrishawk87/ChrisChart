@@ -42,6 +42,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse,
 
 from . import consensus as consensus_mod
 from .bucket import build_map, render
+from .barflow import BarFlow, BarFlowStore, merge as merge_cvd
 from .history import History, render_changes
 from .settings import Settings, SettingsStore, default_db_path
 from .ledger import Ledger
@@ -87,6 +88,11 @@ class Runtime:
         self.db_path = default_db_path()
         self.settings_store = SettingsStore(self.db_path)
         self.history = History(self.db_path)
+        # One row per closed bar per timeframe. The only place a slow
+        # timeframe's CVD can come from: the fills behind it leave the
+        # rolling tape within the hour, and nothing else ever recorded who
+        # crossed the spread.
+        self.barflow = BarFlowStore(self.db_path)
         # The agent's own book, separate from yours on purpose: yours is
         # filtered by your judgement, which is the thing it is being
         # measured against.
@@ -506,6 +512,10 @@ class Runtime:
 
         self.stop_feed()
         feed = LiveFeed(coin, intervals=intervals)
+        # Keep every bar's buy/sell split the moment it closes. This is the
+        # last point at which it exists: the fills roll out of the tape
+        # within the hour and no venue serves them back.
+        feed.on_bar_close = self._keep_bar_flow
 
         seeded: list[str] = []
         for iv in intervals:
@@ -526,6 +536,67 @@ class Runtime:
             self.feed = None
             return out
         return {"ok": True, "running": False}
+
+    def _keep_bar_flow(self, timeframe: str, candle) -> None:
+        """Write one closed bar's aggression, if it was ever counted.
+
+        Called from the feed's socket thread, so it must not raise: a
+        failed write here is a lost row, and taking the feed down with it
+        would be a far worse trade.
+
+        A bar that was adopted rather than counted is skipped. Its buy and
+        sell are zero because nobody watched them, and a stored zero is
+        indistinguishable from a bar that really was balanced.
+        """
+        feed = self.feed
+        if feed is None or not getattr(candle, "flow_measured", False):
+            return
+        try:
+            self.barflow.record(BarFlow(
+                coin=feed.coin, timeframe=timeframe,
+                bar_ts=float(candle.start_ts),
+                buy=float(candle.buy_notional),
+                sell=float(candle.sell_notional),
+                trades=int(candle.trades), volume=float(candle.volume),
+                open_px=float(candle.open), close_px=float(candle.close)))
+            # Housekeeping on the slowest bar's schedule -- a handful of
+            # times a day rather than on every minute. The table is one
+            # row per bar, so this is about never thinking about it again
+            # rather than about space.
+            if float(getattr(candle, "interval_s", 0.0)) >= 14400.0:
+                self.barflow.prune()
+        except Exception:
+            pass
+
+    def bar_cvd(self, coin: str, timeframe: str, interval_s: float,
+                bar_open: float, bars: int):
+        """Completed-bar CVD for one timeframe, from both places it lives.
+
+        The database has what previous runs recorded; the feed has what
+        this run has counted since it connected. The feed wins on any bar
+        both of them hold -- see `barflow.merge` for why two partial counts
+        of one bar must not be added together.
+        """
+        try:
+            stored = self.barflow.recent(coin, timeframe, bars=bars,
+                                         before_ts=bar_open)
+        except Exception:
+            stored = []
+        live: list[BarFlow] = []
+        feed = self.feed_for(coin)
+        if feed is not None:
+            for c in feed.closed_candles(timeframe, back=bars):
+                if not getattr(c, "flow_measured", False):
+                    continue
+                if float(c.start_ts) >= bar_open:
+                    continue
+                live.append(BarFlow(
+                    coin=coin, timeframe=timeframe,
+                    bar_ts=float(c.start_ts), buy=float(c.buy_notional),
+                    sell=float(c.sell_notional), trades=int(c.trades),
+                    volume=float(c.volume), open_px=float(c.open),
+                    close_px=float(c.close)))
+        return merge_cvd(timeframe, stored, live, bars=bars)
 
     def feed_for(self, coin: str):
         """The feed, only if it is live on this market and actually ticking."""
@@ -3497,9 +3568,12 @@ def create_app() -> FastAPI:
         # measuring different bars would be worse than no row at all.
         asked = [t.strip() for t in (timeframes or "").split(",") if t.strip()]
         want = _fl.wanted(asked, _IV)
+        def cvd_for(name: str, iv: float, bar_open: float, bars: int):
+            return rt.bar_cvd(coin, name, iv, bar_open, bars)
+
         lad = _fl.build(feed.tape, feed.book, want, sp,
                         target_ticks=float(target_ticks),
-                        spike=float(spike))
+                        spike=float(spike), cvd_for=cvd_for)
         return {"ok": True, "coin": coin,
                 "spec": {"symbol": sp.symbol, "tick_size": sp.tick_size,
                          "tick_value": sp.tick_value,
@@ -4180,14 +4254,24 @@ def create_app() -> FastAPI:
                 if bar is not None and bar.seeded:
                     cov = (min(1.0, (now_s - feed.started_at) / iv)
                            if feed.started_at else 0.0)
-                    readings.append(pr.from_live(tf, iv, bar, book,
-                                                 coverage=max(cov, 0.05)))
+                    # This timeframe's own completed bars, so the reading
+                    # knows how far a bar of this length normally travels
+                    # HERE. Without it the flat band falls back to a prior,
+                    # and a prior that is too wide reports an ordinary down
+                    # minute as flat -- which inverts it into an absorption
+                    # read pointing the other way.
+                    readings.append(pr.from_live(
+                        tf, iv, bar, book, coverage=max(cov, 0.05),
+                        history=feed.history(tf)))
                     ages[tf] = round(max(0.0, feed.age), 1)
                     srcs[tf] = "tape"
                     continue
                 try:
+                    # Enough bars to learn what a normal one looks like here,
+                    # not just enough to read the last few.
                     tf_bars = (bars if tf == interval
-                               else client.candles(coin, tf, bars=6))
+                               else client.candles(
+                                   coin, tf, bars=pr.TYPICAL_BARS + 6))
                 except Exception:
                     continue
                 if not tf_bars:
@@ -4201,8 +4285,18 @@ def create_app() -> FastAPI:
                 # in progress: two minutes into a 4-hour candle there is
                 # nothing in it, and the higher timeframe would go silent
                 # exactly when it matters most.
+                #
+                # THE WINDOW IS NOT PASSED IN. It used to be pinned to three
+                # bars here, which silently overrode `lookback_for` and
+                # applied the four-hour argument to the one-minute row --
+                # so a reversal inside the current minute was averaged with
+                # the two minutes before it and the row kept reading UP
+                # while price was already coming down. The row reported
+                # "1 bar" the whole time, because the label came from
+                # `lookback_for` while the behaviour came from this
+                # argument.
                 r_ = pr.from_candles(
-                    tf, iv, tf_bars, lookback=3, book=book,
+                    tf, iv, tf_bars, book=book,
                     elapsed_s=max(0.0, min(iv, now_s - tf_bars[-1].ts)))
                 if r_ is not None:
                     readings.append(r_)
@@ -4219,7 +4313,18 @@ def create_app() -> FastAPI:
                 "position_in_range": r.position_in_range,
                 "age_s": ages.get(r.timeframe),
                 "source": srcs.get(r.timeframe, "polled"),
-                "bars_used": pr.lookback_for(r.interval_s),
+                # Reported from the reading itself rather than recomputed
+                # from the interval, so the number on the row is the number
+                # the row was built with.
+                "bars_used": r.span_bars,
+                # The evidence behind the call, so a disagreement with the
+                # chart can be settled on the screen instead of by eye.
+                "open_px": r.open_px, "last_px": r.last_px,
+                "range_bps": r.range_bps,
+                "flat_bps": r.flat_band, "learned": r.learned,
+                "typical_bps": r.typical_bps,
+                "forming": r.forming, "pressing": r.pressing,
+                "seeded": r.seeded,
                 "describe": r.describe(),
             } for r in conf.ordered]
             out["confrontation"] = {
@@ -6856,15 +6961,31 @@ function readTfList() {
 function readHalf(t) {
   if (!t) return '<span class="who wide thin">NO READ</span>'
               + '<span class="meta thin">this timeframe was not read</span>';
+  /* FORMING is not CONTESTED. Contested means both sides turned up and
+     neither won; forming means there is not enough in this bar yet to say
+     anything, and printing a direction for it was how an ordinary down
+     minute came out reading UP. */
+  if (t.forming)
+    return '<span class="who wide thin">FORMING</span>'
+         + '<span class="meta thin">' + (t.move_bps >= 0 ? '+' : '')
+         + t.move_bps.toFixed(2) + 'bps'
+         + (t.seeded === false ? ' · open not seen' : '')
+         + ' · ' + (t.trades || 0) + ' fills' + tfAge(t) + '</span>';
   const w = Math.round(Math.abs(t.signed) * 50);
+  /* Two decimals, not one. A fast row's whole argument happens inside the
+     first decimal place, and "+0.0bps" next to a candle that visibly
+     moved is what a rounding error looks like from the outside. */
   return '<span class="who ' + (t.winner === 'buyers' ? 'long'
             : t.winner === 'sellers' ? 'short' : '') + '">'
        + t.winner.toUpperCase() + '</span>'
        + '<span class="bar"><i class="' + t.winner + '" style="width:'
        + w + '%"></i></span>'
        + '<span class="meta">' + (t.move_bps >= 0 ? '+' : '')
-       + t.move_bps.toFixed(1) + 'bps'
-       + (t.absorbing ? ' · absorbed' : '')
+       + t.move_bps.toFixed(2) + 'bps'
+       + (t.absorbing ? ' · absorbed <' + (t.flat_bps || 0).toFixed(2)
+                      : '')
+       + (t.learned === false ? ' · <span class="thin">prior band</span>'
+                              : '')
        + (t.measured ? '' : ' · inferred') + tfAge(t) + '</span>';
 }
 
@@ -6889,7 +7010,13 @@ function flowHalf(r) {
        + '<span class="bar"><i class="' + cls + '" style="width:'
        + w + '%"></i></span>'
        + '<span class="meta">Δ ' + flowNum(r.delta)
-       + ' · cvd ' + flowNum(r.cvd) + ' · ' + r.trades + 'p'
+       /* The bar count rides with the CVD. Six bars of CVD and two bars of
+          CVD are different claims and the row draws them the same width,
+          so the row says which it is rather than leaving it to be assumed. */
+       + ' · cvd ' + (r.cvd_source === 'none' ? '—' : flowNum(r.cvd))
+       + (r.cvd_complete ? '' : '<span class="thin">(' + (r.bars || 0)
+            + '/' + (r.asked || 0) + ')</span>')
+       + ' · ' + r.trades + 'p'
        + (p.confident ? ' · ' + p.ratio.toFixed(1) + 'x'
                       : ' · <span class="thin">pace —</span>')
        + '</span>';

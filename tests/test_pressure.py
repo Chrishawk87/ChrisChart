@@ -26,12 +26,21 @@ from liqmap.structure import Candle
 
 
 def p(tf="15m", interval=900, open_px=100.0, last=100.0, high=None, low=None,
-      buy=0.0, sell=0.0, measured=True, **kw):
+      buy=0.0, sell=0.0, measured=True, trades=50, elapsed_s=None, **kw):
+    """A bar with real fills in it, a full interval elapsed by default.
+
+    Both defaults are deliberate. A measured bar with no fills and no time
+    on it cannot support a reading, and the module now says so rather than
+    inverting on an empty range -- so a fixture that leaves them out is
+    describing a bar that does not exist.
+    """
     return Pressure(
         timeframe=tf, interval_s=interval, open_px=open_px, last_px=last,
         high_px=high if high is not None else max(open_px, last),
         low_px=low if low is not None else min(open_px, last),
-        buy_notional=buy, sell_notional=sell, measured=measured, **kw)
+        buy_notional=buy, sell_notional=sell, measured=measured,
+        trades=trades,
+        elapsed_s=float(interval) if elapsed_s is None else elapsed_s, **kw)
 
 
 # --------------------------------------------------------------------------
@@ -426,3 +435,201 @@ def test_an_explicit_lookback_still_wins():
                    low=99.0 + i, close=100.5 + i, volume=5.0)
             for i in range(5)]
     assert P.from_candles("1m", 60.0, bars, lookback=4).trades is not None
+
+
+# ------------------------------------------------- what counts as "flat"
+#
+# A fixed band was the bug. 2bps on every timeframe meant nearly every fast
+# row came back flat, and a flat row with one side aggressing is reported as
+# the OTHER side winning by absorption -- so the minute read UP while price
+# was coming down. Chris's own screenshot had four of five rows marked
+# absorbed at moves between 0.6 and 1.3bps.
+
+
+def test_a_fast_bar_is_judged_on_a_tighter_band_than_a_slow_one():
+    fast = p(tf="1m", interval=60)
+    slow = p(tf="4h", interval=14400)
+    assert fast.flat_band < slow.flat_band
+
+
+def test_the_band_comes_from_what_this_market_actually_does():
+    """Two markets, same timeframe, different character. The quiet one's
+    flat band has to be tighter or every ordinary move in it reads flat."""
+    quiet = p(tf="1m", interval=60, typical_bps=0.5)
+    wild = p(tf="1m", interval=60, typical_bps=40.0)
+    assert quiet.flat_band < wild.flat_band
+    assert quiet.learned and wild.learned
+    assert not p(tf="1m", interval=60).learned
+
+
+def test_an_ordinary_down_minute_is_not_called_flat_and_inverted():
+    """THE bug, in the shape it was reported.
+
+    A one-minute bar down 0.6bps in a market whose minutes normally move
+    about 1.5bps. Sellers are aggressing. Under a fixed 2bps band that is
+    'flat', so the row inverted to BUYERS. It is not flat, and it must
+    read SELLERS.
+    """
+    r = p(tf="1m", interval=60, open_px=100.0, last=99.994,
+          buy=100_000, sell=900_000, typical_bps=1.5,
+          typical_notional=1_000_000)
+    assert r.move_bps == pytest.approx(-0.6, abs=0.01)
+    assert r.move_bps < -r.flat_band
+    assert r.winner == "sellers"
+    assert not r.absorbing
+
+
+def test_the_same_move_on_the_four_hour_is_still_flat():
+    """And the band has not simply been loosened everywhere -- the slow
+    row, where the old constant was defensible, behaves as before."""
+    r = p(tf="4h", interval=14400, open_px=100.0, last=99.994,
+          buy=100_000, sell=900_000, typical_bps=60.0,
+          typical_notional=1_000_000)
+    assert abs(r.move_bps) < r.flat_band
+    assert r.winner == "buyers"          # sellers aggressing, absorbed
+    assert r.absorbing
+
+
+def test_a_bar_barely_begun_is_judged_against_a_smaller_move():
+    """Ten seconds into a minute, a tenth of a normal minute's move is not
+    a flat bar. The band shrinks with the square root of elapsed, which is
+    how far a random walk gets in a fraction of the time."""
+    young = p(tf="1m", interval=60, typical_bps=2.0, elapsed_s=6.0)
+    grown = p(tf="1m", interval=60, typical_bps=2.0, elapsed_s=60.0)
+    assert young.flat_band < grown.flat_band
+    assert young.flat_band > grown.flat_band / 10.0
+
+
+def test_a_polled_window_of_three_bars_gets_a_wider_band():
+    one = p(tf="1h", interval=3600, typical_bps=10.0, span_bars=1)
+    three = p(tf="1h", interval=3600, typical_bps=10.0, span_bars=3)
+    assert three.flat_band > one.flat_band
+
+
+# ------------------------------------------- absorption needs aggression
+
+
+def test_a_quiet_bar_is_contested_not_absorbed():
+    """Twelve fills that happen to lean one way is not the passive side
+    taking size. Calling it absorption hands the row a confident inverted
+    direction built on nothing.
+
+    The bar has a real range, so it is not merely forming -- this is the
+    aggression gate on its own, not the one in front of it.
+    """
+    r = p(tf="1m", interval=60, open_px=100.0, last=100.0, high=100.05,
+          low=99.95, buy=900, sell=100, trades=12, typical_bps=2.0,
+          typical_notional=1_000_000)
+    assert not r.forming
+    assert not r.pressing
+    assert r.winner == "contested"
+    assert not r.absorbing
+
+
+def test_the_aggression_gate_applies_to_the_sell_side_too():
+    """Both branches invert, so both need the guard. One of them having it
+    is the kind of half-fix that looks right in the diff."""
+    r = p(tf="1m", interval=60, open_px=100.0, last=100.0, high=100.05,
+          low=99.95, buy=100, sell=900, trades=12, typical_bps=2.0,
+          typical_notional=1_000_000)
+    assert r.aggressor == "sell"
+    assert not r.forming and not r.pressing
+    assert r.winner == "contested"
+    assert not r.absorbing
+
+
+def test_real_size_going_nowhere_is_still_absorption():
+    """And the signal the module exists for is untouched."""
+    r = p(tf="1m", interval=60, open_px=100.0, last=100.0,
+          buy=9_000_000, sell=500_000, trades=400, typical_bps=2.0,
+          typical_notional=1_000_000)
+    assert r.pressing
+    assert r.winner == "sellers"
+    assert r.absorbing
+
+
+def test_a_measured_bar_with_almost_no_fills_says_nothing():
+    r = p(tf="1m", interval=60, open_px=100.0, last=100.5, buy=5e6,
+          trades=1, typical_bps=2.0, typical_notional=1e6)
+    assert r.forming
+    assert r.winner == "contested"
+    assert r.strength == 0.0
+
+
+def test_a_bar_whose_open_was_never_seen_refuses_to_read():
+    """Every bps figure on it is measured from the first price that
+    happened to arrive, which is not the open."""
+    r = p(tf="15m", open_px=100.0, last=100.4, buy=9e6, sell=1e5,
+          seeded=False, typical_bps=5.0, typical_notional=1e6)
+    assert r.forming
+    assert r.winner == "contested"
+    assert "never seen" in r.describe()
+
+
+def test_forming_is_reported_separately_from_contested():
+    quiet = p(tf="1m", interval=60, open_px=100.0, last=100.0,
+              buy=500, sell=500, trades=4, typical_bps=2.0,
+              typical_notional=1e6)
+    assert quiet.forming
+    assert "forming" in quiet.describe()
+
+
+# ------------------------------------------------- learning what is normal
+
+
+def test_typical_is_the_median_not_the_mean():
+    """One news bar in twenty would drag a mean far enough to make every
+    ordinary bar afterwards look flat -- which is the exact failure this
+    figure exists to prevent."""
+    from liqmap.pressure import typical
+
+    calm = [Candle(ts=i * 60.0, open=100.0, high=100.1, low=99.9,
+                   close=100.01, volume=10.0) for i in range(19)]
+    shock = [Candle(ts=19 * 60.0, open=100.0, high=130.0, low=100.0,
+                    close=130.0, volume=10.0)]
+    bps, _ = typical(calm + shock)
+    assert bps == pytest.approx(1.0, abs=0.2)
+
+
+def test_too_few_bars_learns_nothing_rather_than_guessing():
+    from liqmap.pressure import typical
+
+    bars = [Candle(ts=i * 60.0, open=100.0, high=101.0, low=99.0,
+                   close=100.5, volume=10.0) for i in range(2)]
+    assert typical(bars) == (0.0, 0.0)
+
+
+def test_a_live_reading_learns_from_its_own_timeframes_history():
+    from liqmap.live import LiveCandle
+
+    hist = [Candle(ts=i * 60.0, open=100.0, high=100.2, low=99.8,
+                   close=100.02, volume=5.0, trades=50) for i in range(10)]
+    bar = LiveCandle(interval_s=60.0, start_ts=600.0, open=100.0, high=100.0,
+                     low=100.0, close=100.0, volume=1.0, trades=40,
+                     buy_notional=9e5, sell_notional=1e5)
+    r = from_live("1m", 60.0, bar, None, history=hist)
+    assert r.learned
+    assert r.typical_bps == pytest.approx(2.0, abs=0.1)
+    assert r.seeded
+
+
+def test_a_live_reading_carries_whether_the_open_was_observed():
+    from liqmap.live import LiveCandle
+
+    bar = LiveCandle(interval_s=60.0, start_ts=0.0, open=100.0, high=101.0,
+                     low=100.0, close=101.0, trades=90, buy_notional=9e5,
+                     seeded=False)
+    assert not from_live("1m", 60.0, bar, None).seeded
+
+
+def test_the_window_a_polled_reading_used_is_the_window_it_reports():
+    """The route used to pin this to three bars while the row reported
+    one, so a 1m row read three minutes and said it read one."""
+    bars = [Candle(ts=i * 60.0, open=100.0 + i, high=101.0 + i, low=99.0 + i,
+                   close=100.5 + i, volume=10.0, trades=20) for i in range(8)]
+    from liqmap.pressure import from_candles, lookback_for
+
+    fast = from_candles("1m", 60.0, bars)
+    slow = from_candles("4h", 14400.0, bars)
+    assert fast.span_bars == lookback_for(60.0) == 1
+    assert slow.span_bars == lookback_for(14400.0) == 3

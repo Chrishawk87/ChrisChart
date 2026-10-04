@@ -2327,3 +2327,105 @@ def test_the_feed_is_stopped_before_anything_reloads(client):
     fn = html[html.index("function onCoinChange() {"):]
     fn = fn[:fn.index("\n}\n")]
     assert fn.index("stopFeed()") < fn.index("loadRead()")
+
+
+def test_the_read_route_does_not_pin_the_window_behind_the_label(client):
+    """THE lagged-row bug.
+
+    `lookback_for` scales the window: a 4-hour row aggregates three bars
+    because two minutes into one there is nothing in it, and a 1-minute row
+    reads only itself because a reversal inside this minute must not be
+    averaged with the two before it.
+
+    The route passed `lookback=3` explicitly, which defeated that entirely
+    while the row went on reporting `lookback_for`'s answer. So a polled
+    1-minute row read three minutes and claimed to read one, and it kept
+    saying UP while price was already coming down.
+    """
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.create_app)
+    call = src[src.index("r_ = pr.from_candles("):]
+    call = call[:call.index(")")]
+    assert "lookback" not in call, "the window is pinned again"
+
+
+def test_the_row_reports_the_window_it_was_actually_built_with(client):
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.create_app)
+    i = src.index('"bars_used"')
+    assert "r.span_bars" in src[i:i + 60]
+
+
+def test_a_live_row_is_given_its_own_timeframes_history(client):
+    """Without it the flat band falls back to a prior, and a prior that is
+    too wide reports an ordinary down minute as flat -- which inverts it
+    into an absorption read pointing the other way."""
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.create_app)
+    call = src[src.index("readings.append(pr.from_live("):]
+    call = call[:call.index("ages[tf]")]
+    assert "history=feed.history(tf)" in call
+
+
+def test_the_row_carries_the_evidence_behind_its_call(client):
+    """A row that disagrees with the chart has to be settleable on the
+    screen. Chris's screenshot could not be: it showed a direction and a
+    bps figure and nothing about the threshold that produced them."""
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.create_app)
+    block = src[src.index('out["timeframes"]'):]
+    block = block[:block.index("out[\"confrontation\"]")]
+    for field in ('"flat_bps"', '"learned"', '"forming"', '"seeded"',
+                  '"range_bps"', '"open_px"', '"last_px"'):
+        assert field in block, f"{field} is not on the row"
+
+
+def test_a_forming_row_is_drawn_as_forming_not_as_a_direction(client):
+    html = client.get("/").text
+    fn = html[html.index("function readHalf(t) {"):]
+    fn = fn[:fn.index("\nfunction flowHalf(")]
+    assert "FORMING" in fn
+    assert "t.forming" in fn
+    assert fn.index("t.forming") < fn.index("t.winner")
+
+
+def test_the_fast_rows_bps_is_not_rounded_into_nothing(client):
+    """A fast row's whole argument happens inside the first decimal place.
+    '+0.0bps' beside a candle that visibly moved is what a rounding error
+    looks like from the outside."""
+    html = client.get("/").text
+    fn = html[html.index("function readHalf(t) {"):]
+    fn = fn[:fn.index("\nfunction flowHalf(")]
+    assert "toFixed(1)" not in fn
+    assert "toFixed(2)" in fn
+
+
+def test_a_band_that_is_a_prior_rather_than_a_measurement_says_so(client):
+    html = client.get("/").text
+    fn = html[html.index("function readHalf(t) {"):]
+    fn = fn[:fn.index("\nfunction flowHalf(")]
+    assert "t.learned === false" in fn
+    assert "prior band" in fn
+
+
+def test_the_feed_keeps_every_bars_flow_as_it_closes(client):
+    import inspect
+
+    from liqmap import web as w
+    src = inspect.getsource(w.create_app) + inspect.getsource(w.Runtime)
+    assert "feed.on_bar_close = self._keep_bar_flow" in src
+    keep = src[src.index("def _keep_bar_flow"):]
+    keep = keep[:keep.index("\n    def ")]
+    assert "flow_measured" in keep, (
+        "an adopted bar's zero delta would be stored as a balanced one")
+    assert "except Exception" in keep, (
+        "this runs on the socket thread; a failed write must not take the "
+        "feed down with it")

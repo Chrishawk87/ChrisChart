@@ -580,3 +580,85 @@ def test_the_meta_line_does_not_clip_the_age_off_a_stale_row():
     narrow = css[css.index("@media (max-width:980px)"):]
     narrow = narrow[:narrow.index("\n  }")]
     assert ".tf2 .meta{white-space:normal}" in narrow
+
+
+# ------------------------------------- CVD that outlives the rolling tape
+#
+# The tape holds about an hour. A four-hour rung has seen a quarter of one
+# bar, so its CVD cannot come from the tape at any price -- which is why
+# every slow row sat at NOT COVERED. The completed bars are kept instead.
+
+
+class FakeCVD:
+    def __init__(self, cvd, bars, source="stored"):
+        self.cvd, self.bars, self.source = cvd, bars, source
+
+
+def test_a_rung_takes_its_cvd_from_the_completed_bars_when_it_can():
+    seen = []
+
+    def cvd_for(name, iv, bar_open, bars):
+        seen.append((name, iv, bar_open, bars))
+        return FakeCVD(500_000.0, 6)
+
+    rs = fl.rungs(tape_of(busy()), (("4h", 14400.0),), now=615.0,
+                  cvd_for=cvd_for)
+    assert seen and seen[0][0] == "4h"
+    assert rs[0].bars == 6
+    assert rs[0].cvd_source == "stored"
+
+
+def test_the_bar_in_progress_is_added_to_the_stored_bars_not_counted_twice():
+    """The store holds CLOSED bars. The live bar is the tape's, and it has
+    to be added exactly once."""
+    def cvd_for(name, iv, bar_open, bars):
+        return FakeCVD(1000.0, 6)
+
+    rs = fl.rungs(tape_of(busy()), (("1m", 60.0),), now=615.0,
+                  cvd_for=cvd_for)
+    assert rs[0].cvd == pytest.approx(1000.0 + rs[0].delta)
+
+
+def test_the_completed_bars_are_asked_for_before_this_bars_open():
+    """Anything at or after the open is the bar in progress, and it is
+    added separately -- asking for it here would count it twice."""
+    grabbed = {}
+
+    def cvd_for(name, iv, bar_open, bars):
+        grabbed["open"] = bar_open
+        return FakeCVD(0.0, 1)
+
+    fl.rungs(tape_of(busy()), (("1m", 60.0),), now=615.0, cvd_for=cvd_for)
+    assert grabbed["open"] == pytest.approx(600.0)
+
+
+def test_without_a_store_the_cvd_falls_back_to_the_tape_and_says_so():
+    rs = fl.rungs(tape_of(busy()), (("1m", 60.0),), now=615.0)
+    assert rs[0].cvd_source == "tape"
+
+
+def test_a_rung_reports_how_many_bars_its_cvd_actually_had():
+    def cvd_for(name, iv, bar_open, bars):
+        return FakeCVD(10.0, 2)
+
+    rs = fl.rungs(tape_of(busy()), (("4h", 14400.0),), now=615.0,
+                  cvd_for=cvd_for)
+    d = rs[0].to_dict()
+    assert d["bars"] == 2 and d["asked"] == fl.RUNGS_BACK
+    assert not d["cvd_complete"]
+
+
+def test_the_row_shows_a_short_cvd_as_short():
+    src = _src()
+    fn = src[src.index("function flowHalf(r) {"):]
+    fn = fn[:fn.index("\nfunction renderLadder(")]
+    assert "cvd_complete" in fn and "r.asked" in fn
+    assert "cvd_source === 'none'" in fn
+
+
+def test_the_route_hands_the_ladder_somewhere_to_get_bars_from():
+    src = _src()
+    route = src[src.index('@app.get("/api/flow"'):
+                src.index('@app.get("/api/mtf"')]
+    assert "cvd_for=cvd_for" in route
+    assert "rt.bar_cvd(" in route

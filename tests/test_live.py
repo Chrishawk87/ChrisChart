@@ -588,3 +588,97 @@ def test_status_carries_the_feed_quality():
     s = f.status()
     for key in ("fast_book", "updates_per_s", "feed_quality"):
         assert key in s
+
+
+# ------------------------------------- the bar's flow, kept when it closes
+#
+# A bar's buy/sell split exists in exactly one place for exactly one hour:
+# the rolling tape. When the bar closes, that split is the only thing worth
+# keeping from the fills behind it, and after the tape rolls it is gone for
+# good -- no venue serves historical aggressor data back.
+
+
+def test_a_closing_bar_is_handed_over_with_its_timeframe():
+    from liqmap.live import LiveFeed
+    from liqmap.flow import Trade
+
+    f = LiveFeed("BTC", intervals=("1m",))
+    seen = []
+    f.on_bar_close = lambda tf, c: seen.append((tf, c))
+    f.builders["1m"].add(Trade(px=100.0, sz=1.0, aggressor="buy", ts=0.0))
+    f.builders["1m"].add(Trade(px=101.0, sz=1.0, aggressor="sell", ts=61.0))
+    assert len(seen) == 1
+    tf, bar = seen[0]
+    assert tf == "1m"
+    assert bar.buy_notional > 0 and bar.flow_measured
+
+
+def test_an_interval_added_later_is_wired_up_too():
+    """The dashboard's selector can name any interval, and a feed opened on
+    1m has nothing to hand over for 30m unless the builder it adds on
+    demand reports its closes like the rest."""
+    from liqmap.live import LiveFeed
+    from liqmap.flow import Trade
+
+    f = LiveFeed("BTC", intervals=("1m",))
+    seen = []
+    f.on_bar_close = lambda tf, c: seen.append(tf)
+    f.ensure_interval("30m")
+    f.builders["30m"].add(Trade(px=100.0, sz=1.0, aggressor="buy", ts=0.0))
+    f.builders["30m"].add(Trade(px=101.0, sz=1.0, aggressor="buy", ts=1801.0))
+    assert seen == ["30m"]
+
+
+def test_an_adopted_bar_is_marked_as_never_having_been_counted():
+    """THE trap. A fetched candle's buy and sell are zero because nobody
+    watched them, not because the bar was balanced. A CVD that adds it in
+    cannot tell the difference."""
+    from liqmap.live import LiveCandle
+    from liqmap.structure import Candle
+
+    c = LiveCandle.from_candle(
+        Candle(ts=0.0, open=1.0, high=2.0, low=1.0, close=2.0, volume=5.0),
+        60.0)
+    assert not c.flow_measured
+    assert c.buy_notional == 0.0 and c.sell_notional == 0.0
+
+
+def test_the_bar_already_in_progress_at_connect_is_marked_the_same_way():
+    """Its first fills happened before the socket was open, so its delta
+    is a fraction of the bar's and must not be stored as the bar's."""
+    from liqmap.live import CandleBuilder
+    from liqmap.structure import Candle
+
+    b = CandleBuilder(60.0)
+    b.seed(Candle(ts=0.0, open=1.0, high=2.0, low=1.0, close=2.0, volume=5.0))
+    assert not b.current.flow_measured
+
+
+def test_a_bar_built_from_fills_is_marked_as_counted():
+    from liqmap.live import CandleBuilder
+    from liqmap.flow import Trade
+
+    b = CandleBuilder(60.0)
+    b.add(Trade(px=100.0, sz=1.0, aggressor="buy", ts=0.0))
+    assert b.current.flow_measured
+
+
+def test_closed_candles_keep_the_split_that_history_throws_away():
+    """`history` returns plain OHLCV, which has had the one thing a CVD is
+    made of stripped off it."""
+    from liqmap.live import LiveFeed
+    from liqmap.flow import Trade
+
+    f = LiveFeed("BTC", intervals=("1m",))
+    for i in range(3):
+        f.builders["1m"].add(
+            Trade(px=100.0, sz=1.0, aggressor="buy", ts=i * 61.0))
+    closed = f.closed_candles("1m", back=6)
+    assert closed and all(c.buy_notional > 0 for c in closed)
+    assert not hasattr(f.history("1m")[0], "buy_notional")
+
+
+def test_closed_candles_on_an_interval_the_feed_does_not_build():
+    from liqmap.live import LiveFeed
+
+    assert LiveFeed("BTC", intervals=("1m",)).closed_candles("4h") == []
