@@ -253,7 +253,7 @@ def test_the_row_keeps_bps_as_the_reading():
     src = _src()
     fn = src[src.index("function moveText(t) {"):]
     fn = fn[:fn.index("\n}")]
-    assert "toFixed(2) + 'bps'" in fn, "bps stopped being the reading"
+    assert "toFixed(1) + 'bps'" in fn, "bps stopped being the reading"
     assert "t.move_units" in fn, "the tick count is not beside it"
     for gone in ("'ext'", "'back'", "u.state", "u.extension"):
         assert gone not in fn, (

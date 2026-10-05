@@ -2329,18 +2329,14 @@ def test_the_feed_is_stopped_before_anything_reloads(client):
     assert fn.index("stopFeed()") < fn.index("loadRead()")
 
 
-def test_the_read_route_does_not_pin_the_window_behind_the_label(client):
-    """THE lagged-row bug.
+def test_the_polled_window_and_its_label_agree(client):
+    """The original bug was that the row reported "1 bar" while reading
+    three. I fixed it by changing the BEHAVIOUR, which moved every polled
+    1m and 5m figure on the panel to about a third of what it had been --
+    the numbers the +/-1.0 rule had been calibrated on by eye.
 
-    `lookback_for` scales the window: a 4-hour row aggregates three bars
-    because two minutes into one there is nothing in it, and a 1-minute row
-    reads only itself because a reversal inside this minute must not be
-    averaged with the two before it.
-
-    The route passed `lookback=3` explicitly, which defeated that entirely
-    while the row went on reporting `lookback_for`'s answer. So a polled
-    1-minute row read three minutes and claimed to read one, and it kept
-    saying UP while price was already coming down.
+    The window is three bars again, and the label reports three. Fixing a
+    label by changing what it describes is not fixing the label.
     """
     import inspect
 
@@ -2348,7 +2344,12 @@ def test_the_read_route_does_not_pin_the_window_behind_the_label(client):
     src = inspect.getsource(w.create_app)
     call = src[src.index("r_ = pr.from_candles("):]
     call = call[:call.index(")")]
-    assert "lookback" not in call, "the window is pinned again"
+    assert "lookback=POLLED_BARS" in call
+    assert w.POLLED_BARS == 3
+
+    i = src.index('"bars_used"')
+    assert "r.span_bars" in src[i:i + 60], (
+        "the row must report the window it was actually built with")
 
 
 def test_the_row_reports_the_window_it_was_actually_built_with(client):
@@ -2397,25 +2398,29 @@ def test_a_forming_row_is_drawn_as_forming_not_as_a_direction(client):
     assert fn.index("t.forming") < fn.index("t.winner")
 
 
-def test_the_fast_rows_move_is_not_rounded_into_nothing(client):
-    """A fast row's whole argument happens inside the first decimal place.
-    '+0.0bps' beside a candle that visibly moved is what a rounding error
-    looks like from the outside -- and that is why the row reads in the
-    market's own unit now, where a tenth of a tick is already finer than
-    anything that can happen."""
+def test_the_bps_is_shown_to_one_decimal_as_it_always_was(client):
+    """I moved this to two decimals along the way. It made every number on
+    the panel look different from the one it was the day before, for no
+    reason anybody asked for, and that is most of why the reading stopped
+    feeling like the reading."""
     html = client.get("/").text
     fn = html[html.index("function moveText(t) {"):]
     fn = fn[:fn.index("\n}")]
-    assert "toFixed(2) + 'bps'" in fn, "the bps fallback lost its precision"
-    assert "t.move_units" in fn, "the row is not reading in native units"
+    assert "toFixed(1) + 'bps'" in fn
+    assert "toFixed(2)" not in fn
+    assert "t.move_units" in fn, "the tick count is not beside it"
 
 
-def test_a_band_that_is_a_prior_rather_than_a_measurement_says_so(client):
+def test_the_row_says_absorbed_and_nothing_else(client):
+    """It read "absorbed" before I started, and it reads "absorbed" now.
+    The band figure and the prior-band tag were both additions nobody
+    asked for, and they are in the payload for anyone who wants them."""
     html = client.get("/").text
     fn = html[html.index("function readHalf(t) {"):]
     fn = fn[:fn.index("\nfunction flowHalf(")]
-    assert "t.learned === false" in fn
-    assert "prior" in fn
+    assert "' · absorbed'" in fn
+    assert "absorbed <" not in fn
+    assert "prior band" not in fn
 
 
 def test_the_feed_keeps_every_bars_flow_as_it_closes(client):

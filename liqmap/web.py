@@ -86,6 +86,9 @@ MAX_UPLOAD_BARS = 250_000
 # longest bar whose shape can be cut straight from the tape. The tape holds
 # an hour, so anything past five minutes cannot supply enough completed
 # bars from it and goes to the one-minute path instead.
+# Bars a polled row aggregates. Three, on every timeframe.
+POLLED_BARS = 3
+
 CURVE_TTL_S = 120.0
 FAST_CURVE_S = 300.0
 
@@ -4392,17 +4395,20 @@ def create_app() -> FastAPI:
                 # nothing in it, and the higher timeframe would go silent
                 # exactly when it matters most.
                 #
-                # THE WINDOW IS NOT PASSED IN. It used to be pinned to three
-                # bars here, which silently overrode `lookback_for` and
-                # applied the four-hour argument to the one-minute row --
-                # so a reversal inside the current minute was averaged with
-                # the two minutes before it and the row kept reading UP
-                # while price was already coming down. The row reported
-                # "1 bar" the whole time, because the label came from
-                # `lookback_for` while the behaviour came from this
-                # argument.
+                # THREE BARS ON EVERY TIMEFRAME, INCLUDING THE FAST ONES.
+                #
+                # `lookback_for` scales this window, and I switched the
+                # route over to it as a bug fix. It was not one. The bug
+                # was the LABEL: the row reported "1 bar" while reading
+                # three. Changing the behaviour instead changed every
+                # polled 1m and 5m figure on the panel to about a third
+                # of what it had been -- and those are the numbers the
+                # +/-1.0 rule was calibrated on by watching them.
+                #
+                # So the window goes back to what it was and `bars_used`
+                # now reports what it actually used.
                 r_ = pr.from_candles(
-                    tf, iv, tf_bars, book=book,
+                    tf, iv, tf_bars, lookback=POLLED_BARS, book=book,
                     elapsed_s=max(0.0, min(iv, now_s - tf_bars[-1].ts)))
                 if r_ is not None:
                     readings.append(r_)
@@ -7203,19 +7209,13 @@ function readHalf(t) {
          + (t.seeded === false ? ' · open not seen' : '')
          + ' · ' + (t.trades || 0) + ' fills' + tfAge(t) + '</span>';
   const w = Math.round(Math.abs(t.signed) * 50);
-  /* Two decimals, not one. A fast row's whole argument happens inside the
-     first decimal place, and "+0.0bps" next to a candle that visibly
-     moved is what a rounding error looks like from the outside. */
   return '<span class="who ' + (t.winner === 'buyers' ? 'long'
             : t.winner === 'sellers' ? 'short' : '') + '">'
        + t.winner.toUpperCase() + '</span>'
        + '<span class="bar"><i class="' + t.winner + '" style="width:'
        + w + '%"></i></span>'
        + '<span class="meta">' + moveText(t)
-       + (t.absorbing ? ' · absorbed <' + (t.flat_bps || 0).toFixed(2)
-                      : '')
-       + (t.learned === false ? ' · <span class="thin">prior band</span>'
-                              : '')
+       + (t.absorbing ? ' · absorbed' : '')
        + (t.measured ? '' : ' · inferred') + tfAge(t) + '</span>';
 }
 
@@ -7233,7 +7233,11 @@ function readHalf(t) {
    the other -- which is what I did first -- threw away the figure that
    was doing the work to show the one that reads more easily. */
 function moveText(t) {
-  const head = (t.move_bps >= 0 ? '+' : '') + t.move_bps.toFixed(2) + 'bps';
+  /* ONE DECIMAL. This is what the row has always shown, and I changed it
+     to two along the way -- which made every number on the panel look
+     different from the one it was the day before, for no reason anybody
+     asked for. The tick count in brackets is the only addition. */
+  const head = (t.move_bps >= 0 ? '+' : '') + t.move_bps.toFixed(1) + 'bps';
   const n = t.move_units, u = t.unit_label || 't';
   if (n == null || !isFinite(n)) return head;
   return head + ' <span class="thin">(' + (n >= 0 ? '+' : '')
