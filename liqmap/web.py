@@ -43,6 +43,7 @@ from fastapi.responses import (HTMLResponse, JSONResponse,
 from . import consensus as consensus_mod
 from .bucket import build_map, render
 from .barflow import BarFlow, BarFlowStore, merge as merge_cvd
+from .orderflow import velocity as _of_velocity
 from .history import History, render_changes
 from .travel import Tracker
 from .settings import Settings, SettingsStore, default_db_path
@@ -4502,6 +4503,65 @@ def create_app() -> FastAPI:
                 except Exception:
                     continue
 
+            # ---- the six layers, per timeframe -------------------------
+            #
+            # ASSEMBLY, NOT MEASUREMENT. Every figure here was already
+            # produced by the module that owns it; this gathers them so
+            # the six readings can be compared instead of being held in
+            # someone's head one at a time.
+            #
+            # The book, the impact baseline and the tape's velocity are
+            # properties of the moment rather than of a bar, so they are
+            # computed once and shared across the rows. Recomputing them
+            # per timeframe would be five chances for the same number to
+            # come out differently.
+            from . import layers as lyr
+
+            lay: dict[str, Any] = {}
+            try:
+                vel = dom_read = None
+                if use_feed and feed is not None:
+                    stamps = [float(t.ts) for t in
+                              getattr(feed.tape, "_trades", []) or []]
+                    vel = _of_velocity(stamps)
+                    dom_read = feed.dom.read(
+                        trades=getattr(feed.tape, "_trades", []) or [],
+                        tick=unit.size)
+
+                refs: list[tuple[str, float]] = []
+                if vw is not None:
+                    refs += [("VWAP", vw.value), ("+1σ", vw.upper_1),
+                             ("−1σ", vw.lower_1)]
+                if higher_struct is not None:
+                    if higher_struct.last_high is not None:
+                        refs.append((f"{higher} swing high",
+                                     higher_struct.last_high.px))
+                    if higher_struct.last_low is not None:
+                        refs.append((f"{higher} swing low",
+                                     higher_struct.last_low.px))
+                if in_zone is not None:
+                    refs += [("zone high", in_zone.high),
+                             ("zone low", in_zone.low)]
+
+                for pres in readings:
+                    tf = pres.timeframe
+                    live_bar = (feed.candle(tf)
+                                if (use_feed and feed) else None)
+                    prof = getattr(live_bar, "profile", None)
+                    tf_refs = list(refs)
+                    poc = getattr(prof, "poc", None) if prof else None
+                    if poc:
+                        tf_refs.append(("POC", float(poc)))
+                    lay[tf] = lyr.assemble(
+                        tf, pres.interval_s, pressure=pres, velocity=vel,
+                        pace=paces.get(tf), absorption=absorption,
+                        dom_read=dom_read, profile=prof, book=book,
+                        refs=tf_refs, unit_size=unit.size,
+                        unit=unit.label).to_dict()
+            except Exception as exc:
+                lay = {"error": f"{type(exc).__name__}: {exc}"}
+            out["layers"] = lay
+
             out["timeframes"] = [{
                 "timeframe": r.timeframe, "winner": r.winner,
                 "aggressor": r.aggressor, "strength": r.strength,
@@ -5004,6 +5064,23 @@ DASHBOARD = """<!doctype html>
      It replaced two single-sided ladders, and their `.tf` rule went with
      them rather than being left behind as dead styling for the next
      person to half-remember. */
+  /* The six layers. One block each, in the order they are read: what
+     somebody did, and then what happened to it. A block that could not be
+     measured is dimmed and says why rather than showing a zero -- a
+     missing layer and a balanced one are different things and the whole
+     read depends on telling them apart. */
+  .lay{display:grid;grid-template-columns:118px 1fr;gap:12px;
+    align-items:baseline;padding:9px 12px;border-radius:4px;
+    margin-bottom:4px;background:var(--bg);
+    border-left:3px solid var(--line);font-size:13px}
+  .lay.off{opacity:.5;border-left-style:dotted}
+  .lay b{font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--dim)}
+  .lay b i{display:block;font-style:normal;font-size:16px;font-weight:700;
+    letter-spacing:0;color:var(--line);line-height:1}
+  .lay .says{color:var(--ink)}
+  .lay .nums{display:block;margin-top:3px;font-size:11px;color:var(--dim);
+    font-variant-numeric:tabular-nums}
   .tf2{display:grid;grid-template-columns:104px 1fr 1fr;gap:10px;
     align-items:stretch;margin-bottom:4px;font-size:13px}
   .tf2>b{align-self:center;font-variant-numeric:tabular-nums;
@@ -5068,6 +5145,10 @@ DASHBOARD = """<!doctype html>
        misaligns nothing -- and wrapping beats clipping the age off the
        end of the one row whose age matters. */
     .tf2 .meta{white-space:normal}
+    /* Stacked, the layer blocks put their name above the sentence
+       rather than beside it. */
+    .lay{grid-template-columns:1fr;gap:2px}
+    .lay b i{display:inline;margin-right:6px;font-size:13px}
   }
   .call{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
     padding:10px 0 4px}
@@ -5384,6 +5465,19 @@ has to be running before the gate stops refusing.">spike
       <div id="readSignals"></div>
       <div id="readSay" class="say" style="display:none"></div>
 
+    </div>
+
+    <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
+         touches the ladder or the candle read above it. -->
+    <div class="panel full" id="layerPanel"><h2>Order flow — the candle in
+      layers<span class="stamp" id="layerStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Six readings of the candle
+        still forming, kept apart rather than blended: who is attacking,
+        how hard, whether anyone is taking the other side, what the resting
+        book is doing about it, what price actually did in return, and
+        where on the map it is happening. A layer that could not be
+        measured says so — <b>missing is not neutral</b>.</div>
+      <div id="layerBody"></div>
     </div>
   </div>
 
@@ -7357,6 +7451,78 @@ function renderLadder() {
   }).join('');
 }
 
+/* ---- the six layers -----------------------------------------------------
+
+   Read in the order they happen: somebody attacks, with some force, into
+   some resistance, the book reacts, price responds, and all of it is
+   happening somewhere on the map. Kept apart rather than blended, because
+   "heavy buying, into a thinning offer, at the prior day's high, with
+   price refusing to go" is a description and the average of those four
+   numbers is nothing at all.
+
+   Painted from the read payload the ladder already receives, so this
+   panel and the ladder can never be looking at different moments. */
+const LAYER_ORDER = [
+  ["intent", "Intent", "who is attacking"],
+  ["force", "Force", "how hard"],
+  ["resistance", "Resistance", "is it being taken"],
+  ["liquidity", "Liquidity", "what the book is doing"],
+  ["response", "Response", "what price did"],
+  ["location", "Location", "where"],
+];
+
+function layerNums(name, L) {
+  if (name === "intent" && L.measured)
+    /* Total traded, not a delta -- so no sign on it. flowNum prefixes a
+       plus for anything positive, which would read as net buying when
+       this is both sides added together. */
+    return flowNum(L.notional).replace('+', '') + ' traded · '
+         + (L.trades || 0) + ' fills';
+  if (name === "force")
+    return (L.pace_known ? L.pace.toFixed(1) + 'x normal volume' : '')
+         + (L.pace_known && L.velocity_known ? ' · ' : '')
+         + (L.velocity_known ? L.velocity.toFixed(1) + 'x tape' : '');
+  if (name === "resistance" && L.measured)
+    return 'impact ' + (L.impact_ratio * 100).toFixed(0) + '%'
+         + (L.busiest_px ? ' · busiest ' + L.busiest_px + ' ('
+             + (L.busiest_share * 100).toFixed(0) + '% of the bar)' : '');
+  if (name === "response" && L.measured)
+    return 'range ' + L.range.toFixed(1) + L.unit;
+  if (name === "liquidity" && L.dom && L.measured)
+    return 'bid pulled ' + (L.dom.bid.pull_share * 100).toFixed(0)
+         + '% · ask pulled ' + (L.dom.ask.pull_share * 100).toFixed(0) + '%';
+  return '';
+}
+
+function paintLayers(d) {
+  const el = $('layerBody');
+  if (!el) return;
+  const all = (d && d.layers) || {};
+  if (all.error) { el.innerHTML = '<div class="msg err">' + esc(all.error)
+                                 + '</div>'; return; }
+  const tf = ($('rInt') && $('rInt').value) || d.interval;
+  const L = all[tf];
+  if (!L) {
+    el.innerHTML = '<div class="msg">no layer read on ' + esc(tf || '?')
+                 + ' yet</div>';
+    return;
+  }
+  el.innerHTML = LAYER_ORDER.map(([key, title, sub], i) => {
+    const part = L[key] || {};
+    const nums = layerNums(key, part);
+    return '<div class="lay' + (part.measured ? '' : ' off') + '">'
+         + '<b><i>' + (i + 1) + '</i>' + title
+         + '<span class="thin" style="display:block;text-transform:none;'
+         + 'letter-spacing:0">' + sub + '</span></b>'
+         + '<span class="says">' + esc(part.describe || '—')
+         + (nums ? '<span class="nums">' + nums + '</span>' : '')
+         + '</span></div>';
+  }).join('');
+  const st = $('layerStamp');
+  if (st) st.textContent = tf + ' · ' + (L.measured || []).length
+                         + ' of 6 measured';
+}
+
 function paintLadder(d) {
   const tfs = d.timeframes || [];
   const say = $('tfSay');
@@ -7674,6 +7840,7 @@ function paintRead(d) {
 
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
   paintLadder(d);
+  paintLayers(d);
   const src = (d.source || '').indexOf('websocket') === 0;
   const flags = (src ? '<span class="flag">LIVE TAPE</span>'
                      : '<span class="flag late">POLLED</span>')
