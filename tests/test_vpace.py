@@ -319,7 +319,7 @@ def test_the_volume_read_is_reported_and_gates_nothing():
     """A quiet bar about to break out would go blank exactly when it
     mattered, so nothing on the row is hidden by a low reading."""
     src = _src()
-    cell = src[src.index("function fuelCell(name, v) {"):]
+    cell = src[src.index("function fuelCell(name, v, call) {"):]
     cell = cell[:cell.index("\nfunction renderLadder(")]
     assert "v.known" in cell
     # The direction half is built without ever consulting the volume.
@@ -334,12 +334,12 @@ def test_the_gauge_sits_with_the_candle_not_inside_one_read():
     src = _src()
     row = src[src.index("function renderLadder() {"):]
     row = row[:row.index("\nfunction paintLadder(")]
-    assert "fuelCell(n, t && t.volume)" in row
+    assert "fuelCell(n, t && t.volume," in row
 
 
 def test_the_row_shows_effort_next_to_its_result():
     src = _src()
-    cell = src[src.index("function fuelCell(name, v) {"):]
+    cell = src[src.index("function fuelCell(name, v, call) {"):]
     cell = cell[:cell.index("\nfunction renderLadder(")]
     for tag in ("paid", "held", "thin", "none"):
         assert f"'{tag}'" in cell

@@ -4073,7 +4073,8 @@ def create_app() -> FastAPI:
     @app.get("/api/read", dependencies=[Depends(require_token)])
     def api_read(coin: str = "BTC", interval: str = "15m",
                  higher: str = "4h", size: float = 0.0,
-                 timeframes: str = "") -> dict[str, Any]:
+                 timeframes: str = "", vote_bps: float = 1.0
+                 ) -> dict[str, Any]:
         """The live directional read on the candle still forming.
 
         Everything this service knows, assembled into one answer: flow inside
@@ -4455,6 +4456,24 @@ def create_app() -> FastAPI:
                 except Exception:
                     continue
 
+            # ---- the confirmation ladder --------------------------------
+            #
+            # Each timeframe judged by the faster ones: 1m+5m for the 5m,
+            # those two plus itself for the 15m, 5m+15m+1h for the hour,
+            # 15m+1h+4h for the four. The SIGN OF THE MOVE is the vote,
+            # not the winning side -- those disagree whenever absorption
+            # inverts a row, and here the move decides.
+            from . import stack as stk
+
+            try:
+                out["stack"] = stk.read(
+                    [stk.Row(timeframe=p.timeframe, interval_s=p.interval_s,
+                             bps=p.move_bps, typical_bps=p.typical_bps)
+                     for p in readings],
+                    base=max(0.01, float(vote_bps)))
+            except Exception as exc:
+                out["stack"] = {"error": f"{type(exc).__name__}: {exc}"}
+
             paces: dict[str, Any] = {}
             for pres in readings:
                 # A reading that aggregates several bars has no pace: its
@@ -4508,6 +4527,10 @@ def create_app() -> FastAPI:
                 # ticks, points or pips instead of basis points.
                 "move_units": unit.of(r.last_px - r.open_px),
                 "unit_label": unit.label,
+                "verdict": ((out.get("stack") or {}).get("verdicts")
+                            or {}).get(r.timeframe),
+                "vote": ((out.get("stack") or {}).get("votes")
+                         or {}).get(r.timeframe),
                 "flat_units": unit.from_bps(r.flat_band, r.last_px),
                 "describe": r.describe(),
             } for r in conf.ordered]
@@ -4975,7 +4998,7 @@ DASHBOARD = """<!doctype html>
      It replaced two single-sided ladders, and their `.tf` rule went with
      them rather than being left behind as dead styling for the next
      person to half-remember. */
-  .tf2{display:grid;grid-template-columns:72px 1fr 1fr;gap:10px;
+  .tf2{display:grid;grid-template-columns:104px 1fr 1fr;gap:10px;
     align-items:stretch;margin-bottom:4px;font-size:13px}
   .tf2>b{align-self:center;font-variant-numeric:tabular-nums;
     text-align:right;color:var(--dim)}
@@ -4985,6 +5008,14 @@ DASHBOARD = """<!doctype html>
      would imply it belonged to that read. */
   .tf2>b span{display:block;font-weight:400;font-size:10px;
     line-height:1.3;white-space:nowrap}
+  /* The timeframe and its verdict share a line, because the verdict is
+     about that timeframe and reads as a label on it rather than as
+     another column to scan. */
+  .tf2>b .tfname{font-size:13px;font-weight:700;color:var(--dim)}
+  .tf2>b em{font-style:normal;font-weight:700;font-size:11px;
+    letter-spacing:.04em}
+  .tf2>b em.long{color:var(--up)}
+  .tf2>b em.short{color:var(--down)}
   .tf2>b span span{display:inline}
   .tf2>b i{display:block;height:3px;border-radius:2px;background:var(--line);
     margin-top:2px;position:relative;overflow:hidden}
@@ -5024,7 +5055,7 @@ DASHBOARD = """<!doctype html>
      squeezing both: a delta that has wrapped to three lines is worse than
      a delta on the next row. */
   @media (max-width:980px){
-    .tf2{grid-template-columns:72px 1fr;row-gap:2px;margin-bottom:10px}
+    .tf2{grid-template-columns:104px 1fr;row-gap:2px;margin-bottom:10px}
     .tf2>span,.tf2 .half{grid-column:2}
     .tf2 .half{grid-template-columns:72px 1fr 200px}
     /* Stacked, the halves are no longer side by side, so a wrapped line
@@ -7255,10 +7286,31 @@ function flowHalf(r) {
 
    It is reported and never gates anything: a quiet bar about to break out
    would go blank exactly when it mattered. */
-function fuelCell(name, v) {
+/* BUY or SELL, next to the timeframe it belongs to.
+
+   A timeframe does not call a trade on its own. It prints only when it
+   and the faster ones below it all point the same way -- 1m+5m for the
+   5m, both of those plus itself for the 15m, 5m+15m+1h for the hour,
+   15m+1h+4h for the four. The minute argues and never decides, so it
+   never shows a word of its own.
+
+   NOTHING PRINTS WHEN THEY DO NOT AGREE, and that silence is the signal.
+   The reason is on the cell rather than the row, because a row that
+   explained itself every time would be unreadable in the ninety per cent
+   of moments when there is no trade. */
+function verdictTag(d) {
+  if (!d || !d.side) return '';
+  return ' <em class="' + (d.side === 'buy' ? 'long' : 'short') + '">'
+       + d.side.toUpperCase() + '</em>';
+}
+
+function fuelCell(name, v, call) {
+  const head = '<span class="tfname">' + esc(name) + verdictTag(call)
+             + '</span>';
+  const why = call && call.why ? call.why : '';
   if (!v || !v.known)
-    return '<b>' + esc(name) + '<span class="thin">vol —</span>'
-         + '<i style="--v:0%"></i></b>';
+    return '<b title="' + esc(why) + '">' + head
+         + '<span class="thin">vol —</span><i style="--v:0%"></i></b>';
   const x = v.projected_x || 0;
   const cls = v.heavy ? 'heavy' : v.quiet ? 'quiet' : '';
   /* Effort next to its result, because volume alone never answers
@@ -7266,7 +7318,8 @@ function fuelCell(name, v) {
      wide range and absorption with none. */
   const tag = {paid_for: 'paid', absorbed: 'held', thin: 'thin',
                no_fuel: 'none'}[v.state] || '';
-  return '<b title="' + esc(v.describe || '') + '">' + esc(name)
+  return '<b title="' + esc((why ? why + ' | ' : '') + (v.describe || ''))
+       + '">' + head
        + '<span>' + x.toFixed(x < 10 ? 1 : 0) + 'x '
        + '<span class="thin">' + tag + '</span></span>'
        + '<i class="' + cls + '" style="--v:'
@@ -7289,7 +7342,8 @@ function renderLadder() {
     ? '<div class="msg err">' + esc(ladderErr) + '</div>' : '';
   el.innerHTML = err + names.map(n => {
     const t = read[n], r = flow[n], p = (r && r.pace) || {};
-    return '<div class="tf2">' + fuelCell(n, t && t.volume)
+    return '<div class="tf2">' + fuelCell(n, t && t.volume,
+                                           t && t.verdict)
          + '<div class="half ' + (t ? t.winner : '') + '" title="'
          + esc((t && t.describe) || 'no candle read on this timeframe')
          + '">' + readHalf(t) + '</div>'
