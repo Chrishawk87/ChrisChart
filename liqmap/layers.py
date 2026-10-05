@@ -208,6 +208,13 @@ class Response:
     with_intent: bool | None = None   # did price go the aggressor's way
     stalled: bool = False
     measured: bool = False
+    # Where in its own range the bar is sitting. 0 at the low, 1 at the
+    # high. A bar that ran up and came back to its low is a different
+    # thing from one sitting on its high, and the move alone cannot tell
+    # them apart.
+    position: float = 0.5
+    # Has it gone anywhere FOR A BAR OF THIS LENGTH, from `vpace`.
+    wide: bool = False
 
     def describe(self) -> str:
         if not self.measured:
@@ -223,6 +230,7 @@ class Response:
         return {"move": _d(self.move, 3), "range": _d(self.range_, 3),
                 "unit": self.unit, "impact": _d(self.impact, 3),
                 "with_intent": self.with_intent, "stalled": self.stalled,
+                "position": _d(self.position, 3), "wide": self.wide,
                 "measured": self.measured, "describe": self.describe()}
 
 
@@ -255,6 +263,10 @@ class Location:
     price: float = 0.0
     near: list[Reference] = field(default_factory=list)
     unit: str = "pt"
+    # The bar's own extremes, so "traded through it and came back" is
+    # answerable here rather than being re-derived by whatever asks.
+    high: float = 0.0
+    low: float = 0.0
 
     @property
     def measured(self) -> bool:
@@ -265,6 +277,23 @@ class Location:
         """The nearest reference, if there is one."""
         return self.near[0] if self.near else None
 
+    def through(self) -> list[tuple[Reference, str]]:
+        """References the bar traded through and is now back on this side of.
+
+        The shape behind a failed break: price went past the level, did
+        not hold, and is back. Reported as an observation -- whether it
+        STAYS failed is not knowable until the bar closes.
+        """
+        out: list[tuple[Reference, str]] = []
+        if self.high <= 0 or self.low <= 0 or self.price <= 0:
+            return out
+        for r in self.near:
+            if self.high > r.price and self.price < r.price:
+                out.append((r, "above"))
+            elif self.low < r.price and self.price > r.price:
+                out.append((r, "below"))
+        return out
+
     def describe(self) -> str:
         if not self.near:
             return "nothing on the map within reach of this bar"
@@ -274,7 +303,10 @@ class Location:
 
     def to_dict(self) -> dict:
         return {"price": _d(self.price, 8), "unit": self.unit,
+                "high": _d(self.high, 8), "low": _d(self.low, 8),
                 "measured": self.measured,
+                "through": [{"name": r.name, "side": side}
+                            for r, side in self.through()],
                 "at": self.at.to_dict() if self.at else None,
                 "near": [r.to_dict() for r in self.near],
                 "describe": self.describe()}
@@ -422,9 +454,12 @@ def assemble(timeframe: str, interval_s: float, *,
             impact=out.resistance.impact_ratio,
             with_intent=with_intent,
             stalled=bool(absorption is not None and absorption.absorbing),
+            position=float(getattr(pressure, "position_in_range", 0.5)),
+            wide=bool(pace is not None and getattr(pace, "wide", False)),
             measured=not bool(getattr(pressure, "forming", False)))
         out.location = Location(
             price=float(pressure.last_px), unit=unit,
+            high=float(pressure.high_px), low=float(pressure.low_px),
             near=nearby(float(pressure.last_px), refs, unit_size,
                         bar_range=float(pressure.high_px - pressure.low_px),
                         unit=unit))

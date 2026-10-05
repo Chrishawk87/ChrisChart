@@ -122,6 +122,12 @@ class Runtime:
         # a figure measured on the server can later be tested against
         # outcomes rather than only looked at.
         self.travel = Tracker()
+        # What each timeframe settled on for the bar BEFORE the one in
+        # progress, keyed by (market, timeframe). Reversal is the only
+        # state that needs it -- turning against something requires
+        # knowing which way that something pointed -- and it is carried
+        # forward only when the bar actually rolls.
+        self._last_state: dict[tuple[str, str], tuple[float, Any]] = {}
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -591,6 +597,42 @@ class Runtime:
                 self.barflow.prune()
         except Exception:
             pass
+
+    def previous_state(self, coin: str, timeframe: str, bar_open: float):
+        """What this timeframe settled on for the bar BEFORE this one.
+
+        Never the current bar. Handing back the state this same bar had a
+        second ago would let a reading reverse against itself and
+        oscillate for the whole candle.
+        """
+        got = self._last_state.get((coin, timeframe))
+        return got[2] if got else None
+
+    def remember_state(self, coin: str, timeframe: str, bar_open: float,
+                       res) -> None:
+        """Keep this bar's newest reading, and the last bar's settled one.
+
+        TWO entries, not one. A bar is re-read many times before it
+        closes, so the current reading is overwritten each time; the
+        previous bar's LAST reading is what it settled on and is kept
+        beside it.
+
+        Keeping only one would make reversal fire once at the bar
+        boundary and then vanish for the rest of the candle -- the first
+        read after the roll would see the old bar, and every read after
+        that would see this one and find nothing to turn against.
+        """
+        key = (coin, timeframe)
+        bar_open = float(bar_open)
+        got = self._last_state.get(key)
+        if got is None:
+            self._last_state[key] = (bar_open, res, None)
+            return
+        cur_open, cur_res, prev = got
+        if bar_open > cur_open:
+            self._last_state[key] = (bar_open, res, cur_res)   # it rolled
+        else:
+            self._last_state[key] = (cur_open, res, prev)
 
     def minute_rows(self, coin: str, want: int) -> list[BarFlow]:
         """Recent one-minute bars, from the database and from this feed.
@@ -4516,6 +4558,7 @@ def create_app() -> FastAPI:
             # per timeframe would be five chances for the same number to
             # come out differently.
             from . import layers as lyr
+            from . import result as rsl
 
             lay: dict[str, Any] = {}
             try:
@@ -4552,12 +4595,20 @@ def create_app() -> FastAPI:
                     poc = getattr(prof, "poc", None) if prof else None
                     if poc:
                         tf_refs.append(("POC", float(poc)))
-                    lay[tf] = lyr.assemble(
+                    built = lyr.assemble(
                         tf, pres.interval_s, pressure=pres, velocity=vel,
                         pace=paces.get(tf), absorption=absorption,
                         dom_read=dom_read, profile=prof, book=book,
                         refs=tf_refs, unit_size=unit.size,
-                        unit=unit.label).to_dict()
+                        unit=unit.label)
+                    bar_open = (now_s - (now_s % pres.interval_s)
+                                if pres.interval_s > 0 else 0.0)
+                    res = rsl.classify(
+                        built, previous=rt.previous_state(coin, tf, bar_open))
+                    rt.remember_state(coin, tf, bar_open, res)
+                    d_ = built.to_dict()
+                    d_["result"] = res.to_dict()
+                    lay[tf] = d_
             except Exception as exc:
                 lay = {"error": f"{type(exc).__name__}: {exc}"}
             out["layers"] = lay
@@ -5477,6 +5528,7 @@ has to be running before the gate stops refusing.">spike
         book is doing about it, what price actually did in return, and
         where on the map it is happening. A layer that could not be
         measured says so — <b>missing is not neutral</b>.</div>
+      <div id="layerResult" class="say" style="margin-bottom:10px">—</div>
       <div id="layerBody"></div>
     </div>
   </div>
@@ -7495,7 +7547,7 @@ function layerNums(name, L) {
 }
 
 function paintLayers(d) {
-  const el = $('layerBody');
+  const el = $('layerBody'), head = $('layerResult');
   if (!el) return;
   const all = (d && d.layers) || {};
   if (all.error) { el.innerHTML = '<div class="msg err">' + esc(all.error)
@@ -7506,6 +7558,31 @@ function paintLayers(d) {
     el.innerHTML = '<div class="msg">no layer read on ' + esc(tf || '?')
                  + ' yet</div>';
     return;
+  }
+  /* The verdict, above the six readings that produced it.
+
+     A PROVISIONAL WORD IS DRAWN DIFFERENTLY. Failed break, exhaustion
+     and reversal all describe how something turned out, and inside a bar
+     that has not closed the most that can honestly be said is "so far".
+     Drawing those the same as a settled word would hand them a
+     confidence the moment does not have. */
+  const R = L.result || {};
+  if (head) {
+    const side = R.side
+      ? '<b class="' + (R.side === 'buy' ? 'long' : 'short') + '">'
+        + R.side.toUpperCase() + '</b>'
+      : '<span class="thin">no side</span>';
+    head.innerHTML =
+        '<span class="flag' + (R.provisional ? ' late' : '') + '">'
+      + esc((R.state || 'unknown').replace(/_/g, ' ').toUpperCase())
+      + '</span>' + side
+      + (R.provisional
+          ? ' <span class="thin">so far — this bar can still close the '
+            + 'other way</span>' : '')
+      + '<div class="thin" style="margin-top:4px">' + esc(R.why || '')
+      + '</div>'
+      + '<div class="thin" style="margin-top:2px">' + esc(R.meaning || '')
+      + '</div>';
   }
   el.innerHTML = LAYER_ORDER.map(([key, title, sub], i) => {
     const part = L[key] || {};
