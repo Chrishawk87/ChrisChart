@@ -2397,15 +2397,17 @@ def test_a_forming_row_is_drawn_as_forming_not_as_a_direction(client):
     assert fn.index("t.forming") < fn.index("t.winner")
 
 
-def test_the_fast_rows_bps_is_not_rounded_into_nothing(client):
+def test_the_fast_rows_move_is_not_rounded_into_nothing(client):
     """A fast row's whole argument happens inside the first decimal place.
     '+0.0bps' beside a candle that visibly moved is what a rounding error
-    looks like from the outside."""
+    looks like from the outside -- and that is why the row reads in the
+    market's own unit now, where a tenth of a tick is already finer than
+    anything that can happen."""
     html = client.get("/").text
-    fn = html[html.index("function readHalf(t) {"):]
-    fn = fn[:fn.index("\nfunction flowHalf(")]
-    assert "toFixed(1)" not in fn
-    assert "toFixed(2)" in fn
+    fn = html[html.index("function moveText(t) {"):]
+    fn = fn[:fn.index("\n}")]
+    assert "toFixed(2) + 'bps'" in fn, "the bps fallback lost its precision"
+    assert "t.move_units" in fn, "the row is not reading in native units"
 
 
 def test_a_band_that_is_a_prior_rather_than_a_measurement_says_so(client):
@@ -2413,7 +2415,7 @@ def test_a_band_that_is_a_prior_rather_than_a_measurement_says_so(client):
     fn = html[html.index("function readHalf(t) {"):]
     fn = fn[:fn.index("\nfunction flowHalf(")]
     assert "t.learned === false" in fn
-    assert "prior band" in fn
+    assert "prior" in fn
 
 
 def test_the_feed_keeps_every_bars_flow_as_it_closes(client):

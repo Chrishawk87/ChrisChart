@@ -44,6 +44,7 @@ from . import consensus as consensus_mod
 from .bucket import build_map, render
 from .barflow import BarFlow, BarFlowStore, merge as merge_cvd
 from .history import History, render_changes
+from .travel import Tracker
 from .settings import Settings, SettingsStore, default_db_path
 from .ledger import Ledger
 import bisect
@@ -110,6 +111,13 @@ class Runtime:
         # on a timer because the tape path walks every fill the tape holds
         # and the dashboard polls several times a minute.
         self._curves: dict[tuple[str, str], tuple[float, Any]] = {}
+        # Where each timeframe's on-candle move has been, so the panel can
+        # say whether the number is rising or falling rather than only what
+        # it is. Kept here rather than in the browser because both the
+        # polled path and the pushed one go through one route, and because
+        # a figure measured on the server can later be tested against
+        # outcomes rather than only looked at.
+        self.travel = Tracker()
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -4409,7 +4417,43 @@ def create_app() -> FastAPI:
             #
             # Reported, never gating: a quiet bar about to break out would
             # go blank exactly when it mattered.
+            from . import travel as tvl
+            from . import units as unt
             from . import vpace as vpz
+
+            # The unit this market is actually read in. Everything stays in
+            # basis points underneath -- that is what makes a $4 token and a
+            # $100k one comparable -- and converts here, at the edge, to the
+            # thing a trader would say out loud.
+            unit = unt.from_book(coin, book, price=float(current.close or 0.0))
+            if not unit.measured:
+                base = tf_hist.get(interval) or []
+                if base:
+                    unit = unt.from_bars(coin, base, price=float(current.close or 0.0))
+            out["unit"] = unit.to_dict()
+
+            # ---- is that number rising or falling ----------------------
+            #
+            # The level and its direction of travel are different
+            # questions and only the second one is about right now: +3t
+            # rising and +3t falling are the same number and opposite
+            # situations. A snapshot could never say which, which is why
+            # watching it felt like it was holding something back.
+            travels: dict[str, Any] = {}
+            for pres in readings:
+                try:
+                    bar_open = now_s - (now_s % pres.interval_s) \
+                        if pres.interval_s > 0 else 0.0
+                    moved = unit.of(pres.last_px - pres.open_px)
+                    rt.travel.record(coin, pres.timeframe, now_s, moved,
+                                     bar_open)
+                    travels[pres.timeframe] = rt.travel.read(
+                        coin, pres.timeframe, unit=unit.label, now=now_s,
+                        best=unit.of(tvl.best_of(
+                            pres.open_px, pres.high_px, pres.low_px,
+                            pres.last_px)))
+                except Exception:
+                    continue
 
             paces: dict[str, Any] = {}
             for pres in readings:
@@ -4458,6 +4502,12 @@ def create_app() -> FastAPI:
                 "seeded": r.seeded,
                 "volume": (paces[r.timeframe].to_dict()
                            if r.timeframe in paces else None),
+                "travel": (travels[r.timeframe].to_dict()
+                           if travels.get(r.timeframe) is not None else None),
+                # The move in the market's own unit, so the row can show
+                # ticks, points or pips instead of basis points.
+                "move_units": unit.of(r.last_px - r.open_px),
+                "flat_units": unit.from_bps(r.flat_band, r.last_px),
                 "describe": r.describe(),
             } for r in conf.ordered]
             out["confrontation"] = {
@@ -4951,6 +5001,11 @@ DASHBOARD = """<!doctype html>
      takes that room rather than wrapping "NOT COVERED" onto two lines
      and making the empty row the tallest one on the ladder. */
   .tf2 .who.wide{grid-column:1/3;white-space:nowrap}
+  /* The move's direction of travel. Not coloured by side -- the row's
+     left edge already carries that -- but by whether the move is growing
+     or being given back, which is the thing the panel never said. */
+  .tf2 .meta b.grow{color:var(--ink);font-weight:600}
+  .tf2 .meta b.fade{color:var(--accent);font-weight:600}
   .tf2 .bar{height:6px;background:var(--line);border-radius:3px;
     position:relative}
   .tf2 .bar i{position:absolute;top:0;bottom:0;border-radius:3px}
@@ -5063,7 +5118,7 @@ DASHBOARD = """<!doctype html>
         to trade from. <b>Nothing here places an order.</b></div>
 
       <div class="conbar">
-        <label>candle <select id="sInt" onchange="loadSuggest()">
+        <label>candle <select id="sInt" onchange="chartTfChanged()">
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></select></label>
         <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
@@ -5233,7 +5288,7 @@ bars">ppo</button>
         <b>inverts</b> flow: heavy buying that is not moving price is a bearish
         reading, not a bullish one.</div>
       <div class="conbar">
-        <label>candle <select id="rInt" onchange="loadRead()">
+        <label>candle <select id="rInt" onchange="readTfChanged()">
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></select></label>
         <label>higher TF <select id="rHigh" onchange="loadRead()">
@@ -5244,6 +5299,10 @@ bars">ppo</button>
           <option value="0">off</option><option value="0.6">60%</option>
           <option value="0.7">70%</option><option value="0.8" selected>80%</option>
           <option value="0.9">90%</option></select> confidence</label>
+        <label title="The read follows the chart's timeframe. Trading the
+15m means reading the 15m, and two selectors on one screen is a way to end
+up reading one timeframe while looking at another."><input type="checkbox"
+          id="rFollow" checked onchange="followChartTf()"> follow chart</label>
         <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
           poll 10s</label>
         <label>book window <select id="bkWin" onchange="loadBookCall()">
@@ -7113,8 +7172,7 @@ function readHalf(t) {
      minute came out reading UP. */
   if (t.forming)
     return '<span class="who wide thin">FORMING</span>'
-         + '<span class="meta thin">' + (t.move_bps >= 0 ? '+' : '')
-         + t.move_bps.toFixed(2) + 'bps'
+         + '<span class="meta thin">' + moveText(t)
          + (t.seeded === false ? ' · open not seen' : '')
          + ' · ' + (t.trades || 0) + ' fills' + tfAge(t) + '</span>';
   const w = Math.round(Math.abs(t.signed) * 50);
@@ -7126,13 +7184,37 @@ function readHalf(t) {
        + t.winner.toUpperCase() + '</span>'
        + '<span class="bar"><i class="' + t.winner + '" style="width:'
        + w + '%"></i></span>'
-       + '<span class="meta">' + (t.move_bps >= 0 ? '+' : '')
-       + t.move_bps.toFixed(2) + 'bps'
-       + (t.absorbing ? ' · absorbed <' + (t.flat_bps || 0).toFixed(2)
-                      : '')
-       + (t.learned === false ? ' · <span class="thin">prior band</span>'
-                              : '')
+       + '<span class="meta">' + moveText(t)
+       + (t.absorbing ? ' · absorbed' : '')
+       + (t.learned === false ? ' · <span class="thin">prior</span>' : '')
        + (t.measured ? '' : ' · inferred') + tfAge(t) + '</span>';
+}
+
+/* The move, in the unit this market is traded in, AND which way it is
+   going.
+
+   Basis points are the right thing to compute in and the wrong thing to
+   read: nobody watching an index perp thinks in bps, they think in points.
+   The conversion happens here, at the edge, so every threshold underneath
+   stays comparable across markets.
+
+   The second half is the part that was missing entirely. +3t rising and
+   +3t falling are the same number and opposite situations, and the panel
+   only ever showed the number. `ext` is the move growing, `back` is it
+   being given back, and the figure after it is by how much over the last
+   few seconds. */
+function moveText(t) {
+  const u = t.travel, lab = (u && u.unit) || 't';
+  const n = (t.move_units == null) ? null : t.move_units;
+  const head = n == null
+    ? ((t.move_bps >= 0 ? '+' : '') + t.move_bps.toFixed(2) + 'bps')
+    : ((n >= 0 ? '+' : '') + n.toFixed(1) + lab);
+  if (!u || !u.enough) return head;
+  if (u.state === 'flat') return head + ' <span class="thin">flat</span>';
+  const word = u.state === 'extending' ? 'ext' : 'back';
+  const by = Math.abs(u.extension).toFixed(1);
+  return head + ' <b class="' + (u.state === 'extending' ? 'grow' : 'fade')
+       + '">' + word + ' ' + by + '</b>';
 }
 
 function flowHalf(r) {
@@ -7217,7 +7299,8 @@ function renderLadder() {
     const t = read[n], r = flow[n], p = (r && r.pace) || {};
     return '<div class="tf2">' + fuelCell(n, t && t.volume)
          + '<div class="half ' + (t ? t.winner : '') + '" title="'
-         + esc((t && t.describe) || 'no candle read on this timeframe')
+         + esc(((t && t.describe) || 'no candle read on this timeframe')
+               + (t && t.travel ? ' | ' + t.travel.describe : ''))
          + '">' + readHalf(t) + '</div>'
          + '<div class="half ' + (r && r.covered ? r.side : '')
          + '" title="' + esc(p.note || 'no order flow on this timeframe')
@@ -7470,6 +7553,37 @@ function flowNum(n) {
           : a >= 1e3 ? (n / 1e3).toFixed(0) + 'k'
           : n.toFixed(0);
   return (n > 0 ? '+' : '') + s;
+}
+
+/* ---- the read follows the chart -----------------------------------------
+
+   Two candle selectors on one screen is a way to end up reading the 5m
+   while looking at the 15m and never noticing. Trading the 15m means
+   reading the 15m, so the chart leads and the read follows.
+
+   The link is a checkbox rather than a weld, because comparing one
+   timeframe's read against another chart is a real thing to want. Setting
+   the read's own selector by hand breaks the link rather than being
+   silently undone on the next chart change -- an override that gets
+   reverted is worse than no override. */
+function followChartTf() {
+  const box = $('rFollow'), chart = $('sInt'), read = $('rInt');
+  if (!box || !chart || !read) return false;
+  if (!box.checked || read.value === chart.value) return false;
+  read.value = chart.value;
+  return true;
+}
+
+function chartTfChanged() {
+  loadSuggest();
+  if (followChartTf()) loadRead();
+}
+
+function readTfChanged() {
+  const box = $('rFollow'), chart = $('sInt'), read = $('rInt');
+  if (box && box.checked && chart && read && read.value !== chart.value)
+    box.checked = false;
+  loadRead();
 }
 
 async function loadRead() {
