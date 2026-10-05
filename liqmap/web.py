@@ -4559,6 +4559,9 @@ def create_app() -> FastAPI:
             # come out differently.
             from . import layers as lyr
             from . import result as rsl
+            from . import swingcall as swc
+            from .structure import DEFAULT_SWING_STRENGTH as _SWING_STRENGTH
+            from .structure import swings as _swings
 
             lay: dict[str, Any] = {}
             try:
@@ -4609,6 +4612,20 @@ def create_app() -> FastAPI:
                     d_ = built.to_dict()
                     d_["result"] = res.to_dict()
                     lay[tf] = d_
+
+                # ---- what the next swing will be ----------------------
+                #
+                # The structural consequence of all of the above: the next
+                # pivot is the opposite kind of the last confirmed one, and
+                # the only question is which side of the prior level it
+                # lands. Built on the CHART'S candles and only on swings
+                # that were knowable, so the most recent pivot is several
+                # bars old by construction.
+                chosen = lay.get(interval) or {}
+                lead = ((chosen.get("result") or {}).get("side"))
+                out["swing"] = swc.call_next(
+                    bars, _swings(bars, strength=_SWING_STRENGTH),
+                    side=lead, strength=_SWING_STRENGTH).to_dict()
             except Exception as exc:
                 lay = {"error": f"{type(exc).__name__}: {exc}"}
             out["layers"] = lay
@@ -5529,6 +5546,7 @@ has to be running before the gate stops refusing.">spike
         where on the map it is happening. A layer that could not be
         measured says so — <b>missing is not neutral</b>.</div>
       <div id="layerResult" class="say" style="margin-bottom:10px">—</div>
+      <div id="swingCall" class="say" style="margin-bottom:10px">—</div>
       <div id="layerBody"></div>
     </div>
   </div>
@@ -7595,6 +7613,30 @@ function paintLayers(d) {
          + (nums ? '<span class="nums">' + nums + '</span>' : '')
          + '</span></div>';
   }).join('');
+  /* The structural consequence: which pivot forms next and which side of
+     the last one it lands.
+
+     SETTLED IS NOT A PREDICTION. When price has already traded through
+     the prior level, the next high is going to be a higher high whatever
+     anyone thinks -- there is nothing left to forecast, only to wait for
+     the confirmation bars. It is drawn as a statement of fact and the
+     word "predicted" is kept for the other kind. */
+  const S = (d && d.swing) || {};
+  const sw = $('swingCall');
+  if (sw) {
+    if (!S.call) {
+      sw.innerHTML = '<span class="thin">' + esc(S.why || 'no structural '
+                   + 'call') + '</span>';
+    } else {
+      sw.innerHTML =
+          '<span class="flag' + (S.settled ? '' : ' late') + '">'
+        + (S.settled ? 'ALREADY SET' : 'PREDICTED') + '</span>'
+        + '<b class="' + (S.call[0] === 'H' ? 'long' : 'short') + '">'
+        + esc(S.call) + '</b> on the next ' + esc(S.next_kind || 'swing')
+        + '<div class="thin" style="margin-top:4px">' + esc(S.describe || '')
+        + '</div>';
+    }
+  }
   const st = $('layerStamp');
   if (st) st.textContent = tf + ' · ' + (L.measured || []).length
                          + ' of 6 measured';
