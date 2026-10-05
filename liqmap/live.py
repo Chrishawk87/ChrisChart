@@ -286,6 +286,12 @@ class LiveFeed:
         from .bookread import BookReader
         self.reader = BookReader()
 
+        # Layer four: what the resting book is DOING. Keyed by absolute
+        # price, because indexing from the touch turns every price move
+        # into a report of liquidity vanishing.
+        from .dom import DomWatch
+        self.dom = DomWatch()
+
         # Impact baseline, learned from this market's own tape. Without a
         # scale, "ten million of buying" means nothing -- it is enormous at
         # 3am and unremarkable at the open.
@@ -573,6 +579,11 @@ class LiveFeed:
             self.book = b
             self.book_updates += 1
             self.reader.add(b, now=time.time())
+            # And the ladder by absolute price, sampled rather than kept
+            # per push. The reader above keeps the touch; this keeps the
+            # depth, which is what stacking, pulling and migration are
+            # questions about.
+            self.dom.add(b, now=time.time())
             # Keep a short history of the spread and the imbalance. A single
             # snapshot says what the book looks like; the series says what is
             # happening to it, which is the part you can trade. A spread
