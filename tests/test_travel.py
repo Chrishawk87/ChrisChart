@@ -242,22 +242,30 @@ def _src():
     return inspect.getsource(w)
 
 
-def test_the_row_shows_which_way_the_number_is_going():
-    """The whole complaint: the panel showed what the move was and never
-    whether it was rising or falling."""
+def test_the_row_keeps_bps_as_the_reading():
+    """I replaced the bps figure with ticks and an extending/retracing
+    word, and the row got worse and read wrong. bps is what every
+    threshold in this project is expressed in and what makes two markets
+    comparable; the tick count is an addition beside it, never a swap.
+
+    This test exists so that mistake cannot be made twice.
+    """
     src = _src()
     fn = src[src.index("function moveText(t) {"):]
     fn = fn[:fn.index("\n}")]
-    assert "u.state" in fn
-    assert "'ext'" in fn and "'back'" in fn
-    assert "u.extension" in fn, "the row says the direction but not by how much"
+    assert "toFixed(2) + 'bps'" in fn, "bps stopped being the reading"
+    assert "t.move_units" in fn, "the tick count is not beside it"
+    for gone in ("'ext'", "'back'", "u.state", "u.extension"):
+        assert gone not in fn, (
+            "the direction-of-travel wording is back on the row")
 
 
-def test_a_move_with_too_few_reads_behind_it_shows_no_direction():
+def test_the_tick_count_is_the_same_move_not_a_different_one():
+    """It is the bps figure converted, so the two can never disagree."""
     src = _src()
-    fn = src[src.index("function moveText(t) {"):]
-    fn = fn[:fn.index("\n}")]
-    assert "u.enough" in fn
+    i = src.index('"move_units"')
+    assert "unit.of(r.last_px - r.open_px)" in src[i:i + 80]
+    assert '"unit_label"' in src
 
 
 def test_the_route_records_the_move_before_reading_the_trend():

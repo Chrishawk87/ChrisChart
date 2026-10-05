@@ -4507,6 +4507,7 @@ def create_app() -> FastAPI:
                 # The move in the market's own unit, so the row can show
                 # ticks, points or pips instead of basis points.
                 "move_units": unit.of(r.last_px - r.open_px),
+                "unit_label": unit.label,
                 "flat_units": unit.from_bps(r.flat_band, r.last_px),
                 "describe": r.describe(),
             } for r in conf.ordered]
@@ -5001,11 +5002,6 @@ DASHBOARD = """<!doctype html>
      takes that room rather than wrapping "NOT COVERED" onto two lines
      and making the empty row the tallest one on the ladder. */
   .tf2 .who.wide{grid-column:1/3;white-space:nowrap}
-  /* The move's direction of travel. Not coloured by side -- the row's
-     left edge already carries that -- but by whether the move is growing
-     or being given back, which is the thing the panel never said. */
-  .tf2 .meta b.grow{color:var(--ink);font-weight:600}
-  .tf2 .meta b.fade{color:var(--accent);font-weight:600}
   .tf2 .bar{height:6px;background:var(--line);border-radius:3px;
     position:relative}
   .tf2 .bar i{position:absolute;top:0;bottom:0;border-radius:3px}
@@ -7185,36 +7181,32 @@ function readHalf(t) {
        + '<span class="bar"><i class="' + t.winner + '" style="width:'
        + w + '%"></i></span>'
        + '<span class="meta">' + moveText(t)
-       + (t.absorbing ? ' · absorbed' : '')
-       + (t.learned === false ? ' · <span class="thin">prior</span>' : '')
+       + (t.absorbing ? ' · absorbed <' + (t.flat_bps || 0).toFixed(2)
+                      : '')
+       + (t.learned === false ? ' · <span class="thin">prior band</span>'
+                              : '')
        + (t.measured ? '' : ' · inferred') + tfAge(t) + '</span>';
 }
 
-/* The move, in the unit this market is traded in, AND which way it is
-   going.
+/* The move on the candle, in bps, with the same move in the market's own
+   increment beside it.
 
-   Basis points are the right thing to compute in and the wrong thing to
-   read: nobody watching an index perp thinks in bps, they think in points.
-   The conversion happens here, at the edge, so every threshold underneath
-   stays comparable across markets.
+   THE BPS FIGURE IS THE READING. It is what every threshold in this
+   project is expressed in, it is what makes a one-minute bar on a $4
+   token comparable with a four-hour bar on a $100k one, and it is what
+   was on this row for every version of this panel that worked.
 
-   The second half is the part that was missing entirely. +3t rising and
-   +3t falling are the same number and opposite situations, and the panel
-   only ever showed the number. `ext` is the move growing, `back` is it
-   being given back, and the figure after it is by how much over the last
-   few seconds. */
+   The tick count is an ADDITION, not a replacement. Reading 2.6 ticks on
+   the 1m against 9.1 on the 5m is a comparison you can make at a glance;
+   doing it from -0.34bps against -1.18bps is arithmetic. Swapping one for
+   the other -- which is what I did first -- threw away the figure that
+   was doing the work to show the one that reads more easily. */
 function moveText(t) {
-  const u = t.travel, lab = (u && u.unit) || 't';
-  const n = (t.move_units == null) ? null : t.move_units;
-  const head = n == null
-    ? ((t.move_bps >= 0 ? '+' : '') + t.move_bps.toFixed(2) + 'bps')
-    : ((n >= 0 ? '+' : '') + n.toFixed(1) + lab);
-  if (!u || !u.enough) return head;
-  if (u.state === 'flat') return head + ' <span class="thin">flat</span>';
-  const word = u.state === 'extending' ? 'ext' : 'back';
-  const by = Math.abs(u.extension).toFixed(1);
-  return head + ' <b class="' + (u.state === 'extending' ? 'grow' : 'fade')
-       + '">' + word + ' ' + by + '</b>';
+  const head = (t.move_bps >= 0 ? '+' : '') + t.move_bps.toFixed(2) + 'bps';
+  const n = t.move_units, u = t.unit_label || 't';
+  if (n == null || !isFinite(n)) return head;
+  return head + ' <span class="thin">(' + (n >= 0 ? '+' : '')
+       + n.toFixed(Math.abs(n) >= 10 ? 0 : 1) + u + ')</span>';
 }
 
 function flowHalf(r) {
@@ -7299,8 +7291,7 @@ function renderLadder() {
     const t = read[n], r = flow[n], p = (r && r.pace) || {};
     return '<div class="tf2">' + fuelCell(n, t && t.volume)
          + '<div class="half ' + (t ? t.winner : '') + '" title="'
-         + esc(((t && t.describe) || 'no candle read on this timeframe')
-               + (t && t.travel ? ' | ' + t.travel.describe : ''))
+         + esc((t && t.describe) || 'no candle read on this timeframe')
          + '">' + readHalf(t) + '</div>'
          + '<div class="half ' + (r && r.covered ? r.side : '')
          + '" title="' + esc(p.note || 'no order flow on this timeframe')
