@@ -29,19 +29,21 @@ quiet to vote prints nothing, which is the whole point: the 1m sitting at
 -0.52 when the bar is 1.0 means there is no trade, not that the 1m is
 neutral about it.
 
-THE THRESHOLD SCALES, AND IT HAS TO
+ONE BAR, THE SAME ON EVERY TIMEFRAME
 
-One bar of this project's history is the argument for it. A fixed 2bps
-band for "price did not move" was applied to every timeframe at once and
-inverted most of the ladder, because 2bps is a large minute and a
-motionless four hours. The same mistake is available here: 1.0bps is a
-real move on a one-minute bar and noise on a four-hour one, so a flat
-threshold would let the slow rows wave every set through.
+1.0bps past zero either way, everywhere. This module OBSERVES: it is
+handed the move already on the row and one number to compare it against,
+and nothing else reaches it, so nothing else can quietly start mattering.
 
-So the bar is 1.0 on the ONE-MINUTE bar and scales by how far bars of
-each length actually travel in this market -- the same figure the flat
-band learns. With nothing learned yet it falls back to the square root of
-the interval, which is how a random walk's distance grows.
+A version that scaled the bar per timeframe shipped once and was wrong.
+The general argument for scaling is sound -- a fixed band for "price did
+not move" inverted this whole panel a few days ago -- but it fails here,
+and only the real numbers show why. These moves are all small: a
+four-hour bar reading -3.4bps is a quiet four hours, so scaled against
+how far four-hour bars normally travel its bar landed near 18bps. Every
+row abstained, every set went quiet, and the ladder printed nothing at
+all. Scaling answers "is this bar big for its length"; the question here
+is "is there a real move on the screen", which is a different one.
 
 NOTHING HERE PLACES, SIZES OR TIMES AN ORDER. It prints a word.
 """
@@ -60,10 +62,9 @@ CONFIRMERS: dict[str, tuple[str, ...]] = {
     "4h": ("15m", "1h", "4h"),
 }
 
-# The bar a ONE-MINUTE bar has to clear, in bps. Every other timeframe's
-# threshold is this scaled up.
+# The bar every timeframe has to clear, in bps. One number, applied to the
+# move already on the row.
 BASE_BPS = 1.0
-ANCHOR_S = 60.0
 
 Side = Literal["buy", "sell"]
 
@@ -78,7 +79,6 @@ class Vote:
     threshold: float = BASE_BPS
     side: Side | None = None
     present: bool = True
-    scaled: bool = False        # threshold learned rather than assumed
 
     @property
     def abstains(self) -> bool:
@@ -97,7 +97,7 @@ class Vote:
         return {"timeframe": self.timeframe, "bps": round(self.bps, 3),
                 "threshold": round(self.threshold, 3), "side": self.side,
                 "present": self.present, "abstains": self.abstains,
-                "scaled": self.scaled, "describe": self.describe()}
+                "describe": self.describe()}
 
 
 @dataclass
@@ -119,50 +119,44 @@ class Verdict:
                 "votes": [v.to_dict() for v in self.votes]}
 
 
-def threshold_for(interval_s: float, typical_bps: float = 0.0,
-                  anchor_typical: float = 0.0, base: float = BASE_BPS,
-                  anchor_s: float = ANCHOR_S) -> tuple[float, bool]:
-    """The bar this timeframe has to clear, and whether it was learned.
+def threshold_for(interval_s: float = 0.0,
+                  base: float = BASE_BPS) -> float:
+    """The bar a timeframe has to clear: the same number on all of them.
 
-    Anchored on the one-minute so that `base` means exactly what it says
-    there, and scaled by how far bars of this length actually move here.
-    Falls back to the square root of the interval, which is how far a
-    random walk gets in a longer stretch of time.
+    THE SAME NUMBER IS THE POINT. This module observes the bps already on
+    the row and applies one rule to it -- past the bar one way is a sell,
+    past it the other is a buy, inside it is no vote. Nothing is scaled,
+    weighted or adjusted per timeframe.
 
-    Never below `base`. A slower bar that happens to have been quieter
-    than the minute lately must not become the EASIEST row to satisfy --
-    that would let the slowest timeframe, the one with the most weight in
-    the stack, be waved through on the least evidence.
+    A scaled version of this existed for one delivery and was wrong, in a
+    way only the real numbers showed. These moves are all small: a
+    four-hour bar reading -3.4bps is a quiet four hours, so scaled against
+    how far four-hour bars normally travel its bar landed near 18bps and
+    it could never vote. Every row abstained, every set went quiet, and
+    the ladder printed nothing at all.
+
+    `interval_s` is accepted and unused, so that a caller reading this
+    cannot be left wondering whether the timeframe secretly matters here.
+    It does not.
     """
-    if typical_bps > 0 and anchor_typical > 0:
-        out = base * (typical_bps / anchor_typical)
-        learned = True
-    elif interval_s > 0 and anchor_s > 0:
-        out = base * (interval_s / anchor_s) ** 0.5
-        learned = False
-    else:
-        return base, False
-    if interval_s >= anchor_s:
-        out = max(base, out)
-    return out, learned
+    return base
 
 
 def vote_on(timeframe: str, interval_s: float, bps: float,
-            typical_bps: float = 0.0, anchor_typical: float = 0.0,
             base: float = BASE_BPS) -> Vote:
     """Which way this timeframe votes, from the SIGN of its move.
 
     Not from the winning side: `pressure` inverts that on absorption, so a
     bar can read BUYERS while price is down, and here the move decides.
     """
-    t, learned = threshold_for(interval_s, typical_bps, anchor_typical, base)
+    t = threshold_for(interval_s, base)
     side: Side | None = None
     if bps >= t:
         side = "buy"
     elif bps <= -t:
         side = "sell"
     return Vote(timeframe=timeframe, interval_s=interval_s, bps=bps,
-                threshold=t, side=side, present=True, scaled=learned)
+                threshold=t, side=side, present=True)
 
 
 def verdict_for(timeframe: str, votes: dict[str, Vote]) -> Verdict:
@@ -212,20 +206,13 @@ class Row:
     timeframe: str
     interval_s: float
     bps: float
-    typical_bps: float = 0.0
 
 
-def read(rows: Sequence[Row], base: float = BASE_BPS,
-         anchor: str = "1m") -> dict:
+def read(rows: Sequence[Row], base: float = BASE_BPS) -> dict:
     """Every timeframe's vote, and the verdict for the ones that print."""
-    by_tf = {r.timeframe: r for r in rows}
-    anchor_row = by_tf.get(anchor)
-    anchor_typical = anchor_row.typical_bps if anchor_row else 0.0
-
-    votes = {r.timeframe: vote_on(r.timeframe, r.interval_s, r.bps,
-                                  r.typical_bps, anchor_typical, base)
+    votes = {r.timeframe: vote_on(r.timeframe, r.interval_s, r.bps, base)
              for r in rows}
     verdicts = {tf: verdict_for(tf, votes) for tf in CONFIRMERS}
-    return {"base_bps": base, "anchor": anchor,
+    return {"base_bps": base,
             "votes": {k: v.to_dict() for k, v in votes.items()},
             "verdicts": {k: v.to_dict() for k, v in verdicts.items()}}

@@ -4468,7 +4468,7 @@ def create_app() -> FastAPI:
             try:
                 out["stack"] = stk.read(
                     [stk.Row(timeframe=p.timeframe, interval_s=p.interval_s,
-                             bps=p.move_bps, typical_bps=p.typical_bps)
+                             bps=p.move_bps)
                      for p in readings],
                     base=max(0.01, float(vote_bps)))
             except Exception as exc:

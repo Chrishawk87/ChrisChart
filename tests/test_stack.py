@@ -32,15 +32,12 @@ from liqmap import stack as st
 
 
 def rows(**kw):
-    """Timeframes as (bps, typical_bps), defaulting typical to a flat scale."""
+    """Timeframes as the bps already on their row. Nothing else reaches
+    this module, so nothing else can quietly start mattering."""
     secs = {"1m": 60.0, "5m": 300.0, "15m": 900.0, "1h": 3600.0,
             "4h": 14400.0}
-    out = []
-    for tf, v in kw.items():
-        bps, typ = v if isinstance(v, tuple) else (v, 0.0)
-        out.append(st.Row(timeframe=tf, interval_s=secs[tf], bps=bps,
-                          typical_bps=typ))
-    return out
+    return [st.Row(timeframe=tf, interval_s=secs[tf], bps=float(bps))
+            for tf, bps in kw.items()]
 
 
 def side(d, tf):
@@ -123,10 +120,10 @@ def test_a_small_positive_move_is_not_a_buy_either():
 
 
 def test_a_move_that_barely_misses_in_either_direction_abstains():
-    assert st.vote_on("15m", 900.0, bps=+3.8).side is None
-    assert st.vote_on("15m", 900.0, bps=-3.8).side is None
-    assert st.vote_on("15m", 900.0, bps=+3.9).side == "buy"
-    assert st.vote_on("15m", 900.0, bps=-3.9).side == "sell"
+    assert st.vote_on("15m", 900.0, bps=+0.9).side is None
+    assert st.vote_on("15m", 900.0, bps=-0.9).side is None
+    assert st.vote_on("15m", 900.0, bps=+1.1).side == "buy"
+    assert st.vote_on("15m", 900.0, bps=-1.1).side == "sell"
 
 
 def test_exactly_at_the_bar_counts():
@@ -161,61 +158,44 @@ def test_the_sign_of_the_move_decides_not_the_winning_side():
 
 # --------------------------------------------------------- the threshold
 
-def test_a_slower_timeframe_has_a_higher_bar():
-    """1.0bps is a real move on a minute and noise on four hours. A flat
-    bar would let the slowest row -- the one carrying the most weight in
-    the stack -- be waved through on the least evidence."""
-    m1, _ = st.threshold_for(60.0)
-    m15, _ = st.threshold_for(900.0)
-    h4, _ = st.threshold_for(14400.0)
-    assert m1 < m15 < h4
+def test_the_bar_is_the_same_on_every_timeframe_by_default():
+    """FLAT IS THE DEFAULT, and it is not the obvious choice.
+
+    Everywhere else here, a fixed bps threshold across timeframes has been
+    a bug. It is right in this one place, and only the real numbers show
+    why: these moves are all small. A four-hour at -3.4bps is a quiet four
+    hours, so scaled against how far four-hour bars normally travel its
+    bar lands near 18bps and it can never vote -- every row abstains and
+    the ladder prints nothing, ever.
+    """
+    assert st.threshold_for(60.0) == st.threshold_for(14400.0)
+    assert st.threshold_for(14400.0) == pytest.approx(st.BASE_BPS)
+
+
+def test_the_module_never_sees_a_per_timeframe_yardstick():
+    """Observation only: it is handed the bps that is already on the row
+    and one number to compare it against."""
+    import inspect
+
+    src = inspect.getsource(st)
+    body = "\n".join(ln for ln in src.split("\n")
+                     if not ln.strip().startswith("#"))
+    for gone in ("typical_bps", "anchor_typical", "scale=", "** 0.5"):
+        assert gone not in body
+
+
+def test_the_four_hour_in_chriss_own_screenshot_can_actually_vote():
+    """-3.42bps on the 4h, -1.31 on the 1h. Those are the numbers on the
+    screen, and a bar they cannot reach is a panel that never speaks."""
+    assert st.vote_on("4h", 14400.0, bps=-3.42).side == "sell"
+    assert st.vote_on("1h", 3600.0, bps=-1.31).side == "sell"
+    assert st.vote_on("15m", 900.0, bps=-0.64).side is None
 
 
 def test_the_minute_sits_exactly_on_the_number_you_set():
-    t, _ = st.threshold_for(60.0, base=1.0)
-    assert t == pytest.approx(1.0)
-    t2, _ = st.threshold_for(60.0, base=2.5)
-    assert t2 == pytest.approx(2.5)
+    assert st.threshold_for(60.0, base=1.0) == pytest.approx(1.0)
+    assert st.threshold_for(900.0, base=2.5) == pytest.approx(2.5)
 
-
-def test_the_bar_is_learned_from_this_market_where_it_can_be():
-    """Scaled by how far bars of each length actually travel here, which
-    is the same figure the flat band learns."""
-    calm, learned_c = st.threshold_for(900.0, typical_bps=2.0,
-                                       anchor_typical=1.0)
-    wild, learned_w = st.threshold_for(900.0, typical_bps=20.0,
-                                       anchor_typical=1.0)
-    assert learned_c and learned_w
-    assert wild > calm
-    assert calm == pytest.approx(2.0)
-
-
-def test_with_nothing_learned_it_falls_back_to_the_square_root():
-    t, learned = st.threshold_for(900.0)
-    assert not learned
-    assert t == pytest.approx(1.0 * (900.0 / 60.0) ** 0.5, rel=0.01)
-
-
-def test_a_quiet_slow_bar_never_becomes_the_easiest_row():
-    """A four-hour that has been unusually still must not end up with a
-    LOWER bar than the minute. It carries the most weight in the stack and
-    would be waved through on the least evidence."""
-    t, _ = st.threshold_for(14400.0, typical_bps=0.2, anchor_typical=5.0)
-    assert t >= st.BASE_BPS
-
-
-def test_the_scaling_uses_the_minute_as_its_anchor():
-    d = st.read(rows(**{"1m": (-2.0, 1.0), "5m": (-4.0, 3.0)}))
-    assert d["votes"]["5m"]["threshold"] == pytest.approx(3.0)
-    assert d["votes"]["5m"]["scaled"]
-
-
-def test_a_row_says_whether_its_bar_was_learned_or_assumed():
-    d = st.read(rows(**{"1m": -2.0, "5m": -4.0}))
-    assert not d["votes"]["5m"]["scaled"]
-
-
-# ---------------------------------------------------------------- reporting
 
 def test_every_verdict_says_what_it_took_or_what_stopped_it():
     d = st.read(rows(**{"1m": -0.2, "5m": -4.0, "15m": -9.0}))
@@ -292,7 +272,6 @@ def test_the_route_feeds_the_ladder_the_move_and_not_the_winner():
     block = src[src.index("out[\"stack\"] = stk.read("):]
     block = block[:block.index("paces: dict[str, Any] = {}")]
     assert "bps=p.move_bps" in block
-    assert "typical_bps=p.typical_bps" in block
     assert "winner" not in block
 
 
@@ -320,3 +299,4 @@ def test_every_row_carries_its_own_verdict_and_vote():
     block = block[:block.index('out["confrontation"]')]
     assert '"verdict":' in block and '"vote":' in block
     assert '.get("verdicts")' in block and '.get("votes")' in block
+
