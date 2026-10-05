@@ -8,6 +8,30 @@ just want to see it running; switch to GitHub when you start changing things.
 
 ---
 
+## Shipping a change: `./ship.sh`
+
+Once the GitHub route below is set up, this is the whole loop:
+
+```bash
+cd ~/Downloads/chrischart
+./ship.sh ~/Downloads/whatever-was-delivered.zip "what changed"
+```
+
+It unpacks the zip over the repo, shows what changed, refuses to commit
+anything that looks like a secret or a database or market data, runs the
+tests, commits and pushes. Railway builds from GitHub, so the deploy starts
+on its own.
+
+The two flags worth knowing: `--dry-run` unpacks and tests without
+committing, and `--no-push` commits but leaves the push to you. With no zip
+it commits whatever is already in the tree. `./ship.sh --help` has the rest.
+
+**Unpacking a zip without pushing changes nothing that is running.** That is
+the mistake this script exists to stop — the files are on your laptop, and
+Railway is still serving the last commit.
+
+---
+
 ## 0. Get it into git (both routes need this)
 
 ```bash

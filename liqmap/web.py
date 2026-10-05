@@ -81,6 +81,14 @@ MAX_UPLOAD_BARS = 250_000
 # state
 # --------------------------------------------------------------------------
 
+# How long a learned volume shape is reused before it is rebuilt, and the
+# longest bar whose shape can be cut straight from the tape. The tape holds
+# an hour, so anything past five minutes cannot supply enough completed
+# bars from it and goes to the one-minute path instead.
+CURVE_TTL_S = 120.0
+FAST_CURVE_S = 300.0
+
+
 class Runtime:
     """Shared, lazily built state. One database, reused connections."""
 
@@ -98,6 +106,10 @@ class Runtime:
         # measured against.
         self.ledger = Ledger(self.db_path)
         self._pilots: dict[tuple[str, str], Autopilot] = {}
+        # The shape of volume inside a bar, per market and timeframe. Built
+        # on a timer because the tape path walks every fill the tape holds
+        # and the dashboard polls several times a minute.
+        self._curves: dict[tuple[str, str], tuple[float, Any]] = {}
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -567,6 +579,85 @@ class Runtime:
                 self.barflow.prune()
         except Exception:
             pass
+
+    def minute_rows(self, coin: str, want: int) -> list[BarFlow]:
+        """Recent one-minute bars, from the database and from this feed.
+
+        Both, for the same reason the CVD reads both: the database has
+        what previous runs wrote and the feed has what this one has
+        counted since it connected. The feed wins on a bar both hold.
+        """
+        try:
+            rows = {float(r.bar_ts): r for r in
+                    self.barflow.recent(coin, "1m", bars=want)}
+        except Exception:
+            rows = {}
+        feed = self.feed_for(coin)
+        if feed is not None:
+            for c in feed.closed_candles("1m", back=want):
+                if not getattr(c, "flow_measured", False):
+                    continue
+                rows[float(c.start_ts)] = BarFlow(
+                    coin=coin, timeframe="1m", bar_ts=float(c.start_ts),
+                    buy=float(c.buy_notional), sell=float(c.sell_notional),
+                    trades=int(c.trades), volume=float(c.volume),
+                    open_px=float(c.open), close_px=float(c.close))
+        return [rows[k] for k in sorted(rows)]
+
+    def volume_curve(self, coin: str, timeframe: str, interval_s: float):
+        """The shape of volume inside a bar of this timeframe, cached.
+
+        Rebuilt on a timer rather than per request: the tape path walks
+        every fill the tape holds, and the dashboard polls this several
+        times a minute across five timeframes. The shape of a market's
+        bars does not change between two polls.
+        """
+        key = (coin, timeframe)
+        now = time.time()
+        hit = self._curves.get(key)
+        if hit is not None and (now - hit[0]) < CURVE_TTL_S:
+            return hit[1]
+        curve = self._build_curve(coin, timeframe, interval_s, now)
+        self._curves[key] = (now, curve)
+        return curve
+
+    def _build_curve(self, coin: str, timeframe: str, interval_s: float,
+                     now: float):
+        from . import vpace as _vp
+
+        # FAST BARS -- straight off the fills. Nothing finer than a
+        # one-minute bar is stored anywhere, but the fills themselves are
+        # finer than any bar and an hour of them is in the tape.
+        feed = self.feed_for(coin)
+        if feed is not None and 0 < interval_s <= FAST_CURVE_S:
+            try:
+                sliced = _vp.slices_from_tape(
+                    getattr(feed.tape, "_trades", []), interval_s, now=now)
+                c = _vp.curve_from_bars(timeframe, interval_s, sliced,
+                                        source="tape")
+                if c.learned:
+                    return c
+            except Exception:
+                pass
+
+        # SLOW BARS -- from the one-minute bars inside them, which are
+        # already being written down as they close.
+        n = _vp.minute_slices(interval_s)
+        if n:
+            per_bar = max(1, int(round(interval_s / 60.0)))
+            want = per_bar * (_vp.MIN_CURVE_BARS + 6)
+            try:
+                rows = self.minute_rows(coin, want)
+                c = _vp.curve_from_bars(
+                    timeframe, interval_s,
+                    _vp.slices_from_minutes(rows, interval_s, n),
+                    source="bars")
+                if c.learned:
+                    return c
+            except Exception:
+                pass
+
+        return _vp.even_curve(timeframe, interval_s)
 
     def bar_cvd(self, coin: str, timeframe: str, interval_s: float,
                 bar_open: float, bars: int):
@@ -4248,6 +4339,10 @@ def create_app() -> FastAPI:
             # disagrees with you, and the two call for opposite reactions.
             ages: dict[str, float] = {}
             srcs: dict[str, str] = {}
+            # Kept per timeframe so the volume read below has the same bars
+            # the direction read was built from, rather than fetching them
+            # a second time and possibly getting a different slice.
+            tf_hist: dict[str, Any] = {}
             for tf in want:
                 iv = float(client.INTERVALS[tf])
                 bar = feed.candle(tf) if (use_feed and feed) else None
@@ -4263,6 +4358,7 @@ def create_app() -> FastAPI:
                     readings.append(pr.from_live(
                         tf, iv, bar, book, coverage=max(cov, 0.05),
                         history=feed.history(tf)))
+                    tf_hist[tf] = feed.history(tf)
                     ages[tf] = round(max(0.0, feed.age), 1)
                     srcs[tf] = "tape"
                     continue
@@ -4279,6 +4375,7 @@ def create_app() -> FastAPI:
                 # A polled bar is as old as the moment it was last written,
                 # which for a closed bar is however long ago it closed.
                 last_ts = float(getattr(tf_bars[-1], "ts", 0.0) or 0.0)
+                tf_hist[tf] = list(tf_bars)
                 ages[tf] = round(max(0.0, now_s - last_ts), 1)
                 srcs[tf] = "polled"
                 # Aggregate the recent bars rather than reading only the one
@@ -4302,6 +4399,40 @@ def create_app() -> FastAPI:
                     readings.append(r_)
 
             conf = pr.confront(readings)
+
+            # ---- has this bar got the volume to move --------------------
+            #
+            # Direction says which way the bar wants to go; this says
+            # whether it can. Compared against what a bar of this length
+            # has normally done BY THIS POINT -- against a whole bar's
+            # volume every bar reads quiet until it is nearly over.
+            #
+            # Reported, never gating: a quiet bar about to break out would
+            # go blank exactly when it mattered.
+            from . import vpace as vpz
+
+            paces: dict[str, Any] = {}
+            for pres in readings:
+                # A reading that aggregates several bars has no pace: its
+                # volume spans a window and the shape describes one bar,
+                # and dividing one by the other would be a number rather
+                # than a measurement.
+                if pres.span_bars > 1:
+                    continue
+                try:
+                    hist = tf_hist.get(pres.timeframe) or []
+                    curve = rt.volume_curve(coin, pres.timeframe,
+                                            pres.interval_s)
+                    paces[pres.timeframe] = vpz.VolumePace(
+                        timeframe=pres.timeframe, interval_s=pres.interval_s,
+                        done=pres.total_notional,
+                        normal_full=pres.typical_notional,
+                        elapsed_s=pres.elapsed_s, range_bps=pres.range_bps,
+                        normal_range_bps=pr.typical_range(hist),
+                        curve=curve)
+                except Exception:
+                    continue
+
             out["timeframes"] = [{
                 "timeframe": r.timeframe, "winner": r.winner,
                 "aggressor": r.aggressor, "strength": r.strength,
@@ -4325,6 +4456,8 @@ def create_app() -> FastAPI:
                 "typical_bps": r.typical_bps,
                 "forming": r.forming, "pressing": r.pressing,
                 "seeded": r.seeded,
+                "volume": (paces[r.timeframe].to_dict()
+                           if r.timeframe in paces else None),
                 "describe": r.describe(),
             } for r in conf.ordered]
             out["confrontation"] = {
@@ -4791,10 +4924,23 @@ DASHBOARD = """<!doctype html>
      It replaced two single-sided ladders, and their `.tf` rule went with
      them rather than being left behind as dead styling for the next
      person to half-remember. */
-  .tf2{display:grid;grid-template-columns:46px 1fr 1fr;gap:10px;
+  .tf2{display:grid;grid-template-columns:72px 1fr 1fr;gap:10px;
     align-items:stretch;margin-bottom:4px;font-size:13px}
   .tf2>b{align-self:center;font-variant-numeric:tabular-nums;
     text-align:right;color:var(--dim)}
+  /* The fuel gauge sits with the timeframe rather than in either half,
+     because how much volume this candle has is a fact about the CANDLE.
+     Both reads are looking at the same bar, and putting it in one half
+     would imply it belonged to that read. */
+  .tf2>b span{display:block;font-weight:400;font-size:10px;
+    line-height:1.3;white-space:nowrap}
+  .tf2>b span span{display:inline}
+  .tf2>b i{display:block;height:3px;border-radius:2px;background:var(--line);
+    margin-top:2px;position:relative;overflow:hidden}
+  .tf2>b i::after{content:"";position:absolute;left:0;top:0;bottom:0;
+    width:var(--v,0%);background:var(--dim)}
+  .tf2>b i.heavy::after{background:var(--accent)}
+  .tf2>b i.quiet::after{background:var(--line)}
   .tf2 .half{display:grid;grid-template-columns:72px 1fr 250px;gap:8px;
     align-items:center;padding:7px 10px;border-radius:4px;
     background:var(--bg);border-left:3px solid var(--line);min-width:0}
@@ -4827,7 +4973,7 @@ DASHBOARD = """<!doctype html>
      squeezing both: a delta that has wrapped to three lines is worse than
      a delta on the next row. */
   @media (max-width:980px){
-    .tf2{grid-template-columns:46px 1fr;row-gap:2px;margin-bottom:10px}
+    .tf2{grid-template-columns:72px 1fr;row-gap:2px;margin-bottom:10px}
     .tf2>span,.tf2 .half{grid-column:2}
     .tf2 .half{grid-template-columns:72px 1fr 200px}
     /* Stacked, the halves are no longer side by side, so a wrapped line
@@ -7022,6 +7168,37 @@ function flowHalf(r) {
        + '</span>';
 }
 
+/* The timeframe, and whether this candle has the volume to move.
+
+   DIRECTION SAYS WHICH WAY, VOLUME SAYS WHETHER IT CAN. A bar leaning hard
+   on a tenth of its usual volume is three traders agreeing with each other;
+   the same lean on twice its usual volume is a move being paid for, and the
+   two look identical on a direction read.
+
+   The figure is the pace against what a normal bar of this length has done
+   BY THIS POINT, not against a whole one -- measured against a whole bar,
+   every bar reads quiet until it is nearly over.
+
+   It is reported and never gates anything: a quiet bar about to break out
+   would go blank exactly when it mattered. */
+function fuelCell(name, v) {
+  if (!v || !v.known)
+    return '<b>' + esc(name) + '<span class="thin">vol —</span>'
+         + '<i style="--v:0%"></i></b>';
+  const x = v.projected_x || 0;
+  const cls = v.heavy ? 'heavy' : v.quiet ? 'quiet' : '';
+  /* Effort next to its result, because volume alone never answers
+     move-or-hold: the same heavy volume is a move being paid for with a
+     wide range and absorption with none. */
+  const tag = {paid_for: 'paid', absorbed: 'held', thin: 'thin',
+               no_fuel: 'none'}[v.state] || '';
+  return '<b title="' + esc(v.describe || '') + '">' + esc(name)
+       + '<span>' + x.toFixed(x < 10 ? 1 : 0) + 'x '
+       + '<span class="thin">' + tag + '</span></span>'
+       + '<i class="' + cls + '" style="--v:'
+       + Math.round(Math.min(x, 2) / 2 * 100) + '%"></i></b>';
+}
+
 function renderLadder() {
   const el = $('tfLadder');
   if (!el) return;
@@ -7038,7 +7215,7 @@ function renderLadder() {
     ? '<div class="msg err">' + esc(ladderErr) + '</div>' : '';
   el.innerHTML = err + names.map(n => {
     const t = read[n], r = flow[n], p = (r && r.pace) || {};
-    return '<div class="tf2"><b>' + esc(n) + '</b>'
+    return '<div class="tf2">' + fuelCell(n, t && t.volume)
          + '<div class="half ' + (t ? t.winner : '') + '" title="'
          + esc((t && t.describe) || 'no candle read on this timeframe')
          + '">' + readHalf(t) + '</div>'

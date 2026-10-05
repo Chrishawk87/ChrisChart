@@ -489,6 +489,20 @@ def typical(bars: Sequence[Candle],
     return _median(moves), _median(notional)
 
 
+def typical_range(bars: Sequence[Candle], back: int = TYPICAL_BARS) -> float:
+    """The median high-to-low of recent bars, in bps.
+
+    Separate from `typical`'s move figure, and they are not the same
+    thing: a bar can travel a long way and come back, so its range is
+    always at least its move and usually more. Judging whether a bar has
+    "gone anywhere" against the move median would call ordinary bars wide.
+    """
+    window = [b for b in bars[-max(1, back):] if b.open > 0 and b.high >= b.low]
+    if len(window) < MIN_TYPICAL_BARS:
+        return 0.0
+    return _median([(b.high - b.low) / b.open * 10_000.0 for b in window])
+
+
 def from_live(timeframe: str, interval_s: float, candle, book: Book | None,
               coverage: float = 1.0, history: Sequence[Candle] = ()
               ) -> Pressure:
