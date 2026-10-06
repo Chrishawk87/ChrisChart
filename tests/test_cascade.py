@@ -315,7 +315,11 @@ def test_the_panel_shows_no_call_rather_than_a_greyed_out_side():
 
 
 def test_the_panel_is_painted_on_every_read():
-    assert "  paintCascade(d);\n  paintLayers(d);" in _src()
+    """Asserts the call, not what sits next to it -- a neighbouring paint
+    being added is not this panel breaking."""
+    src = _src()
+    block = src[src.index("function paintRead(d)"):]
+    assert "paintCascade(d);" in block
 
 
 def test_the_stack_panel_does_not_live_inside_the_ladder_or_the_layers():

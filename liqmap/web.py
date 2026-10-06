@@ -93,6 +93,10 @@ POLLED_BARS = 3
 CURVE_TTL_S = 120.0
 FAST_CURVE_S = 300.0
 
+# Trajectory samples put on the wire. The trace keeps the whole bar; only
+# the tail is drawn, and the payload is polled every couple of seconds.
+_TRACE_KEEP = 40
+
 
 class Runtime:
     """Shared, lazily built state. One database, reused connections."""
@@ -129,6 +133,9 @@ class Runtime:
         # forward only when the bar actually rolls.
         self._last_state: dict[tuple[str, str], tuple[float, Any]] = {}
         self._last_aligned: dict[tuple[str, str], str] = {}
+        # How the read got where it is, per coin and traded timeframe.
+        from .trace import Tracer as _Tracer
+        self.tracer = _Tracer()
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -4710,6 +4717,31 @@ def create_app() -> FastAPI:
                                 previous=rt.last_aligned(coin, interval))
                 rt.remember_aligned(coin, interval, csc.aligned_way(casc))
                 out["cascade"] = casc.to_dict()
+
+                # ---- and how the read GOT here ---------------------
+                #
+                # A COUNT, NEVER A PROBABILITY. Seven already-published
+                # readings, each voting for or against the direction THE
+                # BAR ITSELF is going -- not the direction this engine
+                # likes, which would have the stack voting for its own
+                # opinion.
+                #
+                # The candidate comes from price, so the whole thing can
+                # disagree with the panel above it, and when it does that
+                # disagreement is the information.
+                chosen_r = next((r for r in conf.ordered
+                                 if r.timeframe == interval), None)
+                if chosen_r is not None:
+                    step_s = float(chosen_r.interval_s or 0.0)
+                    b_open = (now_s - (now_s % step_s)) if step_s > 0 else 0.0
+                    tc = rt.tracer.observe(
+                        coin, interval, b_open, step_s, ts=now_s,
+                        move_bps=chosen_r.move_bps,
+                        layers=lay.get(interval) or {},
+                        cascade=out["cascade"],
+                        volume=(paces[interval].to_dict()
+                                if interval in paces else None))
+                    out["trace"] = tc.to_dict(keep=_TRACE_KEEP)
             except Exception as exc:
                 out["cascade"] = {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -5595,7 +5627,13 @@ has to be running before the gate stops refusing.">spike
         that is what absorption looks like. Nothing above your timeframe
         takes part.</div>
       <div id="cascSay" class="say" style="margin-bottom:10px">—</div>
-      <div id="cascRows"></div>
+      <!-- The stack on the left, how the read GOT here on the right. Two
+           columns so the state and its trajectory are read together; on a
+           narrow screen they stack. -->
+      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
+        <div id="cascRows" style="flex:1 1 300px;min-width:280px"></div>
+        <div id="traceBox" style="flex:1 1 320px;min-width:300px"></div>
+      </div>
     </div>
 
     <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
@@ -7697,6 +7735,98 @@ function paintCascade(d) {
   if (st) st.textContent = C.trading ? 'trading ' + C.trading : '';
 }
 
+/* How the read got where it is.
+
+   A COUNT, NEVER A PERCENTAGE. "5 of 7 agree" is checkable against the
+   seven lines underneath it; a composited percentage is a confidence
+   score wearing a percent sign and is most convincing where it is most
+   wrong. When enough closed bars have been scored, a count maps to a hit
+   rate that was measured -- that is when it earns the percent sign. */
+const TRACE_MARK = {
+  'for':        ['✓', 'long'],
+  'against':    ['✗', 'short'],
+  'quiet':      ['·', 'thin'],
+  'unmeasured': ['–', 'thin']
+};
+
+function paintTrace(d) {
+  const el = $('traceBox');
+  if (!el) return;
+  const T = (d && d.trace) || null;
+  const N = T && T.now;
+  if (!T || !N) {
+    el.innerHTML = '<div class="msg">no trajectory on this bar yet</div>';
+    return;
+  }
+  if (!N.way) {
+    el.innerHTML = '<div class="msg">' + esc(N.describe) + '</div>';
+    return;
+  }
+  const c = T.change_60s;
+  /* null is not zero. A leg a few seconds old has no trajectory, and
+     drawing that as "holding" claims a steadiness nobody measured. */
+  const arrow = c === null || c === undefined
+      ? '<span class="thin">just started</span>'
+    : c > 0 ? '<b class="long">↑ strengthening +' + c + '</b>'
+    : c < 0 ? '<b class="short">↓ weakening ' + c + '</b>'
+    : '<span class="thin">→ holding</span>';
+
+  const rows = (N.checks || []).map(k => {
+    const m = TRACE_MARK[k.verdict] || TRACE_MARK.unmeasured;
+    return '<div style="display:flex;gap:8px;padding:3px 0;font-size:12px">'
+         + '<span class="' + m[1] + '" style="width:12px;flex:none">'
+         + m[0] + '</span>'
+         + '<b style="width:76px;flex:none">' + esc(k.name) + '</b>'
+         + '<span class="thin">' + esc(k.why) + '</span></div>';
+  }).join('');
+
+  /* The column on the left: the last handful of samples, oldest first.
+     A bar that has been building for seven minutes and one that has just
+     fallen apart look identical at the instant they cross. */
+  const S = (T.leg && T.leg.samples) || [];
+  const tail = S.slice(-8);
+  const spark = tail.map(s => {
+    const t = new Date(s.ts * 1000).toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    const w = s.counted ? Math.round(s['for'] / s.counted * 100) : 0;
+    return '<div style="display:flex;gap:8px;align-items:center;'
+         + 'font-size:11px;padding:1px 0">'
+         + '<span class="thin" style="width:62px;flex:none">' + esc(t)
+         + '</span>'
+         + '<span style="flex:1;height:5px;background:rgba(255,255,255,.07);'
+         + 'border-radius:3px;overflow:hidden"><span style="display:block;'
+         + 'height:100%;width:' + w + '%;background:#2ecc71"></span></span>'
+         + '<span class="thin" style="width:44px;flex:none;text-align:right">'
+         + s['for'] + ' of ' + s.counted + '</span></div>';
+  }).join('');
+
+  /* "0 of 0 agree with up" is accurate and reads as a case against the
+     move. Nothing was measured; say that instead. */
+  const headline = N.counted
+    ? '<b>' + N['for'] + ' of ' + N.counted + '</b> '
+      + '<span class="thin">agree with ' + esc(N.way) + '</span> ' + arrow
+    : '<b class="thin">nothing measured yet</b> '
+      + '<span class="thin">— the feed is still warming up</span>';
+  el.innerHTML =
+      '<div class="say" style="margin-bottom:8px">' + headline
+    + (N.unmeasured ? '<div class="thin" style="margin-top:3px">'
+        + N.unmeasured + ' not measured yet</div>' : '')
+    + ((T.changes && T.changes.length)
+        ? '<div class="thin" style="margin-top:3px">just changed: '
+          + esc(T.changes.join(', ')) + '</div>' : '')
+    + (T.flips ? '<div class="thin" style="margin-top:3px">crossed its open '
+        + T.flips + (T.flips === 1 ? ' time' : ' times')
+        + ' — counts before that asked a different question</div>' : '')
+    + '</div>'
+    + rows
+    + (spark ? '<div style="margin-top:8px;border-top:1px solid '
+             + 'rgba(255,255,255,.06);padding-top:6px">' + spark + '</div>'
+             : '')
+    + '<div class="thin" style="margin-top:6px;font-size:11px">A count of '
+    + 'readings that agree, not a probability — each line is one '
+    + 'measurement you can check above.</div>';
+}
+
 function paintLayers(d) {
   const el = $('layerBody'), head = $('layerResult');
   if (!el) return;
@@ -8093,6 +8223,7 @@ function paintRead(d) {
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
   paintLadder(d);
   paintCascade(d);
+  paintTrace(d);
   paintLayers(d);
   const src = (d.source || '').indexOf('websocket') === 0;
   const flags = (src ? '<span class="flag">LIVE TAPE</span>'
