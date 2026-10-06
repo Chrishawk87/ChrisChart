@@ -128,6 +128,7 @@ class Runtime:
         # knowing which way that something pointed -- and it is carried
         # forward only when the bar actually rolls.
         self._last_state: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._last_aligned: dict[tuple[str, str], str] = {}
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -633,6 +634,26 @@ class Runtime:
             self._last_state[key] = (bar_open, res, cur_res)   # it rolled
         else:
             self._last_state[key] = (cur_open, res, prev)
+
+    def last_aligned(self, coin: str, trading: str):
+        """The direction the stack beneath `trading` was last ALIGNED in.
+
+        The only thing that tells a turn apart from a trend that has been
+        running. Unlike the per-bar state above this one is deliberately
+        NOT bar-scoped: a stack that went green an hour ago is still what
+        a flip now would be flipping away from.
+        """
+        return self._last_aligned.get((coin, trading))
+
+    def remember_aligned(self, coin: str, trading: str, way) -> None:
+        """Keep it only when the whole stack agreed.
+
+        A pullback is not an alignment, and carrying one forward would
+        make the next alignment look like a reversal of something that
+        never happened.
+        """
+        if way is not None:
+            self._last_aligned[(coin, trading)] = way
 
     def minute_rows(self, coin: str, want: int) -> list[BarFlow]:
         """Recent one-minute bars, from the database and from this feed.
@@ -4668,6 +4689,30 @@ def create_app() -> FastAPI:
                 "flat_units": unit.from_bps(r.flat_band, r.last_px),
                 "describe": r.describe(),
             } for r in conf.ordered]
+            # ---- the stack beneath the timeframe being traded -----------
+            #
+            # A separate read, on purpose. The ladder above votes on the
+            # bps sign alone; this applies the stricter test -- colour AND
+            # bps have to agree -- to the trading timeframe and everything
+            # UNDER it. Nothing above takes part.
+            #
+            # Fed from the rows that are already on the screen rather than
+            # from anything recomputed, so the panel and the ladder can
+            # never disagree about what a row said.
+            try:
+                from . import cascade as csc
+
+                rows_ = {r.timeframe: (csc.colour_of(r.winner,
+                                                     forming=r.forming),
+                                       r.move_bps)
+                         for r in conf.ordered if r.measured}
+                casc = csc.read(interval, rows_,
+                                previous=rt.last_aligned(coin, interval))
+                rt.remember_aligned(coin, interval, csc.aligned_way(casc))
+                out["cascade"] = casc.to_dict()
+            except Exception as exc:
+                out["cascade"] = {"error": f"{type(exc).__name__}: {exc}"}
+
             out["confrontation"] = {
                 "aligned": conf.aligned, "conflicted": conf.conflicted,
                 "consensus": conf.consensus, "verdict": conf.verdict(),
@@ -5533,6 +5578,24 @@ has to be running before the gate stops refusing.">spike
       <div id="readSignals"></div>
       <div id="readSay" class="say" style="display:none"></div>
 
+    </div>
+
+    <!-- The stack beneath the timeframe being traded. ITS OWN PANEL and
+         its own rule: the ladder above votes on the bps sign alone, this
+         requires the colour AND the bps to agree. Reads the same rows. -->
+    <div class="panel full" id="stackPanel"><h2>The stack under your
+      timeframe<span class="stamp" id="cascStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">A one-minute candle builds
+        a fifteen from the ground up, so the rows below the one you are
+        trading are not separate opinions — they are your candle being
+        built in front of you. A row counts <b>up</b> only if it is green
+        <i>and</i> its move is positive, <b>down</b> only if red
+        <i>and</i> negative. A green row with a negative move is not a
+        weak buy, it is a row contradicting itself, and it is thrown out —
+        that is what absorption looks like. Nothing above your timeframe
+        takes part.</div>
+      <div id="cascSay" class="say" style="margin-bottom:10px">—</div>
+      <div id="cascRows"></div>
     </div>
 
     <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
@@ -7564,6 +7627,76 @@ function layerNums(name, L) {
   return '';
 }
 
+/* The stack beneath the timeframe being traded.
+
+   Drawn from the server's reading rather than re-decided here: the page
+   shows which rows qualified and which were thrown out, so a verdict can
+   be argued with on the screen instead of taken on faith. */
+const CASC_WORD = {
+  trend:     ['flag',      'the whole stack agrees'],
+  reversal:  ['flag late', 'it has flipped'],
+  pullback:  ['flag late', 'against the trend, not with it'],
+  no_commit: ['flag',      'nothing is committed'],
+  mixed:     ['flag',      'nothing is committed'],
+  unread:    ['flag',      'not enough to read']
+};
+
+function paintCascade(d) {
+  const el = $('cascRows'), head = $('cascSay');
+  if (!el) return;
+  const C = (d && d.cascade) || {};
+  if (C.error) {
+    el.innerHTML = '<div class="msg err">' + esc(C.error) + '</div>';
+    if (head) head.innerHTML = '—';
+    return;
+  }
+  const w = CASC_WORD[C.state] || CASC_WORD.unread;
+  /* A SIDE ONLY WHERE THERE IS ONE. A pullback is the stack mid-argument
+     and hands out nothing; drawing a greyed-out BUY there would read as a
+     weak buy rather than as no call at all. */
+  const side = C.side
+    ? '<b class="' + (C.side === 'buy' ? 'long' : 'short') + '">'
+      + C.side.toUpperCase() + '</b>'
+    : '<span class="thin">no call</span>';
+  if (head) {
+    head.innerHTML =
+        '<span class="' + w[0] + '">'
+      + esc((C.state || 'unread').replace(/_/g, ' ').toUpperCase())
+      + '</span>' + side
+      + '<div class="thin" style="margin-top:4px">' + esc(C.describe || '')
+      + '</div>'
+      + '<div class="thin" style="margin-top:2px">' + esc(w[1]) + '</div>';
+  }
+  el.innerHTML = (C.rungs || []).map((r, i) => {
+    const traded = i === 0;
+    /* Thrown out is not the same as silent, and the two have to look
+       different -- a row fighting its own number is the one worth
+       looking at. */
+    const mark = !r.present ? '<span class="thin">not read</span>'
+      : r.conflicted
+        ? '<span class="flag late">THROWN OUT</span>'
+      : r.qualified === 'up'   ? '<b class="long">UP</b>'
+      : r.qualified === 'down' ? '<b class="short">DOWN</b>'
+      : '<span class="thin">no colour</span>';
+    const dot = r.colour === 'green' ? '#2ecc71'
+              : r.colour === 'red'   ? '#e74c3c' : '#666';
+    return '<div style="display:flex;align-items:center;gap:10px;'
+         + 'padding:5px 0;border-top:1px solid rgba(255,255,255,.06)">'
+         + '<span style="width:8px;height:8px;border-radius:50%;'
+         + 'background:' + dot + ';flex:none"></span>'
+         + '<b style="width:42px">' + esc(r.timeframe) + '</b>'
+         + '<span style="width:70px" class="thin">'
+         + (r.present ? (r.bps >= 0 ? '+' : '') + r.bps.toFixed(1) + 'bps'
+                      : '—') + '</span>'
+         + '<span style="width:110px">' + mark + '</span>'
+         + '<span class="thin">' + esc(traded ? 'you are trading this'
+                                              : 'building it') + '</span>'
+         + '</div>';
+  }).join('') || '<div class="msg">no rows</div>';
+  const st = $('cascStamp');
+  if (st) st.textContent = C.trading ? 'trading ' + C.trading : '';
+}
+
 function paintLayers(d) {
   const el = $('layerBody'), head = $('layerResult');
   if (!el) return;
@@ -7959,6 +8092,7 @@ function paintRead(d) {
 
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
   paintLadder(d);
+  paintCascade(d);
   paintLayers(d);
   const src = (d.source || '').indexOf('websocket') === 0;
   const flags = (src ? '<span class="flag">LIVE TAPE</span>'
