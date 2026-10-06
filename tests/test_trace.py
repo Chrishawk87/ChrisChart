@@ -463,52 +463,66 @@ def _panel():
     return fn[:fn.index("function paintLayers(d) {")]
 
 
-def test_the_panel_never_prints_a_percentage_of_the_count():
-    """The bar width is a drawing. The NUMBER stays a count."""
+def test_the_panel_shows_only_the_direction_and_whether_it_is_building():
+    """The seven readings are computed and sent; they are not drawn.
+
+    What is on screen is the direction and whether the case for it is
+    strengthening or weakening -- one line, under the fastest row.
+    """
     fn = _panel()
-    assert "' of ' + s.counted" in fn
-    assert "N.counted" in fn
-    # The CODE, not the caption. The caption says the word while telling
-    # the reader there isn't one -- and a grep over the whole function
-    # fails on its own disclaimer, which it did, the first time.
+    assert "'UP'" in fn and "'DOWN'" in fn
+    assert "strengthening" in fn and "weakening" in fn
+    # None of the seven appear on screen.
+    for name in tr.CHECKS:
+        assert name not in fn, name
+    assert "N.checks" not in fn
+    assert "T.leg" not in fn and "samples" not in fn
+
+
+def test_the_panel_prints_no_number_at_all():
+    """Not a count and certainly not a percentage. The count still rides
+    in the payload for when there are scored bars behind it."""
     import re
 
-    code = re.sub(r"'[^']*'", "''", fn)
+    code = re.sub(r"'[^']*'", "''", _panel())
     for word in ("probability", "likely", "confidence", "percent"):
         assert word not in code.lower(), word
+    assert "N['for']" not in code and "n_for" not in code
 
 
 def test_the_panel_draws_no_trajectory_differently_from_a_flat_one():
-    """A leg a few seconds old has no trajectory, and drawing that as
-    'holding' claims a steadiness nobody measured."""
+    """A leg a few seconds old, or one that has just crossed the open,
+    has no trajectory -- drawing that as 'holding' claims a steadiness
+    nobody measured."""
     fn = _panel()
     assert "just started" in fn
     assert "holding" in fn
     assert "c === null" in fn
 
 
-def test_the_panel_says_how_many_could_not_be_read():
-    assert "not measured yet" in _panel()
-
-
-def test_a_cold_feed_does_not_draw_as_zero_agreeing():
-    """'0 of 0 agree with up' is accurate and reads as a case against the
-    move."""
+def test_a_cold_feed_does_not_draw_a_direction():
+    """A confident arrow over a feed that has told us nothing."""
     fn = _panel()
-    assert "N.counted\n" in fn or "N.counted ?" in fn or "? '<b>'" in fn
-    assert "nothing measured yet" in fn
-
-
-def test_the_panel_warns_that_counts_across_a_flip_are_not_comparable():
-    assert "asked a different question" in _panel()
+    assert "!N.counted" in fn
+    assert "warming up" in fn
 
 
 def test_the_panel_is_painted_on_every_read():
     assert "  paintCascade(d);\n  paintTrace(d);\n  paintLayers(d);" in _src()
 
 
-def test_the_trajectory_sits_beside_the_stack_not_inside_the_layers():
+def test_the_line_sits_under_the_stack_rows_not_in_the_layers_panel():
     src = _src()
-    assert 'id="traceBox"' in src
     panel = src[src.index('id="stackPanel"'):src.index('id="layerPanel"')]
-    assert 'id="cascRows"' in panel and 'id="traceBox"' in panel
+    assert panel.index('id="cascRows"') < panel.index('id="traceLine"')
+    assert 'id="traceBox"' not in src        # the old side column is gone
+
+
+def test_the_seven_are_still_read_and_still_sent_even_though_hidden():
+    """Hidden, not switched off. If the route stopped taking them the
+    line above would have nothing behind it."""
+    block = _route()
+    assert "rt.tracer.observe(" in block
+    assert 'out["trace"] = tc.to_dict(' in block
+    d = _leg([3, 4, 5, 6]).to_dict()
+    assert len(d["now"]["checks"]) == len(tr.CHECKS)

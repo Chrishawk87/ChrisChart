@@ -5627,13 +5627,11 @@ has to be running before the gate stops refusing.">spike
         that is what absorption looks like. Nothing above your timeframe
         takes part.</div>
       <div id="cascSay" class="say" style="margin-bottom:10px">—</div>
-      <!-- The stack on the left, how the read GOT here on the right. Two
-           columns so the state and its trajectory are read together; on a
-           narrow screen they stack. -->
-      <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-start">
-        <div id="cascRows" style="flex:1 1 300px;min-width:280px"></div>
-        <div id="traceBox" style="flex:1 1 320px;min-width:300px"></div>
-      </div>
+      <div id="cascRows"></div>
+      <!-- One line, directly under the fastest row. The seven readings
+           behind it are still taken on every poll and still go out in the
+           payload -- they are just not on the screen. -->
+      <div id="traceLine"></div>
     </div>
 
     <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
@@ -7735,96 +7733,50 @@ function paintCascade(d) {
   if (st) st.textContent = C.trading ? 'trading ' + C.trading : '';
 }
 
-/* How the read got where it is.
+/* How the read got where it is -- ONE LINE.
 
-   A COUNT, NEVER A PERCENTAGE. "5 of 7 agree" is checkable against the
-   seven lines underneath it; a composited percentage is a confidence
-   score wearing a percent sign and is most convincing where it is most
-   wrong. When enough closed bars have been scored, a count maps to a hit
-   rate that was measured -- that is when it earns the percent sign. */
-const TRACE_MARK = {
-  'for':        ['✓', 'long'],
-  'against':    ['✗', 'short'],
-  'quiet':      ['·', 'thin'],
-  'unmeasured': ['–', 'thin']
-};
+   The seven readings behind it (stack, intent, efficiency, response,
+   book, fuel, location) are still taken on every poll and still go out
+   in the payload. They are just not drawn: what is wanted on the screen
+   is the direction and whether the case for it is building or coming
+   apart, directly under the fastest row.
 
+   A COUNT STILL, NEVER A PERCENTAGE -- and here not even the count. When
+   nothing has been measured there is no direction to show, and this says
+   so rather than drawing a confident arrow over an empty feed. */
 function paintTrace(d) {
-  const el = $('traceBox');
+  const el = $('traceLine');
   if (!el) return;
   const T = (d && d.trace) || null;
   const N = T && T.now;
-  if (!T || !N) {
-    el.innerHTML = '<div class="msg">no trajectory on this bar yet</div>';
+  const line = (cls, txt) =>
+      '<div style="display:flex;align-items:center;gap:8px;padding:7px 0 2px;'
+    + 'border-top:1px solid rgba(255,255,255,.06)">'
+    + '<span class="' + cls + '">' + txt + '</span></div>';
+
+  if (!T || !N || !N.way) {
+    el.innerHTML = line('thin', 'no read on this bar yet');
     return;
   }
-  if (!N.way) {
-    el.innerHTML = '<div class="msg">' + esc(N.describe) + '</div>';
+  /* Nothing measured is not a direction. Drawing one here would put a
+     confident arrow over a feed that has told us nothing. */
+  if (!N.counted) {
+    el.innerHTML = line('thin', 'warming up');
     return;
   }
+  const up = N.way === 'up';
+  const way = '<b class="' + (up ? 'long' : 'short') + '">'
+            + (up ? 'UP' : 'DOWN') + '</b>';
   const c = T.change_60s;
-  /* null is not zero. A leg a few seconds old has no trajectory, and
-     drawing that as "holding" claims a steadiness nobody measured. */
-  const arrow = c === null || c === undefined
+  /* null is not zero. A leg a few seconds old, or one that has just
+     crossed the open, has no trajectory -- calling that "holding"
+     claims a steadiness nobody measured. */
+  const move = c === null || c === undefined
       ? '<span class="thin">just started</span>'
-    : c > 0 ? '<b class="long">↑ strengthening +' + c + '</b>'
-    : c < 0 ? '<b class="short">↓ weakening ' + c + '</b>'
-    : '<span class="thin">→ holding</span>';
-
-  const rows = (N.checks || []).map(k => {
-    const m = TRACE_MARK[k.verdict] || TRACE_MARK.unmeasured;
-    return '<div style="display:flex;gap:8px;padding:3px 0;font-size:12px">'
-         + '<span class="' + m[1] + '" style="width:12px;flex:none">'
-         + m[0] + '</span>'
-         + '<b style="width:76px;flex:none">' + esc(k.name) + '</b>'
-         + '<span class="thin">' + esc(k.why) + '</span></div>';
-  }).join('');
-
-  /* The column on the left: the last handful of samples, oldest first.
-     A bar that has been building for seven minutes and one that has just
-     fallen apart look identical at the instant they cross. */
-  const S = (T.leg && T.leg.samples) || [];
-  const tail = S.slice(-8);
-  const spark = tail.map(s => {
-    const t = new Date(s.ts * 1000).toLocaleTimeString([], {
-      hour: '2-digit', minute: '2-digit', second: '2-digit'});
-    const w = s.counted ? Math.round(s['for'] / s.counted * 100) : 0;
-    return '<div style="display:flex;gap:8px;align-items:center;'
-         + 'font-size:11px;padding:1px 0">'
-         + '<span class="thin" style="width:62px;flex:none">' + esc(t)
-         + '</span>'
-         + '<span style="flex:1;height:5px;background:rgba(255,255,255,.07);'
-         + 'border-radius:3px;overflow:hidden"><span style="display:block;'
-         + 'height:100%;width:' + w + '%;background:#2ecc71"></span></span>'
-         + '<span class="thin" style="width:44px;flex:none;text-align:right">'
-         + s['for'] + ' of ' + s.counted + '</span></div>';
-  }).join('');
-
-  /* "0 of 0 agree with up" is accurate and reads as a case against the
-     move. Nothing was measured; say that instead. */
-  const headline = N.counted
-    ? '<b>' + N['for'] + ' of ' + N.counted + '</b> '
-      + '<span class="thin">agree with ' + esc(N.way) + '</span> ' + arrow
-    : '<b class="thin">nothing measured yet</b> '
-      + '<span class="thin">— the feed is still warming up</span>';
-  el.innerHTML =
-      '<div class="say" style="margin-bottom:8px">' + headline
-    + (N.unmeasured ? '<div class="thin" style="margin-top:3px">'
-        + N.unmeasured + ' not measured yet</div>' : '')
-    + ((T.changes && T.changes.length)
-        ? '<div class="thin" style="margin-top:3px">just changed: '
-          + esc(T.changes.join(', ')) + '</div>' : '')
-    + (T.flips ? '<div class="thin" style="margin-top:3px">crossed its open '
-        + T.flips + (T.flips === 1 ? ' time' : ' times')
-        + ' — counts before that asked a different question</div>' : '')
-    + '</div>'
-    + rows
-    + (spark ? '<div style="margin-top:8px;border-top:1px solid '
-             + 'rgba(255,255,255,.06);padding-top:6px">' + spark + '</div>'
-             : '')
-    + '<div class="thin" style="margin-top:6px;font-size:11px">A count of '
-    + 'readings that agree, not a probability — each line is one '
-    + 'measurement you can check above.</div>';
+    : c > 0 ? '<b class="long">strengthening</b>'
+    : c < 0 ? '<b class="short">weakening</b>'
+    : '<span class="thin">holding</span>';
+  el.innerHTML = line('', way + ' &nbsp;' + move);
 }
 
 function paintLayers(d) {
