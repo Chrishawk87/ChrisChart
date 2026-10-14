@@ -504,13 +504,21 @@ def typical_range(bars: Sequence[Candle], back: int = TYPICAL_BARS) -> float:
 
 
 def from_live(timeframe: str, interval_s: float, candle, book: Book | None,
-              coverage: float = 1.0, history: Sequence[Candle] = ()
-              ) -> Pressure:
+              coverage: float = 1.0, history: Sequence[Candle] = (),
+              now: float | None = None) -> Pressure:
     """From a `live.LiveCandle`, where the buy/sell split is counted.
 
     `history` is this timeframe's recent completed bars, used only to learn
     what a normal bar does here -- how far it travels and how much it
     trades. Without it the reading falls back to scaled priors and says so.
+
+    `now` is the moment being read AT. Live, it is omitted and the candle
+    reads the wall clock, which is correct and is what every caller in the
+    service does. A STUDY WALKING A FILE CANNOT DO THAT: the wall clock
+    says the bar is hours old and fully elapsed, so every reading comes
+    back complete and `forming` is never true. Passing the simulated
+    moment is the only way a backtest sees the same partial bar a trader
+    would have seen.
     """
     t_bps, t_notional = typical(history)
     return Pressure(
@@ -523,7 +531,7 @@ def from_live(timeframe: str, interval_s: float, candle, book: Book | None,
         seeded=bool(getattr(candle, "seeded", True)),
         bid_depth=(book.depth(25.0, "buy") if book and not book.empty else 0.0),
         ask_depth=(book.depth(25.0, "sell") if book and not book.empty else 0.0),
-        elapsed_s=candle.elapsed(), coverage=coverage)
+        elapsed_s=candle.elapsed(now), coverage=coverage)
 
 
 def from_candle(timeframe: str, interval_s: float, candle: Candle,
