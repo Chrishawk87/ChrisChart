@@ -110,6 +110,9 @@ class Runtime:
         # rolling tape within the hour, and nothing else ever recorded who
         # crossed the spread.
         self.barflow = BarFlowStore(self.db_path)
+        # Every call the engine makes, written before its answer exists.
+        from .callbook import CallBook as _CallBook
+        self.callbook = _CallBook(self.db_path)
         # The agent's own book, separate from yours on purpose: yours is
         # filtered by your judgement, which is the thing it is being
         # measured against.
@@ -587,7 +590,23 @@ class Runtime:
         indistinguishable from a bar that really was balanced.
         """
         feed = self.feed
-        if feed is None or not getattr(candle, "flow_measured", False):
+        if feed is None:
+            return
+
+        # SCORE THE CALLS FIRST, AND BEFORE THE AGGRESSION GUARD BELOW.
+        # Whether anybody counted who crossed the spread has nothing to do
+        # with where the bar closed, and a bar adopted at connect still
+        # answers every call that was made on it.
+        try:
+            self.callbook.resolve(feed.coin, timeframe,
+                                  float(candle.start_ts),
+                                  close_px=float(candle.close))
+            if float(getattr(candle, "interval_s", 0.0)) >= 14400.0:
+                self.callbook.prune()
+        except Exception:
+            pass
+
+        if not getattr(candle, "flow_measured", False):
             return
         try:
             self.barflow.record(BarFlow(
@@ -3957,6 +3976,44 @@ def create_app() -> FastAPI:
         c = rt.resolve_symbol(coin)[0] if coin else None
         return rt.history.agreement_table(c, interval or None, min_strength)
 
+    @app.get("/api/calls", dependencies=[Depends(require_token)])
+    def api_calls(coin: str = "", interval: str = "",
+                  kind: str = "") -> dict[str, Any]:
+        """How the engine's calls have actually turned out.
+
+        Distinct from /api/scorecard, which scores the agent's
+        SUGGESTIONS against the trades they would have been. This scores
+        the READS -- the stack and the trajectory -- against the bars they
+        were made on.
+
+        Every call is written down before its bar closes and scored
+        afterwards, beside the NAIVE call — the direction price was
+        already going when the read was taken. Only the comparison
+        between the two means anything: a bar already up at halfway
+        usually closes up, so an engine that agrees with price scores far
+        above a coin flip while contributing nothing.
+
+        It starts empty and fills while the feed runs. There is no way to
+        backfill it, for the same reason the agreement table cannot be:
+        the readings only exist as they happen.
+
+        The arguments narrow which market is being asked about. None of
+        them can narrow which results count.
+        """
+        from . import callbook as _cb
+
+        c = rt.resolve_symbol(coin)[0] if coin else ""
+        cards = rt.callbook.scorecard(coin=c or "", timeframe=interval or "",
+                                      kind=kind or "")
+        return {"coin": c, "interval": interval,
+                "counts": rt.callbook.counts(),
+                "tallies": [t.to_dict() for t in cards],
+                "summary": _cb.summarise(cards),
+                "marks": list(_cb.MARKS),
+                "note": "the engine's rate is only meaningful against the "
+                        "naive rate on the same bars; a high agreement "
+                        "means the two are nearly the same call"}
+
     @app.post("/api/backfill", dependencies=[Depends(require_token)])
     def api_backfill(coin: str = "BTC", interval: str = "15m",
                      days: float = 2.0, at: float = 0.33,
@@ -4708,6 +4765,8 @@ def create_app() -> FastAPI:
             # never disagree about what a row said.
             try:
                 from . import cascade as csc
+                from . import callbook as _cbk
+                from . import trace as trc
 
                 rows_ = {r.timeframe: (csc.colour_of(r.winner,
                                                      forming=r.forming),
@@ -4742,6 +4801,34 @@ def create_app() -> FastAPI:
                         volume=(paces[interval].to_dict()
                                 if interval in paces else None))
                     out["trace"] = tc.to_dict(keep=_TRACE_KEEP)
+
+                    # ---- write the calls down, before the bar closes ---
+                    #
+                    # The whole point: a call recorded now, an outcome
+                    # recorded later, and nothing in between that could
+                    # let one see the other. `record` cannot touch the
+                    # outcome columns; `_keep_bar_flow` fills them in when
+                    # the candle closes.
+                    #
+                    # Only at the declared checkpoints, so the same bar is
+                    # not called ninety times by a polling page -- and a
+                    # read taken at 99% of the bar, which would score
+                    # beautifully and be worth nothing, is never filed.
+                    _mark = _cbk.mark_for(chosen_r.elapsed_s, step_s)
+                    if _mark is not None and chosen_r.open_px > 0:
+                        _common = dict(coin=coin, timeframe=interval,
+                                       bar_ts=b_open, mark=_mark,
+                                       open_px=float(chosen_r.open_px),
+                                       call_px=float(chosen_r.last_px))
+                        rt.callbook.record(_cbk.Call(
+                            kind="cascade", side=(casc.side or ""),
+                            detail=casc.state.value, **_common))
+                        _now_s = tc.latest
+                        rt.callbook.record(_cbk.Call(
+                            kind="trace",
+                            side=trc.called_side(tc.latest),
+                            detail=(f"{_now_s.n_for}/{_now_s.counted}"
+                                    if _now_s else ""), **_common))
             except Exception as exc:
                 out["cascade"] = {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -5647,6 +5734,22 @@ has to be running before the gate stops refusing.">spike
       <div id="layerResult" class="say" style="margin-bottom:10px">—</div>
       <div id="swingCall" class="say" style="margin-bottom:10px">—</div>
       <div id="layerBody"></div>
+    </div>
+
+    <!-- Whether any of it works. Its own panel: nothing above it changes. -->
+    <div class="panel full" id="scorePanel"><h2>Is it right?<span
+      class="stamp" id="scoreStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Every call is written down
+        before its bar closes and scored afterwards — beside the
+        <b>naive</b> call, which is simply the direction price was already
+        going when the read was taken. <b>Only the comparison matters.</b>
+        A bar that is already up at halfway usually closes up, so a read
+        that agrees with price scores far above a coin flip while adding
+        nothing. Where <i>agreement</i> is high the two are the same call
+        in different clothes, whatever the rates say. It fills while the
+        feed runs; it cannot be backfilled.</div>
+      <div id="scoreSay" class="say" style="margin-bottom:10px">—</div>
+      <div id="scoreRows"></div>
     </div>
   </div>
 
@@ -8055,6 +8158,79 @@ function toggleReadAuto() {
    delta for it would describe fifteen minutes as though it were the
    candle. Those rungs are drawn greyed with their coverage, and they do
    not vote on agreement. */
+/* The scorecard. Polled on its own slow schedule -- it changes when bars
+   close, not when the page refreshes. */
+let scoreAt = 0;
+
+function scorePct(x) { return x === null || x === undefined
+  ? '<span class="thin">—</span>' : Math.round(x * 100) + '%'; }
+
+async function loadScore() {
+  const now = Date.now();
+  if (now - scoreAt < 20000) return;
+  scoreAt = now;
+  const say = $('scoreSay'), body = $('scoreRows');
+  if (!say || !body) return;
+  let d;
+  try {
+    d = await api('/api/calls?' + q({coin: coin(),
+                                         interval: ($('rInt') && $('rInt').value)
+                                                   || ''}));
+  } catch (e) {
+    say.innerHTML = '<span class="thin">scorecard unavailable</span>';
+    return;
+  }
+  say.innerHTML = esc(d.summary || '—')
+    + '<div class="thin" style="margin-top:3px">'
+    + (d.counts ? d.counts.calls + ' calls recorded, ' + d.counts.resolved
+                  + ' scored, ' + d.counts.open + ' waiting on their bars'
+                : '') + '</div>';
+
+  const rows = d.tallies || [];
+  if (!rows.length) {
+    body.innerHTML = '<div class="msg">nothing scored yet — leave the feed '
+                   + 'running and come back</div>';
+    return;
+  }
+  body.innerHTML =
+      '<div style="display:flex;gap:8px;padding:4px 0;font-size:11px"'
+    + ' class="thin">'
+    + '<b style="width:90px">read</b><b style="width:48px">when</b>'
+    + '<b style="width:68px">engine</b><b style="width:68px">naive</b>'
+    + '<b style="width:58px">edge</b><b style="width:78px">agrees</b>'
+    + '<b style="width:68px">called</b><b>n</b></div>'
+    + rows.map(t => {
+    /* The edge is the only number worth colouring, and only once there
+       is enough behind it to mean anything. */
+    const thin = t.scored < 100;
+    const e = t.edge;
+    const ec = (e === null || e === undefined || thin) ? 'thin'
+             : e > 0 ? 'long' : e < 0 ? 'short' : 'thin';
+    const same = t.agreement !== null && t.agreement !== undefined
+              && t.agreement >= 0.9;
+    return '<div style="display:flex;gap:8px;align-items:center;'
+         + 'padding:4px 0;font-size:12px;border-top:1px solid '
+         + 'rgba(255,255,255,.06)">'
+         + '<b style="width:90px">' + esc(t.kind) + '</b>'
+         + '<span class="thin" style="width:48px">' + t.mark + '%</span>'
+         + '<span style="width:68px">' + scorePct(t.rate) + '</span>'
+         + '<span class="thin" style="width:68px">' + scorePct(t.naive_rate)
+         + '</span>'
+         + '<b class="' + ec + '" style="width:58px">'
+         + (e === null || e === undefined ? '—'
+            : (e > 0 ? '+' : '') + Math.round(e * 100) + '%') + '</b>'
+         + '<span class="' + (same ? 'short' : 'thin')
+         + '" style="width:78px">' + scorePct(t.agreement) + '</span>'
+         + '<span class="thin" style="width:68px">' + scorePct(t.coverage)
+         + '</span>'
+         + '<span class="thin">' + t.scored
+         + (thin ? ' <i>(too few)</i>' : '') + '</span>'
+         + '</div>';
+  }).join('');
+  const st = $('scoreStamp');
+  if (st) st.textContent = new Date().toLocaleTimeString();
+}
+
 async function loadFlow() {
   const gate = $('flowGate');
   let d;
@@ -8175,6 +8351,7 @@ function paintRead(d) {
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
   paintLadder(d);
   paintCascade(d);
+  loadScore();
   paintTrace(d);
   paintLayers(d);
   const src = (d.source || '').indexOf('websocket') === 0;

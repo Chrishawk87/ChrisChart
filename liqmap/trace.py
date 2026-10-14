@@ -348,6 +348,26 @@ class Sample:
                 "describe": self.describe()}
 
 
+def called_side(s: Sample | None) -> str:
+    """The direction the trajectory backs, as a side, for scoring.
+
+    A STRICT MAJORITY OF WHAT WAS ACTUALLY MEASURED. Not a tuned
+    threshold -- "more than half the readings that could speak agree with
+    where price is going" is the plainest reading of the count, and a
+    number chosen to make the score look better would be fitting the test
+    to the answer.
+
+    Unmeasured checks are out of the denominator, so a warming-up feed
+    produces no call rather than a weak one, and a bar sitting on its open
+    has no direction to back.
+    """
+    if s is None or s.way is None or not s.counted:
+        return ""
+    if s.n_for * 2 <= s.counted:
+        return ""
+    return "buy" if s.way == "up" else "sell"
+
+
 @dataclass
 class Leg:
     """A run of samples that were all asking the same question.

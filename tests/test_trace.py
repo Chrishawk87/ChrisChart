@@ -508,7 +508,11 @@ def test_a_cold_feed_does_not_draw_a_direction():
 
 
 def test_the_panel_is_painted_on_every_read():
-    assert "  paintCascade(d);\n  paintTrace(d);\n  paintLayers(d);" in _src()
+    """Asserts the call, not its neighbours -- another paint being added
+    beside it is not this panel breaking."""
+    src = _src()
+    block = src[src.index("function paintRead(d)"):]
+    assert "paintTrace(d);" in block
 
 
 def test_the_line_sits_under_the_stack_rows_not_in_the_layers_panel():
