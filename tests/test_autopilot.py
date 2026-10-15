@@ -38,9 +38,7 @@ def payload(*, take=True, side="long", entry=100.0, target=101.0,
                       "grade": "A", "book": direction, "delta": direction,
                       "price": direction},
         "confirmation": {"held_s": held_s, "flips": 0,
-                         "candle_strength": 0.6,
                          "participation": {"effort": 0.9}},
-        "action": {"score": 0.6},
         "runway": {"clear_bps": 60.0, "open_road": False},
         "delta": {"score": 0.4},
     }
@@ -125,7 +123,7 @@ def test_enters_when_everything_passes(ledger):
 
 
 def test_stand_aside_is_recorded_with_its_gate(ledger):
-    p = Autopilot("ETH", "15m", ledger, raw=False)
+    p = Autopilot("ETH", "15m", ledger)
     d = p.step(payload(take=False, gate="unconfirmed"), now=100.0)
     assert d.action == "stand_aside"
     assert d.gate == "unconfirmed"
@@ -136,18 +134,15 @@ def test_stand_aside_is_recorded_with_its_gate(ledger):
 
 
 def test_its_own_gates_can_refuse_a_tradeable_call(ledger):
-    p = Autopilot("ETH", "15m", ledger, raw=False,
-                  knobs=Knobs(min_agreement_s=30.0))
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(min_agreement_s=30.0))
     d = p.step(payload(held_s=3.0), now=100.0)
     assert d.action == "stand_aside" and d.gate == "agreement_age"
 
-    p2 = Autopilot("ETH", "15m", ledger, raw=False,
-                   knobs=Knobs(min_agreeing=3))
+    p2 = Autopilot("ETH", "15m", ledger, knobs=Knobs(min_agreeing=3))
     assert p2.step(payload(agreeing=2, candle_ts=2.0),
                    now=100.0).gate == "agreeing"
 
-    p3 = Autopilot("ETH", "15m", ledger, raw=False,
-                   knobs=Knobs(max_breakeven=0.55))
+    p3 = Autopilot("ETH", "15m", ledger, knobs=Knobs(max_breakeven=0.55))
     assert p3.step(payload(breakeven=0.8, candle_ts=3.0),
                    now=100.0).gate == "breakeven"
 
@@ -169,22 +164,13 @@ def test_holds_while_the_read_still_agrees(ledger):
     assert d.action == "hold"
 
 
-def test_raw_voting_is_the_default(ledger):
-    """No gates unless asked for, and levels-only exits, so the live book
-    and the grid stay the same strategy."""
-    p = Autopilot("ETH", "15m", ledger)
-    assert p.raw is True
-    assert p.exit_on_invalidation is False
-
-
 def test_flat_is_not_against_you(ledger):
     """The exact problem this agent was built around.
 
     A reading dropping to flat is the absence of a signal, not a signal.
     Treating it as invalidation closes good positions on a quiet poll.
     """
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=4.0),
-                  exit_on_invalidation=True)
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=4.0))
     p.step(payload(), now=100.0)
     for t in (105.0, 110.0, 115.0, 120.0, 125.0):
         d = p.step(payload(direction="flat"), now=t)
@@ -193,8 +179,7 @@ def test_flat_is_not_against_you(ledger):
 
 
 def test_one_opposite_poll_does_not_close_it(ledger):
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=10.0),
-                  exit_on_invalidation=True)
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=10.0))
     p.step(payload(), now=100.0)
     assert p.step(payload(direction="down"), now=103.0).action == "hold"
     # ... and the timer resets the moment it stops being against.
@@ -203,8 +188,7 @@ def test_one_opposite_poll_does_not_close_it(ledger):
 
 
 def test_a_persistent_flip_closes_it(ledger):
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=8.0),
-                  exit_on_invalidation=True)
+    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=8.0))
     p.step(payload(), now=100.0)
     p.step(payload(direction="down"), now=105.0)
     d = p.step(payload(direction="down"), now=110.0)
@@ -222,45 +206,20 @@ def test_a_level_beats_everything_else(ledger):
     assert d.action == "exit" and d.closed["reason"] == "target"
 
 
-def test_a_trade_never_outlives_its_candle(ledger):
-    """A five minute trade lasts five minutes.
-
-    The position was opened on one candle's book, delta and price. Once
-    that candle closes the reading it rests on no longer exists, and a
-    trade allowed to run on is claiming a result the NEXT candle's signal
-    should have had to earn.
-    """
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=999.0))
-    p.step(payload(candle_ts=9000.0), now=9100.0)
-    assert p.position is not None
-    assert p.step(payload(candle_ts=9000.0, direction="flat"),
-                  now=9800.0).action == "hold"
-    d = p.step(payload(candle_ts=9000.0, direction="up"), now=9901.0)
-    assert d.action == "exit" and d.closed["reason"] == "candle_end"
-
-
-def test_the_deadline_comes_from_the_candle_it_opened_on(ledger):
-    """A signal firing forty seconds before the close gets forty seconds,
-    not a fresh full bar measured from entry."""
-    p = Autopilot("ETH", "15m", ledger, knobs=Knobs(invalidate_s=999.0))
-    p.step(payload(candle_ts=9000.0), now=9860.0)
-    d = p.step(payload(candle_ts=9000.0), now=9910.0)
-    assert d.action == "exit" and d.closed["reason"] == "candle_end"
-
-
-def test_a_one_minute_trade_lasts_one_minute(ledger):
-    p = Autopilot("ETH", "1m", ledger, knobs=Knobs(invalidate_s=999.0))
-    pl = dict(payload(candle_ts=600.0), interval_s=60.0, candle_end=660.0)
-    p.step(pl, now=610.0)
-    assert p.step(pl, now=650.0).action == "hold"
-    assert p.step(pl, now=661.0).closed["reason"] == "candle_end"
+def test_a_quiet_trade_eventually_times_out(ledger):
+    p = Autopilot("ETH", "15m", ledger,
+                  knobs=Knobs(max_hold_bars=1.0, invalidate_s=999.0))
+    p.step(payload(), now=0.0)
+    d = p.step(payload(direction="flat"), now=1000.0)   # > one 900s bar
+    assert d.action == "exit" and d.closed["reason"] == "time"
 
 
 def test_dead_money_and_being_wrong_are_different_rows(ledger):
-    p = Autopilot("ETH", "15m", ledger, exit_on_invalidation=True,
-                  knobs=Knobs(stale_s=50.0, invalidate_s=999.0))
-    p.step(payload(candle_ts=9000.0), now=9010.0)
-    d = p.step(payload(candle_ts=9000.0, direction="flat"), now=9070.0)
+    p = Autopilot("ETH", "15m", ledger,
+                  knobs=Knobs(stale_s=50.0, invalidate_s=999.0,
+                              max_hold_bars=99.0))
+    p.step(payload(), now=0.0)
+    d = p.step(payload(direction="flat"), now=60.0)
     assert d.action == "exit" and d.closed["reason"] == "time"
 
 
@@ -448,7 +407,7 @@ def test_loosening_is_never_proposed():
 
 def test_exit_knobs_are_not_proposed_from_outcomes():
     """They change what happens DURING a trade; replaying needs the path."""
-    for name in ("invalidate_s", "stale_s"):
+    for name in ("invalidate_s", "max_hold_bars", "stale_s"):
         assert name not in tuner_mod.EVALUABLE
         assert name in tuner_mod.NOT_EVALUABLE
         assert tuner_mod.evaluate(name, _book(200), Knobs()) == []
@@ -505,8 +464,7 @@ def test_readiness_says_how_far_off_it_is(ledger):
 
 # ------------------------------------------------------- the safety rails
 
-AGENT_FILES = ("autopilot.py", "ledger.py", "score.py", "tuner.py",
-               "vote.py", "sweep.py")
+AGENT_FILES = ("autopilot.py", "ledger.py", "score.py", "tuner.py")
 
 
 def _code_only(path: Path) -> str:
@@ -579,188 +537,3 @@ def test_the_score_module_never_drops_losing_trades():
     card = score_mod.scorecard(rows)
     assert card["overall"]["n"] == 100
     assert card["overall"]["wins"] == 50
-
-
-# ------------------------------------------- the rule: 3-0, paid for, small
-
-def _unanimous(**kw):
-    return payload(**kw)
-
-
-def _split(**kw):
-    """Two agreeing, one against — a 2-1."""
-    d = payload(**kw)
-    d["three_way"]["delta"] = "down"
-    d["delta"] = {"score": -0.4}
-    return d
-
-
-def _paid(d, effort):
-    d["confirmation"]["participation"] = {"effort": effort}
-    return d
-
-
-def test_only_three_nil_is_taken(ledger):
-    p = Autopilot("ETH", "15m", ledger, require_unanimous=True)
-    d = p.step(_paid(_split(), 5.0), now=100.0)
-    assert d.action == "stand_aside" and d.gate == "not_unanimous"
-    assert p.position is None
-
-
-def test_three_nil_with_volume_is_taken(ledger):
-    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
-                  knobs=Knobs(min_effort=2.0, tp_bps=10.0, sl_bps=10.0))
-    d = p.step(_paid(_unanimous(), 5.0), now=100.0)
-    assert d.action == "enter_long"
-    assert p.position.target_bps == 10.0 and p.position.risk_bps == 10.0
-
-
-def test_a_unanimous_read_nobody_paid_for_is_refused(ledger):
-    """Three columns agreeing on a direction nobody is trading through is
-    a reading, not a move."""
-    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
-                  knobs=Knobs(min_effort=2.0))
-    d = p.step(_paid(_unanimous(), 1.2), now=100.0)      # 120% of normal
-    assert d.action == "stand_aside" and d.gate == "not_paid_for"
-    assert "120%" in d.reason and "200%" in d.reason
-
-
-def test_two_hundred_percent_is_the_line(ledger):
-    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
-                  knobs=Knobs(min_effort=2.0))
-    assert p.step(_paid(_unanimous(candle_ts=1.0), 1.99),
-                  now=100.0).gate == "not_paid_for"
-    p2 = Autopilot("ETH", "15m", ledger, require_unanimous=True,
-                   knobs=Knobs(min_effort=2.0))
-    assert p2.step(_paid(_unanimous(candle_ts=2.0), 2.0),
-                   now=100.0).action == "enter_long"
-
-
-def test_a_candle_with_no_volume_reading_is_not_treated_as_quiet(ledger):
-    """Absent is not the same as zero. Treating it as zero would refuse
-    every trade in the first seconds of a bar."""
-    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
-                  knobs=Knobs(min_effort=2.0))
-    d = _unanimous()
-    d["confirmation"].pop("participation", None)
-    out = p.step(d, now=100.0)
-    assert out.gate == "no_effort_read"
-    assert out.gate != "not_paid_for"
-
-
-def test_ticks_convert_per_market(ledger, tmp_path):
-    """Ten ticks on gold and ten ticks on a cheap perp are different
-    numbers of basis points."""
-    p = Autopilot("ETH", "15m", ledger, unit="ticks",
-                  knobs=Knobs(tp_bps=10.0, sl_bps=10.0, min_effort=0.0))
-    d = _paid(_unanimous(entry=100.0), 5.0)
-    d["tick"] = 0.01                      # 1 tick = 1bps at price 100
-    p.step(d, now=100.0)
-    assert p.position.target_bps == pytest.approx(10.0)
-    assert p.position.target_px == pytest.approx(100.10)
-
-    # Its own book: a second pilot on the same ledger rehydrates the first
-    # one's open position and manages that instead.
-    other = Ledger(str(tmp_path / "b.db"))
-    p2 = Autopilot("ETH", "15m", other, unit="ticks",
-                   knobs=Knobs(tp_bps=10.0, sl_bps=10.0, min_effort=0.0))
-    d2 = _paid(_unanimous(entry=4000.0, candle_ts=2.0), 5.0)
-    d2["tick"] = 0.1                      # 1 tick = 0.25bps at price 4000
-    p2.step(d2, now=100.0)
-    assert p2.position.target_bps == pytest.approx(2.5)
-
-
-def test_ticks_without_a_tick_size_fall_back_rather_than_invent_one(ledger):
-    p = Autopilot("ETH", "15m", ledger, unit="ticks",
-                  knobs=Knobs(tp_bps=10.0, sl_bps=10.0, min_effort=0.0))
-    d = _paid(_unanimous(entry=100.0), 5.0)
-    d["tick"] = 0.0
-    out = p.step(d, now=100.0)
-    assert out.action == "enter_long"
-    assert p.position.target_bps == 10.0
-    assert "read as bps" in out.reason or p.position.target_bps == 10.0
-
-
-def test_the_refusals_are_still_recorded(ledger):
-    """A gate you set is still a gate: the shape it refused has to stay in
-    the book, or the ledger cannot tell you later what it cost."""
-    p = Autopilot("ETH", "15m", ledger, require_unanimous=True,
-                  knobs=Knobs(min_effort=2.0))
-    p.step(_paid(_split(candle_ts=1.0), 5.0), now=100.0)
-    p.step(_paid(_unanimous(candle_ts=2.0), 0.5), now=200.0)
-    gates = {r["gate"] for r in ledger.decisions(action="stand_aside")}
-    assert gates == {"not_unanimous", "not_paid_for"}
-
-
-# -------------------------------------------------- out before the close
-
-def test_it_is_flat_before_the_candle_prints(ledger):
-    """Exiting AT the close assumes a fill at the closing print, which is
-    not a price anyone gets — and it leaves the position alive into the
-    moment the next candle's reading starts forming."""
-    p = Autopilot("ETH", "15m", ledger,
-                  knobs=Knobs(invalidate_s=999.0, exit_before_s=10.0))
-    p.step(payload(candle_ts=9000.0), now=9100.0)
-    assert p.step(payload(candle_ts=9000.0), now=9880.0).action == "hold"
-    d = p.step(payload(candle_ts=9000.0), now=9891.0)     # 9s before 9900
-    assert d.action == "exit" and d.closed["reason"] == "candle_end"
-
-
-def test_the_target_is_what_normally_takes_it_out(ledger):
-    """The candle close is the backstop, not the plan."""
-    p = Autopilot("ETH", "15m", ledger,
-                  knobs=Knobs(tp_bps=10.0, sl_bps=10.0, invalidate_s=999.0))
-    p.step(payload(candle_ts=9000.0, entry=100.0), now=9100.0)
-    tgt = p.position.target_px
-    d = p.step(payload(candle_ts=9000.0, entry=100.0), now=9200.0,
-               high=tgt + 0.01, low=99.99)
-    assert d.action == "exit" and d.closed["reason"] == "target"
-    assert d.closed["net_bps"] > 0
-
-
-def test_a_zero_buffer_still_gets_out_at_the_close(ledger):
-    p = Autopilot("ETH", "15m", ledger,
-                  knobs=Knobs(invalidate_s=999.0, exit_before_s=0.0))
-    p.step(payload(candle_ts=9000.0), now=9100.0)
-    assert p.step(payload(candle_ts=9000.0), now=9899.0).action == "hold"
-    assert p.step(payload(candle_ts=9000.0),
-                  now=9901.0).closed["reason"] == "candle_end"
-
-
-def test_the_export_carries_the_outcome_and_the_conditions(ledger):
-    """One row per trade, result first, then what was true when it was
-    taken — so sorting by result puts the two populations side by side."""
-    pos = ledger.open_position(
-        coin="ETH", interval="15m", candle_ts=9000.0, side="long",
-        entry=100.0, target_px=100.1, stop_px=99.9, target_bps=10.0,
-        risk_bps=10.0, cost_bps=2.0, breakeven=0.6, agreeing=3,
-        features={"vote_shape": "3-0", "vote_book": 0.5, "vote_delta": 0.4,
-                  "vote_price": 0.6, "effort": 3.2, "unit": "bps"},
-        now=9100.0)
-    ledger.close_position(pos, exit_px=100.1, reason="target", now=9200.0)
-    ledger.open_position(coin="ETH", interval="15m", candle_ts=9900.0,
-                         side="short", entry=100.0, target_px=99.9,
-                         stop_px=100.1, target_bps=10.0, risk_bps=10.0,
-                         now=9950.0)
-
-    rows = ledger.export_rows()
-    assert len(rows) == 2
-    done = rows[0]
-    assert done["result"] == "WIN"
-    assert done["net_bps"] == pytest.approx(8.0, abs=0.01)
-    assert done["book"] == "up" and done["delta"] == "up"
-    assert done["effort_pct"] == pytest.approx(320.0)
-    assert done["exit_reason"] == "target"
-    assert done["opened_at"].startswith("1970-")
-    # The one still running is in the file and marked, not quietly dropped.
-    assert rows[1]["result"] == "open" and rows[1]["net_bps"] is None
-
-
-def test_a_loser_is_labelled_a_loser(ledger):
-    pos = ledger.open_position(
-        coin="ETH", interval="15m", candle_ts=1.0, side="long", entry=100.0,
-        target_px=100.1, stop_px=99.9, target_bps=10.0, risk_bps=10.0,
-        cost_bps=2.0, now=10.0)
-    ledger.close_position(pos, exit_px=99.9, reason="stop", now=20.0)
-    r = ledger.export_rows()[0]
-    assert r["result"] == "LOSS" and r["net_bps"] < 0

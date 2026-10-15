@@ -17,3 +17,6 @@ wallets.json
 data/
 *.dbn
 *.dbn.zst
+*.db-shm
+*.db-wal
+*.db-journal
