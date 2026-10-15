@@ -48,9 +48,9 @@ at = _load()
 T = at.TICK
 
 
-def trade(ts, px):
+def trade(ts, px, side="buy", sz=1.0):
     from liqmap.flow import Trade
-    return Trade(px=px, sz=1.0, aggressor="buy", ts=ts)
+    return Trade(px=px, sz=sz, aggressor=side, ts=ts)
 
 
 @pytest.fixture()
@@ -62,7 +62,15 @@ def passthrough(monkeypatch):
 
 
 def tape(pairs):
-    return [trade(ts, px) for ts, px in pairs]
+    """(ts, px) or (ts, px, side)."""
+    return [trade(*row) for row in pairs]
+
+def run(rows, rule="open", traded="15m"):
+    """Episodes for ONE (rule, frame) pair, out of the single pass."""
+    dets, tp, n, span = at.walk(tape(rows), rules=[rule], traded=[traded])
+    return dets[0].episodes, tp, n, span
+
+
 
 
 # ------------------------------------------------------------- the frames
@@ -265,7 +273,7 @@ def test_flat_at_a_bar_boundary_does_not_end_an_episode(passthrough):
     for k in range(1, 40):                   # climbs through 60s
         px += 0.25
         rows.append((1.0 + k * 3.0, px))
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert eps
     longest = max(e.seconds for e in eps)
     assert longest > 60.0, [e.seconds for e in eps]
@@ -280,7 +288,7 @@ def test_a_flip_ends_the_episode(passthrough):
     for k in range(12, 30):                  # back below the 1m open
         px -= 0.5
         rows.append((1.0 + k, px))
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert eps
     assert any(e.ended.startswith("flip_") for e in eps), \
         [e.ended for e in eps]
@@ -295,7 +303,7 @@ def test_the_fifteen_minute_close_ends_it_whatever_else_is_true(
         px += 0.25
         rows.append((t, px))
         t += 1.0                              # crosses 900.0
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert any(e.ended == "bar_close" for e in eps), [e.ended for e in eps]
     for e in eps:
         if e.ended == "bar_close":
@@ -310,7 +318,7 @@ def test_no_episode_spans_two_fifteen_minute_bars(passthrough):
         px += 0.25 if k % 3 else 0.0
         rows.append((t, px))
         t += 1.0
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert eps
     for e in eps:
         assert e.end_ts - e.bar15_ts <= 900.0 + 1e-6
@@ -324,14 +332,14 @@ def test_episodes_do_not_overlap_in_time(passthrough):
         px += 0.25 if (k // 7) % 2 == 0 else -0.25
         rows.append((t, px))
         t += 2.0
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert len(eps) >= 2
     for a, b in zip(eps, eps[1:]):
         assert a.end_ts <= b.start_ts, (a.end_ts, b.start_ts)
 
 
 def test_a_flat_tape_produces_no_episodes(passthrough):
-    eps, _, n, _ = at.walk(tape([(float(i), 7800.0) for i in range(300)]))
+    eps, _, n, _ = run(([(float(i), 7800.0) for i in range(300)]))
     assert n == 300
     assert eps == []
 
@@ -342,7 +350,7 @@ def test_a_down_run_is_found_as_a_down_episode(passthrough):
     for k in range(1, 40):
         px -= 0.25
         rows.append((1.0 + k, px))
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert eps
     assert all(e.way == "down" for e in eps), [e.way for e in eps]
     assert max(e.mfe for e in eps) > 0
@@ -355,7 +363,7 @@ def test_the_episode_records_where_in_the_bar_it_formed(passthrough):
     for k in range(30):
         px += 0.25
         rows.append((t + k, px))
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert eps
     assert 0.0 <= eps[0].offset_s < 900.0
     assert eps[0].offset_s == pytest.approx(300.0, abs=2.0)
@@ -370,7 +378,7 @@ def test_the_first_lapse_in_strict_agreement_is_recorded_separately(
     for k in range(1, 120):
         px += 0.25
         rows.append((1.0 + k, px))
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert eps
     broke = [e for e in eps if e.first_break]
     assert broke, "no episode ever lapsed out of strict agreement"
@@ -393,7 +401,7 @@ def test_a_file_timestamped_from_the_epoch_is_dated_correctly(passthrough):
     for k in range(40):                       # starts at ts == 0.0
         px += 0.25
         rows.append((float(k) * 5.0, px))
-    eps, _, n, span = at.walk(tape(rows))
+    eps, _, n, span = run((rows))
     assert n == 40
     assert span == pytest.approx(195.0)       # 0.0 .. 195.0, not 190.0
     assert eps
@@ -409,7 +417,7 @@ def test_an_episode_later_in_the_session_is_dated_against_its_own_bar(
     for k in range(40):
         px += 0.25
         rows.append((t + k * 5.0, px))
-    eps, _, _, _ = at.walk(tape(rows))
+    eps, _, _, _ = run(rows)
     assert eps
     for e in eps:
         assert 0.0 <= e.offset_s < 900.0
@@ -417,7 +425,7 @@ def test_an_episode_later_in_the_session_is_dated_against_its_own_bar(
 
 
 def test_the_walk_counts_only_prints(passthrough):
-    eps, _, n, span = at.walk(tape([(float(i), 7800.0 + i * 0.25)
+    eps, _, n, span = run(([(float(i), 7800.0 + i * 0.25)
                                  for i in range(50)]))
     assert n == 50
     assert span == pytest.approx(49.0)
@@ -600,3 +608,262 @@ def test_progress_never_writes_to_the_report():
 def test_a_limit_takes_the_first_records():
     assert list(at.capped(range(10), 3)) == [0, 1, 2]
     assert list(at.capped(range(3), 0)) == [0, 1, 2]
+
+
+# ===================================================================
+# THE CASCADE RULE
+#
+# `cascade.Rung.qualified` is the rule the site runs: a row counts up
+# only when it is GREEN **and** its bps is positive. Green comes from the
+# bar's own aggressor delta, so price must have moved AND the aggressors
+# must have paid for it. A row whose colour fights its number is thrown
+# out rather than counted weakly.
+#
+# The danger in wiring that up here is re-implementing it slightly
+# differently, so the study measures a rule the site does not run. These
+# tests check behaviour against `cascade` itself, not against a copy of
+# its logic.
+# ===================================================================
+
+def test_a_bar_tracks_its_own_delta_and_resets_with_the_bar():
+    f = at.Frame(60.0)
+    f.feed(0.0, 100.0, +3.0)
+    f.feed(10.0, 100.5, +2.0)
+    assert f.delta == pytest.approx(5.0)
+    assert f.colour() == "green"
+    f.feed(60.0, 101.0, -4.0)                 # new bar
+    assert f.delta == pytest.approx(-4.0), "delta carried across the bar"
+    assert f.colour() == "red"
+
+
+def test_a_bar_with_no_net_aggression_has_no_colour():
+    f = at.Frame(60.0)
+    f.feed(0.0, 100.0, +2.0)
+    f.feed(1.0, 100.5, -2.0)
+    assert f.delta == pytest.approx(0.0)
+    assert f.colour() == "none"
+
+
+def test_bps_is_measured_against_this_bars_open():
+    f = at.Frame(60.0)
+    f.feed(0.0, 100.0, 1.0)
+    assert f.bps(101.0) == pytest.approx(100.0)
+    assert f.bps(99.0) == pytest.approx(-100.0)
+    assert f.bps(100.0) == pytest.approx(0.0)
+
+
+def _frames(spec):
+    """spec: {tf: (open_px, delta)} -> frames dict positioned at ts 0."""
+    out = {}
+    for name, secs in at.FRAMES:
+        out[name] = at.Frame(secs)
+        if name in spec:
+            op, d = spec[name]
+            out[name].feed(0.0, op, d)
+    return out
+
+
+def test_cascade_agrees_when_price_and_aggression_point_the_same_way():
+    fr = _frames({"1m": (100.0, 5.0), "5m": (100.0, 5.0),
+                  "15m": (100.0, 5.0)})
+    assert at.way_cascade(fr, "15m", 101.0) == "up"
+
+
+def test_cascade_refuses_a_row_whose_colour_fights_its_number():
+    """Price up on the 1m but the aggressors were net sellers. That row
+    is thrown out, so the stack is not aligned -- this is the whole
+    difference between this rule and the loose one."""
+    fr = _frames({"1m": (100.0, -5.0), "5m": (100.0, 5.0),
+                  "15m": (100.0, 5.0)})
+    assert at.way_open(fr, "15m", 101.0) == "up"
+    assert at.way_cascade(fr, "15m", 101.0) == ""
+
+
+def test_cascade_agrees_down_when_price_falls_on_selling():
+    fr = _frames({"1m": (100.0, -5.0), "5m": (100.0, -5.0),
+                  "15m": (100.0, -5.0)})
+    assert at.way_cascade(fr, "15m", 99.0) == "down"
+
+
+def test_cascade_refuses_a_colourless_row():
+    fr = _frames({"1m": (100.0, 0.0), "5m": (100.0, 5.0),
+                  "15m": (100.0, 5.0)})
+    assert at.way_cascade(fr, "15m", 101.0) == ""
+
+
+def test_cascade_says_nothing_before_a_bar_has_opened():
+    fr = _frames({"1m": (100.0, 5.0)})        # 5m and 15m never fed
+    assert at.way_cascade(fr, "15m", 101.0) == ""
+
+
+def test_the_five_minute_stack_is_shorter_and_comes_from_cascade():
+    """The rows under each frame are cascade's, not a list kept here."""
+    import liqmap.cascade as c
+    assert c.STACKS["5m"] == ("5m", "1m")
+    assert c.STACKS["15m"] == ("15m", "5m", "1m")
+    # a 15m row that disagrees cannot affect a 5m stack
+    fr = _frames({"1m": (100.0, 5.0), "5m": (100.0, 5.0),
+                  "15m": (100.0, -5.0)})
+    assert at.way_cascade(fr, "5m", 101.0) == "up"
+    assert at.way_cascade(fr, "15m", 101.0) == ""
+
+
+def test_the_rule_defers_to_cascades_own_aligned_way():
+    """Not a reimplementation: a PULLBACK is not agreement, and only
+    cascade decides what a pullback is."""
+    import inspect
+    src = inspect.getsource(at.way_cascade)
+    assert "cascade.read(" in src
+    assert "cascade.aligned_way(" in src
+    src2 = inspect.getsource(at.rows_cascade)
+    assert "cascade.Rung(" in src2
+    assert ".qualified" in src2
+
+
+def test_the_row_view_and_the_agreement_view_use_the_same_qualification():
+    fr = _frames({"1m": (100.0, -5.0), "5m": (100.0, 5.0),
+                  "15m": (100.0, 5.0)})
+    rows = dict(at.rows_cascade(fr, "15m", 101.0))
+    assert rows["1m"] == "", rows      # thrown out, not 'up'
+    assert rows["5m"] == "up" and rows["15m"] == "up"
+
+
+def test_cascade_fires_less_often_than_the_loose_rule(passthrough):
+    """The hypothesis behind running it at all: requiring the aggression
+    to agree with the price should reject most of the churn."""
+    import random as _r
+    rng = _r.Random(5)
+    rows = []
+    px, t = 7800.0, 0.0
+    for _ in range(4000):
+        px += 0.25 * rng.choice((-1, 1))
+        t += 1.0
+        rows.append((t, px, rng.choice(("buy", "sell"))))
+    dets, _, _, _ = at.walk(tape(rows), rules=["open", "cascade"],
+                            traded=["15m"])
+    by = {d.rule: len(d.episodes) for d in dets}
+    assert by["open"] > 0 and by["cascade"] > 0
+    assert by["cascade"] < by["open"], by
+
+
+def test_one_pass_drives_every_rule_and_frame(passthrough):
+    rows = []
+    px, t = 7800.0, 0.0
+    for k in range(600):
+        px += 0.25 if (k // 40) % 2 == 0 else -0.25
+        t += 1.0
+        rows.append((t, px, "buy" if (k // 40) % 2 == 0 else "sell"))
+    dets, tp, n, _ = at.walk(tape(rows), rules=["open", "cascade"],
+                             traded=["15m", "5m"])
+    assert len(dets) == 4
+    assert n == 600 and tp.n == 600
+    assert {(d.rule, d.traded) for d in dets} == {
+        ("open", "15m"), ("open", "5m"),
+        ("cascade", "15m"), ("cascade", "5m")}
+
+
+def test_every_episode_carries_the_rule_and_frame_that_made_it(
+        passthrough):
+    rows = [(float(k), 7800.0 + k * 0.25, "buy") for k in range(400)]
+    dets, _, _, _ = at.walk(tape(rows), rules=["cascade"], traded=["5m"])
+    eps = dets[0].episodes
+    assert eps
+    for e in eps:
+        assert e.rule == "cascade" and e.traded == "5m"
+
+
+def test_a_five_minute_episode_ends_at_the_five_minute_close(passthrough):
+    rows = []
+    px, t = 7800.0, 280.0
+    for _ in range(60):
+        px += 0.25
+        rows.append((t, px, "buy"))
+        t += 1.0                                  # crosses 300.0
+    dets, _, _, _ = at.walk(tape(rows), rules=["open"], traded=["5m"])
+    eps = dets[0].episodes
+    assert any(e.ended == "bar_close" for e in eps), [e.ended for e in eps]
+    for e in eps:
+        assert e.end_ts - e.bar15_ts <= 300.0 + 1e-6
+
+
+def test_one_row_turning_opposite_ends_it_not_the_whole_stack(passthrough):
+    """The question as asked: how far before ONE disagrees."""
+    rows = []
+    px, t = 7800.0, 0.0
+    for _ in range(130):                          # long climb, all frames up
+        px += 0.25
+        rows.append((t, px, "buy"))
+        t += 1.0
+    # Now fall far enough to drop under the CURRENT 1-minute bar's open --
+    # which is itself high up the climb -- while staying well above the
+    # 15m open. Only the fast row turns.
+    for _ in range(40):
+        px -= 0.25
+        rows.append((t, px, "sell"))
+        t += 1.0
+    dets, _, _, _ = at.walk(tape(rows), rules=["open"], traded=["15m"])
+    eps = dets[0].episodes
+    ended = [e for e in eps if e.ended.startswith("flip_")]
+    assert ended, [e.ended for e in eps]
+    assert any(e.ended == "flip_1m" for e in ended), [e.ended for e in ended]
+
+
+def test_a_falling_tape_sold_into_gives_cascade_down_episodes(passthrough):
+    """Drop the aggressor's sign and every bar reads green, so the whole
+    down side of the study silently disappears while the up side looks
+    completely normal. Nothing in a one-directional fixture notices."""
+    rows = []
+    px, t = 7800.0, 0.0
+    for _ in range(400):
+        px -= 0.25
+        rows.append((t, px, "sell"))
+        t += 1.0
+    dets, _, _, _ = at.walk(tape(rows), rules=["cascade"], traded=["15m"])
+    eps = dets[0].episodes
+    assert eps, "no cascade episodes on a clean sold-into decline"
+    assert all(e.way == "down" for e in eps), [e.way for e in eps]
+    assert max(e.mfe for e in eps) > 0
+
+
+def test_a_rising_tape_bought_gives_cascade_up_episodes(passthrough):
+    rows = []
+    px, t = 7800.0, 0.0
+    for _ in range(400):
+        px += 0.25
+        rows.append((t, px, "buy"))
+        t += 1.0
+    dets, _, _, _ = at.walk(tape(rows), rules=["cascade"], traded=["15m"])
+    eps = dets[0].episodes
+    assert eps
+    assert all(e.way == "up" for e in eps), [e.way for e in eps]
+
+
+def test_price_falling_while_buyers_lift_is_not_cascade_agreement(
+        passthrough):
+    """The absorption case, and the reason the rule exists: price is
+    going down but the aggressors are buying it, so every row's colour
+    fights its number and nothing qualifies."""
+    rows = []
+    px, t = 7800.0, 0.0
+    for _ in range(400):
+        px -= 0.25
+        rows.append((t, px, "buy"))
+        t += 1.0
+    dets, _, _, _ = at.walk(tape(rows), rules=["open", "cascade"],
+                            traded=["15m"])
+    by = {d.rule: d.episodes for d in dets}
+    assert by["open"], "the loose rule should call this a down run"
+    assert all(e.way == "down" for e in by["open"])
+    assert by["cascade"] == [], [e.way for e in by["cascade"]]
+
+
+def test_cascade_read_owns_the_stack_so_a_stray_row_cannot_widen_it():
+    """`cascade.read` selects its rows from `cascade.STACKS` itself, so
+    passing it extra timeframes cannot change what a 5m stack reads.
+    Worth pinning: it is why the stack cannot drift out of step with the
+    site even if this script builds the dict wrongly."""
+    import liqmap.cascade as c
+    rows = {"1m": ("green", 5.0), "5m": ("green", 5.0),
+            "15m": ("red", 5.0)}            # 15m conflicted
+    assert c.aligned_way(c.read("5m", rows)) == "up"
+    assert c.aligned_way(c.read("15m", rows)) is None

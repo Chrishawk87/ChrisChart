@@ -1,26 +1,41 @@
 #!/usr/bin/env python3
-"""When 1m, 5m and 15m agree, how far does price go before one disagrees?
+"""When the stack agrees, how far does price go before it disagrees?
 
     python scripts/agree_travel.py data/ES_c_0_mbp-10_2026-10-08.dbn.zst
 
 THIS IS AN EVENT STUDY, NOT A BACKTEST
 
 No win rate, no expectancy, no verdict. The output is a distribution: given
-that all three timeframes agreed at a moment, how far did price travel, for
-how long, and what ended it. What to do with that is the reader's business.
+that the stack agreed at a moment, how far did price travel, for how long,
+and what ended it. What to do with that is the reader's business.
 
-WHAT "AGREE" MEANS, AND WHY IT IS CAUSAL
+TWO RULES, BOTH MEASURED, IN ONE PASS
 
-Every bar is stamped at its start and its direction is read the way the live
-panel reads it:
+    open      a row is up when price is above that bar's open.
+    cascade   `cascade.read` as the site runs it -- a row counts up only
+              when it is GREEN **and** its bps is positive, so price must
+              have moved AND the aggressors must have paid for it. The
+              stack is agreed only in State.TREND or State.REVERSAL.
 
-    direction = sign(price now - the price this bar opened at)
+`open` is the looser reading and it fired 35 times a 15-minute bar. The
+point of running both over the same prints, with the same scorer and the
+same null, is that the difference between the columns is the rule and
+nothing else. Two scripts could not tell you that.
 
-Both halves are known at the moment they are used. There is no bar close in
-any of this, nothing is confirmed later, and no measurement reaches past the
-instant it is dated. A reading at 10:04:30 uses the 15m bar that opened at
-10:00, the 5m that opened at 10:00 and the 1m that opened at 10:04 -- all
-three of which have already happened.
+AND TWO TRADING FRAMES
+
+`cascade.STACKS` decides what sits under each: 15m is read over (15m, 5m,
+1m) and 5m over (5m, 1m). Both are measured, so "would this work better on
+a 5-minute" is a column rather than another run.
+
+WHY IT IS CAUSAL
+
+Every bar is stamped at its start, and both halves of every row are known
+at the moment they are used: the bar's open has happened, the price now has
+happened, and the delta is of prints already on the tape. Nothing is
+confirmed later and no measurement reaches past the instant it is dated. A
+reading at 10:04:30 uses the 15m bar that opened at 10:00, the 5m that
+opened at 10:00 and the 1m that opened at 10:04.
 
 FLAT IS NOT DISAGREEMENT
 
@@ -32,10 +47,10 @@ OPPOSITE. How long until the weaker condition -- all three still strictly
 agreeing -- is measured too, and both are printed, because the gap between
 them is itself worth seeing.
 
-AN EPISODE ENDS AT THE 15-MINUTE CLOSE
+AN EPISODE ENDS AT ITS OWN TRADING BAR'S CLOSE
 
-Whatever else happens. That is how the trade is taken, so that is where the
-measurement stops.
+Whatever else happens -- the 15m close for a 15m stack, the 5m close for a
+5m one. That is how the trade is taken, so that is where it stops.
 
 THE NULL IS A RANDOM START OF THE SAME LENGTH
 
@@ -76,10 +91,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from liqmap import dbn                                      # noqa: E402
+from liqmap import cascade                                  # noqa: E402
 
 TICK = 0.25
 FRAMES = (("1m", 60.0), ("5m", 300.0), ("15m", 900.0))
-TRADE_FRAME_S = 900.0                  # the bar the trade is taken on
+SPAN_OF = dict(FRAMES)
+TRADE_FRAME_S = 900.0                  # the longest bar a trade is held in
+
+# The stacks measured, each with the bar its trade is held in. The rows
+# under each come from `cascade.STACKS`, not from anything chosen here.
+TRADED = ("15m", "5m")
+
+RULES = ("cascade", "open")
 
 # The projection. How often agreement reached each of these before ending.
 PROJECTION = (2, 4, 6, 8, 12, 16, 20, 24, 32)
@@ -135,23 +158,31 @@ def capped(records, limit: int):
 class Frame:
     """One timeframe's bar in progress, read from the tape.
 
-    Holds the open of the bar that is forming and nothing else. The open is
-    the first price printed in the bar, which is known from that print on.
+    Holds the open of the bar that is forming and the signed size traded
+    inside it. Both are known from the prints that have already happened,
+    which is the whole reason this can be read live.
     """
 
     def __init__(self, seconds: float) -> None:
         self.span = seconds
         self.bar_ts: float | None = None
         self.open_px = 0.0
+        self.delta = 0.0
 
-    def feed(self, ts: float, px: float) -> bool:
-        """Returns True when this print opened a new bar."""
+    def feed(self, ts: float, px: float, signed: float = 0.0) -> bool:
+        """Returns True when this print opened a new bar.
+
+        The delta RESETS with the bar. Carrying it across would make a
+        row's colour a statement about the previous bar.
+        """
         slot = math.floor(ts / self.span) * self.span
-        if self.bar_ts is None or slot != self.bar_ts:
+        new = self.bar_ts is None or slot != self.bar_ts
+        if new:
             self.bar_ts = slot
             self.open_px = px
-            return True
-        return False
+            self.delta = 0.0
+        self.delta += signed
+        return new
 
     def way(self, px: float) -> str:
         if self.bar_ts is None:
@@ -161,6 +192,84 @@ class Frame:
         if px < self.open_px:
             return "down"
         return "flat"
+
+    def bps(self, px: float) -> float:
+        if self.bar_ts is None or self.open_px <= 0:
+            return 0.0
+        return (px - self.open_px) / self.open_px * 10_000.0
+
+    def colour(self) -> str:
+        """Green when the aggressors were net buyers in this bar.
+
+        `cascade.colour_of` maps a winning side to a colour; the winning
+        side here is the sign of the bar's own delta.
+        """
+        if self.bar_ts is None or self.delta == 0.0:
+            return "none"
+        return cascade.colour_of("buyers" if self.delta > 0 else "sellers")
+
+
+# ------------------------------------------------------------- the rules
+
+def way_open(frames: dict, traded: str, px: float) -> str:
+    """Every row in the stack above or below its own bar's open."""
+    want = cascade.STACKS.get(traded)
+    if not want:
+        return ""
+    ways = [frames[tf].way(px) for tf in want]
+    if any(w in ("", "flat") for w in ways):
+        return ""
+    first = ways[0]
+    return first if all(w == first for w in ways) else ""
+
+
+def way_cascade(frames: dict, traded: str, px: float) -> str:
+    """`cascade.read` exactly as the site runs it.
+
+    A row counts only when its colour and its bps point the same way, and
+    the stack counts as agreed only in TREND or REVERSAL -- which is what
+    `cascade.aligned_way` returns and nothing else does.
+    """
+    want = cascade.STACKS.get(traded)
+    if not want:
+        return ""
+    rows = {}
+    for tf in want:
+        f = frames[tf]
+        if f.bar_ts is None:
+            return ""
+        rows[tf] = (f.colour(), f.bps(px))
+    return cascade.aligned_way(cascade.read(traded, rows)) or ""
+
+
+def rows_open(frames: dict, traded: str, px: float) -> list[tuple[str, str]]:
+    """(timeframe, way) per row, with '' and 'flat' meaning no opinion."""
+    return [(tf, frames[tf].way(px))
+            for tf in cascade.STACKS.get(traded, ())]
+
+
+def rows_cascade(frames: dict, traded: str,
+                 px: float) -> list[tuple[str, str]]:
+    """(timeframe, qualified way) per row, using cascade's own Rung.
+
+    A row whose colour fights its own bps is thrown out rather than
+    counted weakly -- that is `Rung.qualified`, not a reimplementation of
+    it, so the rule here cannot drift from the rule on the site.
+    """
+    out = []
+    for tf in cascade.STACKS.get(traded, ()):
+        f = frames[tf]
+        if f.bar_ts is None:
+            out.append((tf, ""))
+            continue
+        rung = cascade.Rung(timeframe=tf, colour=f.colour(),
+                            bps=f.bps(px), present=True)
+        out.append((tf, rung.qualified or ""))
+    return out
+
+
+WAY_FN = {"open": way_open, "cascade": way_cascade}
+ROWS_FN = {"open": rows_open, "cascade": rows_cascade}
 
 
 class Tape:
@@ -244,13 +353,14 @@ class Episode:
     start_ts: float
     start_px: float
     way: str
-    bar15_ts: float
-    offset_s: float                  # how far into the 15m bar it formed
+    bar15_ts: float                  # the trading bar it sits in
+    offset_s: float                  # how far into that bar it formed
+    rule: str = ""                   # open | cascade
+    traded: str = ""                 # 15m | 5m
 
     end_ts: float = 0.0
     end_px: float = 0.0
-    ended: str = ""                  # flip_1m | flip_5m | flip_15m |
-                                     # bar_close | file_end
+    ended: str = ""                  # flip | bar_close | file_end
     first_break: str = ""            # what stopped STRICT agreement first
     break_ts: float | None = None
     break_ticks: float | None = None
@@ -293,13 +403,100 @@ class Episode:
 
 # ------------------------------------------------------------------ the walk
 
+class Detector:
+    """One (rule, traded frame) pair, keeping its own live episode.
+
+    Several of these run off ONE pass over the tape. Four passes would be
+    four readings of the same file taken minutes apart in wall-clock time
+    and, more to the point, four chances for the rules to end up measured
+    against subtly different prints.
+    """
+
+    def __init__(self, rule: str, traded: str) -> None:
+        self.rule = rule
+        self.traded = traded
+        self.fn = WAY_FN[rule]
+        self.rows_fn = ROWS_FN[rule]
+        self.live: Episode | None = None
+        self.episodes: list[Episode] = []
+
+    def feed(self, frames: dict, ts: float, px: float,
+             bar_closed: bool) -> None:
+        live = self.live
+
+        # THE TRADING BAR'S CLOSE ENDS IT, whatever the rows say.
+        if live is not None and bar_closed:
+            self._close(live, ts, px, "bar_close")
+            live = self.live = None
+
+        now = self.fn(frames, self.traded, px)
+
+        if live is None:
+            if now:
+                self.live = self._begin(frames, ts, px, now)
+            return
+
+        live.observe(px)
+        rows = self.rows_fn(frames, self.traded, px)
+
+        # AGREEMENT LAPSING is recorded but does not end it -- at the
+        # first print of any new bar that row sits on its own open and
+        # reads flat, and ending there would measure the bar grid.
+        if live.first_break == "" and now != live.way:
+            live.first_break = next(
+                (tf for tf, w in rows if w != live.way), "(stack)")
+            live.break_ts = ts
+            live.break_ticks = ((px - live.start_px) / TICK
+                                if live.way == "up"
+                                else (live.start_px - px) / TICK)
+
+        # ONE ROW TURNING OPPOSITE ENDS IT. That is the question as it was
+        # asked -- how far before ONE disagrees -- so it is not the whole
+        # stack agreeing the other way, which would be a far later and far
+        # rarer event.
+        other = "down" if live.way == "up" else "up"
+        against = [tf for tf, w in rows if w == other]
+        if against:
+            self._close(live, ts, px, f"flip_{against[0]}")
+            self.live = self._begin(frames, ts, px, now) if now else None
+
+    def _begin(self, frames: dict, ts: float, px: float,
+               way: str) -> Episode:
+        """Dated against the bar its trade is held in.
+
+        `bar_ts or ts` was wrong here: a slot of 0.0 is falsy, so a file
+        timestamped from the epoch dated every episode against its own
+        start and reported an offset of zero for all of them. The same
+        falsy zero has now cost this project three times.
+        """
+        f = frames[self.traded]
+        b = f.bar_ts if f.bar_ts is not None else ts
+        ep = Episode(start_ts=ts, start_px=px, way=way, bar15_ts=b,
+                     offset_s=ts - b, rule=self.rule, traded=self.traded)
+        ep.observe(px)
+        return ep
+
+    def _close(self, ep: Episode, ts: float, px: float, why: str) -> None:
+        ep.end_ts, ep.end_px, ep.ended = ts, px, why
+        self.episodes.append(ep)
+
+    def finish(self, ts: float, px: float) -> None:
+        if self.live is not None:
+            self._close(self.live, ts, px, "file_end")
+            self.live = None
+
+
 def walk(records, symbol: str = "ES", flip: bool = False,
-         progress: Progress | None = None):
-    """One pass. Returns (episodes, tape, prints, span_s)."""
-    frames = [(name, Frame(secs)) for name, secs in FRAMES]
+         progress: Progress | None = None,
+         rules=RULES, traded=TRADED):
+    """ONE pass, every rule and frame at once.
+
+    Returns (detectors, tape, prints, span_s).
+    """
+    frames = {name: Frame(secs) for name, secs in FRAMES}
+    dets = [Detector(r, t) for r in rules for t in traded
+            if t in cascade.STACKS]
     tape = Tape()
-    out: list[Episode] = []
-    live: Episode | None = None
     # `None`, not 0.0. A file whose timestamps start at the epoch has a
     # first print at exactly 0.0, and `if first_ts == 0.0` would then
     # reassign on the SECOND print and quietly drop one from the span.
@@ -313,87 +510,24 @@ def walk(records, symbol: str = "ES", flip: bool = False,
         ts, px = item.ts, item.px
         n += 1
         if progress is not None:
-            progress.extra = f"{len(out):,} episodes"
+            progress.extra = f"{sum(len(d.episodes) for d in dets):,} eps"
             progress.tick()
         if first_ts is None:
             first_ts = ts
         last_ts, last_px = ts, px
         tape.add(ts, px)
 
-        opened15 = False
-        for name, f in frames:
-            new = f.feed(ts, px)
-            if name == "15m" and new:
-                opened15 = True
+        signed = item.sz if item.aggressor == "buy" else -item.sz
+        opened = {name: f.feed(ts, px, signed) for name, f in frames.items()}
 
-        # THE 15-MINUTE CLOSE ENDS IT, whatever the timeframes say. The
-        # trade is taken on that bar, so the measurement stops there.
-        if live is not None and opened15:
-            _close(live, ts, px, "bar_close", out)
-            live = None
+        for d in dets:
+            d.feed(frames, ts, px, opened.get(d.traded, False))
 
-        ways = [f.way(px) for _, f in frames]
-        now = agreed_way(ways)
-
-        if live is None:
-            if now:
-                live = _begin(frames, ts, px, now)
-            continue
-
-        live.observe(px)
-
-        # STRICT agreement lapsing is recorded but does not end it.
-        if live.first_break == "" and now != live.way:
-            live.first_break = _who_broke(frames, ways, live.way)
-            live.break_ts = ts
-            live.break_ticks = ((px - live.start_px) / TICK
-                                if live.way == "up"
-                                else (live.start_px - px) / TICK)
-
-        # A FLIP ends it: some timeframe is now pointing the other way.
-        other = "down" if live.way == "up" else "up"
-        flipped = [nm for (nm, _), w in zip(frames, ways) if w == other]
-        if flipped:
-            _close(live, ts, px, f"flip_{flipped[0]}", out)
-            live = None
-            if now:
-                live = _begin(frames, ts, px, now)
-
-    if live is not None:
-        _close(live, last_ts, last_px, "file_end", out)
+    for d in dets:
+        d.finish(last_ts, last_px)
     if progress is not None:
         progress.done()
-    return out, tape, n, max(0.0, last_ts - (first_ts or 0.0))
-
-
-def _begin(frames, ts: float, px: float, way: str) -> Episode:
-    """Open an episode, dated against the 15-minute bar it sits in.
-
-    `bar_ts or ts` was wrong here: a 15-minute slot of 0.0 is falsy, so a
-    file timestamped from the epoch dated every episode against its own
-    start and reported an offset of zero for all of them. The same falsy
-    zero has now cost this project three times.
-    """
-    f15 = frames[2][1]
-    b15 = f15.bar_ts if f15.bar_ts is not None else ts
-    ep = Episode(start_ts=ts, start_px=px, way=way,
-                 bar15_ts=b15, offset_s=ts - b15)
-    ep.observe(px)
-    return ep
-
-
-def _close(ep: Episode, ts: float, px: float, why: str,
-           out: list[Episode]) -> None:
-    ep.end_ts, ep.end_px, ep.ended = ts, px, why
-    out.append(ep)
-
-
-def _who_broke(frames, ways, agreed: str) -> str:
-    """Which timeframe stopped agreeing first. Flat counts here."""
-    for (name, _), w in zip(frames, ways):
-        if w != agreed:
-            return name
-    return ""
+    return dets, tape, n, max(0.0, last_ts - (first_ts or 0.0))
 
 
 # ------------------------------------------------------------------ reporting
@@ -492,6 +626,86 @@ def spread(eps: list[Episode], label: str) -> None:
           f"  |  {_median(sec):5.1f}s")
 
 
+def report_block(eps, tape, rng, rule: str, traded: str,
+                 span_s: float) -> None:
+    """Everything about one (rule, frame) pair."""
+    title = f"RULE = {rule.upper()}   TRADED ON {traded}   " \
+            f"stack {'/'.join(cascade.STACKS.get(traded, ()))}"
+    print("=" * 78)
+    print(title)
+    print("=" * 78)
+    if not eps:
+        print("  no agreement episodes at all")
+        print()
+        return
+
+    bars = len({e.bar15_ts for e in eps})
+    print(f"  {len(eps):,} episodes, {bars} {traded} bars with any "
+          f"agreement ({len(eps) / max(1, bars):.1f} per bar)")
+    print()
+
+    tot = len(eps)
+    by_end: dict[str, int] = {}
+    for e in eps:
+        by_end[e.ended] = by_end.get(e.ended, 0) + 1
+    print("  WHAT ENDED THEM")
+    for why, k in sorted(by_end.items(), key=lambda kv: -kv[1]):
+        print(f"    {why:<12} {k:>7,}  {k / tot:5.1%}")
+
+    by_br: dict[str, int] = {}
+    for e in eps:
+        key = e.first_break or "(never)"
+        by_br[key] = by_br.get(key, 0) + 1
+    print("  WHICH ROW LAPSED FIRST  (flat counts here; does not end it)")
+    for who, k in sorted(by_br.items(), key=lambda kv: -kv[1]):
+        print(f"    {who:<12} {k:>7,}  {k / tot:5.1%}")
+    brk = [e.break_ticks for e in eps if e.break_ticks is not None]
+    if brk:
+        print(f"    travel at that lapse: p50 {_median(brk):.1f}t  "
+              f"p75 {_pct(brk, .75):.1f}t  p90 {_pct(brk, .90):.1f}t")
+    print()
+
+    print("  TRAVEL WHILE AGREED  (ticks, from the price at agreement)")
+    spread(eps, "all")
+    spread([e for e in eps if e.way == "up"], "agreed up")
+    spread([e for e in eps if e.way == "down"], "agreed down")
+    print()
+
+    print("  TICK PROJECTION -- episodes reaching each distance.")
+    print("  An episode is long BECAUSE price kept going, so this table")
+    print("  selects for travel and you do not know the length when you")
+    print("  enter. The fixed-horizon table under it is the honest one.")
+    projection_header()
+    projection(eps, "all episodes", tape, rng)
+    print()
+
+    print("  FIXED HORIZON from the agreement, ignoring the stopping rule")
+    projection_header()
+    horizon_table(eps, tape, rng, "all")
+    print()
+
+    print("  BY WHERE IT FORMED IN THE BAR")
+    projection_header()
+    span = SPAN_OF.get(traded, TRADE_FRAME_S)
+    edges = [span * i / 5.0 for i in range(6)]
+    for lo, hi in zip(edges, edges[1:]):
+        sub = [e for e in eps if lo <= e.offset_s < hi]
+        projection(sub, f"{lo / 60:.1f}-{hi / 60:.1f} min in", tape, rng)
+    print()
+
+    per: dict[float, list[Episode]] = {}
+    for e in eps:
+        per.setdefault(e.bar15_ts, []).append(e)
+    counts = [len(v) for v in per.values()]
+    firsts = [v[0] for v in per.values()]
+    print(f"  PER {traded} BAR -- episodes per bar: p50 {_median(counts)}, "
+          f"p90 {_pct(counts, .90)}, max {max(counts)}")
+    spread(firsts, "first of bar")
+    projection_header()
+    projection(firsts, "first of bar", tape, rng)
+    print()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path")
@@ -500,106 +714,69 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=0,
                     help="stop after N records -- a trial run, not a result")
     ap.add_argument("--seed", type=int, default=20261015)
+    ap.add_argument("--rules", default=",".join(RULES))
+    ap.add_argument("--traded", default=",".join(TRADED))
     args = ap.parse_args(argv)
     rng = random.Random(args.seed)
+    rules = [r.strip() for r in args.rules.split(",") if r.strip()]
+    traded = [t.strip() for t in args.traded.split(",") if t.strip()]
+    for r in rules:
+        if r not in WAY_FN:
+            print(f"unknown rule: {r}", file=sys.stderr)
+            return 2
 
     print(f"file      {args.path}")
-    print(f"frames    " + ", ".join(n for n, _ in FRAMES)
-          + "; direction = price now against this bar's open")
-    print(f"episode   starts when all three agree, ends on a FLIP or at "
-          f"the 15m close")
-    print("progress on stderr")
+    print(f"rules     " + ", ".join(rules))
+    print(f"traded    " + ", ".join(
+        f"{t} over {'/'.join(cascade.STACKS.get(t, ()))}" for t in traded))
+    print(f"episode   starts when the stack agrees, ends on a FLIP the "
+          f"other way or at the trading bar's close")
+    print("progress on stderr; ONE pass drives every block below")
     if args.limit:
         print(f"LIMIT     {args.limit:,} records -- a trial run, not a "
               f"result.")
     print()
 
-    eps, tape, prints, span = walk(
+    dets, tape, prints, span = walk(
         capped(dbn.open_file(args.path), args.limit),
-        symbol=args.symbol, flip=args.flip, progress=Progress("walk"))
-    if not eps:
-        print("no agreement episodes found")
-        return 0
+        symbol=args.symbol, flip=args.flip, progress=Progress("walk"),
+        rules=rules, traded=traded)
 
-    bars = len({e.bar15_ts for e in eps})
+    print()
+    print(f"{prints:,} prints over {span / 3600.0:.2f} h")
+    print()
+    for d in dets:
+        report_block(d.episodes, tape, rng, d.rule, d.traded, span)
+
     print("=" * 78)
-    print(f"{len(eps):,} agreement episodes over {prints:,} prints, "
-          f"{span / 3600.0:.2f} h, {bars} fifteen-minute bars "
-          f"({len(eps) / max(1, bars):.1f} per bar)")
+    print("SIDE BY SIDE -- fixed horizon, the share reaching 16 ticks "
+          "(4 points)")
     print("=" * 78)
+    print(f"  {'rule / frame':<22}" + "".join(f"{h:>9.0f}s"
+                                              for h in HORIZONS_S))
+    for d in dets:
+        if not d.episodes:
+            continue
+        bits = [f"  {d.rule + ' / ' + d.traded:<22}"]
+        for h in HORIZONS_S:
+            got = []
+            for e in d.episodes:
+                tv = tape.travel(tape.index_at(e.start_ts), h)
+                if tv is None:
+                    continue
+                got.append(tv[0] if e.way == "up" else tv[1])
+            if len(got) < MIN_GROUP:
+                bits.append(f"{len(got):>8}n")
+            else:
+                hit = sum(1 for g in got if g >= 16) / len(got)
+                bits.append(f"{hit:>9.1%}")
+        print("".join(bits))
+    print(f"  {'(random start null)':<22}", end="")
+    for h in HORIZONS_S:
+        c = control_rate(tape, [h] * 400, 16, rng)
+        print("        -" if c is None else f"{c:>9.1%}", end="")
     print()
-
-    print("WHAT ENDED THEM")
-    tot = len(eps)
-    by_end: dict[str, int] = {}
-    for e in eps:
-        by_end[e.ended] = by_end.get(e.ended, 0) + 1
-    for why, k in sorted(by_end.items(), key=lambda kv: -kv[1]):
-        print(f"  {why:<14} {k:>7,}  {k / tot:5.1%}")
     print()
-
-    print("WHICH TIMEFRAME STOPPED AGREEING FIRST  (flat counts here)")
-    by_br: dict[str, int] = {}
-    for e in eps:
-        by_br[e.first_break or "(never)"] = \
-            by_br.get(e.first_break or "(never)", 0) + 1
-    for who, k in sorted(by_br.items(), key=lambda kv: -kv[1]):
-        print(f"  {who:<14} {k:>7,}  {k / tot:5.1%}")
-    brk = [e.break_ticks for e in eps if e.break_ticks is not None]
-    if brk:
-        print(f"  travel at that first lapse: p50 {_median(brk):.1f}t, "
-              f"p75 {_pct(brk, .75):.1f}t, p90 {_pct(brk, .90):.1f}t")
-    print()
-
-    print("TRAVEL WHILE AGREED  (ticks, from the price at agreement)")
-    spread(eps, "all episodes")
-    spread([e for e in eps if e.way == "up"], "agreed up")
-    spread([e for e in eps if e.way == "down"], "agreed down")
-    print()
-
-    print("TICK PROJECTION -- share of episodes reaching each distance")
-    print("  '(random start)' is a window of the SAME LENGTH from a random")
-    print("  moment, scored in a coin-flip direction. That is the null.")
-    print()
-    print("  READ THIS TABLE WITH CARE. An episode is long BECAUSE price")
-    print("  kept going, so conditioning on its duration selects for")
-    print("  travel. The null is duration-matched but cannot be")
-    print("  selection-matched, so a gap here is not by itself an edge --")
-    print("  and you do not know an episode's length when you enter it.")
-    print("  The fixed-horizon table below is the one a trade lives on.")
-    projection_header()
-    projection(eps, "all episodes", tape, rng)
-    projection([e for e in eps if e.way == "up"], "agreed up", tape, rng)
-    projection([e for e in eps if e.way == "down"], "agreed down", tape, rng)
-    print()
-
-    print("TRAVEL OVER A FIXED HORIZON from the agreement, ignoring the")
-    print("stopping rule -- the number a held trade lives on.")
-    projection_header()
-    horizon_table(eps, tape, rng, "all")
-    print()
-
-    print("BY WHERE IT FORMED IN THE 15-MINUTE BAR")
-    projection_header()
-    for lo, hi in OFFSET_BUCKETS:
-        sub = [e for e in eps if lo <= e.offset_s < hi]
-        projection(sub, f"{lo / 60:.0f}-{hi / 60:.0f} min in", tape, rng)
-    print()
-
-    print("PER 15-MINUTE BAR")
-    per: dict[float, list[Episode]] = {}
-    for e in eps:
-        per.setdefault(e.bar15_ts, []).append(e)
-    counts = [len(v) for v in per.values()]
-    firsts = [v[0] for v in per.values()]
-    print(f"  episodes per bar: p50 {_median(counts)}, "
-          f"p90 {_pct(counts, .90)}, max {max(counts)}")
-    print(f"  bars with no agreement at all are not counted here")
-    spread(firsts, "first episode of bar")
-    projection_header()
-    projection(firsts, "first of bar", tape, rng)
-    print()
-
     return 0
 
 
