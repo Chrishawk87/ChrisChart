@@ -46,9 +46,11 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import itertools
 import math
 import random
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -86,6 +88,46 @@ HORIZON_S = max(TIME_STOPS)            # the excursion window
 
 # The geometry the tables lead with, in ticks.
 HEADLINE = ((16, 4), (20, 4))
+
+HEARTBEAT = 500_000        # records between progress lines
+
+
+class Progress:
+    """A heartbeat on stderr while a long pass runs.
+
+    Eight million records take minutes and this printed nothing until the
+    pass finished, which is indistinguishable from a hang -- so the first
+    thing anyone does is kill it. Goes to stderr so a piped stdout still
+    holds nothing but the report.
+    """
+
+    def __init__(self, label: str, every: int = HEARTBEAT, total: int = 0,
+                 out=None) -> None:
+        self.label = label
+        self.every = max(1, every)
+        self.total = total
+        self.n = 0
+        self.extra = ""
+        self.out = out if out is not None else sys.stderr
+        self.start = time.time()
+
+    def tick(self) -> None:
+        self.n += 1
+        if self.n % self.every:
+            return
+        el = max(1e-9, time.time() - self.start)
+        bits = [f"  [{self.label}] {self.n:,}"]
+        if self.total:
+            bits.append(f"/{self.total:,} ({self.n / self.total:.0%})")
+        bits.append(f"  {el:,.0f}s  {self.n / el:,.0f}/s")
+        if self.extra:
+            bits.append(f"  {self.extra}")
+        print("".join(bits), file=self.out, flush=True)
+
+    def done(self) -> None:
+        el = max(1e-9, time.time() - self.start)
+        print(f"  [{self.label}] done: {self.n:,} in {el:,.0f}s",
+              file=self.out, flush=True)
 DOM_WINDOW_S = 20.0
 TREND_LOOKBACK_S = 60.0
 
@@ -383,10 +425,22 @@ class Look:
 BOOK_CUTS = (0.10, 0.25, 0.40)
 
 
+def capped(records, limit: int):
+    """The first `limit` records, or all of them when limit is 0.
+
+    For finding out how long a full run will take before starting one.
+    Whatever comes out of a capped run is part of a session, so the
+    report says so rather than leaving it to be noticed.
+    """
+    if limit <= 0:
+        return records
+    return itertools.islice(records, limit)
+
+
 # -------------------------------------------------------------- the walk
 
 def walk(records, reversal_ticks: int, symbol: str = "ES",
-         flip: bool = False):
+         flip: bool = False, progress: Progress | None = None):
     """One pass. Returns (looks, tape, prints)."""
     tape = Tape()
     reader = BookReader()
@@ -402,6 +456,9 @@ def walk(records, reversal_ticks: int, symbol: str = "ES",
     last_low: float | None = None
 
     for kind, item in dbn.stream(records, symbol=symbol, flip=flip):
+        if progress is not None:
+            progress.extra = f"{len(looks):,} pivots"
+            progress.tick()
         if kind == "clear":
             continue
 
@@ -513,6 +570,8 @@ def walk(records, reversal_ticks: int, symbol: str = "ES",
         else:
             last_low = leg.px
 
+    if progress is not None:
+        progress.done()
     return looks, tape, tape.n
 
 
@@ -544,7 +603,8 @@ def _dom_edges(watch: DomWatch, trades, now: float):
 
 # ------------------------------------------------------------- the scorer
 
-def score(looks: list[Look], tape: Tape) -> None:
+def score(looks: list[Look], tape: Tape,
+          progress: Progress | None = None) -> None:
     """ONE scorer, run ONCE. Every arm reads what it produced.
 
     Both possible sides are walked for every look, because the arms are
@@ -558,6 +618,8 @@ def score(looks: list[Look], tape: Tape) -> None:
     assigns is always one of the two walked here.
     """
     for l in looks:
+        if progress is not None:
+            progress.tick()
         l.cross = {}
         for side in ("buy", "sell"):
             long = side == "buy"
@@ -567,6 +629,8 @@ def score(looks: list[Look], tape: Tape) -> None:
             s_px = [entry - sgn * s * TICK for s in STOP_TICKS]
             l.cross[side] = tape.crossings(l.ts, entry, t_px, s_px, long,
                                            HORIZON_S)
+    if progress is not None:
+        progress.done()
 
 
 def outcome(l: Look, side: str, t_i: int, s_i: int,
@@ -766,6 +830,8 @@ def main(argv=None) -> int:
                     help="aggressor convention is inverted in this file")
     ap.add_argument("--rt-ticks", type=float, default=DEFAULT_RT_TICKS)
     ap.add_argument("--seed", type=int, default=20261015)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="stop after N records -- a trial run, not a result")
     args = ap.parse_args(argv)
 
     print(f"file      {args.path}")
@@ -777,12 +843,19 @@ def main(argv=None) -> int:
         for t, s in HEADLINE))
     print(f"time stop {', '.join(f'{c:.0f}s' for c in TIME_STOPS)} "
           f"(grid -- the number was not supplied)")
+    print(f"passes    {len(REVERSALS)} (one per reversal threshold); "
+          f"progress on stderr")
+    if args.limit:
+        print(f"LIMIT     {args.limit:,} records -- a trial run. The "
+              f"figures below cover part of the session and are not a "
+              f"result.")
     print()
 
     for rev in REVERSALS:
-        store = dbn.open_file(args.path)
+        store = capped(dbn.open_file(args.path), args.limit)
         looks, tape, prints = walk(store, rev, symbol=args.symbol,
-                                   flip=args.flip)
+                                   flip=args.flip,
+                                   progress=Progress(f"walk r={rev}"))
         cut = len(looks)
         print("=" * 78)
         print(f"REVERSAL {rev} TICKS -- {len(looks)} confirmed pivots over "
@@ -791,7 +864,9 @@ def main(argv=None) -> int:
         if not looks:
             continue
 
-        score(looks, tape)          # once; every table below reads this
+        # Once. Every table below reads what this produced.
+        score(looks, tape, progress=Progress(f"score r={rev}", every=2000,
+                                             total=len(looks)))
 
         med_leg = _median([l.leg_ticks for l in looks])
         med_s = _median([l.leg_s for l in looks])

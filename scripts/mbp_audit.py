@@ -39,8 +39,10 @@ NOTHING HERE READS A SIGNAL OR SCORES AN OUTCOME. It counts records.
 from __future__ import annotations
 
 import argparse
+import itertools
 import math
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +55,38 @@ from liqmap.dom import ladder_of, read as dom_read, volume_by_price  # noqa: E40
 WINDOW_S = 20.0            # the window dom_probe and book_control both used
 TICK = 0.25
 MAX_GAP_REPORT = 10
+HEARTBEAT = 500_000        # records between progress lines
+
+
+class Progress:
+    """A heartbeat on stderr while a long pass runs.
+
+    Eight million records take minutes and this printed nothing until the
+    pass finished, which is indistinguishable from a hang -- so the first
+    thing anyone does is kill it. Goes to stderr so a piped stdout still
+    holds nothing but the report.
+    """
+
+    def __init__(self, label: str, every: int = HEARTBEAT,
+                 out=None) -> None:
+        self.label = label
+        self.every = max(1, every)
+        self.n = 0
+        self.out = out if out is not None else sys.stderr
+        self.start = time.time()
+
+    def tick(self) -> None:
+        self.n += 1
+        if self.n % self.every:
+            return
+        el = max(1e-9, time.time() - self.start)
+        print(f"  [{self.label}] {self.n:,} records  {el:,.0f}s  "
+              f"{self.n / el:,.0f}/s", file=self.out, flush=True)
+
+    def done(self) -> None:
+        el = max(1e-9, time.time() - self.start)
+        print(f"  [{self.label}] done: {self.n:,} records in {el:,.0f}s",
+              file=self.out, flush=True)
 
 
 @dataclass
@@ -83,10 +117,13 @@ class Census:
         del self.gaps[MAX_GAP_REPORT:]
 
 
-def census(records, gap_s: float = 1.0) -> Census:
+def census(records, gap_s: float = 1.0, progress: Progress | None = None
+           ) -> Census:
     c = Census()
     prev_ts = None
     for rec in records:
+        if progress is not None:
+            progress.tick()
         c.records += 1
         act = dbn._action(rec) or "?"
         side = dbn._side(rec)
@@ -126,6 +163,8 @@ def census(records, gap_s: float = 1.0) -> Census:
                 c.crossed += 1
         else:
             c.empty_book += 1
+    if progress is not None:
+        progress.done()
     return c
 
 
@@ -154,7 +193,7 @@ def _span(lad, side: str) -> tuple[float, float]:
 
 
 def compare(records, window_s: float = WINDOW_S, depth: int = 10,
-            symbol: str = "ES") -> Compare:
+            symbol: str = "ES", progress: Progress | None = None) -> Compare:
     """Walk in windows; at each boundary measure the same thing both ways.
 
     The inference is `dom.read` exactly as production calls it. The truth is
@@ -172,6 +211,8 @@ def compare(records, window_s: float = WINDOW_S, depth: int = 10,
     trades: list = []
 
     for rec in records:
+        if progress is not None:
+            progress.tick()
         act = dbn._action(rec)
         side = dbn._side(rec)
         sz = float(dbn._get(rec, "size", 0) or 0)
@@ -244,6 +285,8 @@ def compare(records, window_s: float = WINDOW_S, depth: int = 10,
         pending_add = {"bid": defaultdict(float), "ask": defaultdict(float)}
         trades = []
 
+    if progress is not None:
+        progress.done()
     return out
 
 
@@ -268,6 +311,18 @@ ACTION_NAMES = {"A": "add", "C": "cancel", "M": "modify", "T": "trade",
                 "F": "fill", "R": "clear", "?": "(none)"}
 
 
+def capped(records, limit: int):
+    """The first `limit` records, or all of them when limit is 0.
+
+    For finding out how long a full run will take before starting one.
+    Whatever comes out of a capped run is part of a session, so the
+    report says so rather than leaving it to be noticed.
+    """
+    if limit <= 0:
+        return records
+    return itertools.islice(records, limit)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("path")
@@ -275,11 +330,18 @@ def main(argv=None) -> int:
     ap.add_argument("--window", type=float, default=WINDOW_S)
     ap.add_argument("--gap", type=float, default=1.0,
                     help="seconds of silence worth reporting")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="stop after N records -- a trial run, not a result")
     args = ap.parse_args(argv)
 
     print(f"file   {args.path}")
+    print("(two passes over the file; progress on stderr)")
+    if args.limit:
+        print(f"LIMIT  {args.limit:,} records -- a trial run. The figures "
+              f"below cover part of the session and are not a result.")
     print()
-    c = census(dbn.open_file(args.path), gap_s=args.gap)
+    c = census(capped(dbn.open_file(args.path), args.limit), gap_s=args.gap,
+               progress=Progress("census"))
 
     span = max(0.0, c.ts_last - c.ts_first)
     print("RECORDS")
@@ -329,8 +391,9 @@ def main(argv=None) -> int:
 
     print(f"INFERRED vs ACTUAL  (window {args.window:.0f}s, "
           f"clipped to the overlapping price span)")
-    cmp = compare(dbn.open_file(args.path), window_s=args.window,
-                  symbol=args.symbol)
+    cmp = compare(capped(dbn.open_file(args.path), args.limit),
+                  window_s=args.window, symbol=args.symbol,
+                  progress=Progress("compare"))
     if cmp.windows == 0:
         print("  no comparable windows")
         return 0

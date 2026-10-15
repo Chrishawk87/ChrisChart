@@ -310,3 +310,57 @@ def test_nothing_here_places_an_order():
     src = inspect.getsource(ma).lower()
     for word in ("def submit", "def execute", "def place", "def order"):
         assert word not in src
+
+
+# ------------------------------------------------------------- progress
+
+def test_progress_never_writes_to_the_report():
+    """Two passes over eight million records printed nothing until each
+    finished, which looks exactly like a hang. The heartbeat fixes that,
+    but on stdout it would corrupt the report it is reporting on."""
+    import io
+    buf = io.StringIO()
+    p = ma.Progress("x", every=2, out=buf)
+    for _ in range(4):
+        p.tick()
+    p.done()
+    assert buf.getvalue()
+    assert p.out is not sys.stdout
+
+
+def test_progress_defaults_to_stderr():
+    assert ma.Progress("x").out is sys.stderr
+
+
+def test_progress_survives_a_zero_interval():
+    import io
+    ma.Progress("x", every=0, out=io.StringIO()).tick()
+
+
+def test_both_passes_accept_a_progress_object():
+    import io
+    a, b = io.StringIO(), io.StringIO()
+    recs = [plain(float(i), "C", "B", 1, 99.75) for i in range(6)]
+    ma.census(recs, progress=ma.Progress("c", every=2, out=a))
+    ma.compare(recs, progress=ma.Progress("p", every=2, out=b))
+    assert a.getvalue() and b.getvalue()
+
+
+def test_both_passes_run_without_one():
+    recs = [plain(float(i), "C", "B", 1, 99.75) for i in range(4)]
+    assert ma.census(recs).records == 4
+    assert ma.compare(recs).windows == 0
+
+
+def test_a_limit_takes_the_first_records_and_no_limit_takes_them_all():
+    assert list(ma.capped(range(10), 3)) == [0, 1, 2]
+    assert list(ma.capped(range(4), 0)) == [0, 1, 2, 3]
+    assert list(ma.capped(range(4), -1)) == [0, 1, 2, 3]
+
+
+def test_a_capped_run_says_so_in_the_report():
+    """A partial figure that does not announce itself gets quoted as a
+    result for the session."""
+    import inspect
+    src = inspect.getsource(ma.main)
+    assert "LIMIT" in src and "not a result" in src

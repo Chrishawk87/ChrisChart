@@ -802,3 +802,77 @@ def test_nothing_here_places_an_order():
     src = inspect.getsource(ss).lower()
     for word in ("def submit", "def execute", "def place", "def order"):
         assert word not in src
+
+
+# ------------------------------------------------------------- progress
+
+def test_progress_never_writes_to_the_report():
+    """It goes to stderr. On stdout it would land in the middle of the
+    tables and in whatever file the run was piped into."""
+    import io
+    buf = io.StringIO()
+    p = ss.Progress("x", every=2, out=buf)
+    for _ in range(4):
+        p.tick()
+    p.done()
+    assert buf.getvalue()
+    assert p.out is not sys.stdout
+
+
+def test_progress_defaults_to_stderr():
+    assert ss.Progress("x").out is sys.stderr
+
+
+def test_progress_prints_on_the_interval_and_not_between():
+    import io
+    buf = io.StringIO()
+    p = ss.Progress("x", every=3, out=buf)
+    p.tick(); p.tick()
+    assert buf.getvalue() == ""
+    p.tick()
+    assert "3" in buf.getvalue()
+
+
+def test_progress_survives_a_zero_interval():
+    import io
+    p = ss.Progress("x", every=0, out=io.StringIO())
+    p.tick()          # must not divide by zero
+
+
+def test_progress_reports_a_share_only_when_a_total_is_known():
+    import io
+    a, b = io.StringIO(), io.StringIO()
+    p = ss.Progress("x", every=1, total=10, out=a)
+    p.tick()
+    q = ss.Progress("x", every=1, out=b)
+    q.tick()
+    assert "%" in a.getvalue()
+    assert "%" not in b.getvalue()
+
+
+def test_the_walk_and_the_scorer_run_without_a_progress_object(passthrough):
+    """It is optional, and the tests drive them without one."""
+    looks, tape, _ = ss.walk(zigzag([(12, True), (12, False)]), 2)
+    ss.score(looks, tape)
+    assert all(l.cross for l in looks)
+
+
+def test_the_walk_reports_the_pivot_count_as_it_goes(passthrough):
+    """The number worth seeing early: a threshold producing a pivot every
+    few prints will not finish, and that should be visible in seconds
+    rather than after the pass."""
+    import io
+    buf = io.StringIO()
+    p = ss.Progress("w", every=10, out=buf)
+    ss.walk(zigzag([(12, True), (12, False), (12, True)]), 2, progress=p)
+    assert "pivots" in buf.getvalue()
+
+
+def test_a_limit_takes_the_first_records_and_no_limit_takes_them_all():
+    assert list(ss.capped(range(10), 3)) == [0, 1, 2]
+    assert list(ss.capped(range(4), 0)) == [0, 1, 2, 3]
+    assert list(ss.capped(range(4), -1)) == [0, 1, 2, 3]
+
+
+def test_a_limit_longer_than_the_file_is_not_an_error():
+    assert list(ss.capped(range(3), 99)) == [0, 1, 2]
