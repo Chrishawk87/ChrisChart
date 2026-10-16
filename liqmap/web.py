@@ -5950,6 +5950,27 @@ quiet.">volume over <input id="swEffort" value="200" size="3">% of
 
   <div class="grid tabpane" id="tab-book" hidden>
 
+    <div class="panel full" id="ofiPanel"><h2>Order flow imbalance &mdash; who is winning the book race
+      <span class="stamp" id="ofiStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">CME depth, event by event. This
+        measures pressure at the touch <b>right now</b> &mdash; it does not forecast.
+        Positive is net buying, negative net selling.</div>
+      <div id="ofiOff" class="say"></div>
+      <div id="ofiOn" style="display:none">
+        <div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin-bottom:10px">
+          <div><span id="ofiSide" style="font-size:26px;font-weight:700">&mdash;</span>
+            <span class="msg" id="ofiSideNote"></span></div>
+          <div class="msg">z <b id="ofiZ" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">window <b id="ofiWin" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">book <b id="ofiObi" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">spread <b id="ofiSpread" style="font-family:var(--mono)">&mdash;</b></div>
+        </div>
+        <svg id="ofiSpark" viewBox="0 0 600 70" preserveAspectRatio="none"
+             style="width:100%;height:70px;display:block"></svg>
+        <div class="msg" id="ofiStats" style="margin-top:8px">&mdash;</div>
+      </div>
+    </div>
+
     <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
       <span class="stamp" id="bookStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">The order book is the structure.
@@ -6151,6 +6172,93 @@ async function api(path, opts) {
 }
 
 function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (bad ? ' err' : ''); }
+
+// ---- Order flow imbalance -------------------------------------------------
+// Polls only while its tab is open: the snapshot is cheap but there is no
+// reason to ask for a reading nobody is looking at.
+function ofiFmt(v, d) {
+  return (v === null || v === undefined || v === '') ? '—'
+    : (typeof v === 'number' ? v.toFixed(d === undefined ? 2 : d) : v);
+}
+
+function paintOfi(d) {
+  const off = $('ofiOff'), on = $('ofiOn');
+  $('ofiStamp').textContent = d.updated_at
+    ? new Date(d.updated_at * 1000).toLocaleTimeString() : '';
+  if (!d.running || !d.last) {
+    on.style.display = 'none';
+    off.style.display = '';
+    const why = d.error || d.blocked_by || 'not running';
+    off.innerHTML = '<b>Engine idle.</b> ' + why
+      + '<br><span class="msg">Set DATABENTO_API_KEY and LIQMAP_OFI=true, '
+      + 'then redeploy. Symbol: ' + (d.symbols || []).join(', ')
+      + ' &middot; window ' + d.window + ' &middot; baseline ' + d.baseline
+      + '</span>';
+    return;
+  }
+  off.style.display = 'none';
+  on.style.display = '';
+  const L = d.last;
+  const z = L.z;
+  const side = L.side || (z === null ? 'warming up'
+    : (z > 0 ? 'buyers ahead' : (z < 0 ? 'sellers ahead' : 'level')));
+  const col = (z === null) ? 'var(--dim)'
+    : (z > 0 ? 'var(--up)' : (z < 0 ? 'var(--down)' : 'var(--dim)'));
+  $('ofiSide').textContent = side;
+  $('ofiSide').style.color = col;
+  $('ofiSideNote').textContent = L.warm ? '' : '(baseline still filling)';
+  $('ofiZ').textContent = ofiFmt(z);
+  $('ofiWin').textContent = (L.window > 0 ? '+' : '') + L.window;
+  $('ofiObi').textContent = ofiFmt(L.obi);
+  $('ofiSpread').textContent = ofiFmt(L.spread / 250000000, 2) + 't';
+  const r = d.refused || {};
+  $('ofiStats').textContent =
+    (d.readings || 0).toLocaleString() + ' readings · '
+    + (d.records || 0).toLocaleString() + ' records · refused '
+    + Object.keys(r).map(k => k + ' ' + r[k]).join(', ')
+    + ' · age ' + ofiFmt(d.age_s, 2) + 's';
+  drawOfiSpark(d.history || []);
+}
+
+function drawOfiSpark(rows) {
+  const svg = $('ofiSpark');
+  const zs = rows.filter(r => r.z !== null && r.z !== undefined);
+  if (zs.length < 2) { svg.innerHTML = ''; return; }
+  const W = 600, H = 70, mid = H / 2;
+  let hi = 0;
+  for (const r of zs) hi = Math.max(hi, Math.abs(r.z));
+  hi = hi || 1;                       // all zero: a flat line, not a crash
+  const pts = zs.map((r, i) => {
+    const x = (i / (zs.length - 1)) * W;
+    const y = mid - (r.z / hi) * (mid - 4);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  const last = zs[zs.length - 1].z;
+  const col = last > 0 ? 'var(--up)' : (last < 0 ? 'var(--down)' : 'var(--dim)');
+  svg.innerHTML =
+    '<line x1="0" y1="' + mid + '" x2="' + W + '" y2="' + mid
+    + '" stroke="var(--line)" stroke-width="1"/>'
+    + '<polyline fill="none" stroke="' + col + '" stroke-width="1.5" '
+    + 'vector-effect="non-scaling-stroke" points="' + pts + '"/>'
+    + '<text x="4" y="10" font-size="9" fill="var(--dim)">+'
+    + hi.toFixed(1) + '</text>'
+    + '<text x="4" y="' + (H - 3) + '" font-size="9" fill="var(--dim)">-'
+    + hi.toFixed(1) + '</text>';
+}
+
+async function loadOfi() {
+  const pane = $('tab-book');
+  if (!pane || pane.hidden || !tok()) return;
+  try { paintOfi(await api('/api/ofi?history=150')); }
+  catch (e) {
+    $('ofiOn').style.display = 'none';
+    $('ofiOff').style.display = '';
+    $('ofiOff').textContent = 'could not read /api/ofi: ' + e.message;
+  }
+}
+setInterval(loadOfi, 2000);
+
+
 
 async function loadAll() {
   note('loading…');
