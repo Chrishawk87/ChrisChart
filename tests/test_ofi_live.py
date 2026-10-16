@@ -75,9 +75,13 @@ class TestSameEngine:
     def test_the_module_reuses_bookstate_and_race(self):
         src = (Path(__file__).resolve().parent.parent
                / "liqmap" / "ofi_live.py").read_text()
-        assert "ofi.BookState()" in src
+        # Matched on the CONSTRUCTOR, not an exact call. Pinning
+        # `ofi.BookState()` breaks the moment an argument is added,
+        # which says nothing about whether the class was reused.
+        assert "ofi.BookState(" in src
         assert "ofi.Race(" in src
         assert "def level_ofi" not in src, "the formula was copied"
+        assert "class BookState" not in src, "a second state machine"
 
 
 class TestCredentials:

@@ -246,6 +246,7 @@ class Refusals:
 
     first: int = 0
     boundary: int = 0
+    no_book: int = 0
     invalid: int = 0
     crossed: int = 0
     gap: int = 0
@@ -253,13 +254,14 @@ class Refusals:
 
     @property
     def total(self) -> int:
-        return (self.first + self.boundary + self.invalid
+        return (self.first + self.boundary + self.no_book + self.invalid
                 + self.crossed + self.gap + self.roll)
 
     def as_dict(self) -> dict:
         return {"first": self.first, "boundary": self.boundary,
-                "invalid": self.invalid, "crossed": self.crossed,
-                "gap": self.gap, "roll": self.roll}
+                "no_book": self.no_book, "invalid": self.invalid,
+                "crossed": self.crossed, "gap": self.gap,
+                "roll": self.roll}
 
 
 class BookState:
@@ -307,6 +309,21 @@ class BookState:
             return None
 
         cur = levels_from(rec)
+
+        # NO BOOK AT ALL is not a malformed book. A `trades`
+        # subscription delivers TradeMsg, which carries a price and a
+        # size and no bid or ask whatsoever; mixed with a book schema
+        # on one session, half the stream looks like that. Counting
+        # those as `invalid` makes a healthy feed read as broken, and
+        # trips any "most records refused" alarm.
+        #
+        # It must also leave `prev` and `prev_seq` ALONE: these
+        # records are not a book state this one followed, and letting
+        # them advance the sequence would make every real book update
+        # look like a gap.
+        if not cur.levels:
+            self.refused.no_book += 1
+            return None
 
         if iid != self.instrument:
             # A roll. The next contract trades dollars away; an e_n

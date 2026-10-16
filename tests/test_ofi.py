@@ -322,7 +322,8 @@ class TestInvalidTouch:
         st.feed(one(BASE + 2 * TICK, 5, BASE + TICK, 5, seq=2))
         assert st.refused.total == 3
         assert set(st.refused.as_dict()) == {
-            "first", "boundary", "invalid", "crossed", "gap", "roll"}
+            "first", "boundary", "no_book", "invalid", "crossed",
+            "gap", "roll"}
 
 
 # -------------------------------------------------- 6. no rebuilt book
@@ -633,3 +634,83 @@ class TestRace:
             ofi.Race(window=0)
         with pytest.raises(ValueError):
             ofi.Race(baseline=1)
+
+
+class TestRealDatabentoRecords:
+    """Against records built by the databento package itself.
+
+    Hand-rolled fixtures agree with whatever the code already does.
+    These are the actual Rust-backed types the live feed delivers, so
+    they catch a shape assumption that no dict could.
+    """
+
+    @staticmethod
+    def _pkg():
+        return pytest.importorskip("databento_dbn")
+
+    def trade(self, d, px=5800.25, seq=1):
+        NS = 10 ** 9
+        return d.TradeMsg(
+            publisher_id=1, instrument_id=7, ts_event=1700000000 * NS,
+            price=int(px * NS), size=3, action=d.Action.TRADE,
+            side=d.Side.ASK, flags=0, depth=0,
+            ts_recv=1700000000 * NS, ts_in_delta=0, sequence=seq)
+
+    def bbo(self, d, bid=5800.00, bsz=50, ask=5800.25, asz=40, seq=1):
+        NS = 10 ** 9
+        return d.BBOMsg(
+            publisher_id=1, instrument_id=7, ts_event=1700000000 * NS,
+            price=int(ask * NS), size=2, side=d.Side.BID, flags=0,
+            ts_recv=1700000000 * NS, sequence=seq, rtype=d.RType.BBO_1S,
+            levels=d.BidAskPair(bid_px=int(bid * NS), ask_px=int(ask * NS),
+                                bid_sz=bsz, ask_sz=asz,
+                                bid_ct=1, ask_ct=1))
+
+    def test_a_trade_record_carries_no_book(self):
+        """`trades` cannot drive OFI -- there is no bid or ask in the
+        record to difference. The engine must say so, not pretend."""
+        d = self._pkg()
+        st = ofi.BookState(check_sequence=False)
+        assert st.feed(self.trade(d)) is None
+        assert st.refused.no_book == 1
+        assert st.refused.invalid == 0
+
+    def test_a_bbo_record_drives_ofi(self):
+        """BBOMsg has one level and NO action field at all."""
+        d = self._pkg()
+        st = ofi.BookState(check_sequence=False)
+        st.feed(self.bbo(d, bsz=50))
+        ev = st.feed(self.bbo(d, bsz=62, seq=2))
+        assert ev is not None and ev.e_n == 12
+
+    def test_a_bbo_record_has_no_action(self):
+        d = self._pkg()
+        assert dbn_action(self.bbo(d)) == ""
+
+    def test_a_mixed_stream_counts_trades_as_benign(self):
+        """trades + bbo-1s on one session. The trades are not
+        malformed books; counting them as `invalid` makes a healthy
+        feed look broken and trips the refusal alarm."""
+        d = self._pkg()
+        st = ofi.BookState(check_sequence=False)
+        stream = [self.bbo(d, bsz=50, seq=1), self.trade(d, seq=2),
+                  self.bbo(d, bsz=62, seq=3), self.trade(d, seq=4)]
+        got = [st.feed(r) for r in stream]
+        assert [g.e_n for g in got if g] == [12]
+        assert st.refused.no_book == 2
+        assert st.refused.invalid == 0
+        assert st.refused.gap == 0
+
+    def test_a_no_book_record_does_not_disturb_the_previous_state(self):
+        """A trade between two book updates must not break the pair."""
+        d = self._pkg()
+        st = ofi.BookState(check_sequence=False)
+        st.feed(self.bbo(d, bsz=50, seq=1))
+        st.feed(self.trade(d, seq=2))
+        ev = st.feed(self.bbo(d, bsz=62, seq=3))
+        assert ev is not None and ev.e_n == 12, "the trade clobbered prev"
+
+
+def dbn_action(rec):
+    from liqmap import dbn as _d
+    return _d._action(rec)

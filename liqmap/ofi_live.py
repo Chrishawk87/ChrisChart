@@ -152,8 +152,19 @@ class LiveRace:
     # drift apart in time.
     tape: object = None
 
+    @property
+    def schemas(self) -> list:
+        """The schema list, however it was given."""
+        if isinstance(self.schema, (list, tuple)):
+            return [str(x).strip() for x in self.schema if str(x).strip()]
+        return [x.strip() for x in str(self.schema).split(",") if x.strip()]
+
     def __post_init__(self) -> None:
-        self.state = ofi.BookState()
+        # Sequence numbers are per stream. With more than one schema on
+        # a session they interleave, and every real book update would
+        # look like a gap -- so the check is off unless a single schema
+        # makes it meaningful.
+        self.state = ofi.BookState(check_sequence=len(self.schemas) == 1)
         self.race = ofi.Race(window=self.window, baseline=self.baseline)
         self.feats = ofi.Features()
 
@@ -174,8 +185,14 @@ class LiveRace:
                 "databento is not installed (pip install databento)"
             ) from exc
         live = db.Live()
-        live.subscribe(dataset=self.dataset, schema=self.schema,
-                       stype_in=self.stype_in, symbols=self.symbols)
+        # One session, several schemas. `trades` carries no book and
+        # `bbo-1s` carries no trade, so an L1 entitlement needs both to
+        # drive the OFI and the candles -- and they must share a
+        # session, or the two streams arrive on different clocks and
+        # a candle can close before the book update that belongs in it.
+        for schema in self.schemas:
+            live.subscribe(dataset=self.dataset, schema=schema,
+                           stype_in=self.stype_in, symbols=self.symbols)
         return live
 
     def consume(self, records):
@@ -211,7 +228,10 @@ def main(argv=None) -> int:
     ap.add_argument("--stype-in", default="continuous")
     ap.add_argument("--schema", default=SCHEMA,
                     help=f"{SCHEMA} for depth, {SCHEMA_L1} for the "
-                         f"touch only; e_n is identical either way")
+                         f"touch only; e_n is identical either way. "
+                         f"Comma-separate for an L1 entitlement, e.g. "
+                         f"'bbo-1s,trades' -- the first gives the book, "
+                         f"the second the prints")
     ap.add_argument("--window", type=int, default=100)
     ap.add_argument("--baseline", type=int, default=1000)
     ap.add_argument("--z", type=float, default=None,

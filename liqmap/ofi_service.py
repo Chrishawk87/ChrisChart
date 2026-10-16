@@ -93,6 +93,9 @@ class Config:
             dataset=os.environ.get("LIQMAP_OFI_DATASET", "GLBX.MDP3"),
             stype_in=os.environ.get("LIQMAP_OFI_STYPE", "continuous"),
             schema=os.environ.get("LIQMAP_OFI_SCHEMA", "mbp-10"),
+            # LIQMAP_OFI_SCHEMA takes a comma-separated list, because
+            # an L1 entitlement needs `bbo-1s` for the book and
+            # `trades` for the prints.
             window=_env_int("LIQMAP_OFI_WINDOW", DEFAULT_WINDOW),
             baseline=_env_int("LIQMAP_OFI_BASELINE", DEFAULT_BASELINE),
             z_enter=_env_float("LIQMAP_OFI_Z", None),
