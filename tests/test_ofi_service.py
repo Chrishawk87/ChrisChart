@@ -10,6 +10,8 @@ import random
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from liqmap.ofi_service import Config, OfiService            # noqa: E402
@@ -152,3 +154,41 @@ class TestNeverLiveUnderPytest:
         monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
         assert "DATABENTO_API_KEY" in Config(enabled=True).blocked_by()
         assert Config(enabled=False).blocked_by().startswith("LIQMAP_OFI")
+
+
+class TestSchemaValidation:
+    """A bad schema name must fail before a socket opens.
+
+    Caught at connect time it comes back as a message from the
+    gateway that does not say which of your settings was wrong.
+    """
+
+    def test_a_good_pair_is_accepted(self, monkeypatch):
+        monkeypatch.setenv("DATABENTO_API_KEY", "x")
+        c = Config(enabled=True, schema="bbo-1s,trades")
+        assert c.schema_list == ["bbo-1s", "trades"]
+        assert "unknown schema" not in c.blocked_by()
+
+    def test_a_typo_is_named(self, monkeypatch):
+        monkeypatch.setenv("DATABENTO_API_KEY", "x")
+        why = Config(enabled=True, schema="bbo1s").blocked_by()
+        assert "unknown schema bbo1s" in why
+        assert "bbo-1s" in why, "it should list the real names"
+
+    def test_a_duplicate_is_collapsed_not_rejected(self, monkeypatch):
+        monkeypatch.setenv("DATABENTO_API_KEY", "x")
+        c = Config(enabled=True, schema="bbo-1s,bbo-1s")
+        assert c.schema_list == ["bbo-1s"]
+        assert "unknown schema" not in c.blocked_by()
+
+    def test_an_empty_schema_is_refused(self, monkeypatch):
+        monkeypatch.setenv("DATABENTO_API_KEY", "x")
+        assert "empty" in Config(enabled=True, schema="").blocked_by()
+
+    def test_every_live_schema_name_is_known(self):
+        """Pinned against the databento package, not a list I typed."""
+        db = pytest.importorskip("databento")
+        names = {str(getattr(db.Schema, n))
+                 for n in dir(db.Schema) if n.isupper()}
+        from liqmap.ofi_service import VALID_SCHEMAS
+        assert names <= VALID_SCHEMAS, names - VALID_SCHEMAS

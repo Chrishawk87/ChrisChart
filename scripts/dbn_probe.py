@@ -148,7 +148,15 @@ def main(argv=None) -> int:
         return 2
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    schemas = [s.strip() for s in args.schemas.split(",") if s.strip()]
+    # De-duplicated: the gateway rejects the same schema twice, and a
+    # repeat in a comma list is easy to type and invisible in the error
+    # that comes back from the far end.
+    schemas, _seen = [], set()
+    for x in args.schemas.split(","):
+        n = x.strip().lower()
+        if n and n not in _seen:
+            _seen.add(n)
+            schemas.append(n)
 
     print(f"dataset   {args.dataset}")
     print(f"symbols   {', '.join(symbols)}  (stype_in={args.stype_in})")

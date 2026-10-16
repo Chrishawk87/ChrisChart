@@ -40,6 +40,15 @@ from dataclasses import dataclass, field
 from . import ofi
 from .cme_tape import Tape
 
+# The names the gateway accepts. A typo here fails at connect time with
+# a message from the far end that does not say which of your settings
+# was wrong, so it is checked before any socket is opened.
+VALID_SCHEMAS = frozenset((
+    "mbo", "mbp-1", "mbp-10", "cmbp-1", "bbo-1s", "bbo-1m",
+    "cbbo-1s", "cbbo-1m", "tbbo", "tcbbo", "trades",
+    "ohlcv-1s", "ohlcv-1m", "ohlcv-1h", "ohlcv-1d", "ohlcv-eod",
+    "definition", "imbalance", "statistics", "status"))
+
 DEFAULT_SYMBOL = "ES.c.0"
 DEFAULT_WINDOW = 100
 DEFAULT_BASELINE = 1000
@@ -102,6 +111,18 @@ class Config:
         )
 
     @property
+    def schema_list(self) -> list:
+        """The schemas, split and de-duplicated, as the engine will
+        subscribe to them."""
+        out, seen = [], set()
+        for x in str(self.schema).split(","):
+            name = x.strip().lower()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
+
+    @property
     def market(self) -> str:
         """The name the picker shows. 'ES.c.0' -> 'ES'.
 
@@ -122,6 +143,12 @@ class Config:
             return "LIQMAP_OFI_SYMBOLS is empty"
         if self.window < 1 or self.baseline < 2:
             return "window must be >= 1 and baseline >= 2"
+        bad = [n for n in self.schema_list if n not in VALID_SCHEMAS]
+        if bad:
+            return (f"unknown schema {', '.join(bad)} -- one of "
+                    f"{', '.join(sorted(VALID_SCHEMAS))}")
+        if not self.schema_list:
+            return "LIQMAP_OFI_SCHEMA is empty"
         if os.environ.get("PYTEST_CURRENT_TEST"):
             # Every Runtime() builds one of these, and the suite builds
             # many. With LIQMAP_OFI exported in a shell, a test run
@@ -226,6 +253,7 @@ class OfiService:
             "market": cfg.market,
             "dataset": cfg.dataset,
             "schema": cfg.schema,
+            "schemas": cfg.schema_list,
             "window": cfg.window,
             "baseline": cfg.baseline,
             "z_enter": cfg.z_enter,

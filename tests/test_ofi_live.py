@@ -199,3 +199,48 @@ class TestSuggestsOnly:
                  if any(k in n.upper() for k in suspect)
                  and isinstance(v, (int, float))]
         assert not bound
+
+
+class TestSchemaList:
+    """The gateway takes several DIFFERENT schemas on one session and
+    rejects the same one twice. Its own docstring: "Multiple
+    subscriptions for different schemas can be made."
+
+    A repeated name in config is easy to produce and the error comes
+    back from the far end without naming which setting caused it, so
+    duplicates are collapsed before any socket is opened.
+    """
+
+    def test_a_single_schema_is_unchanged(self):
+        assert ofi_live.LiveRace(schema="mbp-10").schemas == ["mbp-10"]
+
+    def test_two_different_schemas_both_survive(self):
+        assert ofi_live.LiveRace(schema="bbo-1s,trades").schemas == [
+            "bbo-1s", "trades"]
+
+    def test_a_repeated_schema_is_collapsed(self):
+        assert ofi_live.LiveRace(schema="bbo-1s,bbo-1s").schemas == [
+            "bbo-1s"]
+
+    def test_a_repeat_later_in_the_list_is_collapsed(self):
+        assert ofi_live.LiveRace(
+            schema="bbo-1s, trades ,bbo-1s").schemas == ["bbo-1s", "trades"]
+
+    def test_case_does_not_make_it_a_different_schema(self):
+        assert ofi_live.LiveRace(schema="MBP-1,mbp-1").schemas == ["mbp-1"]
+
+    def test_a_list_works_too(self):
+        assert ofi_live.LiveRace(
+            schema=["trades", "trades", "bbo-1s"]).schemas == [
+                "trades", "bbo-1s"]
+
+    def test_order_is_kept(self):
+        """The first schema is the one whose sequence numbers the
+        state machine would check against."""
+        assert ofi_live.LiveRace(schema="trades,bbo-1s").schemas == [
+            "trades", "bbo-1s"]
+
+    def test_the_subscribe_loop_uses_the_deduplicated_list(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "liqmap" / "ofi_live.py").read_text()
+        assert "for schema in self.schemas:" in src

@@ -154,10 +154,23 @@ class LiveRace:
 
     @property
     def schemas(self) -> list:
-        """The schema list, however it was given."""
-        if isinstance(self.schema, (list, tuple)):
-            return [str(x).strip() for x in self.schema if str(x).strip()]
-        return [x.strip() for x in str(self.schema).split(",") if x.strip()]
+        """The schema list, however it was given -- WITHOUT duplicates.
+
+        The gateway accepts several DIFFERENT schemas on one session
+        and rejects the same one twice. A repeated name in config is
+        easy to produce and impossible to read in an error from the
+        far end, so it is collapsed here. Order is kept, because the
+        first is the one whose sequence numbers matter.
+        """
+        raw = (self.schema if isinstance(self.schema, (list, tuple))
+               else str(self.schema).split(","))
+        out, seen = [], set()
+        for x in raw:
+            name = str(x).strip().lower()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        return out
 
     def __post_init__(self) -> None:
         # Sequence numbers are per stream. With more than one schema on
