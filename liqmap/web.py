@@ -98,6 +98,23 @@ FAST_CURVE_S = 300.0
 _TRACE_KEEP = 40
 
 
+def _feed_age(feed) -> float | None:
+    """Seconds since the feed's last message, or None if there has
+    never been one.
+
+    `Feed.age` is `float | None`: None means the socket is open and
+    running but nothing has arrived yet -- a market the venue does not
+    carry, or a subscription that was accepted and then stayed quiet.
+
+    It must NOT be collapsed to 0.0. Zero says the feed ticked this
+    instant, which is the opposite of the truth, and every staleness
+    check downstream reads it as the freshest possible data. None
+    travels as JSON null and the page already draws that as unknown.
+    """
+    a = getattr(feed, "age", None)
+    return None if a is None else round(max(0.0, a), 1)
+
+
 class Runtime:
     """Shared, lazily built state. One database, reused connections."""
 
@@ -3826,6 +3843,21 @@ def create_app() -> FastAPI:
         from . import orderflow as _of
         from .live import INTERVALS as _IV
 
+        # A CME symbol is checked BEFORE the feed, because pressing Go
+        # live on one opens a Hyperliquid subscription to a market
+        # Hyperliquid does not carry: it connects, it runs, and it is
+        # sent nothing, forever. That feed is not missing, which is
+        # why the no-feed message below never fires -- it is present
+        # and permanently empty, and an empty ladder drawn without
+        # comment would read as "no flow right now" rather than "this
+        # panel is not looking at your data".
+        if rt.is_cme(coin):
+            return {"ok": False, "coin": coin, "source": "cme",
+                    "why": f"{coin} comes from the CME subscription, not "
+                           f"the Hyperliquid feed this panel reads. The "
+                           f"OFI panel and the price are on the CME data; "
+                           f"the flow ladder is not wired to it yet."}
+
         coin = rt.resolve_symbol(coin)[0] or coin
         feed = rt.feed_for(coin)
         if feed is None:
@@ -3864,7 +3896,7 @@ def create_app() -> FastAPI:
                 "spec": {"symbol": sp.symbol, "tick_size": sp.tick_size,
                          "tick_value": sp.tick_value,
                          "cost_ticks": round(sp.cost_ticks(), 2)},
-                "feed_age_s": round(max(0.0, feed.age), 1),
+                "feed_age_s": _feed_age(feed),
                 **lad.to_dict()}
 
     @app.get("/api/mtf", dependencies=[Depends(require_token)])
@@ -4593,7 +4625,7 @@ def create_app() -> FastAPI:
                         tf, iv, bar, book, coverage=max(cov, 0.05),
                         history=feed.history(tf)))
                     tf_hist[tf] = feed.history(tf)
-                    ages[tf] = round(max(0.0, feed.age), 1)
+                    ages[tf] = _feed_age(feed)
                     srcs[tf] = "tape"
                     continue
                 try:
@@ -8472,7 +8504,8 @@ async function loadFlow() {
   }
 
   const st = $('flowStamp');
-  if (st) st.textContent = 'feed ' + d.feed_age_s + 's';
+  if (st) st.textContent = (d.feed_age_s == null)
+    ? 'feed --' : 'feed ' + d.feed_age_s + 's';
 }
 
 function flowNum(n) {

@@ -2436,3 +2436,85 @@ def test_the_feed_keeps_every_bars_flow_as_it_closes(client):
     assert "except Exception" in keep, (
         "this runs on the socket thread; a failed write must not take the "
         "feed down with it")
+
+
+class TestFeedAgeBeforeAnythingArrives:
+    """A feed can be running, connected, and have received nothing.
+
+    `Feed.age` is `float | None` and returns None until the first
+    message lands. Two routes passed it straight into
+    `round(max(0.0, age), 1)`, which raises:
+
+        TypeError: '>' not supported between instances of
+                   'NoneType' and 'float'
+
+    A Hyperliquid subscription to a CME symbol is exactly this state
+    permanently: the socket opens, the venue does not carry the
+    market, nothing is ever sent.
+    """
+
+    def test_none_stays_none(self):
+        """0.0 would claim the feed ticked this instant -- the
+        opposite of never having ticked."""
+        class NeverTicked:
+            age = None
+        assert web._feed_age(NeverTicked()) is None
+
+    def test_a_real_age_is_rounded(self):
+        class Ticked:
+            age = 3.14159
+        assert web._feed_age(Ticked()) == 3.1
+
+    def test_a_negative_age_is_floored_at_zero(self):
+        """A clock that stepped backwards must not report the future."""
+        class Backwards:
+            age = -2.0
+        assert web._feed_age(Backwards()) == 0.0
+
+    def test_a_feed_without_the_attribute_does_not_raise(self):
+        assert web._feed_age(object()) is None
+
+    def test_the_crash_pattern_is_gone_from_the_source(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "liqmap" / "web.py").read_text()
+        assert "max(0.0, feed.age)" not in src
+
+
+class TestFlowOnACmeSymbol:
+    """ES is served by the Databento subscription, not Hyperliquid.
+
+    Before: a 500. After the crash fix alone it would have been an
+    empty ladder with ok=true, which reads as "no flow right now"
+    rather than "this panel is not looking at your data".
+    """
+
+    def _as_cme(self, client, monkeypatch, symbol="ES"):
+        rt = web.runtime()
+        monkeypatch.setattr(rt, "is_cme",
+                            lambda c, s=symbol: str(c).upper() == s)
+        return rt
+
+    def test_it_does_not_500(self, client, monkeypatch):
+        self._as_cme(client, monkeypatch)
+        r = client.get("/api/flow",
+                       params={"coin": "ES", "target_ticks": "10",
+                               "spike": "2",
+                               "timeframes": "4h,1h,15m,5m,1m"},
+                       headers={"Authorization": f"Bearer {TOKEN}"})
+        assert r.status_code == 200
+        assert "TypeError" not in r.text
+
+    def test_it_says_the_panel_is_not_on_the_cme_data(self, client,
+                                                      monkeypatch):
+        self._as_cme(client, monkeypatch)
+        body = client.get("/api/flow", params={"coin": "ES"},
+                          headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert body["ok"] is False, "an empty ladder must not read as ok"
+        why = body["why"].lower()
+        assert "cme" in why and "not wired" in why
+
+    def test_a_hyperliquid_symbol_is_untouched(self, client, monkeypatch):
+        self._as_cme(client, monkeypatch)
+        body = client.get("/api/flow", params={"coin": "BTC"},
+                          headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert "not wired" not in body.get("why", "")
