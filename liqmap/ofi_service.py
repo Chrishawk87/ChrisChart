@@ -75,6 +75,7 @@ class Config:
     symbols: tuple = (DEFAULT_SYMBOL,)
     dataset: str = "GLBX.MDP3"
     stype_in: str = "continuous"
+    schema: str = "mbp-10"
     window: int = DEFAULT_WINDOW
     baseline: int = DEFAULT_BASELINE
     z_enter: float | None = None
@@ -90,6 +91,7 @@ class Config:
             symbols=syms or (DEFAULT_SYMBOL,),
             dataset=os.environ.get("LIQMAP_OFI_DATASET", "GLBX.MDP3"),
             stype_in=os.environ.get("LIQMAP_OFI_STYPE", "continuous"),
+            schema=os.environ.get("LIQMAP_OFI_SCHEMA", "mbp-10"),
             window=_env_int("LIQMAP_OFI_WINDOW", DEFAULT_WINDOW),
             baseline=_env_int("LIQMAP_OFI_BASELINE", DEFAULT_BASELINE),
             z_enter=_env_float("LIQMAP_OFI_Z", None),
@@ -164,7 +166,8 @@ class OfiService:
                 window=self.config.window,
                 baseline=self.config.baseline,
                 z_enter=self.config.z_enter,
-                stype_in=self.config.stype_in)
+                stype_in=self.config.stype_in,
+                schema=self.config.schema)
             for ev, rd in self.engine.run():
                 if self._stop.is_set():
                     break
@@ -193,6 +196,7 @@ class OfiService:
             "error": self.error,
             "symbols": list(cfg.symbols),
             "dataset": cfg.dataset,
+            "schema": cfg.schema,
             "window": cfg.window,
             "baseline": cfg.baseline,
             "z_enter": cfg.z_enter,
@@ -227,7 +231,8 @@ class OfiService:
                 window=self.config.window,
                 baseline=self.config.baseline,
                 z_enter=self.config.z_enter,
-                stype_in=self.config.stype_in)
+                stype_in=self.config.stype_in,
+                schema=self.config.schema)
         n = 0
         for ev, rd in self.engine.consume(records):
             payload = reading_payload(ev, rd, self.config.z_enter)

@@ -44,7 +44,15 @@ from dataclasses import dataclass, field
 from . import ofi
 
 DATASET = "GLBX.MDP3"          # CME Globex MDP 3.0
+
+# mbp-10 gives ten levels; mbp-1 gives the touch only. The CKS formula
+# reads the best bid and ask and nothing else, so `e_n`, the z-score and
+# the OBI at the touch are IDENTICAL either way -- only the
+# depth-derived extras (e_multi, total depth, book_slope, obi_1/2) need
+# the deeper book. mbp-1 is the right subscription when depth is not
+# entitled.
 SCHEMA = "mbp-10"
+SCHEMA_L1 = "mbp-1"
 
 
 @dataclass
@@ -136,6 +144,7 @@ class LiveRace:
     baseline: int = 1000
     z_enter: float | None = None
     stype_in: str = "continuous"
+    schema: str = SCHEMA
     publisher: Publisher | None = None
 
     def __post_init__(self) -> None:
@@ -160,7 +169,7 @@ class LiveRace:
                 "databento is not installed (pip install databento)"
             ) from exc
         live = db.Live()
-        live.subscribe(dataset=self.dataset, schema=SCHEMA,
+        live.subscribe(dataset=self.dataset, schema=self.schema,
                        stype_in=self.stype_in, symbols=self.symbols)
         return live
 
@@ -193,6 +202,9 @@ def main(argv=None) -> int:
                     help="comma separated")
     ap.add_argument("--dataset", default=DATASET)
     ap.add_argument("--stype-in", default="continuous")
+    ap.add_argument("--schema", default=SCHEMA,
+                    help=f"{SCHEMA} for depth, {SCHEMA_L1} for the "
+                         f"touch only; e_n is identical either way")
     ap.add_argument("--window", type=int, default=100)
     ap.add_argument("--baseline", type=int, default=1000)
     ap.add_argument("--z", type=float, default=None,
@@ -219,10 +231,10 @@ def main(argv=None) -> int:
                                if s.strip()],
                       dataset=args.dataset, window=args.window,
                       baseline=args.baseline, z_enter=args.z,
-                      stype_in=args.stype_in,
+                      stype_in=args.stype_in, schema=args.schema,
                       publisher=pub if args.redis else None)
 
-    print(f"dataset    {args.dataset}  {SCHEMA}", file=sys.stderr)
+    print(f"dataset    {args.dataset}  {args.schema}", file=sys.stderr)
     print(f"symbols    {args.symbols}", file=sys.stderr)
     print(f"window     {args.window}   baseline {args.baseline}",
           file=sys.stderr)

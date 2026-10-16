@@ -32,3 +32,9 @@ websocket-client>=1.7
 # Dev
 pytest>=8.0
 httpx>=0.27
+
+# CME depth for the OFI engine. Needed on the web service: without it
+# `ofi_service` starts, finds no client and reports
+# "databento is not installed" on /api/ofi -- which looks like a dead
+# feed rather than a missing package.
+databento>=0.34
