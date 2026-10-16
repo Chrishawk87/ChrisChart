@@ -146,6 +146,11 @@ class LiveRace:
     stype_in: str = "continuous"
     schema: str = SCHEMA
     publisher: Publisher | None = None
+    # Anything with `.offer(rec)`. The same records carry trades, so
+    # one subscription feeds both the OFI engine and the candles --
+    # two subscriptions to the same stream would cost twice and could
+    # drift apart in time.
+    tape: object = None
 
     def __post_init__(self) -> None:
         self.state = ofi.BookState()
@@ -181,6 +186,8 @@ class LiveRace:
         comparable.
         """
         for rec in records:
+            if self.tape is not None:
+                self.tape.offer(rec)
             ev = self.state.feed(rec)
             if ev is None:
                 continue

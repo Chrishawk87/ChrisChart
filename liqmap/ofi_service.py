@@ -38,6 +38,7 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from . import ofi
+from .cme_tape import Tape
 
 DEFAULT_SYMBOL = "ES.c.0"
 DEFAULT_WINDOW = 100
@@ -130,6 +131,10 @@ class OfiService:
         self.readings = 0
         self.error = ""
         self.engine = None
+        # Candles from the same stream. Present whether or not the
+        # engine ever connects, so a panel reading it gets an empty
+        # tape rather than an attribute error.
+        self.tape = Tape(symbol=(self.config.symbols or ["ES"])[0])
 
     # ------------------------------------------------------- lifecycle
 
@@ -167,7 +172,8 @@ class OfiService:
                 baseline=self.config.baseline,
                 z_enter=self.config.z_enter,
                 stype_in=self.config.stype_in,
-                schema=self.config.schema)
+                schema=self.config.schema,
+                tape=self.tape)
             for ev, rd in self.engine.run():
                 if self._stop.is_set():
                     break
@@ -210,6 +216,12 @@ class OfiService:
         if self.engine is not None:
             out["refused"] = self.engine.state.refused.as_dict()
             out["records"] = self.engine.state.seen
+        out["tape"] = {"trades": self.tape.trades,
+                       "records": self.tape.records,
+                       "last_px": self.tape.last_px,
+                       "last_side": self.tape.last_side,
+                       "closed": {k: len(v)
+                                  for k, v in self.tape.closed.items()}}
         if history:
             rows = list(self._history)[-history:]
             out["history"] = [{"at": a, "window": w, "z": z}
@@ -232,7 +244,8 @@ class OfiService:
                 baseline=self.config.baseline,
                 z_enter=self.config.z_enter,
                 stype_in=self.config.stype_in,
-                schema=self.config.schema)
+                schema=self.config.schema,
+                tape=self.tape)
         n = 0
         for ev, rd in self.engine.consume(records):
             payload = reading_payload(ev, rd, self.config.z_enter)

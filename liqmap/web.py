@@ -3094,6 +3094,17 @@ def create_app() -> FastAPI:
         """
         return rt.ofi.snapshot(history=max(0, min(600, history)))
 
+    @app.get("/api/cme", dependencies=[Depends(require_token)])
+    def api_cme(interval: str = "1m", candles: int = 0) -> dict[str, Any]:
+        """ES candles built from the same CME subscription as the OFI.
+
+        The MBP stream carries trade prints beside the book updates, so
+        these are the venue's own trades with the aggressor side it
+        states -- not an uptick rule applied to a price series.
+        """
+        return rt.ofi.tape.snapshot(interval=interval,
+                                    limit=max(0, min(1000, candles)))
+
     @app.get("/api/now", dependencies=[Depends(require_token)])
     def api_now(coin: str = "BTC") -> dict[str, Any]:
         """Live price and how stale everything else is. Cheap enough to poll."""
