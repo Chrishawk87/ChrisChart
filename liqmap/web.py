@@ -139,6 +139,14 @@ class Runtime:
         # How the read got where it is, per coin and traded timeframe.
         from .trace import Tracer as _Tracer
         self.tracer = _Tracer()
+        # Order Flow Imbalance on CME depth. Inert until LIQMAP_OFI
+        # and DATABENTO_API_KEY are both set -- `start()` returns
+        # False and says which one is missing rather than raising, so
+        # the deploy carries the engine while the subscription is
+        # still being arranged.
+        from .ofi_service import OfiService as _OfiService
+        self.ofi = _OfiService()
+        self.ofi.start()
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -3071,6 +3079,20 @@ def create_app() -> FastAPI:
     def api_markets(refresh: bool = False) -> dict[str, Any]:
         """Everything listed and tradeable, across every perp DEX."""
         return rt.markets(force=refresh)
+
+    @app.get("/api/ofi", dependencies=[Depends(require_token)])
+    def api_ofi(history: int = 0) -> dict[str, Any]:
+        """Order Flow Imbalance: who is winning the book race now.
+
+        Always answers. When the engine is not running, `blocked_by`
+        names the condition that is not met -- a panel that cannot
+        tell "waiting for the subscription" from "silently dead" is
+        worse than no panel.
+
+        `history` returns that many recent readings for a sparkline.
+        `side` is present only when LIQMAP_OFI_Z names a line.
+        """
+        return rt.ofi.snapshot(history=max(0, min(600, history)))
 
     @app.get("/api/now", dependencies=[Depends(require_token)])
     def api_now(coin: str = "BTC") -> dict[str, Any]:

@@ -54,6 +54,17 @@ OTHER_SUFFIXES = (".parquet", ".npy", ".db", ".sqlite", ".sqlite3", ".json")
 MAX_PREVIEW = 3
 SAMPLE_ROWS = 200_000           # cap on rows read for the bar diagnostics
 
+# Directories that contain thousands of files and no market data. Without
+# this, pointing the audit at a home directory buries the four files that
+# matter under a thousand lines of package metadata and editor resources --
+# which is exactly what happened the first time it was run.
+SKIP_DIRS = frozenset((
+    ".venv", "venv", "env", "site-packages", "node_modules", "__pycache__",
+    ".git", ".tox", ".mypy_cache", ".pytest_cache", ".cache", "dist-info",
+    "Contents",                 # macOS .app bundles
+))
+SKIP_SUFFIXES = (".app", ".framework", ".egg-info", ".dist-info")
+
 
 @dataclass
 class Found:
@@ -82,7 +93,24 @@ def human(n: float) -> str:
 
 # ------------------------------------------------------------- finding them
 
-def scan(roots) -> list[Found]:
+def skipped(path: Path, root: Path) -> bool:
+    """Is this inside a directory that holds no market data?
+
+    Checked against the part of the path BELOW the root, so pointing the
+    audit at a folder that is itself called `data` or sits inside one does
+    not silently exclude everything in it.
+    """
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        rel = path
+    for part in rel.parts[:-1]:
+        if part in SKIP_DIRS or part.endswith(SKIP_SUFFIXES):
+            return True
+    return False
+
+
+def scan(roots, skip: bool = True) -> list[Found]:
     out: list[Found] = []
     seen = set()
     for root in roots:
@@ -90,7 +118,8 @@ def scan(roots) -> list[Found]:
         if p.is_file():
             paths = [p]
         elif p.is_dir():
-            paths = sorted(q for q in p.rglob("*") if q.is_file())
+            paths = sorted(q for q in p.rglob("*")
+                           if q.is_file() and not (skip and skipped(q, p)))
         else:
             print(f"  (no such path: {p})", file=sys.stderr)
             continue
@@ -219,15 +248,34 @@ class BarStats:
     symbols: Counter = field(default_factory=Counter)
     first_ts: float | None = None
     last_ts: float = 0.0
+    # When each instrument was first and last seen. On a continuous symbol
+    # this is where the contract changed, and a roll splices two different
+    # prices together -- a thirty-point step that is carry, not a move.
+    spans: dict = field(default_factory=dict)
+    # Bar ranges per calendar month, because a quiet week says nothing
+    # about whether a four-tick bracket survives a CPI print.
+    by_month: dict = field(default_factory=dict)
 
 
-def bar_stats(records, expect_s: float, limit: int = SAMPLE_ROWS) -> BarStats:
-    """Walk OHLCV records and count what a backtest would trip over."""
+def bar_stats(records, expect_s: float, limit: int = SAMPLE_ROWS,
+              every: int = 0) -> BarStats:
+    """Walk OHLCV records and count what a backtest would trip over.
+
+    `limit` caps how many bars are KEPT. `every` reads the whole file but
+    keeps one bar in N, which matters because the first two hundred
+    thousand bars of a two-year file are five quiet days in October 2024
+    and say nothing about whether a four-tick bracket survives a CPI
+    print. A cap without a stride measures the start of the file.
+    """
     from liqmap import dbn
     st = BarStats()
     prev = None
+    seen = 0
     for rec in records:
-        if st.bars >= limit:
+        seen += 1
+        if every > 1 and seen % every:
+            continue
+        if limit and st.bars >= limit:
             break
         ts = dbn.seconds(dbn._get(rec, "ts_event"))
         o = dbn.price(dbn._get(rec, "open"))
@@ -238,6 +286,8 @@ def bar_stats(records, expect_s: float, limit: int = SAMPLE_ROWS) -> BarStats:
         iid = dbn._get(rec, "instrument_id")
         if iid is not None:
             st.symbols[iid] += 1
+            lo_hi = st.spans.get(iid)
+            st.spans[iid] = (ts if lo_hi is None else lo_hi[0], ts)
 
         st.bars += 1
         if st.first_ts is None:
@@ -248,7 +298,9 @@ def bar_stats(records, expect_s: float, limit: int = SAMPLE_ROWS) -> BarStats:
                 or low > min(o, c):
             st.bad_prices += 1
         else:
-            st.ranges.append((h - low) / TICK)
+            r = (h - low) / TICK
+            st.ranges.append(r)
+            st.by_month.setdefault(_month(ts), []).append(r)
         if v <= 0:
             st.zero_volume += 1
 
@@ -265,6 +317,11 @@ def bar_stats(records, expect_s: float, limit: int = SAMPLE_ROWS) -> BarStats:
     st.gaps.sort(reverse=True)
     del st.gaps[20:]
     return st
+
+
+def _month(ts: float) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ts, _dt.timezone.utc).strftime("%Y-%m")
 
 
 def _session_day(ts: float) -> str:
@@ -333,6 +390,12 @@ def main(argv=None) -> int:
                     help="round-trip cost assumptions in ticks")
     ap.add_argument("--bars-of", default="",
                     help="a DBN OHLCV file to run the bar diagnostics on")
+    ap.add_argument("--all-dirs", action="store_true",
+                    help="do not skip venvs, node_modules and app bundles")
+    ap.add_argument("--every", type=int, default=0,
+                    help="keep one bar in N, across the WHOLE file")
+    ap.add_argument("--max-bars", type=int, default=SAMPLE_ROWS,
+                    help="bars to keep (0 = no cap)")
     ap.add_argument("--expect-s", type=float, default=60.0,
                     help="seconds per bar in --bars-of")
     args = ap.parse_args(argv)
@@ -344,7 +407,7 @@ def main(argv=None) -> int:
     print("=" * 78)
     print()
 
-    found = scan(args.roots)
+    found = scan(args.roots, skip=not args.all_dirs)
     if not found:
         print("No data files found under:", ", ".join(args.roots))
         print("Nothing can be tested until there is something to test on.")
@@ -409,13 +472,26 @@ def main(argv=None) -> int:
         except Exception as exc:                  # noqa: BLE001
             print(f"  could not open: {exc}")
             return 0
-        st = bar_stats(store, args.expect_s)
-        print(f"    {st.bars:,} bars read (cap {SAMPLE_ROWS:,})")
+        st = bar_stats(store, args.expect_s, limit=args.max_bars,
+                       every=args.every)
+        if args.every > 1:
+            print(f"    {st.bars:,} bars kept, one in {args.every:,} "
+                  f"across the whole file")
+        else:
+            print(f"    {st.bars:,} bars read from the START of the file "
+                  f"(cap {args.max_bars:,}) -- pass --every to sample it "
+                  f"all")
         print(f"    {len(st.sessions)} distinct sessions")
         if st.first_ts is not None:
             print(f"    {_stamp(st.first_ts)}  ->  {_stamp(st.last_ts)}")
-        print(f"    instruments: {len(st.symbols)}"
-              + (f"  {dict(st.symbols.most_common(5))}" if st.symbols else ""))
+        print(f"    instruments: {len(st.symbols)}")
+        for iid, (a, b) in sorted(st.spans.items(), key=lambda kv: kv[1][0]):
+            print(f"        {iid:<10} {st.symbols[iid]:>10,} bars  "
+                  f"{_stamp(a)}  ->  {_stamp(b)}")
+        if len(st.spans) > 1:
+            print("        each change of instrument is a CONTRACT ROLL:")
+            print("        the price steps by carry, not by anything the")
+            print("        market did, and a bar spanning one is not a move.")
         print(f"    duplicate stamps {st.duplicates:,}, "
               f"out of order {st.out_of_order:,}")
         print(f"    bad OHLC rows {st.bad_prices:,}, "
@@ -427,6 +503,21 @@ def main(argv=None) -> int:
         print()
         print("    THE BRACKET DIAGNOSTIC")
         bracket_report(st.ranges, args.target, stops)
+        print()
+        if st.by_month:
+            print()
+            print("    BAR RANGE BY MONTH  (a quiet week proves nothing)")
+            worst = sorted(st.by_month.items(),
+                           key=lambda kv: -_pct(kv[1], 0.99))[:6]
+            for mth, rs in sorted(st.by_month.items()):
+                flag = " <-- widest" if (mth, rs) == worst[0] else ""
+                print(f"      {mth}  n={len(rs):>9,}  "
+                      f"p50 {_median(rs):4.1f}  p90 {_pct(rs, .90):5.1f}  "
+                      f"p99 {_pct(rs, .99):6.1f}  "
+                      f"max {max(rs):7.1f}{flag}")
+            print()
+            print("    THE BRACKET DIAGNOSTIC IN THE WIDEST MONTH")
+            bracket_report(worst[0][1], args.target, stops)
         print()
         print("    A high unresolvable share means this dataset cannot")
         print("    settle this target honestly. Finer bars or the tape")

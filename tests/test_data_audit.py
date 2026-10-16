@@ -378,3 +378,91 @@ def test_percentiles_hit_the_ends():
     assert da._pct(xs, 0.0) == 0
     assert da._pct(xs, 1.0) == 100
     assert da._median(xs) == 50
+
+
+# -------------------------------------------------- the noise exclusions
+
+def test_package_and_editor_directories_are_skipped(tmp_path):
+    """Pointed at a home directory, the first run buried four market-data
+    files under a thousand lines of botocore JSON and VS Code resources.
+    An inventory nobody can read is not an inventory."""
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "es.dbn.zst").write_bytes(b"x")
+    for junk in (".venv/lib/python3.14/site-packages/botocore/data",
+                 "node_modules/foo",
+                 "Visual Studio Code.app/Contents/Resources/app",
+                 "project/__pycache__"):
+        d = tmp_path / junk
+        d.mkdir(parents=True)
+        (d / "thing.json").write_text("{}")
+    got = {f.path.name for f in da.scan([tmp_path])}
+    assert got == {"es.dbn.zst"}, got
+
+
+def test_the_exclusions_can_be_turned_off(tmp_path):
+    (tmp_path / "node_modules").mkdir()
+    (tmp_path / "node_modules" / "a.json").write_text("{}")
+    assert da.scan([tmp_path]) == []
+    assert len(da.scan([tmp_path], skip=False)) == 1
+
+
+def test_a_root_that_is_itself_inside_a_skipped_name_still_works(tmp_path):
+    """Auditing a folder called `data` that happens to live under a venv
+    must not exclude its own contents -- the check is relative to the
+    root it was pointed at."""
+    root = tmp_path / ".venv" / "data"
+    root.mkdir(parents=True)
+    (root / "es.dbn.zst").write_bytes(b"x")
+    assert len(da.scan([root])) == 1
+
+
+def test_a_file_named_like_a_skipped_directory_is_still_found(tmp_path):
+    """The exclusion applies to PARENT directories, not the file itself."""
+    (tmp_path / "node_modules.csv").write_text("a\n")
+    assert len(da.scan([tmp_path])) == 1
+
+
+# ------------------------------------------- sampling the WHOLE file
+
+def test_a_stride_samples_across_the_file_not_just_its_start():
+    """The first 200,000 bars of a two-year file are five quiet days in
+    October 2024. A cap without a stride measures the beginning of the
+    file and calls it the dataset."""
+    recs = [bar(float(i), h=100.0 + i * 0.25, low=100.0)
+            for i in range(1000)]
+    near = da.bar_stats(iter(recs), expect_s=1.0, limit=100)
+    wide = da.bar_stats(iter(recs), expect_s=1.0, limit=100, every=10)
+    assert near.bars == wide.bars == 100
+    assert max(near.ranges) < max(wide.ranges), "the stride saw no further"
+
+
+def test_a_stride_of_one_keeps_everything():
+    recs = [bar(float(i)) for i in range(50)]
+    assert da.bar_stats(iter(recs), 1.0, limit=0, every=1).bars == 50
+
+
+def test_no_cap_reads_the_lot():
+    recs = [bar(float(i)) for i in range(300)]
+    assert da.bar_stats(iter(recs), 1.0, limit=0).bars == 300
+
+
+def test_each_instrument_records_when_it_was_first_and_last_seen():
+    """A change of instrument on a continuous symbol IS the roll, and a
+    bar spanning one is carry rather than a move."""
+    recs = ([bar(float(i), iid=1) for i in range(5)]
+            + [bar(100.0 + i, iid=2) for i in range(5)])
+    st = da.bar_stats(recs, expect_s=1.0)
+    assert set(st.spans) == {1, 2}
+    assert st.spans[1][0] == 0.0 and st.spans[1][1] == 4.0
+    assert st.spans[2][0] == 100.0
+    assert st.spans[1][1] < st.spans[2][0]
+
+
+def test_ranges_are_bucketed_by_month():
+    jan = 1_767_225_600.0          # 2026-01-01 UTC
+    jul = 1_782_950_400.0          # 2026-07-01 UTC
+    recs = [bar(jan, h=100.5, low=100.0), bar(jul, h=102.0, low=100.0)]
+    st = da.bar_stats(recs, expect_s=1.0)
+    assert set(st.by_month) == {"2026-01", "2026-07"}
+    assert st.by_month["2026-01"] == [pytest.approx(2.0)]
+    assert st.by_month["2026-07"] == [pytest.approx(8.0)]
