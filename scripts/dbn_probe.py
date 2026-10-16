@@ -37,6 +37,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -45,6 +46,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from liqmap import dbn                                      # noqa: E402
 
 DATASET = "GLBX.MDP3"
+# How long after the package's own timeout the watchdog gives up on it.
+WATCHDOG_GRACE = 5.0
 CANDIDATES = ("mbp-10", "mbp-1", "tbbo", "bbo-1s", "bbo-1m", "trades")
 
 
@@ -93,35 +96,75 @@ def verdict(rows: list[dict]) -> str:
 
 def probe(schema: str, symbols: list[str], dataset: str, stype: str,
           seconds: float, show: int) -> dict:
+    """Listen to one schema for `seconds`, whatever arrives -- or doesn't.
+
+    CALLBACKS, NOT ITERATION. Iterating the client blocks in the socket
+    read until a record arrives, so a deadline checked inside that loop
+    is only consulted when there is already something to look at. A
+    schema that accepts the subscription and then sends nothing -- a
+    quiet market, precisely the case this script exists to identify --
+    never reaches the check and the probe hangs for good.
+
+    `block_for_close(timeout=)` is a real wall-clock deadline: the
+    package calls `terminate()` when it expires, whether or not a byte
+    ever came down the wire. The watchdog below is a second line for
+    the case where the session never opens at all.
+    """
     import databento as db
-    out = {"schema": schema, "records": 0, "rows": [], "error": ""}
-    client = None
+    out = {"schema": schema, "records": 0, "rows": [], "error": "",
+           "elapsed": 0.0}
+    client, watchdog = None, None
+    started = time.time()
+
+    def on_record(rec) -> None:
+        name = type(rec).__name__
+        # Session chatter, not market data.
+        if name in ("SystemMsg", "SymbolMappingMsg", "ErrorMsg"):
+            if name == "ErrorMsg" and not out["error"]:
+                out["error"] = str(getattr(rec, "err", rec))
+            return
+        out["records"] += 1
+        if len(out["rows"]) < show:
+            out["rows"].append(describe(rec))
+
+    def on_error(exc: Exception) -> None:
+        if not out["error"]:
+            out["error"] = f"{type(exc).__name__}: {exc}"
+
     try:
         client = db.Live()
         client.subscribe(dataset=dataset, schema=schema,
                          stype_in=stype, symbols=symbols)
-        deadline = time.time() + seconds
-        for rec in client:
-            name = type(rec).__name__
-            # Session chatter, not market data.
-            if name in ("SystemMsg", "SymbolMappingMsg", "ErrorMsg"):
-                if name == "ErrorMsg":
-                    out["error"] = str(getattr(rec, "err", rec))
-                continue
-            out["records"] += 1
-            if len(out["rows"]) < show:
-                out["rows"].append(describe(rec))
-            if time.time() > deadline:
-                break
+        client.add_callback(on_record, on_error)
+        client.start()
+        # Belt and braces: if the package's own timeout somehow does
+        # not fire, this does. A probe that hangs is worse than a
+        # probe that reports nothing, because it tells you nothing
+        # AND costs you the terminal.
+        watchdog = threading.Timer(
+            seconds + WATCHDOG_GRACE,
+            lambda: _hush(client.terminate))
+        watchdog.daemon = True
+        watchdog.start()
+        client.block_for_close(timeout=seconds)
     except Exception as exc:                            # noqa: BLE001
-        out["error"] = f"{type(exc).__name__}: {exc}"
+        if not out["error"]:
+            out["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        try:
-            if client is not None:
-                client.stop()
-        except Exception:                               # noqa: BLE001
-            pass
+        if watchdog is not None:
+            watchdog.cancel()
+        if client is not None:
+            _hush(client.terminate)
+        out["elapsed"] = round(time.time() - started, 1)
     return out
+
+
+def _hush(fn) -> None:
+    """Call it; a client that never opened raises on being closed."""
+    try:
+        fn()
+    except Exception:                                   # noqa: BLE001
+        pass
 
 
 def main(argv=None) -> int:
@@ -165,17 +208,22 @@ def main(argv=None) -> int:
           "quiet. A clean")
     print("subscription with 0 records is a closed market, not a broken "
           "key -- the error")
-    print("line is what separates them.\n")
+    print("line is what separates them. Each schema returns after the "
+          "listen window")
+    print(f"whether or not anything arrives, so the whole run takes about "
+          f"{len(schemas) * args.seconds:.0f}s.\n")
 
     results = []
     for schema in schemas:
-        print(f"--- {schema}")
+        print(f"--- {schema}", flush=True)
+        print(f"    listening {args.seconds:.0f}s ...", end="", flush=True)
         r = probe(schema, symbols, args.dataset, args.stype_in,
                   args.seconds, args.show)
         results.append(r)
+        print(f"\r    {' ' * 28}\r", end="")
         if r["error"]:
             print(f"    ERROR  {r['error']}")
-        print(f"    {r['records']:,} records in {args.seconds:.0f}s")
+        print(f"    {r['records']:,} records in {r['elapsed']:.1f}s")
         for row in r["rows"]:
             bits = [f"{row['type']}", f"action={row['action']!r}",
                     f"levels={row['levels']}"]
