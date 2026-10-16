@@ -98,6 +98,17 @@ class Config:
             z_enter=_env_float("LIQMAP_OFI_Z", None),
         )
 
+    @property
+    def market(self) -> str:
+        """The name the picker shows. 'ES.c.0' -> 'ES'.
+
+        The subscription symbol carries Databento's continuous-contract
+        suffix, which is noise in a dropdown and would not match
+        anything a person types.
+        """
+        raw = (self.symbols or ("ES",))[0]
+        return raw.split(".")[0].upper()
+
     def blocked_by(self) -> str:
         """The first unmet condition, in words. '' when ready."""
         if not self.enabled:
@@ -108,6 +119,14 @@ class Config:
             return "LIQMAP_OFI_SYMBOLS is empty"
         if self.window < 1 or self.baseline < 2:
             return "window must be >= 1 and baseline >= 2"
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            # Every Runtime() builds one of these, and the suite builds
+            # many. With LIQMAP_OFI exported in a shell, a test run
+            # would open that many live market-data subscriptions --
+            # billable, and against a feed the tests have no business
+            # touching. Checked last so the reasons a person actually
+            # needs still take precedence in the message.
+            return "not started under pytest"
         return ""
 
 
@@ -201,6 +220,7 @@ class OfiService:
             "blocked_by": cfg.blocked_by(),
             "error": self.error,
             "symbols": list(cfg.symbols),
+            "market": cfg.market,
             "dataset": cfg.dataset,
             "schema": cfg.schema,
             "window": cfg.window,

@@ -476,6 +476,28 @@ class Runtime:
     # budget the sweep needs.
     MARKETS_TTL_S = 300.0
 
+    def cme_market(self) -> dict[str, Any] | None:
+        """The CME row for the picker, or None when the engine is off.
+
+        Built from the tape rather than a quote request: the price is
+        whatever last printed on the subscription we already hold, so
+        this costs nothing and cannot fail.
+        """
+        svc = getattr(self, "ofi", None)
+        if svc is None or not svc.config.enabled:
+            return None
+        from .assetclass import label as _class_label
+        base = svc.config.market
+        return {"symbol": base, "base": base, "dex": "CME", "hip3": False,
+                "price": svc.tape.last_px or 0.0, "klass": "index",
+                "klass_label": _class_label("index"),
+                "has_data": svc.tape.trades > 0, "source": "cme"}
+
+    def is_cme(self, coin: str) -> bool:
+        """Does this symbol belong to the CME source rather than HL?"""
+        row = self.cme_market()
+        return bool(row and str(coin).upper() == row["symbol"])
+
     def markets(self, force: bool = False) -> dict[str, Any]:
         """Every market you can actually trade, across every perp DEX.
 
@@ -497,10 +519,19 @@ class Runtime:
         except Exception as exc:
             if self._markets_cache:
                 return {**self._markets_cache, "stale": True, "error": str(exc)}
-            return {"markets": [], "error": str(exc), "venues": []}
+            # CME does not ride on Hyperliquid, so it stays listed even
+            # when that venue is unreachable. A picker that empties
+            # because an unrelated exchange is down is a worse failure
+            # than one that is short.
+            cme = self.cme_market()
+            return {"markets": [cme] if cme else [], "error": str(exc),
+                    "venues": ["CME"] if cme else []}
 
         have = {r["coin"] for r in self.history.coins_with_data()}
         rows = []
+        cme = self.cme_market()
+        if cme is not None:
+            rows.append(cme)
         for sym, px in mids.items():
             dex, base = split_symbol(sym)
             klass = classify(sym, dex)
@@ -2141,6 +2172,34 @@ class Runtime:
             self.ledger, k, signals, bars,
             cost_bps=float(self.autopilot.get("fee_bps") or 0.0), now=now)
 
+    def cme_now(self, coin: str) -> dict[str, Any]:
+        """`now` for the CME market, answered from the tape.
+
+        No request is made: the price is the last print on the
+        subscription already open, and `age_s` is how long ago that
+        was. A stale tape therefore shows as a growing age rather than
+        as a confident wrong price.
+        """
+        tape = self.ofi.tape
+        now = time.time()
+        snap = tape.snapshot()
+        out: dict[str, Any] = {
+            "coin": self.ofi.config.market,
+            "source": "cme",
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "server_epoch": now,
+            "price": tape.last_px or None,
+            "last_side": tape.last_side,
+            "trades": tape.trades,
+            "age_s": (round(now - tape.last_ts, 3) if tape.last_ts else None),
+            "running": self.ofi.running,
+        }
+        if snap.get("book"):
+            out["book"] = snap["book"]
+        if not self.ofi.running:
+            out["note"] = self.ofi.config.blocked_by() or self.ofi.error
+        return out
+
     def now(self, coin: str) -> dict[str, Any]:
         """Spot price plus how old everything else on the dashboard is.
 
@@ -2154,6 +2213,8 @@ class Runtime:
         means a machine whose clock is a few minutes off reports everything as
         fresh, or everything as stale, and both are worse than no age at all.
         """
+        if self.is_cme(coin):
+            return self.cme_now(coin)
         coin = self.resolve_symbol(coin)[0] or coin.upper()
         now = time.time()
         out: dict[str, Any] = {

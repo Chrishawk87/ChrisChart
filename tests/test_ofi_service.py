@@ -55,9 +55,12 @@ class TestBlockedReasons:
         assert s.start() is False
         assert "DATABENTO_API_KEY" in s.snapshot()["blocked_by"]
 
-    def test_a_ready_config_is_not_blocked(self, monkeypatch):
+    def test_a_ready_config_clears_every_user_facing_reason(self,
+                                                             monkeypatch):
+        """Under pytest the last guard still fires by design, so this
+        checks that nothing a PERSON has to fix remains."""
         monkeypatch.setenv("DATABENTO_API_KEY", "x")
-        assert Config(enabled=True).blocked_by() == ""
+        assert Config(enabled=True).blocked_by() == "not started under pytest"
 
     def test_a_degenerate_window_is_blocked(self, monkeypatch):
         monkeypatch.setenv("DATABENTO_API_KEY", "x")
@@ -128,3 +131,24 @@ class TestWiring:
                / "liqmap" / "ofi_service.py").read_text()
         for bad in ("def submit", "def execute", "def place", "def order"):
             assert bad not in src
+
+
+class TestNeverLiveUnderPytest:
+    """A test run must not open a billable market-data subscription.
+
+    `Runtime()` starts the service, and the suite builds many of them.
+    With LIQMAP_OFI exported in a shell that would be one live CME
+    subscription per Runtime.
+    """
+
+    def test_a_fully_configured_engine_still_refuses(self, monkeypatch):
+        monkeypatch.setenv("DATABENTO_API_KEY", "real-looking-key")
+        cfg = Config(enabled=True)
+        assert cfg.blocked_by() == "not started under pytest"
+        assert OfiService(cfg).start() is False
+
+    def test_the_real_reasons_are_reported_first(self, monkeypatch):
+        """The pytest guard must not mask the message a person needs."""
+        monkeypatch.delenv("DATABENTO_API_KEY", raising=False)
+        assert "DATABENTO_API_KEY" in Config(enabled=True).blocked_by()
+        assert Config(enabled=False).blocked_by().startswith("LIQMAP_OFI")
