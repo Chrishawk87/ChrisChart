@@ -5479,6 +5479,28 @@ DASHBOARD = """<!doctype html>
 
   <div class="grid tabpane" id="tab-dash">
 
+    <div class="panel full" id="ofiPanel"><h2>Order flow imbalance &mdash; who is winning the book race
+      <span class="stamp" id="ofiStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">CME depth, event by event. This
+        measures pressure at the touch <b>right now</b> &mdash; it does not forecast.
+        Positive is net buying, negative net selling.</div>
+      <div id="ofiOff" class="say"></div>
+      <div id="ofiOn" style="display:none">
+        <div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin-bottom:10px">
+          <div><span id="ofiSide" style="font-size:26px;font-weight:700">&mdash;</span>
+            <span class="msg" id="ofiSideNote"></span></div>
+          <div class="msg">z <b id="ofiZ" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">window <b id="ofiWin" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">book <b id="ofiObi" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">spread <b id="ofiSpread" style="font-family:var(--mono)">&mdash;</b></div>
+        </div>
+        <svg id="ofiSpark" viewBox="0 0 600 70" preserveAspectRatio="none"
+             style="width:100%;height:70px;display:block"></svg>
+        <div class="msg" id="ofiStats" style="margin-top:8px">&mdash;</div>
+      </div>
+    </div>
+
+
     <div class="panel full" id="agentPanel"><h2>Chart
       <span class="stamp" id="sugStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Candles, the two volume
@@ -5950,27 +5972,6 @@ quiet.">volume over <input id="swEffort" value="200" size="3">% of
 
   <div class="grid tabpane" id="tab-book" hidden>
 
-    <div class="panel full" id="ofiPanel"><h2>Order flow imbalance &mdash; who is winning the book race
-      <span class="stamp" id="ofiStamp"></span></h2>
-      <div class="msg" style="margin-bottom:8px">CME depth, event by event. This
-        measures pressure at the touch <b>right now</b> &mdash; it does not forecast.
-        Positive is net buying, negative net selling.</div>
-      <div id="ofiOff" class="say"></div>
-      <div id="ofiOn" style="display:none">
-        <div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin-bottom:10px">
-          <div><span id="ofiSide" style="font-size:26px;font-weight:700">&mdash;</span>
-            <span class="msg" id="ofiSideNote"></span></div>
-          <div class="msg">z <b id="ofiZ" style="font-family:var(--mono)">&mdash;</b></div>
-          <div class="msg">window <b id="ofiWin" style="font-family:var(--mono)">&mdash;</b></div>
-          <div class="msg">book <b id="ofiObi" style="font-family:var(--mono)">&mdash;</b></div>
-          <div class="msg">spread <b id="ofiSpread" style="font-family:var(--mono)">&mdash;</b></div>
-        </div>
-        <svg id="ofiSpark" viewBox="0 0 600 70" preserveAspectRatio="none"
-             style="width:100%;height:70px;display:block"></svg>
-        <div class="msg" id="ofiStats" style="margin-top:8px">&mdash;</div>
-      </div>
-    </div>
-
     <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
       <span class="stamp" id="bookStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">The order book is the structure.
@@ -6247,7 +6248,7 @@ function drawOfiSpark(rows) {
 }
 
 async function loadOfi() {
-  const pane = $('tab-book');
+  const pane = $('tab-dash');
   if (!pane || pane.hidden || !tok()) return;
   try { paintOfi(await api('/api/ofi?history=150')); }
   catch (e) {
