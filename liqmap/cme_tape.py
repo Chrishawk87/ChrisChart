@@ -37,10 +37,23 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from . import dbn
+from .flow import FlowTape
 from .live import CandleBuilder
 
 DEFAULT_INTERVALS = (60.0, 300.0, 900.0)      # 1m, 5m, 15m
 KEEP_CLOSED = 300                             # per interval
+
+# How much raw tape the flow ladder can reach back through. An hour is
+# what the other venues keep, and the ladder reports coverage honestly,
+# so a 4-hour rung simply says it is not covered rather than inventing
+# a number from the fragment it can see.
+TAPE_SECONDS = 3600.0
+
+# And a hard ceiling on how many trades that hour may contain. Measured
+# at 136 bytes a trade, an hour of an active ES session is 100-250MB --
+# the age bound alone does not bound memory, because the trade rate is
+# the market's decision. 250k trades is about 34MB.
+TAPE_MAX_TRADES = 250_000
 
 
 def label(seconds: float) -> str:
@@ -66,6 +79,11 @@ class Tape:
     builders: dict = field(default_factory=dict)
     closed: dict = field(default_factory=dict)
     book: object = None
+    # The raw trades, kept as well as folded into candles. The candle
+    # builders answer "what did this bar do"; the ladder asks "which
+    # side has been paying, over these last N seconds", and a closed
+    # bar cannot answer that for the bar still forming.
+    flow: object = None
     last_px: float = 0.0
     last_side: str = ""
     last_ts: float = 0.0
@@ -74,6 +92,9 @@ class Tape:
     books: int = 0
 
     def __post_init__(self) -> None:
+        if self.flow is None:
+            self.flow = FlowTape(max_age=TAPE_SECONDS,
+                                 max_trades=TAPE_MAX_TRADES)
         for s in self.intervals:
             name = label(s)
             self.closed[name] = deque(maxlen=self.keep)
@@ -106,6 +127,7 @@ class Tape:
             return False
         self.trades += 1
         self.last_px, self.last_side, self.last_ts = t.px, t.aggressor, t.ts
+        self.flow.add(t)
         for b in self.builders.values():
             b.add(t)
         return True
@@ -188,3 +210,70 @@ class Tape:
                 for c in self.history(interval, limit=limit)
             ]
         return out
+
+
+@dataclass
+class LadderFeed:
+    """The CME tape, shaped like a live feed.
+
+    The flow ladder was written against the Hyperliquid feed, but it
+    only ever touches four things: `.tape` (walked for `_trades`),
+    `.book` (read at index 0), `.age`, and `.coin`. Presenting those
+    four is the whole adapter -- the measurement code is reused as
+    written rather than copied and re-pointed, so the ES ladder and
+    the BTC ladder cannot drift apart in what they mean.
+
+    WHY IT REPORTS WHICH HALF IS MISSING. An L1 entitlement needs TWO
+    subscriptions: `bbo-1s` carries a book and no trade, `trades`
+    carries a trade and no book. With only one of them the ladder is
+    not wrong, it is half-blind -- and a half-blind ladder draws the
+    same empty rungs as a quiet market. `missing()` says which.
+    """
+
+    src: Tape
+    coin: str = "ES"
+    running: bool = False
+    schemas: tuple = ()
+
+    @property
+    def tape(self):
+        return self.src.flow
+
+    @property
+    def book(self):
+        return self.src.book
+
+    @property
+    def age(self) -> float | None:
+        """Seconds since the last print, or None if there has been none.
+
+        None rather than 0.0, for the same reason the live feed says
+        None: a tape that has never ticked has not just ticked.
+        """
+        import time as _t
+        return (_t.time() - self.src.last_ts) if self.src.last_ts else None
+
+    @property
+    def started_at(self) -> float | None:
+        return None
+
+    def candle(self, interval: str, now: float | None = None):
+        return self.src.candle(interval, now=now)
+
+    def history(self, interval: str, limit: int = 200):
+        return self.src.history(interval, limit=limit)
+
+    def missing(self) -> str:
+        """Which half of the subscription is not delivering. '' when both."""
+        if not self.running:
+            return "the CME engine is not running"
+        gaps = []
+        if self.src.trades == 0:
+            gaps.append("no prints have arrived -- the ladder reads the "
+                        "aggressor side, which only the `trades` schema "
+                        "carries")
+        if self.src.book is None:
+            gaps.append("no book has arrived -- the spread gate needs a "
+                        "bid and an ask, which `trades` does not carry "
+                        "and `bbo-1s` or `mbp-1` does")
+        return "; ".join(gaps)

@@ -22,6 +22,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from liqmap import cme_tape                                 # noqa: E402
 from liqmap.cme_tape import Tape, label                     # noqa: E402
 
 PT = 1_000_000_000
@@ -219,3 +220,171 @@ class TestSuggestsOnly:
                / "liqmap" / "cme_tape.py").read_text()
         assert "from .live import CandleBuilder" in src
         assert "class CandleBuilder" not in src, "a second implementation"
+
+
+# --------------------------------------------------------- the ladder
+
+PT_ = 1_000_000_000
+TICK_ = 250_000_000
+BASE_ = 5800 * PT_
+
+
+class _BBO:
+    """BBOMsg as databento delivers it: a book, and no action at all."""
+    def __init__(self, i, ts, bid_sz=120, ask_sz=100, px=BASE_):
+        self.ts_event = int(ts * 1e9)
+        self.sequence, self.instrument_id = i, 42
+        self.action, self.side = "", "N"
+        self.levels = [type("L", (), {
+            "bid_px": px, "bid_sz": bid_sz,
+            "ask_px": px + TICK_, "ask_sz": ask_sz})()]
+
+
+class _TRD:
+    """TradeMsg: a print with an aggressor, and no levels."""
+    def __init__(self, i, ts, px=BASE_, sz=4, buy=True):
+        self.ts_event = int(ts * 1e9)
+        self.sequence, self.instrument_id = i, 42
+        self.action = "T"
+        self.side = "B" if buy else "A"
+        self.price, self.size = px, sz
+
+
+class TestTheTapeKeepsItsTrades:
+    """The candle builders answer "what did this bar do". The ladder
+    asks "which side has been paying, over these last N seconds",
+    which a closed bar cannot answer for the bar still forming.
+    """
+
+    def test_a_print_lands_on_the_flow_tape(self):
+        t = cme_tape.Tape(symbol="ES")
+        t.offer(_TRD(1, 1_700_000_000.0))
+        assert len(t.flow._trades) == 1
+
+    def test_a_book_update_does_not(self):
+        t = cme_tape.Tape(symbol="ES")
+        t.offer(_BBO(1, 1_700_000_000.0))
+        assert t.flow._trades == [], "a quote is not a fill"
+        assert t.book is not None, "but it is still a book"
+
+    def test_the_aggressor_survives(self):
+        """The only directional information in a fill."""
+        t = cme_tape.Tape(symbol="ES")
+        t.offer(_TRD(1, 1_700_000_000.0, buy=True))
+        t.offer(_TRD(2, 1_700_000_001.0, buy=False))
+        assert [x.aggressor for x in t.flow._trades] == ["buy", "sell"]
+
+    def test_it_is_bounded_by_count_not_only_by_age(self):
+        """An hour is a promise about time. How many trades fit in an
+        hour is the market's decision: measured at 136 bytes a trade,
+        an active ES hour is 100-250MB."""
+        t = cme_tape.Tape(symbol="ES")
+        t.flow.max_trades = 100
+        base = 1_700_000_000.0
+        for i in range(500):
+            t.offer(_TRD(i, base + i * 0.001))      # 0.5s, no age pruning
+        assert len(t.flow._trades) == 100
+
+    def test_the_cap_drops_the_oldest(self):
+        """Trimmed from the wrong end, a tape reports a stale delta as
+        current -- worse than reporting a short one."""
+        t = cme_tape.Tape(symbol="ES")
+        t.flow.max_trades = 10
+        base = 1_700_000_000.0
+        for i in range(50):
+            t.offer(_TRD(i, base + i * 0.001))
+        assert t.flow._trades[-1].ts == pytest.approx(base + 49 * 0.001)
+        assert t.flow._trades[0].ts > base
+
+    def test_the_default_tape_is_uncapped(self):
+        """The venues already using FlowTape must be untouched."""
+        from liqmap.flow import FlowTape, Trade
+        tp = FlowTape(max_age=3600.0)
+        assert tp.max_trades is None
+        for i in range(300):
+            tp.add(Trade(px=1.0, sz=1.0, aggressor="buy",
+                         ts=1_700_000_000.0 + i * 0.001))
+        assert len(tp._trades) == 300
+
+
+class TestLadderFeed:
+    """The ladder only ever touches .tape, .book, .age and .coin.
+    Presenting those is the whole adapter -- so the ES ladder and the
+    BTC ladder cannot drift apart in what they mean.
+    """
+
+    def _fed(self, trades=True, books=True, n=40, running=True):
+        t = cme_tape.Tape(symbol="ES")
+        base = 1_700_000_000.0
+        for i in range(n):
+            if books:
+                t.offer(_BBO(i, base + i))
+            if trades:
+                t.offer(_TRD(i, base + i))
+        return cme_tape.LadderFeed(t, coin="ES", running=running)
+
+    def test_it_exposes_the_trade_list_the_ladder_walks(self):
+        f = self._fed()
+        assert hasattr(f.tape, "_trades") and f.tape._trades
+
+    def test_it_exposes_a_book_the_ladder_can_read_at_the_touch(self):
+        f = self._fed()
+        assert f.book.bids and f.book.asks
+        assert f.book.asks[0].px > f.book.bids[0].px
+
+    def test_age_is_none_before_the_first_print(self):
+        """Not 0.0 -- a tape that has never ticked has not just
+        ticked, and that is the bug that 500'd /api/flow."""
+        f = cme_tape.LadderFeed(cme_tape.Tape(symbol="ES"), coin="ES")
+        assert f.age is None
+
+    def test_both_halves_present_means_nothing_is_missing(self):
+        assert self._fed().missing() == ""
+
+    def test_prints_without_a_book_is_named(self):
+        why = self._fed(books=False).missing()
+        assert "no book" in why and "trades" in why
+
+    def test_a_book_without_prints_is_named(self):
+        why = self._fed(trades=False).missing()
+        assert "no prints" in why and "aggressor" in why
+
+    def test_an_engine_that_is_off_says_so_first(self):
+        assert "not running" in self._fed(running=False).missing()
+
+
+class TestTheLadderActuallyBuilds:
+    """The point of the adapter: the existing measurement code runs
+    unchanged against CME records."""
+
+    def _ladder(self):
+        from liqmap import flowladder as fl, orderflow as of
+        from liqmap.live import INTERVALS
+        t = cme_tape.Tape(symbol="ES")
+        now = 1_700_000_000.0
+        for i in range(600):
+            px = BASE_ + (i // 120) * TICK_
+            t.offer(_BBO(i, now - 600 + i, px=px))
+            if i % 2 == 0:
+                t.offer(_TRD(i, now - 600 + i, px=px, buy=(i % 5 != 0)))
+        f = cme_tape.LadderFeed(t, coin="ES", running=True)
+        want = fl.wanted(["15m", "5m", "1m"], INTERVALS)
+        return fl.build(f.tape, f.book, want, of.SPECS["ES"],
+                        target_ticks=10.0, spike=2.0, now=now).to_dict()
+
+    def test_the_rungs_carry_real_deltas(self):
+        rows = {r["timeframe"]: r for r in self._ladder()["rungs"]}
+        assert rows["1m"]["trades"] > 0
+        assert rows["1m"]["delta"] != 0
+
+    def test_the_spread_is_read_against_the_es_tick(self):
+        """0.25, from the published spec -- not inferred from a spread
+        that happens to be two ticks wide at the moment of the read."""
+        book = self._ladder()["book"]
+        assert book["spread_ticks"] == pytest.approx(1.0)
+
+    def test_a_tape_shorter_than_the_bar_is_not_called_covered(self):
+        """Ten minutes of tape cannot report a 15-minute bar."""
+        rows = {r["timeframe"]: r for r in self._ladder()["rungs"]}
+        assert rows["15m"]["covered"] is False
+        assert rows["1m"]["covered"] is True

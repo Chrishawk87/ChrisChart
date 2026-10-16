@@ -375,8 +375,15 @@ class FlowTape:
     tape has seen, not just the retained window, so it survives pruning.
     """
 
-    def __init__(self, max_age: float = 3600.0):
+    def __init__(self, max_age: float = 3600.0,
+                 max_trades: int | None = None):
         self.max_age = max_age
+        # A SECOND CEILING, BY COUNT. `max_age` is a promise about time,
+        # and how many trades fit in an hour is the market's decision,
+        # not ours: measured at 136 bytes a trade, an hour of an active
+        # CME session is 100-250MB. None keeps the original behaviour
+        # exactly, so the venues already using this are untouched.
+        self.max_trades = max_trades
         self._trades: list[Trade] = []
         self._cvd = 0.0
         self._first_px: float | None = None
@@ -400,9 +407,15 @@ class FlowTape:
         if not self._trades:
             return
         cutoff = now - self.max_age
-        if self._trades[0].ts >= cutoff:
-            return
-        self._trades = [t for t in self._trades if t.ts >= cutoff]
+        if self._trades[0].ts < cutoff:
+            self._trades = [t for t in self._trades if t.ts >= cutoff]
+        # The count ceiling, when one is set. The oldest go first, so
+        # what survives is always the most recent window -- a tape
+        # trimmed from the wrong end would report a stale delta as
+        # current, which is worse than reporting a short one.
+        cap = self.max_trades
+        if cap and len(self._trades) > cap:
+            del self._trades[:len(self._trades) - cap]
 
     # -- readings ---------------------------------------------------------
 

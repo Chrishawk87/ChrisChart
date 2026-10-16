@@ -2504,14 +2504,73 @@ class TestFlowOnACmeSymbol:
         assert r.status_code == 200
         assert "TypeError" not in r.text
 
-    def test_it_says_the_panel_is_not_on_the_cme_data(self, client,
-                                                      monkeypatch):
+    def test_an_empty_cme_tape_says_which_half_is_missing(
+            self, client, monkeypatch):
+        """Half a subscription draws the same empty rungs as a quiet
+        market. `bbo-1s` carries a book and no trade; `trades` carries
+        a trade and no book. The panel must say which it is short of
+        rather than implying there is simply no flow right now."""
         self._as_cme(client, monkeypatch)
         body = client.get("/api/flow", params={"coin": "ES"},
                           headers={"Authorization": f"Bearer {TOKEN}"}).json()
         assert body["ok"] is False, "an empty ladder must not read as ok"
         why = body["why"].lower()
-        assert "cme" in why and "not wired" in why
+        assert ("no prints" in why or "no book" in why
+                or "not running" in why), why
+
+    def test_a_fed_cme_tape_produces_a_real_ladder(self, client,
+                                                   monkeypatch):
+        """The point of the adapter: the measurement code that serves
+        the BTC ladder runs unchanged against CME records, so the two
+        cannot drift apart in what they mean."""
+        import time as _time
+        import types as _types
+        from liqmap import cme_tape as _ct
+        rt = self._as_cme(client, monkeypatch)
+        PX = 5800 * 10 ** 9
+
+        class _TRD:
+            """TradeMsg: a print with an aggressor, no levels."""
+            def __init__(self, i, ts, buy=True):
+                self.ts_event = int(ts * 1e9)
+                self.sequence, self.instrument_id = i, 42
+                self.action = "T"
+                self.side = "B" if buy else "A"
+                self.price, self.size = PX, 4
+
+        class _BBO:
+            """BBOMsg: a book, and no action at all."""
+            def __init__(self, i, ts):
+                self.ts_event = int(ts * 1e9)
+                self.sequence, self.instrument_id = i, 42
+                self.action, self.side = "", "N"
+                self.levels = [type("L", (), {
+                    "bid_px": PX, "bid_sz": 120,
+                    "ask_px": PX + 250_000_000, "ask_sz": 100})()]
+
+        tape = _ct.Tape(symbol="ES")
+        now = _time.time()
+        for i in range(200):
+            tape.offer(_BBO(i, now - 200 + i))
+            tape.offer(_TRD(i, now - 200 + i, buy=(i % 4 != 0)))
+
+        monkeypatch.setattr(rt, "ofi", _types.SimpleNamespace(
+            tape=tape, running=True,
+            config=_types.SimpleNamespace(
+                schema_list=["bbo-1s", "trades"])), raising=False)
+
+        body = client.get("/api/flow",
+                          params={"coin": "ES", "target_ticks": "10",
+                                  "timeframes": "15m,5m,1m"},
+                          headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert body["ok"] is True, body.get("why")
+        assert body["source"] == "cme"
+        # The published ES tick, NOT one inferred from whatever the
+        # spread happened to be at the moment of the read.
+        assert body["spec"]["tick_size"] == 0.25
+        rows = {r["timeframe"]: r for r in body["rungs"]}
+        assert rows["1m"]["trades"] > 0
+        assert body["book"]["spread_ticks"] == pytest.approx(1.0)
 
     def test_a_hyperliquid_symbol_is_untouched(self, client, monkeypatch):
         self._as_cme(client, monkeypatch)

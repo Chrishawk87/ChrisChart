@@ -3843,29 +3843,44 @@ def create_app() -> FastAPI:
         from . import orderflow as _of
         from .live import INTERVALS as _IV
 
-        # A CME symbol is checked BEFORE the feed, because pressing Go
+        # A CME symbol is settled BEFORE the feed, because pressing Go
         # live on one opens a Hyperliquid subscription to a market
         # Hyperliquid does not carry: it connects, it runs, and it is
-        # sent nothing, forever. That feed is not missing, which is
-        # why the no-feed message below never fires -- it is present
-        # and permanently empty, and an empty ladder drawn without
-        # comment would read as "no flow right now" rather than "this
-        # panel is not looking at your data".
+        # sent nothing, forever. That feed is not missing, which is why
+        # the no-feed message below never fires for it -- it is present
+        # and permanently empty.
+        source = "hl"
         if rt.is_cme(coin):
-            return {"ok": False, "coin": coin, "source": "cme",
-                    "why": f"{coin} comes from the CME subscription, not "
-                           f"the Hyperliquid feed this panel reads. The "
-                           f"OFI panel and the price are on the CME data; "
-                           f"the flow ladder is not wired to it yet."}
-
-        coin = rt.resolve_symbol(coin)[0] or coin
-        feed = rt.feed_for(coin)
-        if feed is None:
-            return {"ok": False, "coin": coin,
-                    "why": "no live feed on this market -- press Go live. "
-                           "Polled candles carry no aggressor and no book."}
+            from .cme_tape import LadderFeed as _LadderFeed
+            source = "cme"
+            svc = rt.ofi
+            feed = _LadderFeed(svc.tape, coin=coin, running=svc.running,
+                               schemas=tuple(svc.config.schema_list))
+            blind = feed.missing()
+            if blind:
+                # Half a subscription draws the same empty rungs as a
+                # quiet market. Say which half, rather than letting the
+                # page imply there is simply no flow right now.
+                return {"ok": False, "coin": coin, "source": "cme",
+                        "schemas": list(svc.config.schema_list),
+                        "why": blind}
+        else:
+            coin = rt.resolve_symbol(coin)[0] or coin
+            feed = rt.feed_for(coin)
+            if feed is None:
+                return {"ok": False, "coin": coin,
+                        "why": "no live feed on this market -- press Go "
+                               "live. Polled candles carry no aggressor "
+                               "and no book."}
 
         sp = _of.SPECS.get((spec or "").upper())
+        if sp is None and source == "cme":
+            # A CME contract has a published tick. Inferring one from the
+            # spread is the right guess for an unlisted token and the
+            # wrong one here: ES quotes 0.25, but a moment when it is two
+            # ticks wide would infer 0.50 and halve every spread reading
+            # on the panel.
+            sp = _of.SPECS.get(str(coin).upper())
         if sp is None:
             # Infer the tick from what the book is actually quoting rather
             # than assuming ES. The same panel serves a $4 token and a
@@ -3892,7 +3907,7 @@ def create_app() -> FastAPI:
         lad = _fl.build(feed.tape, feed.book, want, sp,
                         target_ticks=float(target_ticks),
                         spike=float(spike), cvd_for=cvd_for)
-        return {"ok": True, "coin": coin,
+        return {"ok": True, "coin": coin, "source": source,
                 "spec": {"symbol": sp.symbol, "tick_size": sp.tick_size,
                          "tick_value": sp.tick_value,
                          "cost_ticks": round(sp.cost_ticks(), 2)},
