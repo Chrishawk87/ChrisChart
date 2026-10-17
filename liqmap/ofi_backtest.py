@@ -109,6 +109,21 @@ class Seconds:
         self.delta.append(int(delta))
 
     @property
+    def out_of_order(self) -> int:
+        """Rows whose timestamp goes backwards.
+
+        `resolve` walks forward from an entry assuming the index is
+        time-ordered. Hand it two files concatenated out of order and
+        it will "resolve" trades against prices from two years
+        earlier and report the result with a straight face.
+        """
+        n = 0
+        for a, b in zip(self.ts, self.ts[1:]):
+            if b < a:
+                n += 1
+        return n
+
+    @property
     def priced(self) -> int:
         """Seconds that carried a print. The rest have a book only."""
         return sum(1 for c in self.cl if c != NO_PRICE)
@@ -540,6 +555,18 @@ def run(sec: Seconds, settings: Settings | None = None) -> dict:
     visible as such.
     """
     st = settings or Settings()
+    back = sec.out_of_order
+    if back:
+        # Refused, not warned. A result computed over a jumbled index
+        # is not a degraded result, it is a meaningless one, and it
+        # looks exactly like a real one on the page.
+        return {"ok": False,
+                "why": (f"the data goes backwards in time at "
+                        f"{back:,} places. That happens when files "
+                        f"from different periods are replayed in one "
+                        f"pass -- re-run ofi_replay.py on files from "
+                        f"one span, in order"),
+                "settings": st.to_dict(), "seconds": len(sec)}
     bad = st.unknown()
     if bad:
         return {"ok": False,

@@ -158,14 +158,23 @@ class Second:
 
     @property
     def empty(self) -> bool:
-        """No record belonged to this second at all.
+        """Nothing in this second filled a single column.
 
-        Counted by RECORDS, not by measurable events. A record that
-        the engine refused -- the first of a file, one with no book --
-        still means the feed was delivering during that second, and a
-        gap in the written index should mean "no data", nothing else.
+        Counted by CONTENT, not by records. A record can arrive and
+        contribute nothing at all -- an `ohlcv-1s` record has no book
+        to difference and no aggressor to count, so it fills neither
+        half. Writing a row for it produces a line of commas: no
+        price, no book, no flow.
+
+        That is not a harmless blank. Glob a wrong-schema file in by
+        accident and you get one such row PER RECORD -- 22.9 million
+        of them from a two-year OHLCV extract, dwarfing the real data
+        and dragging the timestamps out of order.
+
+        The first record of a file is still kept: it carries a book
+        even though it can produce no event.
         """
-        return self.records == 0
+        return self.trades == 0 and self.books == 0 and self.events == 0
 
 
 def replay(paths, writer, limit: int = 0,
@@ -179,8 +188,16 @@ def replay(paths, writer, limit: int = 0,
     st = state if state is not None else ofi.BookState()
     cur: Second | None = None
     seen = rows = 0
+    last_ts = 0.0
+    notes: list = []
 
     for path in paths:
+        # Counted from THIS file's records, not from rows written:
+        # the first record of a new file flushes the previous file's
+        # last second, which would otherwise be credited here and
+        # hide a file that contributed nothing.
+        f_books = f_trades = 0
+        first_ts = 0.0
         import itertools
         store = dbn.open_file(str(path))
         if limit:
@@ -210,6 +227,8 @@ def replay(paths, writer, limit: int = 0,
             # would skip the branch that counts them and leave its
             # tally reading "there were none" rather than "these were
             # counted elsewhere".
+            if not first_ts:
+                first_ts = ts
             ev = st.feed(rec)
             if ev is not None:
                 cur.ofi += ev.e_n
@@ -230,19 +249,50 @@ def replay(paths, writer, limit: int = 0,
                 cur.bid_sz = float(dbn._get(top, "bid_sz", 0) or 0)
                 cur.ask_sz = float(dbn._get(top, "ask_sz", 0) or 0)
                 cur.books += 1
+                f_books += 1
 
             # The tape half, from the same record.
             tr = dbn.trade_from(rec)
             if tr is not None:
                 cur.add_trade(tr)
+                f_trades += 1
 
             pr.extra = f"{rows:,} seconds"
         pr.done()
 
+        name = Path(path).name
+        if f_books == 0 and f_trades == 0:
+            notes.append(
+                f"{name}: NO book and NO trade in any record -- this is "
+                f"not an mbp-10/mbp-1 extract and contributed nothing")
+        elif f_books == 0:
+            notes.append(
+                f"{name}: {f_trades:,} trades but NO book -- a `trades` "
+                f"extract gives candles, never OFI")
+        elif f_trades == 0:
+            notes.append(
+                f"{name}: {f_books:,} book updates but NO trade -- a "
+                f"`bbo` extract gives OFI, never candles")
+        if first_ts and last_ts and first_ts < last_ts:
+            notes.append(
+                f"{name}: starts BEFORE the previous file ended "
+                f"({_when(first_ts)} < {_when(last_ts)}) -- the output "
+                f"is not in time order")
+        if cur is not None:
+            last_ts = max(last_ts, float(cur.ts))
+
     if cur is not None and not cur.empty:
         writer.writerow(cur.row())
         rows += 1
+    for n in notes:
+        print(f"  WARNING  {n}", file=sys.stderr)
     return seen, rows
+
+
+def _when(ts: float) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(
+        ts, _dt.timezone.utc).strftime("%Y-%m-%d")
 
 
 def main(argv=None) -> int:
@@ -253,6 +303,12 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=0,
                     help="records per file, for a quick look")
     ap.add_argument("--no-parquet", action="store_true")
+    ap.add_argument("--no-seq-check", action="store_true",
+                    help="stop refusing records whose sequence is not "
+                         "prev+1. On a CME file filtered to one symbol "
+                         "those skips are OTHER instruments' messages "
+                         "on the same channel, not missed ones, so the "
+                         "check discards real book transitions")
     args = ap.parse_args(argv)
 
     paths = []
@@ -271,7 +327,11 @@ def main(argv=None) -> int:
     print(f"out     {csv_path}", file=sys.stderr)
     print(file=sys.stderr)
 
-    st = ofi.BookState()
+    st = ofi.BookState(check_sequence=not args.no_seq_check)
+    if args.no_seq_check:
+        print("sequence check OFF -- every consecutive record is "
+              "treated as\nthe next state of this symbol's book\n",
+              file=sys.stderr)
     t0 = time.time()
     with open(csv_path, "w", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=COLS, extrasaction="ignore")

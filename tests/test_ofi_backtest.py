@@ -494,3 +494,39 @@ class TestEveryRuleIsStillControlled:
                  + out["arms"][a]["all"]["unresolved"]
                  for a in ("signal", "mirror", "control")}
             assert len(set(n.values())) == 1, (rule, n)
+
+
+class TestOutOfOrderDataIsRefused:
+    """`resolve` walks forward from an entry assuming the index is
+    time-ordered. A jumbled index does not degrade the result, it
+    makes it meaningless -- and it looks exactly like a real one.
+
+    This is not hypothetical: a glob picked up a two-year `ohlcv-1s`
+    extract alongside three days of `mbp-10`, and the replay wrote
+    them in file order, so the timestamps jumped back two years in
+    the middle of the file.
+    """
+
+    def _jumbled(self):
+        s = bt.Seconds()
+        for i in range(300):                 # recent
+            s.add(T0 + i, 23201, 23199, 23200, 50, 100, 100, 10)
+        for i in range(300):                 # two years earlier
+            s.add(T0 - 63_000_000 + i, 23201, 23199, 23200, 50,
+                  100, 100, 10)
+        return s
+
+    def test_the_jump_is_detected(self):
+        assert self._jumbled().out_of_order == 1
+
+    def test_ordered_data_reports_none(self):
+        assert noise(5_000).out_of_order == 0
+
+    def test_a_run_over_it_is_refused_not_reported(self):
+        out = bt.run(self._jumbled())
+        assert out["ok"] is False
+        assert "backwards in time" in out["why"]
+
+    def test_the_refusal_says_how_to_fix_it(self):
+        why = bt.run(self._jumbled())["why"]
+        assert "ofi_replay" in why and "one span" in why
