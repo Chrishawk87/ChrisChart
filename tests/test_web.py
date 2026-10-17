@@ -2556,8 +2556,10 @@ class TestFlowOnACmeSymbol:
 
         monkeypatch.setattr(rt, "ofi", _types.SimpleNamespace(
             tape=tape, running=True,
+            error="",
             config=_types.SimpleNamespace(
-                schema_list=["bbo-1s", "trades"])), raising=False)
+                schema_list=["bbo-1s", "trades"],
+                blocked_by=lambda: "")), raising=False)
 
         body = client.get("/api/flow",
                           params={"coin": "ES", "target_ticks": "10",

@@ -388,3 +388,63 @@ class TestTheLadderActuallyBuilds:
         rows = {r["timeframe"]: r for r in self._ladder()["rungs"]}
         assert rows["15m"]["covered"] is False
         assert rows["1m"]["covered"] is True
+
+
+class TestTheThreeSilences:
+    """A closed market, a dead thread and a wrong schema all draw the
+    same empty panel, and each needs a different fix. The message has
+    to separate them or it is not worth printing.
+    """
+
+    def _feed(self, **kw):
+        kw.setdefault("running", True)
+        return cme_tape.LadderFeed(kw.pop("src", cme_tape.Tape(symbol="ES")),
+                                   coin="ES", **kw)
+
+    def test_an_engine_that_is_off_reports_the_reason_it_is_off(self):
+        why = self._feed(running=False,
+                         note="LIQMAP_OFI is not set to true").missing()
+        assert "not running" in why
+        assert "LIQMAP_OFI is not set to true" in why
+
+    def test_a_subscription_with_nothing_on_it_is_not_called_a_fault(self):
+        why = self._feed(schemas=("bbo-1s", "trades")).missing()
+        assert "no records have arrived" in why
+        assert "closed market, not a fault" in why
+
+    def test_it_gives_the_session_hours_to_check_against(self):
+        why = self._feed().missing()
+        assert "Sunday" in why and "Friday" in why and "Central" in why
+
+    def test_it_names_what_was_subscribed(self):
+        why = self._feed(schemas=("bbo-1s", "trades")).missing()
+        assert "bbo-1s, trades" in why
+
+    def test_a_thread_error_is_surfaced_even_while_it_still_runs(self):
+        why = self._feed(note="BentoError: Not authorized").missing()
+        assert "Not authorized" in why
+
+    def test_records_arriving_without_prints_is_a_schema_problem(self):
+        """Distinct from silence: the feed is alive and entitled, it
+        is just not carrying what the ladder reads."""
+        t = cme_tape.Tape(symbol="ES")
+        for i in range(5):
+            t.offer(_BBO(i, 1_700_000_000.0 + i))
+        why = self._feed(src=t, schemas=("bbo-1s",)).missing()
+        assert "no prints" in why
+        assert "5 records have arrived" in why
+        assert "closed market" not in why, "this one IS a fault"
+
+    def test_records_arriving_without_a_book_is_too(self):
+        t = cme_tape.Tape(symbol="ES")
+        for i in range(5):
+            t.offer(_TRD(i, 1_700_000_000.0 + i))
+        why = self._feed(src=t, schemas=("trades",)).missing()
+        assert "no book" in why and "5 records" in why
+
+    def test_both_halves_still_means_nothing_missing(self):
+        t = cme_tape.Tape(symbol="ES")
+        for i in range(5):
+            t.offer(_BBO(i, 1_700_000_000.0 + i))
+            t.offer(_TRD(i, 1_700_000_000.0 + i))
+        assert self._feed(src=t).missing() == ""

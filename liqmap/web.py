@@ -3854,8 +3854,13 @@ def create_app() -> FastAPI:
             from .cme_tape import LadderFeed as _LadderFeed
             source = "cme"
             svc = rt.ofi
-            feed = _LadderFeed(svc.tape, coin=coin, running=svc.running,
-                               schemas=tuple(svc.config.schema_list))
+            feed = _LadderFeed(
+                svc.tape, coin=coin, running=svc.running,
+                schemas=tuple(svc.config.schema_list),
+                # What the service knows and the tape cannot: a thread
+                # that raised, or a condition that was never met.
+                note=(getattr(svc, "error", "")
+                      or svc.config.blocked_by()))
             blind = feed.missing()
             if blind:
                 # Half a subscription draws the same empty rungs as a

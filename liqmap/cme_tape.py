@@ -234,6 +234,10 @@ class LadderFeed:
     coin: str = "ES"
     running: bool = False
     schemas: tuple = ()
+    # What the service itself knows: a thread that died, or a config
+    # condition that was never met. Without it an engine whose thread
+    # raised at 3am reports exactly what a closed market reports.
+    note: str = ""
 
     @property
     def tape(self):
@@ -264,16 +268,51 @@ class LadderFeed:
         return self.src.history(interval, limit=limit)
 
     def missing(self) -> str:
-        """Which half of the subscription is not delivering. '' when both."""
+        """Why the ladder cannot be drawn. '' when it can.
+
+        THREE DIFFERENT SILENCES, which look identical from the panel
+        and need opposite fixes:
+
+          nothing subscribed   the engine is off or was never configured
+          nothing arriving     the subscription is open and the market
+                               is shut, or the entitlement is refused
+          arriving, wrong kind records are coming but not the ones the
+                               ladder needs -- a schema problem
+
+        `src.records` is what separates the second from the third: it
+        counts every record the tape was offered, trade or not.
+        """
         if not self.running:
-            return "the CME engine is not running"
+            return ("the CME engine is not running"
+                    + (f" -- {self.note}" if self.note else ""))
+
+        if self.src.records == 0:
+            # Open, and nothing has come down it. Outside the session
+            # this is the correct and expected state, so it is named
+            # before anything that sounds like a fault.
+            why = ("the subscription is open but no records have "
+                   "arrived at all. CME equity index futures trade "
+                   "Sunday 17:00 to Friday 16:00 Central, with a break "
+                   "16:00-17:00 each day -- outside those hours this is "
+                   "a closed market, not a fault")
+            if self.schemas:
+                why += f" (subscribed: {', '.join(self.schemas)})"
+            if self.note:
+                why += f". The engine also reports: {self.note}"
+            return why
+
+        # Records ARE arriving, so the feed is alive and entitled --
+        # they are simply not the kind the ladder reads.
         gaps = []
         if self.src.trades == 0:
-            gaps.append("no prints have arrived -- the ladder reads the "
-                        "aggressor side, which only the `trades` schema "
-                        "carries")
+            gaps.append(f"{self.src.records:,} records have arrived but no "
+                        f"prints -- the ladder reads the aggressor side, "
+                        f"which only the `trades` schema carries")
         if self.src.book is None:
-            gaps.append("no book has arrived -- the spread gate needs a "
-                        "bid and an ask, which `trades` does not carry "
-                        "and `bbo-1s` or `mbp-1` does")
+            gaps.append(f"{self.src.records:,} records have arrived but no "
+                        f"book -- the spread gate needs a bid and an ask, "
+                        f"which `trades` does not carry and `bbo-1s` or "
+                        f"`mbp-1` does")
+        if gaps and self.schemas:
+            gaps.append(f"subscribed: {', '.join(self.schemas)}")
         return "; ".join(gaps)
