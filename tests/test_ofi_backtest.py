@@ -146,8 +146,14 @@ def noise(n=120_000, seed=7):
     px = 23200
     for i in range(n):
         px += rng.choice((-1, 0, 0, 1))
+        of = rng.randint(-500, 500)
+        # The book and delta columns are populated too. Left at zero
+        # the book and delta rules abstain on every second, which
+        # looks like "the rule is safe" when it means "the rule was
+        # never actually run".
         s.add(T0 + i, px + rng.randint(0, 2), px - rng.randint(0, 2),
-              px, rng.randint(-500, 500))
+              px, of, rng.randint(40, 300), rng.randint(40, 300),
+              of * 10)
     return s
 
 
@@ -167,8 +173,12 @@ def planted(n=120_000, seed=11):
         else:
             of = rng.randint(-400, 400)
             px += rng.choice((-1, 0, 0, 1))
+        # Book size stays RANDOM even in the planted set: it is the
+        # negative control among the rules, and a rule reading noise
+        # must be seen to read noise while the others light up.
         s.add(T0 + i, px + rng.randint(0, 2), px - rng.randint(0, 2),
-              px, of)
+              px, of, rng.randint(40, 300), rng.randint(40, 300),
+              of * 10)
     return s
 
 
@@ -191,8 +201,13 @@ class TestItReportsNoEdgeWhenThereIsNone:
         out = bt.run(noise())
         assert held(out, "signal")["win_rate"] < out["break_even"]
 
-    def test_the_verdict_says_so_in_words(self):
-        assert "does not clear" in bt.run(noise())["verdict"]
+    def test_the_verdict_never_claims_an_edge(self):
+        """It may reject on break-even or on the mirror -- both are
+        correct rejections. What it must never do is claim it
+        cleared."""
+        v = bt.run(noise())["verdict"]
+        assert "clears break-even" not in v
+        assert ("does not clear" in v or "the other way" in v), v
 
     def test_per_trade_is_negative_once_costs_are_paid(self):
         out = bt.run(noise())
@@ -316,3 +331,166 @@ class TestItDecidesNothing:
         b = bt.run(noise(40_000, seed=5), bt.Settings(cost_ticks=4.0))
         assert (held(a, "signal")["per_trade_ticks"]
                 > held(b, "signal")["per_trade_ticks"])
+
+
+# ------------------------------------------------------------- rules
+
+class TestFrames:
+    """Bars built from the SAME per-second closes, so the timeframes
+    cannot disagree about where their boundaries are."""
+
+    def test_a_bar_opens_at_the_first_close_inside_it(self):
+        f = bt.Frames((60,))
+        f.observe(T0, 23200)
+        f.observe(T0 + 30, 23280)
+        assert f.ways(23280) == [1], "up from the bar's open"
+
+    def test_a_new_bar_resets_the_open(self):
+        f = bt.Frames((60,))
+        f.observe(T0, 23200)
+        f.observe(T0 + 59, 23300)
+        f.observe(T0 + 60, 23300)          # next minute opens here
+        assert f.ways(23300) == [0], "flat against its own open"
+
+    def test_all_frames_pointing_one_way_agree(self):
+        f = bt.Frames((60, 300, 900))
+        f.observe(T0, 23200)
+        assert f.agreed(23400) == 1
+
+    def test_one_frame_disagreeing_is_not_agreement(self):
+        f = bt.Frames((60, 300))
+        f.observe(T0, 23200)               # both open at 23200
+        f.observe(T0 + 60, 23500)          # 1m reopens at 23500
+        assert f.agreed(23400) == 0, "1m down, 5m up"
+
+    def test_a_flat_frame_blocks_agreement(self):
+        """Flat is not a direction, and must not be read as one."""
+        f = bt.Frames((60, 300))
+        f.observe(T0, 23200)
+        f.observe(T0 + 60, 23400)
+        assert f.agreed(23400) == 0
+
+    def test_a_forming_bar_still_counts(self):
+        """It is what the rule would have seen at the time. Waiting
+        for the close would act on a bar that had not happened."""
+        f = bt.Frames((900,))
+        f.observe(T0, 23200)
+        assert f.agreed(23260) == 1
+
+
+class TestBookSide:
+
+    def _sec(self, bid, ask):
+        s = bt.Seconds()
+        s.add(T0, 23200, 23200, 23200, 0, bid, ask, 0)
+        return s
+
+    def test_bids_outweighing_asks_is_long(self):
+        assert bt.book_side(self._sec(300, 100), 0, 2.0) == 1
+
+    def test_asks_outweighing_bids_is_short(self):
+        assert bt.book_side(self._sec(100, 300), 0, 2.0) == -1
+
+    def test_a_balanced_book_abstains(self):
+        assert bt.book_side(self._sec(110, 100), 0, 2.0) == 0
+
+    def test_no_book_abstains_rather_than_reading_one_sided(self):
+        """`ofi_replay` leaves these blank when the file had no
+        levels. A zero size is not a one-sided market."""
+        assert bt.book_side(self._sec(0, 0), 0, 2.0) == 0
+        assert bt.book_side(self._sec(300, 0), 0, 2.0) == 0
+
+    def test_the_ratio_is_the_callers(self):
+        s = self._sec(150, 100)
+        assert bt.book_side(s, 0, 1.2) == 1
+        assert bt.book_side(s, 0, 3.0) == 0
+
+
+class TestRollingDelta:
+
+    def test_it_sums_the_window(self):
+        r = bt.Roll(3)
+        for v in (1, 2, 3):
+            r.push(v)
+        assert r.total == 6
+
+    def test_it_drops_what_falls_out(self):
+        r = bt.Roll(3)
+        for v in (1, 2, 3, 4):
+            r.push(v)
+        assert r.total == 9, "1 should have fallen out"
+
+    def test_it_is_not_full_until_it_is(self):
+        r = bt.Roll(3)
+        r.push(1)
+        assert not r.full
+        r.push(2); r.push(3)
+        assert r.full
+
+
+class TestRuleSelection:
+
+    def test_every_named_rule_runs(self):
+        s = noise(40_000, seed=5)
+        for rule in bt.RULES:
+            out = bt.run(s, bt.Settings(rule=rule))
+            assert out.get("ok"), (rule, out.get("why"))
+
+    def test_an_unknown_rule_is_refused_by_name(self):
+        out = bt.run(noise(5_000), bt.Settings(rule="vibes"))
+        assert out["ok"] is False
+        assert "unknown rule vibes" in out["why"]
+
+    def test_a_typo_inside_a_combination_is_caught(self):
+        out = bt.run(noise(5_000), bt.Settings(rule="ofi+agre"))
+        assert "unknown rule agre" in out["why"]
+
+    def test_a_combination_fires_less_often_than_its_parts(self):
+        """Every rule must agree, so the combination is a subset."""
+        s = planted(60_000, seed=3)
+        one = bt.run(s, bt.Settings(rule="ofi"))["entries"]
+        both = bt.run(s, bt.Settings(rule="ofi+agree"))["entries"]
+        assert both <= one
+
+    def test_an_abstaining_rule_vetoes_rather_than_agreeing(self):
+        """No book in that second must block the entry, not be
+        counted as assent."""
+        s = planted(60_000, seed=3)
+        for i in range(len(s)):            # strip the book entirely
+            s.bid_sz[i] = 0
+            s.ask_sz[i] = 0
+        out = bt.run(s, bt.Settings(rule="ofi+book"))
+        assert out["ok"] is False, "with no book it must never fire"
+
+
+class TestEveryRuleIsStillControlled:
+    """A new rule gets no exemption from the comparison."""
+
+    def test_no_rule_finds_an_edge_in_noise(self):
+        s = noise()
+        for rule in ("ofi", "agree", "book", "delta", "ofi+agree"):
+            out = bt.run(s, bt.Settings(rule=rule))
+            if not out.get("ok"):
+                continue
+            sig = held(out, "signal")["win_rate"]
+            assert sig < out["break_even"], (rule, sig)
+
+    def test_a_rule_reading_pure_noise_does_not_beat_its_mirror(self):
+        """In `planted`, the book column is random. The book rule must
+        show that, even while the other rules are lighting up."""
+        out = bt.run(planted(), bt.Settings(rule="book"))
+        sig = held(out, "signal")["win_rate"]
+        mir = held(out, "mirror")["win_rate"]
+        assert abs(sig - mir) < 0.08, (sig, mir)
+
+    def test_the_arms_stay_matched_for_every_rule(self):
+        s = planted(40_000, seed=3)
+        for rule in ("agree", "book", "delta"):
+            out = bt.run(s, bt.Settings(rule=rule))
+            if not out.get("ok"):
+                continue
+            n = {a: out["arms"][a]["all"]["scored"]
+                 + out["arms"][a]["all"]["ambiguous"]
+                 + out["arms"][a]["all"]["unresolved"]
+                 for a in ("signal", "mirror", "control")}
+            assert len(set(n.values())) == 1, (rule, n)

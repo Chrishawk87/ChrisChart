@@ -122,6 +122,12 @@ class Runtime:
         self.db_path = default_db_path()
         self.settings_store = SettingsStore(self.db_path)
         self.history = History(self.db_path)
+        # One parsed per-second dataset, kept so the backtester panel
+        # does not re-read 1.8 million rows on every slider move.
+        # Deliberately a single slot: two months in memory is a
+        # quarter of a gigabyte, and the panel shows one at a time.
+        self.ofi_bt_name: str = ""
+        self.ofi_bt_secs = None
         # One row per closed bar per timeframe. The only place a slow
         # timeframe's CVD can come from: the fills behind it leave the
         # rolling tape within the hour, and nothing else ever recorded who
@@ -5035,6 +5041,155 @@ def create_app() -> FastAPI:
         return {"coin": c, "interval": interval or None,
                 "stats": rt.history.read_stats(c, interval or None)}
 
+
+    # ------------------------------------------------- OFI backtester
+
+    def _ofi_dir():
+        """Where uploaded per-second datasets live.
+
+        Beside the database, so a mounted Railway volume keeps them.
+        WITHOUT a volume this is ephemeral disk and every deploy wipes
+        them -- the same warning `startup_report` already gives about
+        history, and it applies here with more force because these
+        files take an hour to regenerate.
+        """
+        from pathlib import Path as _Path
+        from .settings import default_db_path
+        d = _Path(default_db_path()).parent / "ofi_sec"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _ofi_safe(name: str) -> str:
+        """A filename from user input, with the path removed.
+
+        Anything but letters, digits, dash and underscore goes, so a
+        name cannot climb out of the directory it is written into.
+        """
+        clean = "".join(c for c in str(name)
+                        if c.isalnum() or c in "-_")[:64]
+        return clean or "dataset"
+
+    @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
+    def api_ofi_datasets() -> dict[str, Any]:
+        """The per-second datasets this service can backtest."""
+        rows = []
+        for f in sorted(_ofi_dir().glob("*.csv")):
+            rows.append({"name": f.stem,
+                         "size_mb": round(f.stat().st_size / 1e6, 1),
+                         "loaded": f.stem == rt.ofi_bt_name})
+        return {"ok": True, "datasets": rows,
+                "dir_is_volume": str(_ofi_dir()).startswith("/data")}
+
+    @app.post("/api/ofi-dataset", dependencies=[Depends(require_token)])
+    async def api_ofi_dataset(file: UploadFile = File(...),
+                              name: str = "") -> dict[str, Any]:
+        """Upload a file from `scripts/ofi_replay.py`.
+
+        A month is ~110MB as CSV, which is over the upload cap -- send
+        a shorter span, or run this service locally where the file
+        already is. The cap is checked against the declared length
+        BEFORE the body is read.
+        """
+        declared = getattr(file, "size", None)
+        if declared is not None and declared > MAX_UPLOAD_BYTES:
+            return {"ok": False,
+                    "error": f"over {MAX_UPLOAD_BYTES // (1024*1024)}MB -- "
+                             f"upload a shorter span, or run the service "
+                             f"where the file already is"}
+        from pathlib import Path as _Path
+        stem = _ofi_safe(name or _Path(file.filename or "dataset").stem)
+        dest = _ofi_dir() / f"{stem}.csv"
+        total = 0
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    fh.close()
+                    dest.unlink(missing_ok=True)
+                    return {"ok": False,
+                            "error": "over the cap once read -- the "
+                                     "declared length was wrong"}
+                fh.write(chunk)
+        head = ""
+        try:
+            with open(dest) as fh:
+                head = fh.readline().strip()
+        except Exception:                               # noqa: BLE001
+            pass
+        if "ofi" not in head:
+            dest.unlink(missing_ok=True)
+            return {"ok": False,
+                    "error": f"that does not look like an ofi_replay "
+                             f"file -- its header is {head[:80]!r}"}
+        rt.ofi_bt_name = ""          # force a reload on the next run
+        rt.ofi_bt_secs = None
+        return {"ok": True, "name": stem,
+                "size_mb": round(total / 1e6, 1)}
+
+    @app.get("/api/ofi-backtest", dependencies=[Depends(require_token)])
+    def api_ofi_backtest(dataset: str = "", rule: str = "ofi",
+                         z: float = 1.5, target: int = 16,
+                         stop: int = 4, cost: float = 1.0,
+                         hold: int = 900, window: int = 60,
+                         baseline: int = 600, cooldown: int = 60,
+                         train: float = 0.5, book_ratio: float = 2.0,
+                         delta_window: int = 60,
+                         frames: str = "60,300,900") -> dict[str, Any]:
+        """Run the SAME engine the command line runs, on a stored file.
+
+        The module is shared with `scripts/ofi_backtest.py` on
+        purpose: a backtest on the dashboard that disagrees with the
+        one in the terminal is worse than having only one of them.
+
+        The parsed file is cached in one slot, because parsing 1.8
+        million rows takes long enough that a panel re-parsing it on
+        every slider move would be unusable. Changing dataset evicts
+        it.
+        """
+        from . import ofi_backtest as _bt
+
+        name = _ofi_safe(dataset)
+        path = _ofi_dir() / f"{name}.csv"
+        if not dataset or not path.exists():
+            have = [f.stem for f in _ofi_dir().glob("*.csv")]
+            return {"ok": False,
+                    "why": (f"no dataset {dataset!r}. "
+                            + (f"have: {', '.join(have)}" if have else
+                               "upload one from scripts/ofi_replay.py")),
+                    "datasets": have}
+
+        if rt.ofi_bt_name != name or rt.ofi_bt_secs is None:
+            rt.ofi_bt_secs = _bt.load(str(path))
+            rt.ofi_bt_name = name
+
+        secs = rt.ofi_bt_secs
+        if not len(secs):
+            return {"ok": False, "why": f"{name} has no rows"}
+
+        try:
+            spans = tuple(int(x) for x in str(frames).split(",")
+                          if x.strip())
+        except ValueError:
+            return {"ok": False, "why": f"frames {frames!r} is not a "
+                                        f"comma separated list of seconds"}
+
+        st = _bt.Settings(
+            rule=rule, z_enter=float(z), window=int(window),
+            baseline=max(2, int(baseline)), target_ticks=int(target),
+            stop_ticks=int(stop), max_hold_s=int(hold),
+            cost_ticks=float(cost), cooldown_s=int(cooldown),
+            train_fraction=min(0.85, max(0.15, float(train))),
+            frames=spans or (60, 300, 900),
+            book_ratio=float(book_ratio),
+            delta_window=max(1, int(delta_window)))
+        out = _bt.run(secs, st)
+        out["dataset"] = name
+        out["rules_available"] = list(_bt.RULES)
+        return out
+
     @app.post("/api/backtest", dependencies=[Depends(require_token)])
     def api_backtest(coin: str = "BTC", interval: str = "15m",
                      bars: int = 1000, train_fraction: float = 0.6,
@@ -5922,6 +6077,53 @@ has to be running before the gate stops refusing.">spike
   </div>
 
   <div class="grid tabpane" id="tab-test" hidden>
+
+    <div class="panel full" id="ofiBtPanel"><h2>OFI backtester &mdash; signal against its own control
+      <span class="stamp" id="btStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Runs on a per-second file from
+        <code>scripts/ofi_replay.py</code>, which carries candles and order flow on
+        one clock. Every rule is scored three ways: <b>signal</b>, <b>mirror</b>
+        (the same entries taken the other way) and <b>control</b> (the same entry
+        times, side by coin flip). A 16-tick target against a 4-tick stop wins
+        often in <i>both</i> directions &mdash; if mirror scores like signal, the
+        bracket is what was measured, not the rule.</div>
+
+      <div class="conbar">
+        <label>dataset <select id="btData"></select></label>
+        <label>upload <input type="file" id="btFile" accept=".csv"></label>
+        <button class="btn" onclick="btUpload()">Send</button>
+        <span class="stamp" id="btUp"></span>
+      </div>
+
+      <div class="conbar">
+        <label><input type="checkbox" id="btR_ofi" checked> OFI</label>
+        <label><input type="checkbox" id="btR_agree"> timeframe agreement</label>
+        <label><input type="checkbox" id="btR_book"> book imbalance</label>
+        <label><input type="checkbox" id="btR_delta"> delta</label>
+        <span class="stamp">every ticked rule must point the same way</span>
+      </div>
+
+      <div class="conbar">
+        <label>|z| <input type="number" id="btZ" value="1.5" step="0.1" style="width:66px"></label>
+        <label>target t <input type="number" id="btTgt" value="16" style="width:60px"></label>
+        <label>stop t <input type="number" id="btStop" value="4" style="width:56px"></label>
+        <label>cost t <input type="number" id="btCost" value="1.0" step="0.1" style="width:60px"></label>
+        <label>hold s <input type="number" id="btHold" value="900" style="width:70px"></label>
+        <label>cooldown s <input type="number" id="btCool" value="60" style="width:66px"></label>
+      </div>
+      <div class="conbar">
+        <label>OFI window s <input type="number" id="btWin" value="60" style="width:66px"></label>
+        <label>baseline <input type="number" id="btBase" value="600" style="width:70px"></label>
+        <label>frames <input type="text" id="btFrames" value="60,300,900" style="width:110px"></label>
+        <label>book ratio <input type="number" id="btRatio" value="2.0" step="0.1" style="width:64px"></label>
+        <label>delta window s <input type="number" id="btDW" value="60" style="width:66px"></label>
+        <label>train <input type="number" id="btTrain" value="0.5" step="0.05" style="width:60px"></label>
+        <button class="btn" onclick="btRun()">Run</button>
+      </div>
+
+      <div id="btBreak" class="msg" style="margin-top:8px"></div>
+      <div id="btOut"></div>
+    </div>
 
     <div class="panel full" id="sweepPanel"><h2>Target and stop — test every pair
       <span class="stamp" id="swStamp"></span></h2>
@@ -7269,6 +7471,108 @@ function paintShapes(d) {
     + '</tbody></table>';
 }
 
+
+/* ---- OFI backtester ---------------------------------------------------
+   The knobs are the caller's. Nothing here picks a threshold, a bracket
+   or a cost -- those are trading decisions, and the panel's job is to
+   report what each choice would have scored against its own controls. */
+async function btDatasets() {
+  try {
+    const d = await api('/api/ofi-datasets');
+    const sel = $('btData');
+    const had = sel.value;
+    sel.innerHTML = (d.datasets || []).map(x =>
+      `<option value="${x.name}">${x.name} (${x.size_mb}MB)</option>`).join('')
+      || '<option value="">none uploaded</option>';
+    if (had) sel.value = had;
+    if (d.datasets && d.datasets.length && !d.dir_is_volume)
+      $('btUp').textContent = 'not on a volume -- a deploy wipes these';
+  } catch (e) { }
+}
+
+async function btUpload() {
+  const f = $('btFile').files[0];
+  if (!f) { $('btUp').textContent = 'pick a .csv first'; return; }
+  $('btUp').textContent = 'uploading ' + (f.size / 1e6).toFixed(1) + 'MB...';
+  const fd = new FormData();
+  fd.append('file', f);
+  // `api` already does the right thing with FormData: it leaves the
+  // Content-Type alone so the browser's multipart boundary survives.
+  const stem = f.name.endsWith('.csv') ? f.name.slice(0, -4) : f.name;
+  try {
+    const d = await api('/api/ofi-dataset?name=' + encodeURIComponent(stem),
+                        { method: 'POST', body: fd });
+    $('btUp').textContent = d.ok ? ('stored ' + d.name) : d.error;
+    if (d.ok) await btDatasets();
+  } catch (e) { $('btUp').textContent = 'upload failed: ' + e; }
+}
+
+function btRules() {
+  return ['ofi', 'agree', 'book', 'delta']
+    .filter(r => $('btR_' + r).checked).join(',');
+}
+
+function btRow(a, label) {
+  const p = v => (v == null) ? '--' : (v * 100).toFixed(1) + '%';
+  const t = v => (v == null) ? '--' : (v >= 0 ? '+' : '') + v.toFixed(3);
+  return `<tr><td>${label}</td><td class="num">${a.scored.toLocaleString()}</td>
+    <td class="num">${p(a.win_rate)}</td>
+    <td class="num">${p(a.win_rate_lo)} &ndash; ${p(a.win_rate_hi)}</td>
+    <td class="num">${t(a.per_trade_ticks)}</td>
+    <td class="num">${a.ambiguous.toLocaleString()}</td>
+    <td class="num">${a.unresolved.toLocaleString()}</td></tr>`;
+}
+
+async function btRun() {
+  const rules = btRules();
+  if (!rules) { $('btOut').innerHTML =
+      '<div class="msg">tick at least one rule</div>'; return; }
+  const q = new URLSearchParams({
+    dataset: $('btData').value || '', rule: rules,
+    z: $('btZ').value, target: $('btTgt').value, stop: $('btStop').value,
+    cost: $('btCost').value, hold: $('btHold').value,
+    window: $('btWin').value, baseline: $('btBase').value,
+    cooldown: $('btCool').value, train: $('btTrain').value,
+    book_ratio: $('btRatio').value, delta_window: $('btDW').value,
+    frames: $('btFrames').value });
+  $('btOut').innerHTML = '<div class="msg">running...</div>';
+  $('btStamp').textContent = '';
+  let d;
+  try { d = await api('/api/ofi-backtest?' + q.toString()); }
+  catch (e) { $('btOut').innerHTML = '<div class="msg">' + e + '</div>'; return; }
+
+  if (!d.ok) {
+    $('btBreak').textContent = '';
+    $('btOut').innerHTML = '<div class="msg">' + (d.why || 'no result') + '</div>';
+    return;
+  }
+  $('btStamp').textContent = d.dataset + '  ' + d.hours + 'h';
+  $('btBreak').innerHTML = `<b>${d.settings.target_ticks}t target /
+    ${d.settings.stop_ticks}t stop at ${d.settings.cost_ticks} ticks of
+    cost</b> &mdash; break-even ${(d.break_even * 100).toFixed(1)}%, because
+    both sides pay the cost. ${d.entries.toLocaleString()} entries over
+    ${d.seconds.toLocaleString()} seconds.`;
+
+  let html = '';
+  for (const split of ['train', 'held_out']) {
+    html += `<h3 style="margin:12px 0 4px">${split === 'train' ? 'train' :
+      'held out &mdash; read this one'}</h3>
+      <table class="tbl"><thead><tr><th>arm</th><th class="num">scored</th>
+      <th class="num">win</th><th class="num">95% interval</th>
+      <th class="num">ticks/trade</th><th class="num">ambig</th>
+      <th class="num">unres</th></tr></thead><tbody>`;
+    for (const arm of ['signal', 'mirror', 'control'])
+      html += btRow(d.arms[arm][split], arm);
+    html += '</tbody></table>';
+  }
+  html += '<div class="msg" style="margin-top:10px"><b>verdict:</b> ' +
+          d.verdict + '</div>';
+  html += '<div class="msg">Ambiguous trades touched both brackets inside one ' +
+          'second; the file does not say which came first, so they are set ' +
+          'aside rather than guessed in your favour.</div>';
+  $('btOut').innerHTML = html;
+}
+
 /* ---- tabs -------------------------------------------------------------
 
    The chart lives on a canvas, and a canvas that was laid out while its
@@ -7286,6 +7590,11 @@ function showTab(key) {
     if (btn) btn.classList.toggle('on', k === key);
   }
   try { localStorage.setItem('liqmap_tab', key); } catch (e) {}
+  if (key === 'test') {
+    // Fill the dataset picker when the tab is opened rather than on
+    // page load: it is a disk listing, and most visits never open it.
+    try { btDatasets(); } catch (e) {}
+  }
   if (key === 'dash') {
     // drawChart reads clientWidth and resizes the backing store itself,
     // so one call is enough -- but it MUST happen after the pane is

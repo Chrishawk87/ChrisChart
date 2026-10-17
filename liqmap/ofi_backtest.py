@@ -76,7 +76,8 @@ class Seconds:
     at the exact moment a bracket is touched.
     """
 
-    __slots__ = ("ts", "hi", "lo", "cl", "ofi", "path")
+    __slots__ = ("ts", "hi", "lo", "cl", "ofi", "path",
+                 "bid_sz", "ask_sz", "delta")
 
     def __init__(self, path: str = "") -> None:
         self.path = path
@@ -85,16 +86,27 @@ class Seconds:
         self.lo = array("i")
         self.cl = array("i")
         self.ofi = array("q")
+        # The book and tape columns the non-OFI rules read. Four more
+        # arrays over a 1.8M-row month is ~58MB on top of ~72MB --
+        # still well inside what a replay machine has, and the
+        # alternative is a second pass over the file per rule.
+        self.bid_sz = array("i")
+        self.ask_sz = array("i")
+        self.delta = array("q")
 
     def __len__(self) -> int:
         return len(self.ts)
 
-    def add(self, ts, hi, lo, cl, of) -> None:
+    def add(self, ts, hi, lo, cl, of, bid_sz=0, ask_sz=0,
+            delta=0) -> None:
         self.ts.append(int(ts))
         self.hi.append(int(hi))
         self.lo.append(int(lo))
         self.cl.append(int(cl))
         self.ofi.append(int(of))
+        self.bid_sz.append(int(bid_sz))
+        self.ask_sz.append(int(ask_sz))
+        self.delta.append(int(delta))
 
     @property
     def priced(self) -> int:
@@ -114,6 +126,21 @@ def to_ticks(raw: str) -> int:
     return int(round(float(raw) / TICK))
 
 
+def _num(raw) -> int:
+    """A numeric field, with empty meaning absent rather than zero.
+
+    `ofi_replay` leaves the book columns blank when the file carried
+    no levels. Zero would be a real size of nothing, which the book
+    rules would read as a one-sided market.
+    """
+    if raw is None or raw == "":
+        return 0
+    try:
+        return int(round(float(raw)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def load(path: str, limit: int = 0) -> Seconds:
     """Read the file `ofi_replay.py` wrote.
 
@@ -128,7 +155,9 @@ def load(path: str, limit: int = 0) -> Seconds:
                 break
             out.add(row["ts"], to_ticks(row.get("high")),
                     to_ticks(row.get("low")), to_ticks(row.get("close")),
-                    int(row.get("ofi") or 0))
+                    int(row.get("ofi") or 0),
+                    _num(row.get("bid_sz")), _num(row.get("ask_sz")),
+                    _num(row.get("delta")))
     return out
 
 
@@ -295,6 +324,93 @@ def score(trades, arm: str) -> Result:
     return r
 
 
+
+# --------------------------------------------------------------- rules
+
+RULES = ("ofi", "agree", "book", "delta")
+
+
+class Frames:
+    """Which way each timeframe's current bar is pointing.
+
+    Bars are built from the SAME per-second closes, so the 1m, 5m and
+    15m views cannot disagree about where their boundaries are.
+    Asking a venue for each separately is three chances for a 15m bar
+    whose open is not the open of the 1m bar at its start.
+
+    A bar still forming is counted, because that is what a rule would
+    have seen at the time. Waiting for the close would let the
+    backtest act on a bar that had not happened yet.
+    """
+
+    def __init__(self, spans=(60, 300, 900)) -> None:
+        self.spans = tuple(int(s) for s in spans if int(s) > 0)
+        self._open = {s: None for s in self.spans}
+        self._start = {s: None for s in self.spans}
+
+    def observe(self, ts: int, close: int) -> None:
+        for s in self.spans:
+            bar = ts - (ts % s)
+            if self._start[s] != bar:
+                self._start[s] = bar
+                self._open[s] = close
+
+    def ways(self, close: int) -> list:
+        out = []
+        for s in self.spans:
+            o = self._open[s]
+            out.append(0 if o is None or close == o
+                       else (1 if close > o else -1))
+        return out
+
+    def agreed(self, close: int) -> int:
+        """+1 or -1 only when EVERY frame points the same way."""
+        ways = self.ways(close)
+        if not ways or 0 in ways:
+            return 0
+        first = ways[0]
+        return first if all(w == first for w in ways) else 0
+
+
+def book_side(sec: "Seconds", i: int, ratio: float) -> int:
+    """Which side of the touch is carrying more size.
+
+    Resting size is the weakest evidence on the book -- it can be
+    pulled the instant it is leaned on, and a print cannot be taken
+    back. It is offered as a rule so it can be MEASURED against the
+    controls rather than argued about.
+    """
+    b, a = sec.bid_sz[i], sec.ask_sz[i]
+    if b <= 0 or a <= 0 or ratio <= 0:
+        return 0                    # no book in that second
+    if b >= a * ratio:
+        return 1
+    if a >= b * ratio:
+        return -1
+    return 0
+
+
+class Roll:
+    """A rolling sum over the last `window` seconds."""
+
+    def __init__(self, window: int) -> None:
+        from collections import deque
+        self.window = max(1, int(window))
+        self._q = deque(maxlen=self.window)
+        self.total = 0
+
+    def push(self, v: int) -> int:
+        if len(self._q) == self._q.maxlen:
+            self.total -= self._q[0]
+        self._q.append(v)
+        self.total += v
+        return self.total
+
+    @property
+    def full(self) -> bool:
+        return len(self._q) == self._q.maxlen
+
+
 # --------------------------------------------------------------- run
 
 def _coin(ts: int, salt: int = 0) -> int:
@@ -310,6 +426,10 @@ def _coin(ts: int, salt: int = 0) -> int:
 
 @dataclass
 class Settings:
+    # Which rule decides the side. One name, or several joined by
+    # "+", in which case EVERY named rule must point the same way --
+    # an agreement rule over the rules themselves.
+    rule: str = "ofi"
     z_enter: float = 1.5
     window: int = 60            # seconds summed into the current OFI
     baseline: int = 600         # window sums the z is measured against
@@ -319,9 +439,30 @@ class Settings:
     cost_ticks: float = 1.0
     train_fraction: float = 0.5
     cooldown_s: int = 60        # no re-entry while one is open
+    frames: tuple = (60, 300, 900)   # the timeframes `agree` reads
+    book_ratio: float = 2.0          # size imbalance `book` wants
+    delta_window: int = 60           # seconds `delta` sums over
+
+    @property
+    def rules(self) -> list:
+        """The rule names, split and cleaned.
+
+        PLUS, SPACE OR COMMA all separate. A URL query decodes "+" as
+        a space, so `?rule=ofi+agree` arrives here as "ofi agree" --
+        accepting only "+" would make every combination silently
+        collapse to one unknown rule over HTTP while working fine on
+        the command line.
+        """
+        import re
+        return [r.lower() for r in re.split(r"[+,\s]+", str(self.rule))
+                if r.strip()]
+
+    def unknown(self) -> list:
+        return [r for r in self.rules if r not in RULES]
 
     def to_dict(self) -> dict:
         d = dict(self.__dict__)
+        d["rules"] = self.rules
         d["break_even"] = round(break_even(self.target_ticks,
                                            self.stop_ticks,
                                            self.cost_ticks), 4)
@@ -331,23 +472,61 @@ class Settings:
 def entries(sec: Seconds, st: Settings) -> list:
     """Where the rule would have entered, and which way.
 
+    ONE PASS, EVERY RULE. The frame bars, the rolling delta and the
+    OFI race are all advanced on every second whether or not the rule
+    being tested reads them, so a rule cannot accidentally see a
+    different history than another rule would have seen at the same
+    moment.
+
     The z comes from `ofi.Race`, the same class the live engine uses,
     so the backtest cannot drift from the panel in how the number is
     computed -- only in what it is computed over (seconds here,
     events live).
+
+    With several rules joined by "+", every one of them must point the
+    same way. A rule that abstains -- no book in that second, a frame
+    with no direction yet -- vetoes the entry rather than being
+    treated as agreement.
     """
+    want = st.rules
     race = ofi.Race(window=st.window, baseline=st.baseline)
+    frames = Frames(st.frames)
+    dlt = Roll(st.delta_window)
+
     out = []
     blocked_until = -1
     for i in range(len(sec)):
+        close = sec.cl[i]
         rd = race.push(int(sec.ofi[i]), ts=float(sec.ts[i]))
-        if rd.z is None or sec.cl[i] == NO_PRICE:
+        dsum = dlt.push(int(sec.delta[i]))
+        if close != NO_PRICE:
+            frames.observe(int(sec.ts[i]), close)
+
+        if close == NO_PRICE or sec.ts[i] < blocked_until:
             continue
-        if sec.ts[i] < blocked_until:
+
+        sides = []
+        for name in want:
+            if name == "ofi":
+                sides.append(0 if rd.z is None or abs(rd.z) < st.z_enter
+                             else (1 if rd.z > 0 else -1))
+            elif name == "agree":
+                sides.append(frames.agreed(close))
+            elif name == "book":
+                sides.append(book_side(sec, i, st.book_ratio))
+            elif name == "delta":
+                sides.append(0 if not dlt.full or dsum == 0
+                             else (1 if dsum > 0 else -1))
+            else:
+                sides.append(0)
+
+        if not sides or 0 in sides:
             continue
-        if abs(rd.z) < st.z_enter:
+        side = sides[0]
+        if any(x != side for x in sides):
             continue
-        out.append((i, 1 if rd.z > 0 else -1, rd.z))
+
+        out.append((i, side, rd.z))
         blocked_until = sec.ts[i] + st.cooldown_s
     return out
 
@@ -361,10 +540,17 @@ def run(sec: Seconds, settings: Settings | None = None) -> dict:
     visible as such.
     """
     st = settings or Settings()
+    bad = st.unknown()
+    if bad:
+        return {"ok": False,
+                "why": (f"unknown rule {', '.join(bad)} -- one of "
+                        f"{', '.join(RULES)}, or several joined by '+'"),
+                "settings": st.to_dict(), "seconds": len(sec)}
     sigs = entries(sec, st)
     if not sigs:
         return {"ok": False,
-                "why": f"no second reached |z| >= {st.z_enter:g}",
+                "why": (f"the rule {st.rule!r} never fired over "
+                        f"{len(sec):,} seconds"),
                 "settings": st.to_dict(), "seconds": len(sec)}
 
     cut = sec.ts[0] + (sec.ts[-1] - sec.ts[0]) * st.train_fraction

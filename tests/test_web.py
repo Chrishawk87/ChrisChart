@@ -2579,3 +2579,133 @@ class TestFlowOnACmeSymbol:
         body = client.get("/api/flow", params={"coin": "BTC"},
                           headers={"Authorization": f"Bearer {TOKEN}"}).json()
         assert "not wired" not in body.get("why", "")
+
+
+class TestOfiBacktesterRoutes:
+    """The panel runs the SAME engine the command line runs. A
+    backtest on the dashboard that disagrees with the one in the
+    terminal is worse than having only one of them.
+    """
+
+    COLS = ["ts", "open", "high", "low", "close", "volume", "trades",
+            "delta", "ofi", "events", "bid", "ask", "bid_sz",
+            "ask_sz", "spread"]
+
+    def _csv(self, n=20_000, seed=5):
+        import csv as _csv
+        import io as _io
+        import random as _rnd
+        rng = _rnd.Random(seed)
+        buf = _io.StringIO()
+        w = _csv.DictWriter(buf, fieldnames=self.COLS)
+        w.writeheader()
+        px, drift, pending = 23200, 0, 0
+        for i in range(n):
+            if pending == 0 and rng.random() < 0.004:
+                drift, pending = rng.choice((1, -1)), 400
+                of = drift * rng.randint(1800, 3000)
+            elif pending > 0:
+                pending -= 1
+                of = drift * rng.randint(0, 200)
+                px += drift if rng.random() < 0.3 else 0
+            else:
+                of = rng.randint(-400, 400)
+                px += rng.choice((-1, 0, 0, 1))
+            w.writerow({"ts": 1_700_000_000 + i,
+                        "open": f"{px * .25:.2f}",
+                        "high": f"{(px + 1) * .25:.2f}",
+                        "low": f"{(px - 1) * .25:.2f}",
+                        "close": f"{px * .25:.2f}", "volume": 5,
+                        "trades": 2, "delta": of * 10, "ofi": of,
+                        "events": 3, "bid": f"{px * .25:.2f}",
+                        "ask": f"{(px + 1) * .25:.2f}",
+                        "bid_sz": rng.randint(40, 300),
+                        "ask_sz": rng.randint(40, 300),
+                        "spread": "1.00"})
+        return buf.getvalue().encode()
+
+    def _upload(self, client, name="ES_day"):
+        return client.post(
+            f"/api/ofi-dataset?name={name}",
+            files={"file": (f"{name}.csv", self._csv(), "text/csv")},
+            headers={"Authorization": f"Bearer {TOKEN}"}).json()
+
+    def test_it_starts_with_nothing(self, client):
+        d = client.get("/api/ofi-datasets",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d["ok"] and d["datasets"] == []
+
+    def test_an_uploaded_file_is_listed(self, client):
+        assert self._upload(client)["ok"] is True
+        d = client.get("/api/ofi-datasets",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert [x["name"] for x in d["datasets"]] == ["ES_day"]
+
+    def test_a_file_that_is_not_an_ofi_replay_file_is_refused(self, client):
+        """Storing it would fail later, at run time, with a confusing
+        error about missing columns."""
+        r = client.post(
+            "/api/ofi-dataset?name=wrong",
+            files={"file": ("wrong.csv", b"a,b,c\n1,2,3\n", "text/csv")},
+            headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert r["ok"] is False
+        assert "ofi_replay" in r["error"]
+
+    def test_a_name_cannot_climb_out_of_the_directory(self, client):
+        self._upload(client)
+        d = client.get("/api/ofi-backtest?dataset=../../etc/passwd",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()
+        assert d["ok"] is False
+        assert "no dataset" in d["why"]
+
+    def test_a_missing_dataset_says_what_there_is(self, client):
+        self._upload(client)
+        d = client.get("/api/ofi-backtest?dataset=nope",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()
+        assert "ES_day" in d["why"]
+
+    def test_an_unknown_rule_is_named(self, client):
+        self._upload(client)
+        d = client.get("/api/ofi-backtest?dataset=ES_day&rule=vibes",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()
+        assert "unknown rule vibes" in d["why"]
+
+    def test_it_runs_and_returns_all_three_arms(self, client):
+        self._upload(client)
+        d = client.get("/api/ofi-backtest?dataset=ES_day&rule=ofi"
+                       "&target=16&stop=4&cost=1.0",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()
+        assert d["ok"] is True, d.get("why")
+        for arm in ("signal", "mirror", "control"):
+            assert "held_out" in d["arms"][arm]
+        assert d["break_even"] == pytest.approx(0.25)
+
+    def test_a_plus_in_the_query_still_means_a_combination(self, client):
+        """A URL decodes "+" as a space. Accepting only "+" would make
+        every combination silently collapse to one unknown rule over
+        HTTP while working fine on the command line."""
+        self._upload(client)
+        d = client.get("/api/ofi-backtest?dataset=ES_day&rule=ofi+agree",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()
+        assert "unknown rule" not in str(d.get("why", ""))
+        assert d["settings"]["rules"] == ["ofi", "agree"]
+
+    def test_the_panel_is_actually_on_the_page(self, client):
+        """It has been claimed twice before that something was on the
+        site when nothing rendered."""
+        html = client.get("/", headers={
+            "Authorization": f"Bearer {TOKEN}"}).text
+        for bit in ("ofiBtPanel", "OFI backtester", "btR_agree",
+                    "btR_book", "btRun()"):
+            assert bit in html, bit
+
+    def test_the_panel_id_is_unique(self, client):
+        html = client.get("/", headers={
+            "Authorization": f"Bearer {TOKEN}"}).text
+        assert html.count('id="ofiBtPanel"') == 1
+        assert html.count('id="btPanel"') == 1, "two panels, one id"
