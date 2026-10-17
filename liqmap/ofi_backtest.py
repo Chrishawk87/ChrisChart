@@ -562,10 +562,11 @@ def run(sec: Seconds, settings: Settings | None = None) -> dict:
         # looks exactly like a real one on the page.
         return {"ok": False,
                 "why": (f"the data goes backwards in time at "
-                        f"{back:,} places. That happens when files "
-                        f"from different periods are replayed in one "
-                        f"pass -- re-run ofi_replay.py on files from "
-                        f"one span, in order"),
+                        f"{back:,} places, so this file was written "
+                        f"by a replay that did not order its inputs. "
+                        f"Re-run scripts/ofi_replay.py -- it now sorts "
+                        f"the files by time and skips seconds that "
+                        f"overlap a file already read"),
                 "settings": st.to_dict(), "seconds": len(sec)}
     bad = st.unknown()
     if bad:

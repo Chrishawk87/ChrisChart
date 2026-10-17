@@ -528,5 +528,8 @@ class TestOutOfOrderDataIsRefused:
         assert "backwards in time" in out["why"]
 
     def test_the_refusal_says_how_to_fix_it(self):
+        """Naming the script and what it now does, rather than
+        leaving the reader to work out which half was at fault."""
         why = bt.run(self._jumbled())["why"]
-        assert "ofi_replay" in why and "one span" in why
+        assert "ofi_replay" in why
+        assert "sorts" in why and "overlap" in why

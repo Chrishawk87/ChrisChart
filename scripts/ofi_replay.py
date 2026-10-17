@@ -177,6 +177,21 @@ class Second:
         return self.trades == 0 and self.books == 0 and self.events == 0
 
 
+def first_record_ts(path) -> float:
+    """The timestamp of a file's first record, for ordering.
+
+    Opening a 1GB file to read one record is cheap: the store is a
+    generator, so nothing after that record is decompressed.
+    """
+    import itertools
+    try:
+        for rec in itertools.islice(dbn.open_file(str(path)), 1):
+            return dbn.seconds(dbn._get(rec, "ts_event")) or 0.0
+    except Exception:                                   # noqa: BLE001
+        return 0.0
+    return 0.0
+
+
 def replay(paths, writer, limit: int = 0,
            state: ofi.BookState | None = None) -> tuple[int, int]:
     """Stream every record through the engine, emitting one row a second.
@@ -189,7 +204,30 @@ def replay(paths, writer, limit: int = 0,
     cur: Second | None = None
     seen = rows = 0
     last_ts = 0.0
+    written_ts = 0                 # the newest second actually written
+    overlapped = 0
     notes: list = []
+
+    def emit(sec: "Second") -> int:
+        """Write a second, unless it is one already covered.
+
+        Databento files are named for a start date but can run for
+        days, so consecutive downloads overlap at the seam. The same
+        second from a second file is the same market data, and
+        writing it again puts a backward step in the index -- which
+        the backtest refuses outright, because `resolve` walks
+        forward assuming the index is ordered.
+        """
+        nonlocal written_ts, overlapped
+        if sec.ts <= written_ts:
+            overlapped += 1
+            return 0
+        writer.writerow(sec.row())
+        written_ts = int(sec.ts)
+        return 1
+
+    # Replay in time order whatever order the shell globbed them in.
+    paths = sorted(paths, key=first_record_ts)
 
     for path in paths:
         # Counted from THIS file's records, not from rows written:
@@ -215,8 +253,7 @@ def replay(paths, writer, limit: int = 0,
 
             if cur is not None and bucket != cur.ts:
                 if not cur.empty:
-                    writer.writerow(cur.row())
-                    rows += 1
+                    rows += emit(cur)
                 cur = None
             if cur is None:
                 cur = Second(bucket)
@@ -275,24 +312,32 @@ def replay(paths, writer, limit: int = 0,
                 f"`bbo` extract gives OFI, never candles")
         if first_ts and last_ts and first_ts < last_ts:
             notes.append(
-                f"{name}: starts BEFORE the previous file ended "
-                f"({_when(first_ts)} < {_when(last_ts)}) -- the output "
-                f"is not in time order")
+                f"{name}: overlaps the previous file "
+                f"(starts {_when(first_ts)}, previous ran to "
+                f"{_when(last_ts)}) -- the overlap is skipped, not "
+                f"written twice")
         if cur is not None:
             last_ts = max(last_ts, float(cur.ts))
 
     if cur is not None and not cur.empty:
-        writer.writerow(cur.row())
-        rows += 1
+        rows += emit(cur)
+    if overlapped:
+        notes.append(
+            f"{overlapped:,} seconds overlapped data already written "
+            f"and were skipped -- consecutive files covering the same "
+            f"span. The output is in time order.")
     for n in notes:
         print(f"  WARNING  {n}", file=sys.stderr)
     return seen, rows
 
 
 def _when(ts: float) -> str:
+    """To the SECOND. A date alone renders an overlap inside one day
+    as "2026-09-25 < 2026-09-25", which reads as a bug in the check
+    rather than a real one-second seam."""
     import datetime as _dt
     return _dt.datetime.fromtimestamp(
-        ts, _dt.timezone.utc).strftime("%Y-%m-%d")
+        ts, _dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def main(argv=None) -> int:

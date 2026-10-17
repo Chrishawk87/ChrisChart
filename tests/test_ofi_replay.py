@@ -295,3 +295,83 @@ class TestNoFabricatedNumbers:
         assert rows == 1
         assert float(out[0]["bid"]) == 5800.00
         assert int(out[0]["events"]) == 0, "no event, but still a book"
+
+
+class TestTheOutputIsInTimeOrder:
+    """Databento files are named for a start date but can run for
+    days, so consecutive downloads overlap at the seam. A real case:
+    a file named 2026-09-21 covered 95 hours and ran into Sep 25,
+    where the next file began.
+
+    One backward step is enough for the backtest to refuse the whole
+    file -- `resolve` walks forward assuming the index is ordered --
+    so the replay has to produce order, not just report disorder.
+    """
+
+    def test_an_overlapping_second_is_not_written_twice(self):
+        a = [_MBP10(i, i, bid_sz=100 + i) for i in range(10)]
+        b = [_MBP10(i, 8 + i, bid_sz=200 + i) for i in range(10)]
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=rp.COLS,
+                           extrasaction="ignore")
+        w.writeheader()
+        real = rp.dbn.open_file
+        files = {"a": a, "b": b}
+        rp.dbn.open_file = lambda p: files[p]
+        try:
+            rp.replay(["a", "b"], w)
+        finally:
+            rp.dbn.open_file = real
+        buf.seek(0)
+        stamps = [int(r["ts"]) for r in csv.DictReader(buf)]
+        assert stamps == sorted(stamps), "went backwards"
+        assert len(stamps) == len(set(stamps)), "wrote a second twice"
+
+    def test_files_globbed_out_of_order_still_come_out_ordered(self):
+        """The shell sorts by name. Names do not sort by time."""
+        late = [_MBP10(i, 500 + i, bid_sz=100 + i) for i in range(10)]
+        early = [_MBP10(i, i, bid_sz=100 + i) for i in range(10)]
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=rp.COLS,
+                           extrasaction="ignore")
+        w.writeheader()
+        real = rp.dbn.open_file
+        files = {"z_late": late, "a_early": early}
+        rp.dbn.open_file = lambda p: files[p]
+        try:
+            rp.replay(["z_late", "a_early"], w)   # worst order
+        finally:
+            rp.dbn.open_file = real
+        buf.seek(0)
+        stamps = [int(r["ts"]) for r in csv.DictReader(buf)]
+        assert stamps == sorted(stamps), stamps[:5]
+
+    def test_the_backtest_accepts_what_the_replay_produces(self):
+        """The two halves have to agree about what ordered means."""
+        from liqmap import ofi_backtest as _bt
+        a = [_MBP10(i, i, bid_sz=100 + i) for i in range(10)]
+        b = [_MBP10(i, 8 + i, bid_sz=200 + i) for i in range(10)]
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=rp.COLS,
+                           extrasaction="ignore")
+        w.writeheader()
+        real = rp.dbn.open_file
+        files = {"a": a, "b": b}
+        rp.dbn.open_file = lambda p: files[p]
+        try:
+            rp.replay(["a", "b"], w)
+        finally:
+            rp.dbn.open_file = real
+        secs = _bt.Seconds()
+        buf.seek(0)
+        for row in csv.DictReader(buf):
+            secs.add(row["ts"], _bt.to_ticks(row.get("high")),
+                     _bt.to_ticks(row.get("low")),
+                     _bt.to_ticks(row.get("close")),
+                     int(row.get("ofi") or 0))
+        assert secs.out_of_order == 0
+
+    def test_the_seam_is_reported_to_the_second(self):
+        """A date alone renders a same-day overlap as
+        '2026-09-25 < 2026-09-25', which reads as a broken check."""
+        assert ":" in rp._when(1_700_000_061.0)
