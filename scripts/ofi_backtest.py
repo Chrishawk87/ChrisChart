@@ -103,8 +103,8 @@ def main(argv=None) -> int:
 
     if args.sweep:
         zs = [float(x) for x in args.sweep.split(",") if x.strip()]
-        print(f"\n{'z':>6}{'entries':>9}{'signal':>9}{'mirror':>9}"
-              f"{'control':>9}{'sig/trade':>11}")
+        print(f"\n{'z':>6}{'entries':>9}{'held':>7}{'signal':>9}"
+              f"{'mirror':>9}{'control':>9}{'sig/trade':>11}")
         for z in zs:
             out = bt.run(secs, settings(z))
             if not out.get("ok"):
@@ -114,20 +114,25 @@ def main(argv=None) -> int:
                  for a in ("signal", "mirror", "control")}
             pt = h["signal"]["per_trade_ticks"]
             print(f"{z:>6}{out['entries']:>9,}"
+                  f"{h['signal']['scored']:>7,}"
                   f"{pct(h['signal']['win_rate'])}"
                   f"{pct(h['mirror']['win_rate'])}"
                   f"{pct(h['control']['win_rate'])}"
                   f"{('   --  ' if pt is None else f'{pt:+7.3f}'):>11}")
         print("\nA shape that improves smoothly with z is evidence. One "
               "good row\namong bad ones is the row you would have picked "
-              "by chance.")
+              "by chance. Read the\n`held` column too: a win rate over "
+              "forty trades is not a measurement.")
         return 0
 
     out = bt.run(secs, settings(args.z))
     if not out.get("ok"):
         print(f"\n{out['why']}")
         return 1
-    print(f"entries {out['entries']:,} at |z| >= {args.z:g}")
+    print(f"entries {out['entries']:,} at |z| >= {args.z:g}  "
+          f"(split by entry count, not wall clock)")
+    print(f"coverage {out['coverage_hours']:,.0f}h of data across a "
+          f"{out['hours']:,.0f}h span")
     table(out, "train")
     table(out, "held_out")
     print(f"\nverdict: {out['verdict']}")

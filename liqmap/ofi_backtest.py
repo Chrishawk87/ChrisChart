@@ -581,7 +581,20 @@ def run(sec: Seconds, settings: Settings | None = None) -> dict:
                         f"{len(sec):,} seconds"),
                 "settings": st.to_dict(), "seconds": len(sec)}
 
-    cut = sec.ts[0] + (sec.ts[-1] - sec.ts[0]) * st.train_fraction
+    # SPLIT BY ENTRY COUNT, NOT BY WALL CLOCK. Market data has
+    # calendar holes -- weekends, days you did not download -- and a
+    # midpoint in TIME can fall inside one of them. Three days of ES
+    # spanning seventeen split 2,508 / 200 that way, and every number
+    # in the held-out column was then computed on 7% of the sample.
+    #
+    # Cutting at the k-th entry keeps the halves chronological, so
+    # nothing leaks backwards, and makes them comparable in size,
+    # which is what the comparison needs.
+    k = int(len(sigs) * st.train_fraction)
+    if 0 < k < len(sigs):
+        cut = float(sec.ts[sigs[k][0]])
+    else:
+        cut = sec.ts[0] + (sec.ts[-1] - sec.ts[0]) * st.train_fraction
     arms = {"signal": [], "mirror": [], "control": []}
     for i, side, _z in sigs:
         arms["signal"].append(resolve(sec, i, side, st.target_ticks,
@@ -596,6 +609,8 @@ def run(sec: Seconds, settings: Settings | None = None) -> dict:
            "seconds": len(sec), "priced_seconds": sec.priced,
            "hours": round(sec.span_hours(), 1),
            "entries": len(sigs),
+           "split_at": cut,
+           "coverage_hours": round(len(sec) / 3600.0, 1),
            "break_even": round(break_even(st.target_ticks, st.stop_ticks,
                                           st.cost_ticks), 4),
            "arms": {}}

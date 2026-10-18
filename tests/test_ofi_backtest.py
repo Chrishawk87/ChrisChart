@@ -533,3 +533,63 @@ class TestOutOfOrderDataIsRefused:
         why = bt.run(self._jumbled())["why"]
         assert "ofi_replay" in why
         assert "sorts" in why and "overlap" in why
+
+
+class TestTheSplitSurvivesCalendarHoles:
+    """Market data has holes -- weekends, days not downloaded. A
+    midpoint in WALL CLOCK time can land inside one.
+
+    Real case: three days of ES spanning seventeen split 2,508 / 200,
+    and every held-out number was then computed on 7% of the sample
+    while looking like a normal result.
+    """
+
+    def _gapped(self):
+        """Two clusters of activity with two weeks of nothing between."""
+        s = bt.Seconds()
+        rng = random.Random(3)
+        px = 23200
+        for block in (0, 1_200_000):          # ~14 days apart
+            for i in range(60_000):
+                px += rng.choice((-1, 0, 0, 1))
+                of = rng.randint(-3000, 3000)
+                s.add(T0 + block + i, px + rng.randint(0, 2),
+                      px - rng.randint(0, 2), px, of,
+                      rng.randint(40, 300), rng.randint(40, 300),
+                      of * 10)
+        return s
+
+    def test_both_halves_get_a_comparable_share(self):
+        out = bt.run(self._gapped(), bt.Settings(z_enter=1.0))
+        tr = out["arms"]["signal"]["train"]["scored"]
+        ho = out["arms"]["signal"]["held_out"]["scored"]
+        assert tr and ho
+        bigger, smaller = max(tr, ho), min(tr, ho)
+        assert bigger / smaller < 2.0, (tr, ho)
+
+    def test_the_split_is_still_chronological(self):
+        """Balance must not come at the cost of letting the model see
+        the future: every train entry precedes every held-out one."""
+        s = self._gapped()
+        st = bt.Settings(z_enter=1.0)
+        out = bt.run(s, st)
+        cut = out["split_at"]
+        sigs = bt.entries(s, st)
+        before = [s.ts[i] for i, _, _ in sigs if s.ts[i] < cut]
+        after = [s.ts[i] for i, _, _ in sigs if s.ts[i] >= cut]
+        assert before and after
+        assert max(before) < min(after)
+
+    def test_the_fraction_is_respected(self):
+        out = bt.run(self._gapped(),
+                     bt.Settings(z_enter=1.0, train_fraction=0.7))
+        tr = out["arms"]["signal"]["train"]["scored"]
+        ho = out["arms"]["signal"]["held_out"]["scored"]
+        assert tr > ho, (tr, ho)
+
+    def test_coverage_is_reported_apart_from_span(self):
+        """414 hours of span over 102 hours of data is a fact worth
+        seeing -- it is the difference between a month of trading and
+        three days scattered through one."""
+        out = bt.run(self._gapped(), bt.Settings(z_enter=1.0))
+        assert out["coverage_hours"] < out["hours"] / 2
