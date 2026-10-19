@@ -98,6 +98,11 @@ class Tape:
     # trade this method already decoded, so the footprint and the
     # candles can never disagree about which prints existed.
     footprint: object = None
+    # The resting book, read diagonally and scoped to the footprint's
+    # candle. Separate from `footprint` on purpose: one counts what
+    # traded, the other what is standing there, and neither
+    # substitutes for the other.
+    bookdiag: object = None
     last_px: float = 0.0
     last_side: str = ""
     last_ts: float = 0.0
@@ -130,6 +135,11 @@ class Tape:
         not trades.
         """
         self.records += 1
+        if self.bookdiag is not None:
+            try:
+                self.bookdiag.observe(rec)
+            except Exception:                           # noqa: BLE001
+                pass            # a display must not stop the tape
         if dbn._get(rec, "levels"):
             try:
                 self.book = dbn.book_from(rec, symbol=self.symbol)
@@ -161,9 +171,17 @@ class Tape:
         if size <= 0:
             return
         try:
-            self.footprint.on_tick(_FTick(
+            closed = self.footprint.on_tick(_FTick(
                 ts=float(t.ts), price=float(t.px), size=size,
                 aggressor=t.aggressor))
+            # The book reading is scoped to the footprint's candle,
+            # driven by the footprint's OWN close events rather than
+            # by a poll -- a reset at poll time would scope it to the
+            # refresh rate instead of to the bar. The footprint is
+            # not modified to do this; its return value already says
+            # when a bar ended.
+            if closed and self.bookdiag is not None:
+                self.bookdiag.reset()
         except Exception:                               # noqa: BLE001
             # The footprint is a display. It must never be able to
             # stop the tape that feeds the engine and the candles.

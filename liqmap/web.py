@@ -907,6 +907,12 @@ class Runtime:
                     multiplier=float(multiplier),
                     min_volume=int(min_volume)))
             svc.tape.footprint = stream
+            # The resting book, scoped to the same candle. Attached
+            # here because the tape's reset is driven by the
+            # footprint's own close event -- the footprint itself is
+            # not modified.
+            from .bookdiag import BookDiagonal
+            svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             self._footprint = stream
             self._footprint_rule = key
             return stream
@@ -5234,6 +5240,13 @@ def create_app() -> FastAPI:
                 "confirmed": [f.as_dict(sc) for f in flags],
             })
         out["history"] = past
+
+        # The resting book, as a SEPARATE key. Nothing about the
+        # footprint's own fields changes: one counts what traded,
+        # the other what is standing there.
+        bd = getattr(tape, "bookdiag", None)
+        if bd is not None:
+            out["book"] = bd.reading().as_dict()
         return out
 
     @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
@@ -5612,7 +5625,9 @@ DASHBOARD = """<!doctype html>
   .k-dash{width:16px;height:0;border-top:1px dashed var(--dim)}
   .k-box{width:9px;height:9px;border:1.5px solid var(--ink);opacity:.6}
 
-  /* ---- footprint ------------------------------------------------
+  
+
+/* ---- footprint ------------------------------------------------
      NEVER COLOUR ALONE. The site's --up and --down sit at deutan
      delta-E 5.1, so a red-green colourblind reader cannot separate
      them. Every cell therefore carries its number, the two sides sit
@@ -5999,6 +6014,8 @@ DASHBOARD = """<!doctype html>
       </div>
 
       <div id="fpStats" class="fpstat"></div>
+      <div id="fpBook" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
       <div id="fpBody"><div class="msg">Loading&hellip;</div></div>
       <div id="fpHist" class="fphist"></div>
     </div>
@@ -7847,6 +7864,38 @@ function fpSign(n) {
   return (n >= 0 ? '+' : '') + n.toLocaleString();
 }
 
+/* ---- the resting book, read diagonally -------------------------
+   A SEPARATE measurement from the footprint above it. That counts
+   contracts that traded and who crossed to get them; this counts
+   contracts that are standing there and have not traded at all.
+   Resting size is the weaker of the two -- it can be pulled the
+   instant it is leaned on -- so it is labelled as what it is. */
+function fpBookRow(d) {
+  const b = d.book;
+  if (!b) return '';
+  const who = w => w === 'bid' ? 'BID' : (w === 'ask' ? 'ASK' : '--');
+  const held = (b.held * 100).toFixed(0);
+  return `
+    <span class="stamp">resting book</span>
+    <span>now <b>${who(b.winning_now)}</b>
+      ${fpMeter(b.size_now, 'book now')}
+      ${b.size_now.toFixed(2)}</span>
+    <span>since open <b>${who(b.winning_since_open)}</b>
+      ${fpMeter(b.size_mean, 'book mean')}
+      ${b.size_mean.toFixed(2)}</span>
+    <span>bid ahead <b>${held}%</b> of the bar</span>
+    <span>contracts <b>${fpNum(b.bid_sz)}</b> /
+      <b>${fpNum(b.ask_sz)}</b></span>
+    <span>orders <b>${fpNum(b.bid_ct)}</b> /
+      <b>${fpNum(b.ask_ct)}</b>
+      ${fpMeter(b.order_now, 'orders')}</span>
+    <span>rungs held <b>${b.bid_rungs}</b> bid /
+      <b>${b.ask_rungs}</b> ask</span>
+    <span class="stamp">${b.updates} updates &middot;
+      ${b.seconds.toFixed(0)}s &middot; spread
+      ${b.spread_ticks.toFixed(1)}t</span>`;
+}
+
 function fpStats(d) {
   const p = d.pulse || {};
   const ratio = (p.ratio == null) ? '--' : p.ratio.toFixed(2);
@@ -7934,6 +7983,7 @@ async function fpLoad() {
   if (!d.ok) {
     $('fpStamp').textContent = '';
     $('fpStats').innerHTML = '';
+    $('fpBook').innerHTML = '';
     $('fpHist').innerHTML = '';
     $('fpBody').innerHTML = '<div class="msg">' +
       (d.why || 'no data') + '</div>';
@@ -7942,6 +7992,7 @@ async function fpLoad() {
   $('fpStamp').textContent = `${d.coin} · ${d.rule} · ` +
     `${(d.tape_trades || 0).toLocaleString()} prints`;
   $('fpStats').innerHTML = fpStats(d);
+  $('fpBook').innerHTML = fpBookRow(d);
   $('fpBody').innerHTML = fpTable(d);
   $('fpHist').innerHTML = fpHistory(d);
 }

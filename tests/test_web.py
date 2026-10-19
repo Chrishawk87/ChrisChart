@@ -2993,3 +2993,36 @@ class TestFootprintPanel:
         assert "${x.toUpperCase()}" in html, "the tag must say buy/sell"
         assert "fpNum(r.bid_volume)" in html
         assert "fpNum(r.ask_volume)" in html
+
+    def test_the_book_reading_is_a_separate_key(self, client,
+                                                monkeypatch):
+        """Added alongside the footprint, never folded into it. One
+        counts what traded, the other what is resting."""
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed(rt, tape)
+        d = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert "book" in d
+        assert "winning_now" in d["book"]
+        assert "pulse" in d and "rows" in d, "footprint fields intact"
+
+    def test_the_book_is_attached_to_the_tape(self, client,
+                                              monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        assert tape.bookdiag is not None
+
+    def test_the_book_strip_is_on_the_page(self, client):
+        html = client.get("/", headers={
+            "Authorization": f"Bearer {TOKEN}"}).text
+        assert "fpBookRow" in html
+        assert 'id="fpBook"' in html
+
+    def test_the_book_function_is_in_the_script_not_the_stylesheet(
+            self, client):
+        """It landed inside <style> once, because the CSS block and
+        the JS block open with the same comment."""
+        html = client.get("/", headers={
+            "Authorization": f"Bearer {TOKEN}"}).text
+        head = html.split("</style>")[0]
+        assert "function fpBookRow" not in head

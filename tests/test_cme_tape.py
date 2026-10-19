@@ -449,3 +449,73 @@ class TestTheThreeSilences:
             t.offer(_BBO(i, 1_700_000_000.0 + i))
             t.offer(_TRD(i, 1_700_000_000.0 + i))
         assert self._feed(src=t).missing() == ""
+
+
+class TestTheTapeFeedsTheBookDiagonal:
+    """One record stream, two readings: what traded (footprint) and
+    what is resting (book diagonal). The footprint is not modified to
+    make this work -- its own return value already says when a bar
+    ended."""
+
+    def _rec(self, i, ts, px, bsz, asz, trade_sz=0, buy=True):
+        o = type("R", (), {})()
+        o.ts_event = int(ts * 1e9)
+        o.sequence, o.instrument_id = i, 42
+        if trade_sz:
+            o.action, o.side = "T", ("B" if buy else "A")
+            o.price, o.size = px, trade_sz
+        else:
+            o.action, o.side = "A", "B"
+        lv = []
+        for k in range(5):
+            L = type("L", (), {})()
+            L.bid_px, L.bid_sz, L.bid_ct = px - k * TICK, bsz, bsz // 10
+            L.ask_px, L.ask_sz, L.ask_ct = (px + (k + 1) * TICK, asz,
+                                            asz // 10)
+            lv.append(L)
+        o.levels = lv
+        return o
+
+    def _wired(self, contracts=100):
+        from liqmap.bookdiag import BookDiagonal
+        from liqmap.footprint import VolumeRule
+        from liqmap.footprint_live import FootprintStream
+        t = cme_tape.Tape(symbol="ES")
+        t.footprint = FootprintStream(tick_size=0.25,
+                                      rule=VolumeRule(contracts))
+        t.bookdiag = BookDiagonal(tick_size=0.25)
+        return t
+
+    def test_book_records_reach_the_diagonal(self):
+        t = self._wired()
+        for i in range(10):
+            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100))
+        assert t.bookdiag.reading().updates == 10
+
+    def test_it_reads_the_resting_sizes_not_the_traded_ones(self):
+        t = self._wired()
+        for i in range(6):
+            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
+                              trade_sz=5, buy=False))
+        r = t.bookdiag.reading()
+        assert r.winning_now() == "bid", "resting bid is the heavy side"
+        assert t.footprint.pulse().delta < 0, "but sellers are paying"
+
+    def test_a_closing_bar_restarts_the_accumulation(self):
+        t = self._wired(contracts=20)
+        base = 1_700_000_000.0
+        for i in range(4):
+            t.offer(self._rec(i, base + i, BASE, 400, 100, trade_sz=5))
+        assert len(t.footprint.history) == 1
+        # the accumulation restarted, the standing book did not vanish
+        assert t.bookdiag.reading().seconds == 0.0
+        assert t.bookdiag.reading().levels
+
+    def test_without_a_diagonal_attached_nothing_changes(self):
+        """It is optional. A tape with no book reader must behave
+        exactly as it did before this existed."""
+        t = cme_tape.Tape(symbol="ES")
+        for i in range(5):
+            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
+                              trade_sz=5))
+        assert t.trades == 5 and t.books == 5
