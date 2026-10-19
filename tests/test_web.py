@@ -2709,3 +2709,135 @@ class TestOfiBacktesterRoutes:
             "Authorization": f"Bearer {TOKEN}"}).text
         assert html.count('id="ofiBtPanel"') == 1
         assert html.count('id="btPanel"') == 1, "two panels, one id"
+
+
+class TestACmeSymbolNeverOpensAHyperliquidSocket:
+    """Pressing Go live on ES opened a Hyperliquid socket for a market
+    Hyperliquid does not carry. It connected, was sent nothing, was
+    dropped by the far end, and reconnected -- thirty times in an
+    hour, under a panel reading "Feed silent / 0 fills / 0 book
+    updates / last message never", which reads as a fault in this
+    service rather than a request for a market that does not exist
+    there.
+    """
+
+    def _as_cme(self, monkeypatch, symbol="ES"):
+        rt = web.runtime()
+        monkeypatch.setattr(rt, "is_cme",
+                            lambda c, s=symbol: str(c).upper() == s)
+        return rt
+
+    def test_starting_the_feed_opens_no_socket(self, client, monkeypatch):
+        rt = self._as_cme(monkeypatch)
+        opened = []
+        monkeypatch.setattr(rt, "stop_feed",
+                            lambda: opened.append("stop") or {})
+        out = rt.start_feed("ES")
+        assert out["source"] == "cme"
+        assert rt.feed is None, "a Hyperliquid feed was created"
+        assert "does not carry it" in out["note"]
+
+    def test_a_hyperliquid_symbol_is_unaffected(self, client, monkeypatch):
+        """The guard must not break every other market."""
+        rt = self._as_cme(monkeypatch)
+        calls = []
+        monkeypatch.setattr(rt, "stop_feed", lambda: calls.append(1) or {})
+
+        class _Boom(Exception):
+            pass
+
+        def _no_network(*a, **k):
+            raise _Boom()
+        monkeypatch.setattr(rt, "client", _no_network)
+        try:
+            rt.start_feed("BTC")
+        except _Boom:
+            pass
+        assert calls, "BTC should still go down the Hyperliquid path"
+
+    def test_feed_for_stays_hyperliquid_only(self, client, monkeypatch):
+        """Seventeen call sites read it and touch thirty attributes of
+        LiveFeed between them. A CME view returned there would have to
+        impersonate all of it."""
+        rt = self._as_cme(monkeypatch)
+        assert rt.feed_for("ES") is None
+
+    def test_cme_feed_is_asked_for_by_name(self, client, monkeypatch):
+        rt = self._as_cme(monkeypatch)
+        assert rt.cme_feed("BTC") is None
+        f = rt.cme_feed("ES")
+        assert f is not None and f.coin == "ES"
+
+
+class TestTheCandleReadUsesTheCmeTape:
+
+    def _as_cme(self, monkeypatch, symbol="ES"):
+        rt = web.runtime()
+        monkeypatch.setattr(rt, "is_cme",
+                            lambda c, s=symbol: str(c).upper() == s)
+        return rt
+
+    def test_the_read_asks_the_cme_tape_for_its_bar(self, client,
+                                                    monkeypatch):
+        rt = self._as_cme(monkeypatch)
+        asked = []
+        real = rt.cme_feed
+
+        def spy(coin):
+            asked.append(coin)
+            return real(coin)
+        monkeypatch.setattr(rt, "cme_feed", spy)
+        client.get("/api/read?coin=ES&interval=15m",
+                   headers={"Authorization": f"Bearer {TOKEN}"})
+        assert "ES" in asked
+
+    def test_a_timeframe_the_tape_lacks_is_added_on_demand(self):
+        """The selector can name any interval. The same prints feed
+        all of them, so adding a builder costs nothing."""
+        from liqmap import cme_tape as _ct
+        f = _ct.LadderFeed(_ct.Tape(symbol="ES"), coin="ES")
+        assert "30m" not in f.builders
+        assert f.ensure_interval("30m") is True
+        assert "30m" in f.builders
+
+    def test_an_unknown_timeframe_is_declined_not_guessed(self):
+        from liqmap import cme_tape as _ct
+        f = _ct.LadderFeed(_ct.Tape(symbol="ES"), coin="ES")
+        assert f.ensure_interval("banana") is False
+
+    def test_absorption_is_absent_rather_than_invented(self):
+        """The Hyperliquid feed measures it against a baseline of its
+        own impact buckets, which this tape does not keep. The read
+        already handles None; a number there would read as a
+        measurement."""
+        from liqmap import cme_tape as _ct
+        f = _ct.LadderFeed(_ct.Tape(symbol="ES"), coin="ES")
+        assert f.absorption(window_s=300.0) is None
+
+    def test_the_read_says_the_tape_is_still_filling(self, client,
+                                                     monkeypatch):
+        """Not "candles unavailable", which named the wrong cause: the
+        venue does not list the market, and the CME tape simply has
+        not accumulated bars yet."""
+        self._as_cme(monkeypatch)
+        d = client.get("/api/read?coin=ES&interval=15m",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d["source"] == "cme"
+        assert "candles unavailable" not in d.get("error", "")
+        assert "closed 15m bars so far" in d["error"]
+
+    def test_it_says_the_tape_keeps_no_history_from_before_it_started(
+            self, client, monkeypatch):
+        """A real limit, and the reason the panel is empty for hours
+        after a restart rather than minutes."""
+        self._as_cme(monkeypatch)
+        d = client.get("/api/read?coin=ES&interval=15m",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert "before the engine started" in d["error"]
+
+    def test_a_hyperliquid_symbol_still_reports_its_own_failure(
+            self, client, monkeypatch):
+        self._as_cme(monkeypatch)
+        d = client.get("/api/read?coin=BTC&interval=15m",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d.get("source") != "cme"

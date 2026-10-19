@@ -218,7 +218,8 @@ class TestSuggestsOnly:
     def test_it_reuses_the_sites_candle_builder(self):
         src = (Path(__file__).resolve().parent.parent
                / "liqmap" / "cme_tape.py").read_text()
-        assert "from .live import CandleBuilder" in src
+        assert "import" in src and "CandleBuilder" in src
+        assert "from .live import" in src, "not its own copy"
         assert "class CandleBuilder" not in src, "a second implementation"
 
 

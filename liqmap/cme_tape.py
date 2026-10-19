@@ -38,7 +38,7 @@ from dataclasses import dataclass, field
 
 from . import dbn
 from .flow import FlowTape
-from .live import CandleBuilder
+from .live import STALE_AFTER_S, CandleBuilder
 
 DEFAULT_INTERVALS = (60.0, 300.0, 900.0)      # 1m, 5m, 15m
 KEEP_CLOSED = 300                             # per interval
@@ -66,6 +66,16 @@ def label(seconds: float) -> str:
     if s % 60 == 0:
         return f"{s // 60}m"
     return f"{s}s"
+
+
+def seconds_of(name: str) -> float:
+    """'15m' -> 900. The inverse of `label`, for a selector that can
+    name any timeframe."""
+    raw = str(name).strip().lower()
+    if not raw or not raw[:-1].isdigit():
+        return 0.0
+    n, unit = int(raw[:-1]), raw[-1]
+    return float(n * {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 0))
 
 
 @dataclass
@@ -266,6 +276,67 @@ class LadderFeed:
 
     def history(self, interval: str, limit: int = 200):
         return self.src.history(interval, limit=limit)
+
+
+    # ---- the rest of the feed surface the candle read expects ------
+    #
+    # The read was written against the Hyperliquid feed and touches ten
+    # things on it. Four are real here; the rest are answered honestly
+    # rather than approximated, because a plausible number from the
+    # wrong source is worse on that panel than a blank.
+
+    bucket_s: float = 15.0          # written by the read; unused here
+
+    @property
+    def stale(self) -> bool:
+        a = self.age
+        return a is None or a > STALE_AFTER_S
+
+    @property
+    def builders(self) -> dict:
+        return self.src.builders
+
+    def ensure_interval(self, name: str, seed_bars=None) -> bool:
+        """Start building a timeframe the tape was not opened with.
+
+        The selector can name any interval. Adding the builder costs
+        nothing -- the same prints already arriving feed all of them.
+        """
+        if name in self.src.builders:
+            return False
+        secs = seconds_of(name)
+        if not secs:
+            return False
+        self.src.closed.setdefault(name, deque(maxlen=self.src.keep))
+        self.src.builders[name] = CandleBuilder(
+            secs, on_close=self.src._closer(name))
+        return True
+
+    def absorption(self, window_s: float = 300.0):
+        """Not computed from the CME tape.
+
+        The Hyperliquid feed measures this against a rolling baseline of
+        its own impact buckets, which this tape does not keep. None is
+        what the read already shows when a baseline is too thin to have
+        a scale, so the panel handles it -- and an invented number
+        there would read as a measurement.
+        """
+        return None
+
+    def status(self) -> dict:
+        return {
+            "running": self.running,
+            "connected": self.running,
+            "coin": self.coin,
+            "source": "cme",
+            "schemas": list(self.schemas),
+            "stale": self.stale,
+            "age_s": self.age,
+            "trades": self.src.trades,
+            "book_updates": self.src.books,
+            "records": self.src.records,
+            "why": self.missing(),
+        }
 
     def missing(self) -> str:
         """Why the ladder cannot be drawn. '' when it can.

@@ -609,6 +609,19 @@ class Runtime:
         """
         from .live import LiveFeed
 
+        # A CME symbol must NOT open a Hyperliquid socket. The venue
+        # does not carry it, so the socket connects, is sent nothing,
+        # is dropped by the far end, and reconnects -- thirty times an
+        # hour, under a panel reading "Feed silent" that looks like a
+        # fault in this service rather than a request for a market
+        # that does not exist there.
+        if self.is_cme(coin):
+            cme = self.cme_feed(coin)
+            return {"ok": True, "source": "cme", "already": True,
+                    **(cme.status() if cme else {}),
+                    "note": (f"{coin} is served by the CME subscription. "
+                             f"No Hyperliquid socket was opened, because "
+                             f"Hyperliquid does not carry it.")}
         coin = self.resolve_symbol(coin)[0] or coin
         if self.feed is not None and self.feed.coin == coin and self.feed.running:
             return {"ok": True, **self.feed.status(), "already": True}
@@ -852,8 +865,29 @@ class Runtime:
                     close_px=float(c.close)))
         return merge_cvd(timeframe, stored, live, bars=bars)
 
+    def cme_feed(self, coin: str):
+        """The CME tape, shaped like a feed. None when this is not a
+        CME symbol."""
+        if not self.is_cme(coin):
+            return None
+        from .cme_tape import LadderFeed
+        svc = self.ofi
+        return LadderFeed(svc.tape, coin=coin, running=svc.running,
+                          schemas=tuple(svc.config.schema_list),
+                          note=(getattr(svc, "error", "")
+                                or svc.config.blocked_by()))
+
     def feed_for(self, coin: str):
-        """The feed, only if it is live on this market and actually ticking."""
+        """The Hyperliquid feed, if it is live here and actually ticking.
+
+        Deliberately NOT CME-aware. Seventeen call sites read this, and
+        between them they touch thirty attributes of `LiveFeed` -- the
+        DOM, the book call, the fast book, quality, spread trend, the
+        update hooks. A CME view returned here would have to impersonate
+        all of it, and a plausible-looking answer from the wrong source
+        is worse on those panels than an empty one. Routes that CAN
+        serve CME ask for it by name, with `cme_feed`.
+        """
         f = self.feed
         if f is None or f.coin != coin or not f.running:
             return None
@@ -3857,16 +3891,9 @@ def create_app() -> FastAPI:
         # and permanently empty.
         source = "hl"
         if rt.is_cme(coin):
-            from .cme_tape import LadderFeed as _LadderFeed
             source = "cme"
             svc = rt.ofi
-            feed = _LadderFeed(
-                svc.tape, coin=coin, running=svc.running,
-                schemas=tuple(svc.config.schema_list),
-                # What the service knows and the tape cannot: a thread
-                # that raised, or a condition that was never met.
-                note=(getattr(svc, "error", "")
-                      or svc.config.blocked_by()))
+            feed = rt.cme_feed(coin)       # one builder, every route
             blind = feed.missing()
             if blind:
                 # Half a subscription draws the same empty rungs as a
@@ -4376,13 +4403,34 @@ def create_app() -> FastAPI:
         client = rt.client()
         out: dict[str, Any] = {"coin": coin, "interval": interval}
 
-        try:
-            bars = client.candles(coin, interval, bars=200)
-        except Exception as exc:
-            return {**out, "error": f"candles unavailable: {exc}"}
-        if len(bars) < 10:
-            return {**out, "error": f"only {len(bars)} candles came back — "
-                                    f"not enough to read structure"}
+        # A CME symbol's bars come from the Databento tape. Asking the
+        # Hyperliquid client for ES candles returns nothing and the read
+        # bailed out here with "candles unavailable" -- which named the
+        # wrong cause: the venue simply does not list the market.
+        cme = rt.cme_feed(coin)
+        if cme is not None:
+            out["source"] = "cme"
+            cme.ensure_interval(interval)
+            bars = list(cme.history(interval, limit=200))
+            if len(bars) < 10:
+                why = cme.missing()
+                return {**out,
+                        "error": (
+                            f"the CME tape has {len(bars)} closed "
+                            f"{interval} bars so far. It builds candles "
+                            f"from prints as they arrive and holds none "
+                            f"from before the engine started, so this "
+                            f"fills in as the session runs"
+                            + (f" -- {why}" if why else ""))}
+        else:
+            try:
+                bars = client.candles(coin, interval, bars=200)
+            except Exception as exc:
+                return {**out, "error": f"candles unavailable: {exc}"}
+            if len(bars) < 10:
+                return {**out,
+                        "error": f"only {len(bars)} candles came back — "
+                                 f"not enough to read structure"}
 
         from .structure import Candle
 
@@ -4392,7 +4440,10 @@ def create_app() -> FastAPI:
         # If a socket is feeding this market, the current bar is BUILT from
         # the tape rather than fetched. Nothing to poll, nothing to lag, and
         # no chance of being handed a closed bar and told it is the live one.
-        feed = rt.feed_for(coin)
+        # A CME symbol is served by the Databento subscription, never by
+        # a Hyperliquid socket. Asked for by name rather than through
+        # `feed_for`, which stays Hyperliquid-only on purpose.
+        feed = rt.cme_feed(coin) or rt.feed_for(coin)
         if feed is not None and interval not in feed.builders:
             # The timeframe selector can name any interval. A feed opened on
             # a different set has nothing for it, which looked exactly like
