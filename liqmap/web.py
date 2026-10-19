@@ -128,6 +128,13 @@ class Runtime:
         # quarter of a gigabyte, and the panel shows one at a time.
         self.ofi_bt_name: str = ""
         self.ofi_bt_secs = None
+        self._footprint = None
+        self._footprint_rule = ""
+        # The panel polls on a timer, so two requests can arrive
+        # together. Without this both build a stream, the tape ends
+        # up pointing at one of them, and the other's reader sees an
+        # empty bar -- which looks like a random reset.
+        self._footprint_lock = threading.Lock()
         # One row per closed bar per timeframe. The only place a slow
         # timeframe's CVD can come from: the fills behind it leave the
         # rolling tape within the hour, and nothing else ever recorded who
@@ -864,6 +871,45 @@ class Runtime:
                     volume=float(c.volume), open_px=float(c.open),
                     close_px=float(c.close)))
         return merge_cvd(timeframe, stored, live, bars=bars)
+
+    FOOTPRINT_RULES = {"1m": 60.0, "5m": 300.0, "15m": 900.0}
+
+    def footprint(self, rule: str = "1m", volume: int = 0,
+                  min_volume: int = 0, multiplier: float = 4.0):
+        """The live footprint stream, attached to the CME tape.
+
+        Built on first use and rebuilt when the bar rule changes,
+        because a series whose bars were closed by two different
+        rules cannot be read as one series. Rebuilding drops the
+        history -- the alternative is a chart whose older bars mean
+        something different from its newer ones.
+        """
+        from .footprint import ImbalanceConfig, TimeRule, VolumeRule
+        from .footprint_live import FootprintStream
+
+        key = (f"v{volume}" if volume > 0 else str(rule),
+               min_volume, multiplier)
+        if self._footprint is not None and self._footprint_rule == key:
+            return self._footprint
+
+        with self._footprint_lock:
+            if (self._footprint is not None
+                    and self._footprint_rule == key):
+                return self._footprint
+            svc = getattr(self, "ofi", None)
+            if svc is None:
+                return None
+            close = (VolumeRule(volume) if volume > 0
+                     else TimeRule(self.FOOTPRINT_RULES.get(rule, 60.0)))
+            stream = FootprintStream(
+                tick_size=0.25, rule=close,
+                imbalance=ImbalanceConfig(
+                    multiplier=float(multiplier),
+                    min_volume=int(min_volume)))
+            svc.tape.footprint = stream
+            self._footprint = stream
+            self._footprint_rule = key
+            return stream
 
     def cme_feed(self, coin: str):
         """The CME tape, shaped like a feed. None when this is not a
@@ -5120,6 +5166,76 @@ def create_app() -> FastAPI:
                         if c.isalnum() or c in "-_")[:64]
         return clean or "dataset"
 
+
+    @app.get("/api/footprint", dependencies=[Depends(require_token)])
+    def api_footprint(coin: str = "ES", rule: str = "1m",
+                      volume: int = 0, min_volume: int = 0,
+                      multiplier: float = 4.0, rows: int = 40,
+                      history: int = 8) -> dict[str, Any]:
+        """The live footprint bar, its flags, and the bars behind it.
+
+        Fed from the SAME decoded trades the CME candles are built
+        from, so the two can never disagree about which prints
+        existed.
+
+        `unconfirmed` flags belong to the bar still forming and can
+        still vanish. `confirmed` belong to closed bars and never
+        change again. The panel draws them differently because they
+        are different claims.
+        """
+        if not rt.is_cme(coin):
+            return {"ok": False, "coin": coin,
+                    "why": f"the footprint reads the CME tape; "
+                           f"{coin} is not a CME symbol"}
+
+        svc = rt.ofi
+        stream = rt.footprint(rule=rule, volume=volume,
+                              min_volume=min_volume,
+                              multiplier=multiplier)
+        if stream is None:
+            return {"ok": False, "coin": coin,
+                    "why": "the CME engine is not configured"}
+
+        tape = svc.tape
+        if tape.trades == 0:
+            # Same three silences as the flow ladder: off, open but
+            # silent, or delivering the wrong records.
+            feed = rt.cme_feed(coin)
+            return {"ok": False, "coin": coin, "source": "cme",
+                    "why": (feed.missing() if feed is not None
+                            else "no prints have arrived yet"),
+                    "trades": 0}
+
+        v = stream.view()
+        out = v.as_dict()
+        out["rows"] = out["rows"][:max(1, min(rows, 200))]
+        out["ok"] = True
+        out["coin"] = coin
+        out["source"] = "cme"
+        out["rule"] = f"{volume} contracts" if volume > 0 else rule
+        out["settings"] = {"multiplier": multiplier,
+                           "min_volume": min_volume}
+        out["tape_trades"] = tape.trades
+
+        past = []
+        n = len(stream.history)
+        for i in range(max(0, n - max(0, min(history, 50))), n):
+            bar = stream.history[i]
+            flags = stream.confirmed_flags(i)
+            sc = stream.scale
+            past.append({
+                "ts_open": bar.ts_open, "ts_close": bar.ts_close,
+                "open": sc.to_price(bar.open_ticks),
+                "high": sc.to_price(bar.high_ticks),
+                "low": sc.to_price(bar.low_ticks),
+                "close": sc.to_price(bar.close_ticks),
+                "volume": bar.total_volume, "delta": bar.delta,
+                "close_reason": bar.close_reason,
+                "confirmed": [f.as_dict(sc) for f in flags],
+            })
+        out["history"] = past
+        return out
+
     @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
     def api_ofi_datasets() -> dict[str, Any]:
         """The per-second datasets this service can backtest."""
@@ -5495,6 +5611,53 @@ DASHBOARD = """<!doctype html>
   .k-dot.k-short{background:var(--down)}
   .k-dash{width:16px;height:0;border-top:1px dashed var(--dim)}
   .k-box{width:9px;height:9px;border:1.5px solid var(--ink);opacity:.6}
+
+  /* ---- footprint ------------------------------------------------
+     NEVER COLOUR ALONE. The site's --up and --down sit at deutan
+     delta-E 5.1, so a red-green colourblind reader cannot separate
+     them. Every cell therefore carries its number, the two sides sit
+     in fixed columns, and an imbalance is a WORD ("BUY"/"SELL") with
+     a state, not a hue. Colour is the secondary cue here, not the
+     carrier. */
+  .fp{width:100%;border-collapse:collapse;font-family:var(--mono);
+      font-size:11px}
+  .fp th{position:sticky;top:0;background:var(--panel);z-index:1;
+      text-align:right;padding:3px 6px;color:var(--dim);font-weight:500}
+  .fp td{padding:0;border-bottom:1px solid var(--line);
+      white-space:nowrap}
+  .fp .px{text-align:right;padding:2px 8px 2px 4px;color:var(--ink)}
+  .fp .n{text-align:right;padding:2px 6px;position:relative;
+      min-width:66px}
+  /* the volume bar sits BEHIND the number, never instead of it */
+  .fp .n span{position:relative;z-index:1}
+  .fp .n i{position:absolute;top:2px;bottom:2px;display:block;
+      border-radius:2px;opacity:.26}
+  .fp .bidc i{right:0;background:var(--down)}
+  .fp .askc i{left:0;background:var(--up)}
+  .fp .dl{text-align:right;padding:2px 6px;color:var(--dim)}
+  .fp tr.poc .px{font-weight:700;text-decoration:underline}
+  .fp .tag{display:inline-block;padding:0 5px;margin-left:6px;
+      border-radius:3px;font-size:10px;letter-spacing:.04em;
+      border:1px solid var(--line)}
+  .fp .tag.buy{border-color:var(--up);color:var(--up)}
+  .fp .tag.sell{border-color:var(--down);color:var(--down)}
+  .fp .tag.unconf{border-style:dashed;opacity:.9}
+  .fp tr.imb-buy{background:color-mix(in srgb,var(--up) 9%,transparent)}
+  .fp tr.imb-sell{background:color-mix(in srgb,var(--down) 9%,transparent)}
+  .fpwrap{max-height:460px;overflow:auto;border:1px solid var(--line);
+      border-radius:4px}
+  /* diverging meter: two poles, NEUTRAL midpoint, centre tick */
+  .meter{position:relative;display:inline-block;width:150px;height:10px;
+      background:var(--line);border-radius:2px;vertical-align:middle}
+  .meter i{position:absolute;top:0;bottom:0;display:block;border-radius:2px}
+  .meter .mid{position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;
+      background:var(--dim);opacity:.8}
+  .fpstat{display:flex;gap:18px;flex-wrap:wrap;align-items:center;
+      margin:8px 0;font-family:var(--mono);font-size:12px}
+  .fpstat b{font-weight:600}
+  .fphist{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
+  .fphist div{border:1px solid var(--line);border-radius:3px;
+      padding:3px 6px;font-family:var(--mono);font-size:10px}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:14px}
   .panel h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;
        color:var(--dim);margin:0 0 10px;font-weight:600}
@@ -5808,6 +5971,37 @@ DASHBOARD = """<!doctype html>
   </div>
 
   <div class="grid tabpane" id="tab-dash">
+
+    <div class="panel full" id="fpPanel"><h2>Footprint &mdash; who paid, at which price
+      <span class="stamp" id="fpStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Every print sorted by the price it
+        traded at and the side that crossed the spread. <b>bid</b> is contracts taken
+        by aggressive sellers, <b>ask</b> by aggressive buyers. A level is flagged when
+        one side beats the <i>diagonal</i> one tick away by the multiplier &mdash; buyers
+        at P against sellers at P&minus;1. Flags on the forming bar are
+        <b>unconfirmed</b> and can still vanish; at the close they become
+        <b>confirmed</b> and never change.</div>
+
+      <div class="conbar">
+        <label>bars <select id="fpRule">
+          <option value="1m">1 minute</option>
+          <option value="5m">5 minutes</option>
+          <option value="15m">15 minutes</option>
+          <option value="vol">by volume</option></select></label>
+        <label>contracts <input type="number" id="fpVol" value="500"
+          style="width:76px"></label>
+        <label>multiplier <input type="number" id="fpMult" value="4"
+          step="0.5" style="width:60px"></label>
+        <label>min volume <input type="number" id="fpMin" value="0"
+          style="width:64px"></label>
+        <label><input type="checkbox" id="fpAuto" checked> live</label>
+        <button class="btn" onclick="fpLoad()">Refresh</button>
+      </div>
+
+      <div id="fpStats" class="fpstat"></div>
+      <div id="fpBody"><div class="msg">Loading&hellip;</div></div>
+      <div id="fpHist" class="fphist"></div>
+    </div>
 
     <div class="panel full" id="ofiPanel"><h2>Order flow imbalance &mdash; who is winning the book race
       <span class="stamp" id="ofiStamp"></span></h2>
@@ -6635,6 +6829,11 @@ async function loadOfi() {
   }
 }
 setInterval(loadOfi, 2000);
+// The footprint matrix allocates per price level, so it is polled at a
+// readable frame rate rather than as fast as the tape moves -- and not
+// at all while its tab is hidden.
+setInterval(fpTick, 1500);
+try { fpLoad(); } catch (e) {}
 
 
 
@@ -7622,6 +7821,136 @@ async function btRun() {
           'second; the file does not say which came first, so they are set ' +
           'aside rather than guessed in your favour.</div>';
   $('btOut').innerHTML = html;
+}
+
+
+/* ---- footprint --------------------------------------------------
+   Two reads at two rates, the way the engine is built for: the
+   scalars come from a published snapshot taken at one instant, and
+   the matrix is asked for at a frame rate because it allocates per
+   level. Nothing here decides anything -- it draws what traded. */
+let FP_TIMER = null;
+
+function fpMeter(v, label) {
+  const pct = Math.max(-1, Math.min(1, v || 0));
+  const w = Math.abs(pct) * 50;
+  const left = pct >= 0 ? 50 : 50 - w;
+  const col = pct >= 0 ? 'var(--up)' : 'var(--down)';
+  return `<span class="meter" title="${label} ${pct.toFixed(2)}">
+    <i style="left:${left}%;width:${w}%;background:${col}"></i>
+    <span class="mid"></span></span>`;
+}
+
+function fpNum(n) { return (n == null) ? '--' : n.toLocaleString(); }
+function fpSign(n) {
+  if (n == null) return '--';
+  return (n >= 0 ? '+' : '') + n.toLocaleString();
+}
+
+function fpStats(d) {
+  const p = d.pulse || {};
+  const ratio = (p.ratio == null) ? '--' : p.ratio.toFixed(2);
+  return `
+    <span>O <b>${(p.open||0).toFixed(2)}</b></span>
+    <span>H <b>${(p.high||0).toFixed(2)}</b></span>
+    <span>L <b>${(p.low||0).toFixed(2)}</b></span>
+    <span>last <b>${(p.last||0).toFixed(2)}</b></span>
+    <span>vol <b>${fpNum(p.total_volume)}</b></span>
+    <span>buyers <b>${fpNum(p.ask_volume)}</b> /
+          sellers <b>${fpNum(p.bid_volume)}</b>
+          &nbsp;ratio <b>${ratio}</b></span>
+    <span>bar delta <b>${fpSign(p.delta)}</b>
+      ${fpMeter(p.pressure, 'bar')} ${(p.pressure||0).toFixed(2)}</span>
+    <span>recent <b>${fpSign(p.window_delta)}</b>
+      ${fpMeter(p.window_pressure, 'recent')}
+      ${(p.window_pressure||0).toFixed(2)}</span>
+    <span>unconfirmed <b>${p.unconfirmed||0}</b>
+      (${p.buy_flags||0} buy / ${p.sell_flags||0} sell)</span>
+    <span class="stamp">bar ${(p.bar_age_s||0).toFixed(0)}s &middot;
+      ${fpNum(p.seq)} ticks</span>`;
+}
+
+function fpTable(d) {
+  const rows = d.rows || [];
+  if (!rows.length) return '<div class="msg">no prints in this bar yet</div>';
+  let peak = 1;
+  for (const r of rows)
+    peak = Math.max(peak, r.bid_volume || 0, r.ask_volume || 0);
+
+  let html = `<div class="fpwrap"><table class="fp"><thead><tr>
+    <th style="text-align:right">price</th>
+    <th>bid &middot; sellers</th><th>ask &middot; buyers</th>
+    <th>delta</th><th style="text-align:left">imbalance</th>
+    </tr></thead><tbody>`;
+  for (const r of rows) {
+    const side = (r.imbalance || []);
+    const cls = side.includes('buy') ? 'imb-buy'
+              : side.includes('sell') ? 'imb-sell' : '';
+    const bw = ((r.bid_volume || 0) / peak * 100).toFixed(1);
+    const aw = ((r.ask_volume || 0) / peak * 100).toFixed(1);
+    // The word carries the meaning; the colour only decorates it.
+    const tags = side.map(x =>
+      `<span class="tag ${x} unconf">${x.toUpperCase()} unconfirmed</span>`
+    ).join('');
+    html += `<tr class="${cls}">
+      <td class="px">${r.price.toFixed(2)}</td>
+      <td class="n bidc"><i style="width:${bw}%"></i>
+        <span>${fpNum(r.bid_volume)}</span></td>
+      <td class="n askc"><i style="width:${aw}%"></i>
+        <span>${fpNum(r.ask_volume)}</span></td>
+      <td class="dl">${fpSign(r.delta)}</td>
+      <td style="padding:2px 6px">${tags}</td></tr>`;
+  }
+  return html + '</tbody></table></div>';
+}
+
+function fpHistory(d) {
+  const h = d.history || [];
+  if (!h.length) return '';
+  return h.slice().reverse().map(b => {
+    const n = (b.confirmed || []).length;
+    const buys = (b.confirmed || []).filter(f => f.side === 'buy').length;
+    return `<div title="closed by ${b.close_reason}">
+      ${b.close.toFixed(2)} &middot; vol ${fpNum(b.volume)} &middot;
+      delta ${fpSign(b.delta)} &middot;
+      <b>${n}</b> confirmed (${buys}b/${n - buys}s)</div>`;
+  }).join('');
+}
+
+async function fpLoad() {
+  const rule = $('fpRule').value;
+  const q = new URLSearchParams({
+    coin: ($('coin') ? $('coin').value : 'ES') || 'ES',
+    rule: rule === 'vol' ? '1m' : rule,
+    volume: rule === 'vol' ? ($('fpVol').value || 0) : 0,
+    multiplier: $('fpMult').value || 4,
+    min_volume: $('fpMin').value || 0 });
+  let d;
+  try { d = await api('/api/footprint?' + q.toString()); }
+  catch (e) {
+    $('fpBody').innerHTML = '<div class="msg">' + e + '</div>';
+    return;
+  }
+  if (!d.ok) {
+    $('fpStamp').textContent = '';
+    $('fpStats').innerHTML = '';
+    $('fpHist').innerHTML = '';
+    $('fpBody').innerHTML = '<div class="msg">' +
+      (d.why || 'no data') + '</div>';
+    return;
+  }
+  $('fpStamp').textContent = `${d.coin} · ${d.rule} · ` +
+    `${(d.tape_trades || 0).toLocaleString()} prints`;
+  $('fpStats').innerHTML = fpStats(d);
+  $('fpBody').innerHTML = fpTable(d);
+  $('fpHist').innerHTML = fpHistory(d);
+}
+
+function fpTick() {
+  if (!$('fpAuto') || !$('fpAuto').checked) return;
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return;          // not on screen, not polled
+  fpLoad();
 }
 
 /* ---- tabs -------------------------------------------------------------

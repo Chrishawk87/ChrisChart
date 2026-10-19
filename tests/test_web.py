@@ -2841,3 +2841,155 @@ class TestTheCandleReadUsesTheCmeTape:
         d = client.get("/api/read?coin=BTC&interval=15m",
                        headers={"Authorization": f"Bearer {TOKEN}"}).json()
         assert d.get("source") != "cme"
+
+
+class TestFootprintPanel:
+    """The footprint reads the CME tape. It is fed from the SAME
+    decoded trade the candles are built from, so the two cannot
+    disagree about which prints existed."""
+
+    def _as_cme(self, monkeypatch):
+        import types as _types
+        from liqmap import cme_tape as _ct
+        rt = web.runtime()
+        tape = _ct.Tape(symbol="ES")
+        monkeypatch.setattr(rt, "is_cme",
+                            lambda c: str(c).upper() == "ES")
+        monkeypatch.setattr(rt, "ofi", _types.SimpleNamespace(
+            tape=tape, running=True, error="",
+            config=_types.SimpleNamespace(
+                market="ES", enabled=True, schema_list=["mbp-10"],
+                symbols=("ES.c.0",), blocked_by=lambda: "")),
+            raising=False)
+        return rt, tape
+
+    def _feed(self, rt, tape, n=400):
+        import random as _rnd
+        from liqmap.footprint import Tick as _T
+        stream = rt.footprint(rule="1m", volume=0, min_volume=0,
+                              multiplier=4.0)
+        rng = _rnd.Random(5)
+        ts, px = 1_700_000_000.0, 5800.0
+        for i in range(n):
+            ts += 0.2
+            tape.trades += 1
+            stream.on_tick(_T(ts=ts, price=round(px, 2),
+                              size=rng.randint(1, 25),
+                              aggressor=rng.choice(("buy", "sell"))))
+            px += rng.choice((-0.25, 0.0, 0.0, 0.25))
+        return stream
+
+    def test_a_non_cme_symbol_is_told_why(self, client, monkeypatch):
+        self._as_cme(monkeypatch)
+        d = client.get("/api/footprint?coin=BTC",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d["ok"] is False and "not a CME symbol" in d["why"]
+
+    def test_an_empty_tape_says_which_silence_it_is(self, client,
+                                                    monkeypatch):
+        self._as_cme(monkeypatch)
+        d = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d["ok"] is False
+        assert d["trades"] == 0
+
+    def test_a_fed_tape_returns_a_matrix(self, client, monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed(rt, tape)
+        d = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d["ok"] is True, d.get("why")
+        assert d["rows"], "no price levels"
+        assert d["pulse"]["total_volume"] > 0
+
+    def test_rows_read_high_to_low(self, client, monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed(rt, tape)
+        d = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        ticks = [r["price_ticks"] for r in d["rows"]]
+        assert ticks == sorted(ticks, reverse=True)
+
+    def test_the_pulse_is_internally_consistent(self, client,
+                                                monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed(rt, tape)
+        p = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()["pulse"]
+        assert p["delta"] == p["ask_volume"] - p["bid_volume"]
+        assert p["total_volume"] == p["ask_volume"] + p["bid_volume"]
+
+    def test_closed_bars_carry_confirmed_flags(self, client,
+                                               monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed(rt, tape, n=1200)
+        d = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d["history"], "no bars closed"
+        states = {f["state"] for b in d["history"]
+                  for f in b["confirmed"]}
+        assert states <= {"confirmed"}, states
+
+    def test_live_flags_are_unconfirmed(self, client, monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed(rt, tape)
+        d = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert all(f["state"] == "unconfirmed" for f in d["flags"])
+
+    def test_changing_the_rule_rebuilds_the_series(self, client,
+                                                  monkeypatch):
+        """Bars closed by two different rules are not one series.
+        Rebuilding drops the history, which is the honest outcome."""
+        rt, tape = self._as_cme(monkeypatch)
+        a = rt.footprint(rule="1m", volume=0, min_volume=0,
+                         multiplier=4.0)
+        b = rt.footprint(rule="5m", volume=0, min_volume=0,
+                         multiplier=4.0)
+        assert a is not b
+        assert tape.footprint is b, "the tape must feed the new one"
+
+    def test_the_same_settings_reuse_the_stream(self, client,
+                                                monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        a = rt.footprint(rule="1m", volume=0, min_volume=0,
+                         multiplier=4.0)
+        b = rt.footprint(rule="1m", volume=0, min_volume=0,
+                         multiplier=4.0)
+        assert a is b, "a poll rebuilt the stream and lost the bar"
+
+    def test_concurrent_polls_do_not_orphan_a_stream(self, client,
+                                                    monkeypatch):
+        import threading as _th
+        rt, tape = self._as_cme(monkeypatch)
+        got = []
+
+        def build():
+            got.append(rt.footprint(rule="1m", volume=0, min_volume=0,
+                                    multiplier=4.0))
+
+        ts_ = [_th.Thread(target=build) for _ in range(8)]
+        for t in ts_:
+            t.start()
+        for t in ts_:
+            t.join(timeout=5)
+        assert len({id(x) for x in got}) == 1, "two streams were built"
+        assert tape.footprint is got[0]
+
+    def test_the_panel_is_on_the_page(self, client):
+        html = client.get("/", headers={
+            "Authorization": f"Bearer {TOKEN}"}).text
+        for bit in ("fpPanel", "fpLoad()", 'class="fp"', "fpMeter",
+                    "unconfirmed"):
+            assert bit in html, bit
+
+    def test_the_panel_never_encodes_a_side_by_colour_alone(self, client):
+        """The site's --up and --down are deutan delta-E 5.1 apart: a
+        red-green colourblind reader cannot separate them. So the tag
+        carries the WORD and both volumes are always printed."""
+        html = client.get("/", headers={
+            "Authorization": f"Bearer {TOKEN}"}).text
+        assert "${x.toUpperCase()}" in html, "the tag must say buy/sell"
+        assert "fpNum(r.bid_volume)" in html
+        assert "fpNum(r.ask_volume)" in html

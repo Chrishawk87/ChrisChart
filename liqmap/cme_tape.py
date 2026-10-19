@@ -94,6 +94,10 @@ class Tape:
     # side has been paying, over these last N seconds", and a closed
     # bar cannot answer that for the bar still forming.
     flow: object = None
+    # A footprint stream, when one is attached. Fed from the SAME
+    # trade this method already decoded, so the footprint and the
+    # candles can never disagree about which prints existed.
+    footprint: object = None
     last_px: float = 0.0
     last_side: str = ""
     last_ts: float = 0.0
@@ -138,9 +142,32 @@ class Tape:
         self.trades += 1
         self.last_px, self.last_side, self.last_ts = t.px, t.aggressor, t.ts
         self.flow.add(t)
+        if self.footprint is not None:
+            self._to_footprint(t)
         for b in self.builders.values():
             b.add(t)
         return True
+
+    def _to_footprint(self, t) -> None:
+        """Hand one decoded trade to the footprint engine.
+
+        Sizes are whole contracts there -- a footprint counts
+        contracts at a price, and a fractional one is not a thing CME
+        prints. A size that rounds to zero is dropped rather than
+        passed as zero, which the engine refuses outright.
+        """
+        from .footprint import Tick as _FTick
+        size = int(round(float(t.sz)))
+        if size <= 0:
+            return
+        try:
+            self.footprint.on_tick(_FTick(
+                ts=float(t.ts), price=float(t.px), size=size,
+                aggressor=t.aggressor))
+        except Exception:                               # noqa: BLE001
+            # The footprint is a display. It must never be able to
+            # stop the tape that feeds the engine and the candles.
+            pass
 
     def roll(self, now: float) -> None:
         """Close any candle whose interval has elapsed without a trade.
