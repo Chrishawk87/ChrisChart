@@ -2340,8 +2340,11 @@ class Runtime:
         now = time.time()
         snap = tape.snapshot()
         front, deferred = self.ofi.config.active_contracts
+        # Echo back the requested symbol so the ticker displays correctly
+        # when the user has selected "ES.Z26" or "ES.H27" in the picker.
+        display_coin = coin.upper() if coin and coin.upper() != self.ofi.config.market else tape.symbol
         out: dict[str, Any] = {
-            "coin": self.ofi.config.market,
+            "coin": display_coin,
             "active_contract": tape.symbol,   # "ES.Z26" — matches IronBeam
             "front_month": front,
             "deferred": deferred,
@@ -3223,7 +3226,9 @@ def create_app() -> FastAPI:
                 # The book call is cheap -- the reader already did the work
                 # on each push -- so it goes out at tape speed alongside the
                 # price, not on the read's slower cadence.
-                if feed is not None:
+                # CME and HL both need this event; the panel under the
+                # chart uses it for the live book/imbalance display.
+                if feed is not None or cme_tape is not None:
                     try:
                         bc = api_bookcall(coin=coin_r)
                         yield f"event: book\ndata: {json.dumps(bc, default=str)}\n\n"
@@ -4629,8 +4634,9 @@ def create_app() -> FastAPI:
                                  f"not enough to read structure"}
 
         from .structure import Candle
+        from .live import INTERVALS as _LIVE_INTERVALS
 
-        step = client.INTERVALS.get(interval, 900)
+        step = _LIVE_INTERVALS.get(interval) or client.INTERVALS.get(interval, 900)
         now_s = time.time()
 
         # If a socket is feeding this market, the current bar is BUILT from
@@ -4664,13 +4670,17 @@ def create_app() -> FastAPI:
         last_is_forming = candle_age < step
 
         # Live mid, fetched BEFORE assembling anything that depends on price.
+        # CME symbols are not listed on Hyperliquid; read directly from the tape.
         live_spot = None
-        try:
-            live_spot = rt.client().mid(coin)
-            rt.last_price.update({coin: live_spot} if live_spot else {})
-            rt.last_price_ts = now_s
-        except Exception as exc:
-            out["price_error"] = str(exc)
+        if cme is not None:
+            live_spot = cme.src.last_px or None   # src is the Tape object
+        else:
+            try:
+                live_spot = rt.client().mid(coin)
+                rt.last_price.update({coin: live_spot} if live_spot else {})
+                rt.last_price_ts = now_s
+            except Exception as exc:
+                out["price_error"] = str(exc)
 
         if use_feed:
             # The socket's own candle wins over anything polled.
