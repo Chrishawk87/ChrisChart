@@ -7729,6 +7729,22 @@ quiet.">volume over <input id="swEffort" value="200" size="3">% of
 
   <div class="grid tabpane" id="tab-book" hidden>
 
+    <div class="panel full" id="execPanel"><h2>Execution track — live, no candle close
+      <span class="stamp" id="execStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Independent of the chart. Reads
+        every raw print, computes Diagonal Cumulative Delta, and watches
+        unconfirmed footprint flags <em>intrabar</em>. A stacked imbalance that
+        agrees with DCD fires a signal immediately — the candle does not have
+        to close, a time-slice does not have to expire, and the frontend does
+        not have to redraw.</div>
+      <div id="execWsBar" class="msg" style="color:var(--dim);font-size:12px;margin-bottom:6px">
+        Press <b>Go live</b> to open the execution signal stream.
+      </div>
+      <div id="execHead" class="msg" style="margin-bottom:8px">—</div>
+      <div id="execStacks" style="margin-bottom:8px"></div>
+      <div id="execLog" style="max-height:220px;overflow:auto;font-family:monospace;font-size:12px"></div>
+    </div>
+
     <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
       <span class="stamp" id="bookStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">The order book is the structure.
@@ -10305,11 +10321,16 @@ function openStream() {
   // For CME/ES this fires on every single book record (100s per second);
   // for HL it will error gracefully and fall back to the SSE book event.
   openBookStream();
+  // Execution track: independent FootprintStream + DCD. Signals arrive
+  // the instant a stacked imbalance agrees with diagonal delta — no
+  // candle close, no poll interval.
+  openExecStream();
 }
 
 function closeStream() {
   if (stream) { stream.close(); stream = null; }
   closeBookStream();
+  closeExecStream();
 }
 
 // ---- Real-time MBP-10 book WebSocket (/ws/book) ---------------------------
@@ -10361,6 +10382,119 @@ function openBookStream() {
 
 function closeBookStream() {
   if (bookWs) { bookWs.close(); bookWs = null; }
+}
+
+// ---- Execution-track WebSocket (/ws/exec) --------------------------------
+
+let execWs = null;
+const _execLog = [];          // newest first, capped
+const _EXEC_LOG_KEEP = 40;
+
+function openExecStream() {
+  closeExecStream();
+  const url = _wsBase() + '/ws/exec?coin=' + encodeURIComponent(coin())
+            + '&token=' + encodeURIComponent(tok());
+  try {
+    execWs = new WebSocket(url);
+  } catch (e) { return; }
+
+  execWs.onopen = () => {
+    const bar = $('execWsBar');
+    if (bar) bar.textContent = 'Execution track live — signals fire intrabar';
+  };
+
+  execWs.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) {
+        const bar = $('execWsBar');
+        if (bar) bar.textContent = 'Exec WS: ' + d.error;
+        return;
+      }
+      // First frame is ExecState (has pulse / stacked / signals_total).
+      // Subsequent frames are Signal dicts (have side + reason, no pulse).
+      if (d.pulse !== undefined || d.stacked !== undefined) {
+        paintExecState(d);
+      } else if (d.side && d.reason) {
+        paintExecSignal(d);
+      }
+    } catch (e) {}
+  };
+
+  execWs.onclose = () => {
+    execWs = null;
+    const bar = $('execWsBar');
+    if (bar) bar.textContent = 'Execution WS closed';
+  };
+}
+
+function closeExecStream() {
+  if (execWs) { execWs.close(); execWs = null; }
+}
+
+function paintExecState(d) {
+  const head = $('execHead');
+  const stacks = $('execStacks');
+  if (!head) return;
+  const p = d.pulse || {};
+  const dd = d.diagonal_delta || 0;
+  const rd = d.raw_delta || 0;
+  const ddCls = dd > 0 ? 'long' : dd < 0 ? 'short' : '';
+  const rdCls = rd > 0 ? 'long' : rd < 0 ? 'short' : '';
+  head.innerHTML =
+    '<b class="' + ddCls + '">DCD ' + (dd >= 0 ? '+' : '') + dd + '</b>'
+    + ' · raw ' + '<span class="' + rdCls + '">' + (rd >= 0 ? '+' : '') + rd + '</span>'
+    + ' · flags ' + (p.unconfirmed || 0)
+    + ' (' + (p.buy_flags || 0) + ' buy / ' + (p.sell_flags || 0) + ' sell)'
+    + ' · signals ' + (d.signals_total || 0)
+    + (p.last ? ' · last ' + Number(p.last).toFixed(2) : '');
+  const stamp = $('execStamp');
+  if (stamp) stamp.textContent = new Date().toLocaleTimeString();
+
+  const rows = d.stacked || [];
+  if (!rows.length) {
+    if (stacks) stacks.innerHTML = '<span style="color:var(--dim)">no stacked run yet</span>';
+  } else if (stacks) {
+    stacks.innerHTML = rows.map(r => {
+      const cls = r.side === 'buy' ? 'long' : 'short';
+      return '<span class="' + cls + '">' + r.side.toUpperCase()
+           + ' ×' + r.run + '  ' + Number(r.low).toFixed(2)
+           + '–' + Number(r.high).toFixed(2) + '</span>';
+    }).join(' · ');
+  }
+  if (d.last_signal) paintExecSignal(d.last_signal, true);
+}
+
+function paintExecSignal(sig, fromState) {
+  if (!sig || !sig.side) return;
+  // Dedup: state snapshot and live frame can carry the same last_signal.
+  if (_execLog.length && _execLog[0].ts === sig.ts && _execLog[0].side === sig.side) {
+    if (!fromState) paintExecLog();
+    return;
+  }
+  _execLog.unshift(sig);
+  if (_execLog.length > _EXEC_LOG_KEEP) _execLog.pop();
+  paintExecLog();
+}
+
+function paintExecLog() {
+  const el = $('execLog');
+  if (!el) return;
+  if (!_execLog.length) {
+    el.innerHTML = '<span style="color:var(--dim)">no signals yet</span>';
+    return;
+  }
+  el.innerHTML = _execLog.map(s => {
+    const cls = s.side === 'buy' ? 'long' : 'short';
+    const t = s.ts ? new Date(s.ts * 1000).toLocaleTimeString() : '—';
+    return '<div style="padding:2px 0;border-bottom:1px solid var(--line)">'
+      + '<b class="' + cls + '">' + String(s.side).toUpperCase() + '</b>'
+      + '  ' + Number(s.price).toFixed(2)
+      + '  DCD ' + (s.diagonal_delta >= 0 ? '+' : '') + s.diagonal_delta
+      + '  stack ×' + s.stacked_run
+      + '  <span style="color:var(--dim)">' + t + ' · ' + (s.reason || '') + '</span>'
+      + '</div>';
+  }).join('');
 }
 
 // ---- Depth ladder renderer ------------------------------------------------

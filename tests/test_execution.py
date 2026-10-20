@@ -380,6 +380,60 @@ class TestExecutionTrack:
         et.on_trade(_FakeTrade(ts=1.0, px=5800.0, sz=0, aggressor="buy"))
         assert et._stream.pulse().seq == 0
 
+    def test_signal_fires_on_stacked_buy_run(self):
+        """Four consecutive buy prints: edge skip + 3 interior flags = stacked.
+
+        The default edge policy skips the bar's low, so a buy at 5800.00
+        is not flagged.  Buys at 5800.25 / .50 / .75 each face an empty
+        diagonal and flag.  The third interior flag completes a run of 3;
+        DCD is already +30 and agrees; a Signal must fire immediately —
+        no candle close, no timer.
+        """
+        received = []
+        et = ExecutionTrack(min_run=3, min_flag_updates=1, cooldown_s=0.0)
+        et.on_signal(lambda sig: received.append(sig))
+        base = 1_700_000_000.0
+        for i, px in enumerate((5800.00, 5800.25, 5800.50, 5800.75)):
+            et.on_trade(_FakeTrade(ts=base + i * 0.1, px=px, sz=10,
+                                   aggressor="buy"))
+        assert len(received) == 1
+        sig = received[0]
+        assert isinstance(sig, Signal)
+        assert sig.side == "buy"
+        assert sig.stacked_run == 3
+        assert sig.diagonal_delta > 0
+        assert sig.price == 5800.75
+
+    def test_signal_does_not_wait_for_bar_close(self):
+        """The execution footprint bar is still open when the signal fires."""
+        received = []
+        et = ExecutionTrack(min_run=3, min_flag_updates=1, cooldown_s=0.0)
+        et.on_signal(lambda sig: received.append(sig))
+        base = 1_700_000_000.0
+        for i, px in enumerate((5800.00, 5800.25, 5800.50, 5800.75)):
+            et.on_trade(_FakeTrade(ts=base + i * 0.1, px=px, sz=10,
+                                   aggressor="buy"))
+        assert received
+        # The engine's own bar must still be forming — a close would reset DCD.
+        assert et._stream.pulse().bars_closed == 0
+        assert et._dcd.raw != 0
+
+    def test_sell_stack_fires_sell_signal(self):
+        """Symmetric to the buy case: four consecutive sells → sell Signal."""
+        received = []
+        et = ExecutionTrack(min_run=3, min_flag_updates=1, cooldown_s=0.0)
+        et.on_signal(lambda sig: received.append(sig))
+        base = 1_700_000_000.0
+        # High of the bar is skipped for sell tests, so print the highest
+        # price first so 5800.75 becomes the edge and the three lower
+        # prices form the stacked run.
+        for i, px in enumerate((5800.75, 5800.50, 5800.25, 5800.00)):
+            et.on_trade(_FakeTrade(ts=base + i * 0.1, px=px, sz=10,
+                                   aggressor="sell"))
+        assert len(received) == 1
+        assert received[0].side == "sell"
+        assert received[0].diagonal_delta < 0
+
     def test_signal_callback_fires(self):
         """Inject enough buy prints at ONE price to create stacked run of 1."""
         received = []
@@ -760,6 +814,21 @@ class TestWsExecCme:
         after = rt.signal_broadcaster.connections
         assert during > before
         assert after == before
+
+
+class TestDashboardExecPanel:
+
+    def test_dashboard_has_exec_panel(self):
+        from liqmap.web import DASHBOARD
+        for marker in ("execPanel", "execWsBar", "execHead",
+                       "execStacks", "execLog", "openExecStream",
+                       "paintExecState", "paintExecSignal"):
+            assert marker in DASHBOARD, f"dashboard missing {marker!r}"
+
+    def test_go_live_opens_exec_stream(self):
+        from liqmap.web import DASHBOARD
+        assert "openExecStream()" in DASHBOARD
+        assert "closeExecStream()" in DASHBOARD
 
 
 class TestApiExecState:
