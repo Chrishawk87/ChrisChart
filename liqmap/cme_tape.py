@@ -446,6 +446,37 @@ class LadderFeed:
         """
         return None
 
+    # ---- stubs for attributes api_read accesses when use_feed is True --
+    #
+    # The read path reaches these because `feed = rt.cme_feed(coin) or
+    # rt.feed_for(coin)` hands it a LadderFeed for ES. Both are honest:
+    # the CME tape does not keep the HL feed's impact-bucket baseline, and
+    # there is no book-history deque to derive a spread trend from.
+
+    @property
+    def baseline(self):
+        """Impact baseline stub. Not computed from the CME tape.
+
+        api_read accesses `.baseline.samples` to report how far along
+        the absorption warm-up is. CME absorption is not computed here,
+        so samples is always 0 rather than a number that would imply
+        something is being measured when it isn't.
+        """
+        from types import SimpleNamespace
+        return SimpleNamespace(samples=0, ready=False)
+
+    def spread_trend(self, window_s: float = 60.0) -> dict:
+        """Spread trend stub. Not tracked for the CME tape.
+
+        LiveFeed keeps a deque of (time, spread_bps, imbalance, mid)
+        snapshots and computes drift from them. LadderFeed has no such
+        deque -- the book arrives infrequently and is not archived.
+        Returning samples=0 tells the caller there is no history yet,
+        which is what the panel already handles for a feed that just
+        connected.
+        """
+        return {"samples": 0}
+
     def status(self) -> dict:
         return {
             "running": self.running,

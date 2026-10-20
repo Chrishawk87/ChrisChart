@@ -250,3 +250,20 @@ class TestChartRouting:
         rt_on.ofi.tape.off_update(fn)
         fill(rt_on, n=5)
         assert len(fired) == count_after_register
+
+    def test_baseline_stub_does_not_crash_api_read(self, rt_on):
+        """api_read accesses feed.baseline.samples for ES. The stub must
+        return 0 (no impact baseline computed) without raising."""
+        cme = rt_on.cme_feed("ES")
+        assert cme is not None
+        assert cme.baseline.samples == 0
+        assert cme.baseline.ready is False
+
+    def test_spread_trend_stub_returns_zero_samples(self, rt_on):
+        """api_read accesses feed.spread_trend() for ES. The stub must
+        return a dict with samples=0 rather than raising AttributeError."""
+        cme = rt_on.cme_feed("ES")
+        assert cme is not None
+        result = cme.spread_trend(window_s=60.0)
+        assert isinstance(result, dict)
+        assert result["samples"] == 0
