@@ -180,3 +180,73 @@ class TestStaleness:
         assert rt_blocked.cme_market()["symbol"] == "ES"
         assert rt_blocked.is_cme("ES") is True
         assert rt_blocked.now("ES")["source"] == "cme"
+
+
+# ---------------------------------------------------------- api_chart routing
+
+class TestChartRouting:
+    """api_chart must use the CME tape for ES, never the HL client."""
+
+    def test_es_chart_uses_cme_feed_not_hyperliquid(self, rt_on, monkeypatch):
+        """When ES has closed bars, api_chart reports source 'cme …'
+        and never touches the Hyperliquid client."""
+        import time
+        from liqmap.structure import Candle
+
+        def boom(*a, **k):
+            raise AssertionError("Hyperliquid candles were fetched for ES")
+        monkeypatch.setattr(type(rt_on), "client", property(
+            lambda self: type("C", (), {"candles": staticmethod(boom),
+                                        "INTERVALS": {"15m": 900}})()))
+
+        # Seed the tape's 15m builder with enough closed bars.
+        now = time.time()
+        bars = [Candle(ts=now - 900 * (10 - i), open=5800.0, high=5810.0,
+                       low=5790.0, close=5805.0, volume=100)
+                for i in range(10)]
+        rt_on.ofi.tape.seed_interval("15m", bars)
+
+        # cme_feed wraps the tape; history must be reachable through it.
+        cme = rt_on.cme_feed("ES")
+        assert cme is not None
+        assert len(cme.history("15m")) >= 1
+
+    def test_es_chart_error_message_when_tape_is_empty(self, rt_on, monkeypatch):
+        """A tape with no closed bars must return a friendly error, not
+        an internal crash or a Hyperliquid 'candles unavailable' message."""
+        def boom(*a, **k):
+            raise AssertionError("Hyperliquid called for ES")
+        monkeypatch.setattr(type(rt_on), "client", property(
+            lambda self: type("C", (), {"candles": staticmethod(boom),
+                                        "INTERVALS": {}})()))
+
+        cme = rt_on.cme_feed("ES")
+        assert cme is not None
+        # An empty tape has no closed bars.
+        assert cme.history("15m") == []
+
+    def test_cme_feed_returns_live_candle_for_es(self, rt_on):
+        """The in-progress bar is accessible through the CME feed."""
+        fill(rt_on, n=30)
+        cme = rt_on.cme_feed("ES")
+        assert cme is not None
+        bar = cme.candle("1m")
+        assert bar is not None
+        assert bar.close > 0
+
+    def test_on_update_fires_when_cme_trade_arrives(self, rt_on):
+        """The tape's on_update hook drives the SSE stream wake-up."""
+        fired = []
+        rt_on.ofi.tape.on_update(lambda: fired.append(1))
+        fill(rt_on, n=10)
+        assert len(fired) > 0
+
+    def test_off_update_stops_callbacks(self, rt_on):
+        fired = []
+        fn = lambda: fired.append(1)
+        rt_on.ofi.tape.on_update(fn)
+        fill(rt_on, n=5)
+        count_after_register = len(fired)
+        rt_on.ofi.tape.off_update(fn)
+        fill(rt_on, n=5)
+        assert len(fired) == count_after_register

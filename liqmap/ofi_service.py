@@ -200,7 +200,99 @@ class OfiService:
             target=self._run, name="ofi", daemon=True)
         self._thread.start()
         self.started_at = time.time()
+        # Seed the chart with recent history so a newly-started engine
+        # does not open to a blank chart. Runs on a background thread
+        # so it does not block the main thread or the live stream.
+        seed_thread = threading.Thread(
+            target=self._seed_history, name="ofi-seed", daemon=True)
+        seed_thread.start()
         return True
+
+    def _seed_history(self) -> None:
+        """Fetch recent OHLCV bars from Databento and pre-populate the
+        tape's candle builders.
+
+        The live MBP subscription delivers prints from the moment it
+        connects; a chart opened at session start has no prior context.
+        One historical OHLCV query per interval fills the visible window
+        immediately rather than waiting for bars to accumulate.
+
+        Uses the Historical client (same API key, separate billing item).
+        Failures are recorded in `self.error` but never raise -- a chart
+        that loads without seed history is still correct, just shallow.
+        """
+        if not os.environ.get("DATABENTO_API_KEY"):
+            return
+        try:
+            import databento as db
+        except ImportError:
+            return
+
+        from datetime import datetime, timezone, timedelta
+        from .cme_tape import seconds_of
+        from .structure import Candle
+
+        # Each interval to seed and how many hours of history to fetch.
+        # Kept short: this is paid data and the chart shows ~200 bars.
+        SEED: list[tuple[str, int]] = [
+            ("1m",  4),   # 4h of 1-minute bars  (~240)
+            ("5m",  24),  # 24h of 5-minute bars  (~288)
+            ("15m", 48),  # 48h of 15-minute bars (~192)
+            ("1h",  200), # 200h of hourly bars   (~200)
+        ]
+
+        symbol = (self.config.symbols or ["ES.c.0"])[0]
+        dataset = self.config.dataset
+        stype_in = self.config.stype_in
+
+        try:
+            client = db.Historical()
+        except Exception as exc:
+            self.error = f"historical seed: {exc}"
+            return
+
+        for interval, hours in SEED:
+            # Skip intervals whose builder does not exist yet and that
+            # the tape was not configured to build.
+            if interval not in self.tape.builders:
+                # Ensure the builder exists so seed_interval can add it.
+                secs = seconds_of(interval)
+                if not secs:
+                    continue
+
+            schema = f"ohlcv-{interval}"
+            now_utc = datetime.now(timezone.utc)
+            start = now_utc - timedelta(hours=hours)
+            try:
+                store = client.timeseries.get_range(
+                    dataset=dataset,
+                    schema=schema,
+                    symbols=[symbol],
+                    stype_in=stype_in,
+                    start=start,
+                    end=now_utc,
+                )
+                candles: list[Candle] = []
+                for rec in store:
+                    ts = getattr(rec, "ts_event", None)
+                    if ts is None:
+                        continue
+                    ts_s = int(ts) * 1e-9
+                    o = getattr(rec, "open", 0) * 1e-9
+                    h = getattr(rec, "high", 0) * 1e-9
+                    lo = getattr(rec, "low", 0) * 1e-9
+                    c = getattr(rec, "close", 0) * 1e-9
+                    v = float(getattr(rec, "volume", 0) or 0)
+                    if o <= 0 or h <= 0 or lo <= 0 or c <= 0:
+                        continue
+                    candles.append(
+                        Candle(ts=ts_s, open=o, high=h, low=lo,
+                               close=c, volume=v))
+                if candles:
+                    self.tape.seed_interval(interval, candles)
+            except Exception as exc:               # noqa: BLE001
+                # A failed seed for one interval should not block the rest.
+                self.error = f"historical seed ({interval}): {exc}"
 
     def stop(self) -> None:
         self._stop.set()

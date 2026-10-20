@@ -519,3 +519,104 @@ class TestTheTapeFeedsTheBookDiagonal:
             t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
                               trade_sz=5))
         assert t.trades == 5 and t.books == 5
+
+
+# ---------------------------------------------------------- on_update / seed
+
+class TestOnUpdate:
+
+    def test_listener_is_called_on_each_trade(self):
+        t = Tape()
+        called = []
+        t.on_update(lambda: called.append(1))
+        t.offer(trade(BASE, 1, "B", T0))
+        t.offer(trade(BASE + TICK, 2, "A", T0 + 1))
+        assert len(called) == 2
+
+    def test_listener_is_not_called_on_book_updates(self):
+        t = Tape()
+        called = []
+        t.on_update(lambda: called.append(1))
+        t.offer(quote(T0))
+        assert called == []
+
+    def test_listener_can_be_removed(self):
+        t = Tape()
+        called = []
+        fn = lambda: called.append(1)
+        t.on_update(fn)
+        t.offer(trade(BASE, 1, "B", T0))
+        t.off_update(fn)
+        t.offer(trade(BASE + TICK, 2, "A", T0 + 1))
+        assert len(called) == 1
+
+    def test_removing_unknown_listener_is_silent(self):
+        t = Tape()
+        t.off_update(lambda: None)  # should not raise
+
+    def test_listener_count_reflects_registered_count(self):
+        t = Tape()
+        assert t.listener_count == 0
+        fn = lambda: None
+        t.on_update(fn)
+        assert t.listener_count == 1
+        t.off_update(fn)
+        assert t.listener_count == 0
+
+    def test_a_crashing_listener_does_not_stop_the_tape(self):
+        t = Tape()
+        good = []
+        t.on_update(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        t.on_update(lambda: good.append(1))
+        t.offer(trade(BASE, 1, "B", T0))
+        assert good == [1]
+        assert t.trades == 1
+
+
+class TestSeedInterval:
+
+    def _candle(self, ts, o=5800.0, h=5801.0, lo=5799.0, c=5800.5, v=100):
+        from liqmap.structure import Candle
+        return Candle(ts=ts, open=o, high=h, low=lo, close=c, volume=v)
+
+    def test_seed_adds_closed_bars_to_builder(self):
+        import time
+        t = Tape()
+        now = time.time()
+        candles = [self._candle(now - 300 * (3 - i)) for i in range(3)]
+        t.seed_interval("5m", candles)
+        assert len(t.builders["5m"].closed) >= 2
+
+    def test_seed_creates_builder_for_unknown_interval(self):
+        t = Tape()
+        assert "30m" not in t.builders
+        import time
+        now = time.time()
+        candles = [self._candle(now - 1800 * (3 - i)) for i in range(3)]
+        t.seed_interval("30m", candles)
+        assert "30m" in t.builders
+
+    def test_seed_does_not_regress_live_data(self):
+        """Seeding with old history must not overwrite newer live bars."""
+        import time
+        t = Tape()
+        now = time.time()
+        # Feed a live trade so the builder has a closed bar from now.
+        ts_live = now - 60
+        t.offer(trade(int(BASE), 2, "B", ts_live))
+        t.offer(trade(int(BASE + TICK), 1, "A", ts_live + 30))
+        closed_before = len(t.builders["1m"].closed)
+
+        # Now seed with older historical bars.
+        old_candles = [self._candle(ts_live - 300 * (2 - i)) for i in range(2)]
+        t.seed_interval("1m", old_candles)
+        # The live closed bar must still be there.
+        assert len(t.builders["1m"].closed) >= closed_before
+
+    def test_seed_with_empty_list_is_silent(self):
+        t = Tape()
+        t.seed_interval("1m", [])  # should not raise
+
+    def test_seed_with_unknown_interval_name_is_silent(self):
+        t = Tape()
+        t.seed_interval("99x", [self._candle(T0)])  # should not raise

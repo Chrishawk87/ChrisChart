@@ -3093,10 +3093,21 @@ def create_app() -> FastAPI:
         coin_r = rt.resolve_symbol(coin)[0] or coin
         tick = threading.Event()
 
-        feed = rt.feed_for(coin_r)
-        wake = (lambda _ch: tick.set())
-        if feed is not None:
-            feed.on_update(wake)
+        # CME (ES) publishes through the Databento tape; HL markets use the
+        # websocket feed. The two sources expose the same `on_update` /
+        # `off_update` surface, so the stream body is source-agnostic.
+        cme_tape = rt.ofi.tape if rt.is_cme(coin_r) else None
+        # `cme_feed` wraps the tape in the LadderFeed interface the candle
+        # read expects. Created once here so the loop body doesn't allocate.
+        cme_feed_obj = rt.cme_feed(coin_r) if cme_tape is not None else None
+        if cme_feed_obj is not None:
+            cme_feed_obj.ensure_interval(interval)
+        feed = rt.feed_for(coin_r) if cme_tape is None else None
+        live_src = cme_tape or feed        # whichever is non-None
+
+        wake = (lambda *_: tick.set())
+        if live_src is not None:
+            live_src.on_update(wake)
 
         def events():
           try:
@@ -3109,7 +3120,7 @@ def create_app() -> FastAPI:
             # polled fallback, so a silent stream is never mistaken for a
             # quiet market.
             yield (f"event: hello\ndata: "
-                   f"{json.dumps({'feed': bool(feed), 'coin': coin_r})}\n\n")
+                   f"{json.dumps({'feed': bool(live_src), 'coin': coin_r})}\n\n")
 
             last_px = None
 
@@ -3128,7 +3139,24 @@ def create_app() -> FastAPI:
                 # first -- a four-second-old price during a move is worse
                 # than useless, because it reads as current. So it is sent
                 # on every batch of fills, independently of the read.
-                if feed is not None:
+                if cme_tape is not None:
+                    # CME: read from the tape directly. The tape's last_px
+                    # is the last trade; the live candle carries the bar.
+                    bar = (cme_feed_obj.candle(interval)
+                           if cme_feed_obj is not None else None)
+                    px = (bar.close if bar else None) or cme_tape.last_px or None
+                    if px and px != last_px:
+                        last_px = px
+                        bar_data = {"px": px, "ts": now}
+                        if bar is not None:
+                            bar_data.update({
+                                "high": bar.high, "low": bar.low,
+                                "open": bar.open, "trades": bar.trades,
+                                "delta": bar.delta,
+                            })
+                        yield ("event: px\ndata: "
+                               + json.dumps(bar_data) + "\n\n")
+                elif feed is not None:
                     bar = feed.candle(interval)
                     px = bar.close if bar else None
                     if px is not None and px != last_px:
@@ -3168,8 +3196,8 @@ def create_app() -> FastAPI:
             # The stream is over; stop waking it. EventSource reconnects on
             # its own, so without this a tab left open overnight accumulates
             # dead callbacks that fire on every single fill.
-            if feed is not None:
-                feed.off_update(wake)
+            if live_src is not None:
+                live_src.off_update(wake)
 
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
@@ -4080,23 +4108,45 @@ def create_app() -> FastAPI:
         n = max(20, min(bars, 500))
         out: dict[str, Any] = {"coin": coin, "interval": interval}
 
-        feed = rt.feed_for(coin)
+        # CME (ES) bars come from the Databento tape, not from Hyperliquid.
+        # `feed_for` is deliberately HL-only, so CME is asked for by name.
+        cme = rt.cme_feed(coin)
+        feed = rt.feed_for(coin) if cme is None else None
         candles: list[Any] = []
         source = "polled"
 
-        if feed is not None:
+        if cme is not None:
+            cme.ensure_interval(interval)
+            hist = cme.history(interval, limit=n)
+            if hist:
+                candles = list(hist)
+                source = "cme (built from Databento fills)"
+        elif feed is not None:
             hist = feed.history(interval)
             if len(hist) >= 10:
                 candles = list(hist[-n:])
                 source = "websocket (built from fills)"
 
-        if not candles:
+        if not candles and cme is None:
             try:
                 candles = rt.client().candles(coin, interval, bars=n)
             except Exception as exc:
                 return {**out, "error": f"candles unavailable: {exc}"}
+        elif not candles and cme is not None:
+            # CME tape has no closed bars yet (engine just started or
+            # market is closed). Return a useful message rather than an
+            # internal error -- the chart will show this to the user.
+            why = cme.missing()
+            return {**out, "source": "cme",
+                    "error": (
+                        f"the ES tape has no closed {interval} bars yet. "
+                        f"Bars accumulate from live prints as the session "
+                        f"runs; historical seed fills in within a minute of "
+                        f"engine start"
+                        + (f" — {why}" if why else ""))}
 
-        live = feed.candle(interval) if feed else None
+        live_feed = cme or feed
+        live = live_feed.candle(interval) if live_feed is not None else None
         rows = [{"ts": c.ts, "o": c.open, "h": c.high, "l": c.low,
                  "c": c.close, "v": c.volume} for c in candles]
         if live is not None:
@@ -4181,13 +4231,19 @@ def create_app() -> FastAPI:
         # read in the unit the instrument actually trades in.
         tick_bps = None
         try:
-            fd = rt.feed_for(coin)
-            bk = fd.book if fd is not None else None
+            # CME uses the tape's book; HL uses the live feed's book.
+            fd = cme if cme is not None else rt.feed_for(coin)
+            bk = getattr(fd, "book", None) if fd is not None else None
             if bk is not None and not bk.empty and bk.mid > 0:
                 from .suggest import infer_tick as _tk
                 t = _tk(bk)
                 if t > 0:
                     tick_bps = round(t / bk.mid * 10_000.0, 5)
+            elif cme is not None:
+                # ES tick is 0.25 points. Use that as the reliable fallback.
+                last = rt.ofi.tape.last_px if rt.ofi is not None else 0.0
+                if last > 0:
+                    tick_bps = round(0.25 / last * 10_000.0, 5)
         except Exception:
             tick_bps = None
 

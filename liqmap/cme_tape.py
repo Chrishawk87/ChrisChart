@@ -35,10 +35,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Callable
 
 from . import dbn
 from .flow import FlowTape
-from .live import STALE_AFTER_S, CandleBuilder
+from .live import STALE_AFTER_S, CandleBuilder, LiveCandle
 
 DEFAULT_INTERVALS = (60.0, 300.0, 900.0)      # 1m, 5m, 15m
 KEEP_CLOSED = 300                             # per interval
@@ -109,6 +110,11 @@ class Tape:
     trades: int = 0
     records: int = 0
     books: int = 0
+    # Functions registered by SSE streams; called on each new trade so a
+    # stream can push a price update without polling. Same pattern as
+    # LiveFeed._listeners -- a snapshot copy before iterating makes
+    # concurrent register/unregister safe enough under the GIL.
+    _listeners: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.flow is None:
@@ -124,6 +130,73 @@ class Tape:
         def on_close(candle) -> None:
             self.closed[name].append(candle)
         return on_close
+
+    # --------------------------------------------------------- listeners
+
+    def on_update(self, fn: Callable) -> None:
+        """Register a callback fired on each trade. Called from the record
+        processing thread; the callback should be fast and non-blocking."""
+        self._listeners.append(fn)
+
+    def off_update(self, fn: Callable) -> None:
+        """Unregister. Mirrors LiveFeed.off_update for the SSE layer."""
+        try:
+            self._listeners.remove(fn)
+        except ValueError:
+            pass
+
+    @property
+    def listener_count(self) -> int:
+        return len(self._listeners)
+
+    # -------------------------------------------------- historical seed
+
+    def seed_interval(self, interval: str, candles: list) -> None:
+        """Pre-populate one builder with historical OHLCV candles.
+
+        The live subscription only carries prints from the moment it
+        connects, so a chart opened at 10:00 has no 9:00 context.
+        Historical bars fetched at startup fill that gap: closed bars
+        are stored in the builder and the in-progress bar is adopted
+        as the seed, exactly as `LiveFeed.seed` does for Hyperliquid.
+
+        Records already seen from the live stream are not displaced --
+        `seed_interval` is a no-op once the builder has closed bars of
+        its own that are newer than anything in the historical batch.
+        """
+        from .structure import Candle as _Candle
+        b = self.builders.get(interval)
+        if b is None:
+            secs = seconds_of(interval)
+            if not secs:
+                return
+            self.closed.setdefault(interval, deque(maxlen=self.keep))
+            b = CandleBuilder(secs, on_close=self._closer(interval))
+            self.builders[interval] = b
+
+        if not candles:
+            return
+
+        # The builder already has live data that post-dates the history.
+        # Seeding over it would regress the candles backwards.
+        if b.closed:
+            newest_live = b.closed[-1].start_ts
+            newest_hist = max(getattr(c, "ts", 0.0) for c in candles)
+            if newest_hist <= newest_live:
+                return
+
+        import time as _time
+        now = _time.time()
+        conv: list[LiveCandle] = [
+            LiveCandle.from_candle(c, b.interval_s) for c in candles]
+
+        last = candles[-1]
+        last_ts = getattr(last, "ts", 0.0)
+        if now - last_ts < b.interval_s:
+            b.seed(last)                          # bar is still forming
+            b.closed = conv[:-1][-b.max_closed:]
+        else:
+            b.closed = conv[-b.max_closed:]
 
     # ------------------------------------------------------------ feed
 
@@ -156,6 +229,11 @@ class Tape:
             self._to_footprint(t)
         for b in self.builders.values():
             b.add(t)
+        for fn in list(self._listeners):
+            try:
+                fn()
+            except Exception:
+                pass
         return True
 
     def _to_footprint(self, t) -> None:
