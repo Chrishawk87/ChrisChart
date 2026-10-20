@@ -272,6 +272,9 @@ class OfiService:
         self.readings = 0
         self.error = ""
         self.engine = None
+        # Called with the latest OFI payload on every reading. Used to
+        # push onto the ingest hub so the dashboard never polls /api/ofi.
+        self._reading_listeners: list = []
         # Candles from the same stream. Present whether or not the
         # engine ever connects, so a panel reading it gets an empty
         # tape rather than an attribute error.
@@ -399,6 +402,16 @@ class OfiService:
                 # A failed seed for one interval should not block the rest.
                 self.error = f"historical seed ({interval}): {exc}"
 
+    def on_reading(self, fn) -> None:
+        """Register a callback fired on every OFI reading (ingest thread)."""
+        self._reading_listeners.append(fn)
+
+    def off_reading(self, fn) -> None:
+        try:
+            self._reading_listeners.remove(fn)
+        except ValueError:
+            pass
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -435,6 +448,11 @@ class OfiService:
                     (payload["at"], rd.window, rd.z))
                 self.readings += 1
                 self.updated_at = payload["at"]
+                for _fn in list(self._reading_listeners):
+                    try:
+                        _fn(payload)
+                    except Exception:           # noqa: BLE001
+                        pass
         except Exception as exc:               # noqa: BLE001
             # The thread dying silently is the failure mode that looks
             # exactly like a quiet market. Record it so `snapshot`
@@ -513,5 +531,10 @@ class OfiService:
             self._history.append((payload["at"], rd.window, rd.z))
             self.readings += 1
             self.updated_at = payload["at"]
+            for _fn in list(self._reading_listeners):
+                try:
+                    _fn(payload)
+                except Exception:               # noqa: BLE001
+                    pass
             n += 1
         return n

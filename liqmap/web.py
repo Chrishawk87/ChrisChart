@@ -188,8 +188,15 @@ class Runtime:
         # diagonal delta agree.  Wired to the tape in lifespan after the
         # event loop starts.
         from .execution import ExecutionTrack as _ExecTrack
+        from .pipeline import IngestHub as _IngestHub, DeltaWorker as _DeltaWorker
         self.exec_track = _ExecTrack()
         self.signal_broadcaster = SignalBroadcaster()
+        # Unified micro-delta hub + DCD worker. Ingest (Tape.offer) only
+        # does hub/worker.push_trade — a queue.put. Calculation and
+        # WebSocket fan-out happen on the worker, never on the UI thread
+        # and never inside a 16ms poll loop.
+        self.ingest_hub = _IngestHub()
+        self.delta_worker = _DeltaWorker(self.ingest_hub, self.exec_track)
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -710,6 +717,27 @@ class Runtime:
 
         feed.start()
         self.feed = feed
+
+        # Push each Hyperliquid fill onto the ingest hub so /ws/live
+        # works for non-CME coins the same way it works for ES — no
+        # /api/now poll, no sequential candle HTTP.
+        def _hl_tick(_channel: str) -> None:
+            if not self.ingest_hub.connections:
+                return
+            bar = feed.candle("1m")
+            px = bar.close if bar is not None else None
+            if not px:
+                return
+            self.ingest_hub.notify({
+                "kind": "tick",
+                "ts": time.time(),
+                "px": float(px),
+                "sz": 0.0,
+                "side": "",
+                "dcd": 0,
+                "raw": 0,
+            })
+        feed.on_update(_hl_tick)
         return {"ok": True, "seeded": seeded, **feed.status()}
 
     def stop_feed(self) -> dict[str, Any]:
@@ -3063,31 +3091,51 @@ def create_app() -> FastAPI:
         loop = _asyncio.get_running_loop()
         rt.book_broadcaster.set_loop(loop)
         rt.signal_broadcaster.set_loop(loop)
+        rt.ingest_hub.set_loop(loop)
+        rt.delta_worker.start()
         if rt.ofi is not None and rt.ofi.tape is not None:
             _tape = rt.ofi.tape
             _bc   = rt.book_broadcaster
+            _hub  = rt.ingest_hub
 
             def _book_notify():
                 # Called from the OFI thread on every MBP-10 book record.
                 # Skip if nobody is connected — avoids building the frame
                 # for nothing during quiet stretches.
-                if _bc.connections:
-                    _bc.notify(_book_delta(_tape))
+                frame = None
+                if _bc.connections or _hub.connections:
+                    frame = _book_delta(_tape)
+                    frame["kind"] = "book"
+                if _bc.connections and frame is not None:
+                    _bc.notify(frame)
+                if _hub.connections and frame is not None:
+                    _hub.notify(frame)
 
             _tape.on_book_update(_book_notify)
 
-            # Wire the execution track: raw Trade objects -> ExecutionTrack.
-            # The ExecutionTrack fires Signals to the SignalBroadcaster,
-            # which pushes them to /ws/exec WebSocket queues.
+            # DCD is NOT computed on the ingest thread. Tape.offer only
+            # queue.put's the Trade; DeltaWorker owns the calculation.
             _et = rt.exec_track
             _sb = rt.signal_broadcaster
 
             def _signal_notify(sig):
+                payload = sig.as_dict()
+                payload["kind"] = "signal"
                 if _sb.connections:
-                    _sb.notify(sig.as_dict())
+                    _sb.notify(payload)
+                if _hub.connections:
+                    _hub.notify(payload)
 
             _et.on_signal(_signal_notify)
-            _tape.on_trade_exec(_et.on_trade)
+            _tape.on_trade_exec(rt.delta_worker.push_trade)
+
+            def _ofi_notify(payload):
+                if _hub.connections:
+                    frame = dict(payload)
+                    frame["kind"] = "ofi"
+                    _hub.notify(frame)
+
+            rt.ofi.on_reading(_ofi_notify)
 
         yield
 
@@ -3634,10 +3682,10 @@ def create_app() -> FastAPI:
                       token: str = "", interval: str = "1m"):
         """High-frequency order flow profile feed at ~60 fps (16 ms cadence).
 
-        Sends volume-at-price snapshots over WebSocket so the WebGL
-        visualization can render directly from memory without HTTP overhead.
-        The token is passed as a query parameter because browser WebSocket
-        cannot set headers.
+        Event-driven micro-deltas. One full snapshot on connect, then a
+        tick/book frame the instant a print hits the ingest queue — no
+        16ms sleep, no snapshot rebuild. The token is a query parameter
+        because browser WebSocket cannot set headers.
         """
         rt = runtime()
         supplied = token.strip()
@@ -3655,13 +3703,21 @@ def create_app() -> FastAPI:
             return
 
         await ws.accept()
+        # One full snapshot on connect so the WebGL buffers have a base.
+        # After that every frame is a micro-delta pushed when a print
+        # (or book record) actually arrives — no 16ms sleep, no rebuild.
+        snap = _flow_snapshot(tape, interval)
+        snap["kind"] = "snap"
+        await ws.send_json(snap)
+
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=256)
+        rt.ingest_hub.add(q)
         try:
             while True:
-                t0 = _asyncio.get_event_loop().time()
-                snap = _flow_snapshot(tape, interval)
-                await ws.send_json(snap)
-                elapsed = _asyncio.get_event_loop().time() - t0
-                await _asyncio.sleep(max(0.001, 0.016 - elapsed))
+                frame = await q.get()
+                kind = frame.get("kind")
+                if kind in ("tick", "book", "snap"):
+                    await ws.send_json(frame)
         except (WebSocketDisconnect, RuntimeError):
             pass
         except Exception as exc:                        # noqa: BLE001
@@ -3669,6 +3725,64 @@ def create_app() -> FastAPI:
                 await ws.send_json({"error": str(exc)})
             except Exception:
                 pass
+        finally:
+            rt.ingest_hub.remove(q)
+
+    @app.websocket("/ws/live")
+    async def ws_live(ws: WebSocket, coin: str = "ES", token: str = ""):
+        """Permanent micro-delta stream for the dashboard.
+
+        Replaces the HTTP polls that used to hit /api/ofi, /api/now,
+        /api/footprint and /api/feed on setInterval. First frame is a
+        combined snap+exec state; every later frame is a tick / book /
+        ofi / signal pushed the instant the worker produces it.
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        tape = rt.ofi.tape if rt.is_cme(coin_up) else None
+        feed = rt.feed_for(coin_up) if tape is None else None
+        await ws.accept()
+        if tape is None and feed is None:
+            await ws.send_json({"error": f"no live tape for {coin_up!r}",
+                                "kind": "error"})
+            await ws.close()
+            return
+
+        if tape is not None:
+            opening = _flow_snapshot(tape, "1m")
+            opening["kind"] = "snap"
+            opening["exec"] = rt.exec_track.state().as_dict()
+        else:
+            bar = feed.candle("1m") if feed is not None else None
+            opening = {
+                "kind": "snap",
+                "ts": time.time(),
+                "px": bar.close if bar else 0.0,
+                "profile": [], "bids": [], "asks": [],
+                "bar": None, "exec": None,
+            }
+        await ws.send_json(opening)
+
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=256)
+        rt.ingest_hub.add(q)
+        try:
+            while True:
+                frame = await q.get()
+                await ws.send_json(frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            rt.ingest_hub.remove(q)
 
     @app.websocket("/ws/exec")
     async def ws_exec(ws: WebSocket, coin: str = "ES", token: str = ""):
@@ -6256,10 +6370,37 @@ function openWS() {
     try {
       const d = JSON.parse(ev.data);
       if (d.error) { $('status').textContent = d.error; return; }
-      latest = d;
+      // snap = full buffer (connect only). tick = one print applied
+      // in-place to the existing typed arrays — no React/state update.
+      if (d.kind === 'tick') applyTick(d);
+      else latest = d;
       lastRecv = performance.now();
     } catch(e) {}
   };
+}
+
+function applyTick(d) {
+  if (!latest) {
+    latest = {ts: d.ts, px: d.px, poc: d.px, maxv: d.sz || 1,
+              profile: [], bids: [], asks: [], bar: null};
+  }
+  latest.ts = d.ts;
+  latest.px = d.px;
+  const rows = latest.profile || (latest.profile = []);
+  let row = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (Math.abs(rows[i].px - d.px) < 1e-9) { row = rows[i]; break; }
+  }
+  if (!row) {
+    row = {px: d.px, b: 0, s: 0};
+    rows.push(row);
+    rows.sort((a, b) => b.px - a.px);
+  }
+  if (d.side === 'buy') row.b += d.sz;
+  else row.s += d.sz;
+  let maxv = 1;
+  for (let i = 0; i < rows.length; i++) maxv = Math.max(maxv, rows[i].b + rows[i].s);
+  latest.maxv = maxv;
 }
 
 /* ─────────────────────────── WEBGL SETUP ───────────────────────────────── */
@@ -7234,7 +7375,7 @@ slippage at your size is measured separately and added to this.">fee
           <input id="sFee" value="9" size="3"
           onchange="loadSuggest()">bps</label>
         <label><input type="checkbox" id="sAuto" onchange="toggleSuggestAuto()">
-          poll 5s</label>
+          auto</label>
         <button class="go" onclick="startFeed()" id="sugLive">Go live</button>
         <button onclick="stopFeed()">Stop feed</button>
         <button onclick="loadSuggest()">Ask</button>
@@ -7404,7 +7545,7 @@ bars">ppo</button>
 up reading one timeframe while looking at another."><input type="checkbox"
           id="rFollow" checked onchange="followChartTf()"> follow chart</label>
         <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
-          poll 10s</label>
+          live</label>
         <label>book window <select id="bkWin" onchange="loadBookCall()">
           <option value="5">5s</option><option value="10">10s</option>
           <option value="20" selected>20s</option><option value="60">60s</option>
@@ -7956,8 +8097,7 @@ async function api(path, opts) {
 function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (bad ? ' err' : ''); }
 
 // ---- Order flow imbalance -------------------------------------------------
-// Polls only while its tab is open: the snapshot is cheap but there is no
-// reason to ask for a reading nobody is looking at.
+// Seeded once from /api/ofi; after Go live, /ws/live ofi frames paint this.
 function ofiFmt(v, d) {
   return (v === null || v === undefined || v === '') ? '—'
     : (typeof v === 'number' ? v.toFixed(d === undefined ? 2 : d) : v);
@@ -8038,11 +8178,10 @@ async function loadOfi() {
     $('ofiOff').textContent = 'could not read /api/ofi: ' + e.message;
   }
 }
-setInterval(loadOfi, 2000);
-// The footprint matrix allocates per price level, so it is polled at a
-// readable frame rate rather than as fast as the tape moves -- and not
-// at all while its tab is hidden.
-setInterval(fpTick, 1500);
+// OFI and footprint used to be HTTP-polled (setInterval 2s / 1.5s).
+// Those timers are gone. One seed fetch paints the last known state;
+// /ws/live then pushes ofi / tick / signal frames into the same painters.
+try { loadOfi(); } catch (e) {}
 try { fpLoad(); } catch (e) {}
 
 
@@ -8270,17 +8409,12 @@ function tickFromStream(p) {
 let streamedAt = 0;
 
 function startTicker() {
-  if (nowPoll) clearInterval(nowPoll);
-  loadNow();
-  // 5s is fine as a backstop while the socket carries the price. Without a
-  // socket this is the only source, so it runs harder — at weight 2 a 2s
-  // poll costs 60/minute against a 1200 budget, which the sweep can absorb.
-  nowPoll = setInterval(() => {
-    const streaming = streamedAt && (Date.now() - streamedAt) < 15000;
-    if (!streaming || Math.random() < 0.2) loadNow();
-  }, 2000);
-  setInterval(paintTicker, 1000);       // keep the age counting between polls
+  if (nowPoll) { clearInterval(nowPoll); nowPoll = null; }
+  loadNow();   // one seed. After that /ws/live tick frames own the price.
+  // Local clock only — no HTTP. paintTicker reads last known nowData.
+  if (!_tickClock) _tickClock = setInterval(paintTicker, 1000);
 }
+let _tickClock = null;
 
 let lastCoin = 'BTC';
 try { const c = localStorage.getItem('liqmap_coin'); if (c) lastCoin = c; } catch (e) {}
@@ -8419,8 +8553,6 @@ async function toggleAutopilot() {
   apOn = d.autopilot.on;
   $('apToggle').textContent = apOn ? 'Stop deciding' : 'Let it decide';
   loadAutopilot();
-  if (apOn && !apPoll) apPoll = setInterval(loadAutopilot, 5000);
-  if (!apOn && apPoll) { clearInterval(apPoll); apPoll = null; }
 }
 
 let apPoll = null;
@@ -9691,7 +9823,7 @@ async function loadDecisions() { /* retired — see above */ }
 
 function toggleSuggestAuto() {
   if (sugPoll) { clearInterval(sugPoll); sugPoll = null; }
-  if ($('sAuto').checked) { loadSuggest(); sugPoll = setInterval(loadSuggest, 5000); }
+  if ($('sAuto').checked) loadSuggest();
 }
 
 function inputFlags(d) {
@@ -10260,7 +10392,7 @@ async function startFeed() {
     if (!r.ok) { note(r.error || 'could not start feed', true); return; }
     note(`feed starting on ${coin()} — seeding from history…`);
     openStream();
-    if (!feedTimer) feedTimer = setInterval(paintFeed, 2000);
+    paintFeed();   // one seed; /ws/live ticks keep the bar current
   } catch (e) { note(e.message, true); }
   finally { $('feedBtn').disabled = false; }
 }
@@ -10325,12 +10457,14 @@ function openStream() {
   // the instant a stacked imbalance agrees with diagonal delta — no
   // candle close, no poll interval.
   openExecStream();
+  openLiveStream();
 }
 
 function closeStream() {
   if (stream) { stream.close(); stream = null; }
   closeBookStream();
   closeExecStream();
+  closeLiveStream();
 }
 
 // ---- Real-time MBP-10 book WebSocket (/ws/book) ---------------------------
@@ -10430,6 +10564,74 @@ function openExecStream() {
 
 function closeExecStream() {
   if (execWs) { execWs.close(); execWs = null; }
+}
+
+// ---- Unified live micro-delta stream (/ws/live) --------------------------
+// Replaces setInterval(loadOfi), setInterval(fpTick), nowPoll HTTP, and
+// feedTimer. One permanent socket; frames write into existing painters.
+
+let liveWs = null;
+const _ofiHist = [];
+
+function openLiveStream() {
+  closeLiveStream();
+  const url = _wsBase() + '/ws/live?coin=' + encodeURIComponent(coin())
+            + '&token=' + encodeURIComponent(tok());
+  try { liveWs = new WebSocket(url); } catch (e) { return; }
+  liveWs.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) return;
+      applyLiveFrame(d);
+    } catch (e) {}
+  };
+  liveWs.onclose = () => { liveWs = null; };
+}
+
+function closeLiveStream() {
+  if (liveWs) { liveWs.close(); liveWs = null; }
+}
+
+function applyLiveFrame(d) {
+  const kind = d.kind || (d.profile ? 'snap' : (d.e_n !== undefined ? 'ofi' : ''));
+  if (kind === 'tick') {
+    tickFromStream({px: d.px, trades: d.raw});
+    if (d.dcd !== undefined) {
+      paintExecState({
+        pulse: {unconfirmed: d.unconfirmed, buy_flags: d.buy_flags,
+                sell_flags: d.sell_flags, last: d.px},
+        diagonal_delta: d.dcd, raw_delta: d.raw,
+        stacked: d.stacked || [],
+        signals_total: d.signals_total || 0,
+        last_signal: d.last_signal || null,
+      });
+    }
+    if (chartData && chartData.bars && chartData.bars.length && d.px) {
+      const last = chartData.bars[chartData.bars.length - 1];
+      if (last.live) {
+        last.close = d.px;
+        last.high = Math.max(last.high, d.px);
+        last.low = Math.min(last.low, d.px);
+        if (!document.hidden) {
+          const pane = $('tab-dash');
+          if (!pane || !pane.hidden) drawChart();
+        }
+      }
+    }
+    try { paintFeed(); } catch (e) {}
+  } else if (kind === 'book') {
+    paintBookCall(d);
+    paintDepthLadder(d);
+  } else if (kind === 'ofi') {
+    _ofiHist.push({at: d.at || d.ts, window: d.window, z: d.z});
+    if (_ofiHist.length > 150) _ofiHist.shift();
+    paintOfi({ok: true, running: true, last: d, history: _ofiHist, age_s: 0});
+  } else if (kind === 'signal') {
+    paintExecSignal(d);
+  } else if (kind === 'snap') {
+    if (d.px) tickFromStream({px: d.px});
+    if (d.exec) paintExecState(d.exec);
+  }
 }
 
 function paintExecState(d) {
@@ -10558,7 +10760,10 @@ let readPoll = null;
 
 function toggleReadAuto() {
   if (readPoll) { clearInterval(readPoll); readPoll = null; }
-  if ($('rAuto').checked) { readPoll = setInterval(loadRead, 10000); loadRead(); }
+  // Auto-read used to HTTP-poll /api/read every 10s. The SSE stream and
+  // /ws/live already push the forming bar; this checkbox now just seeds
+  // once when turned on.
+  if ($('rAuto').checked) loadRead();
 }
 
 /* The order-flow ladder.
@@ -12775,8 +12980,8 @@ async function startWatch() {
                         minutes: mins, band_bps: band}), {method: 'POST'});
     if (!r || r.ok === false) { note('could not start watch: ' + ((r && r.error) || 'unknown'), true); return; }
     note(`watching ${coin()} at ${lvl} for ${mins} min`);
-    if (watchPoll) clearInterval(watchPoll);
-    watchPoll = setInterval(loadLiquidity, 10000);
+    if (watchPoll) { clearInterval(watchPoll); watchPoll = null; }
+    loadLiquidity();   // one seed; book frames keep the ladder current
     loadLiquidity();
   } catch (e) { note(e.message, true); }
 }
