@@ -262,6 +262,10 @@ class OfiService:
 
             schema = f"ohlcv-{interval}"
             now_utc = datetime.now(timezone.utc)
+            # Databento Historical data has ~1 hour of latency.
+            # Use an end time 70 minutes in the past to stay within
+            # the available range and avoid 422 errors.
+            hist_end = now_utc - timedelta(minutes=70)
             start = now_utc - timedelta(hours=hours)
             try:
                 store = client.timeseries.get_range(
@@ -270,7 +274,7 @@ class OfiService:
                     symbols=[symbol],
                     stype_in=stype_in,
                     start=start,
-                    end=now_utc,
+                    end=hist_end,
                 )
                 candles: list[Candle] = []
                 for rec in store:
