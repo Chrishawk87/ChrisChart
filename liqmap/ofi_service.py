@@ -54,6 +54,77 @@ DEFAULT_WINDOW = 100
 DEFAULT_BASELINE = 1000
 HISTORY = 600               # readings kept for the panel to draw
 
+# ----------------------------------------------------- contract helpers
+
+# CME quarterly month codes for ES/NQ/RTY/GC etc.
+_QUARTER_CODES = [(3, "H"), (6, "M"), (9, "U"), (12, "Z")]
+
+# How many calendar days before the third Friday of expiry month CME
+# volume rolls to the next contract.  Empirically 7-11 days; we use
+# 10 so the site rolls before IronBeam's default roll date.
+_ROLL_DAYS_BEFORE = 10
+
+
+def _third_friday(year: int, month: int):
+    from datetime import date, timedelta
+    d = date(year, month, 1)
+    fridays = 0
+    while True:
+        if d.weekday() == 4:        # Friday
+            fridays += 1
+            if fridays == 3:
+                return d
+        d += timedelta(days=1)
+
+
+def cme_quarterly_contracts(product: str = "ES", today=None):
+    """Return (front_month_symbol, deferred_symbol) for a CME quarterly product.
+
+    Uses CME's standard quarterly expiry calendar (H/M/U/Z) and rolls 10
+    calendar days before the third Friday of expiry month so the site stays
+    in sync with IronBeam.
+
+    Examples (today = 2026-10-20):
+        cme_quarterly_contracts("ES")  -> ("ES.Z26", "ES.H27")
+
+    Examples (today = 2026-12-10, i.e. after the roll):
+        cme_quarterly_contracts("ES")  -> ("ES.H27", "ES.M27")
+    """
+    from datetime import date, timedelta
+    if today is None:
+        today = date.today()
+    year = today.year
+    candidates: list[str] = []
+    for yr in (year, year + 1):
+        for month, code in _QUARTER_CODES:
+            tf = _third_friday(yr, month)
+            roll_date = tf - timedelta(days=_ROLL_DAYS_BEFORE)
+            if today < roll_date:
+                candidates.append(f"{product}.{code}{str(yr)[-2:]}")
+    front = candidates[0] if candidates else f"{product}.Z{str(year)[-2:]}"
+    deferred = candidates[1] if len(candidates) > 1 else None
+    return front, deferred
+
+
+def resolve_cme_symbol(symbol: str, stype_in: str):
+    """Translate a continuous-contract symbol to a raw dated symbol.
+
+    When the user (or the Railway env var) specifies ``ES.c.0`` with
+    ``stype_in=continuous``, Databento routes to the front-month
+    contract but may apply roll-adjusted prices that differ from the
+    actual exchange quotes IronBeam shows.  Resolving to the explicit
+    dated symbol (``ES.Z26``) with ``raw_symbol`` ensures the prices
+    match the actual contract tick-for-tick.
+
+    Symbols that are already explicit contracts (no ``.c.`` in the name)
+    are returned unchanged.
+    """
+    if stype_in != "continuous" or ".c." not in symbol:
+        return symbol, stype_in
+    product = symbol.split(".")[0].upper()   # "ES.c.0" -> "ES"
+    front, _ = cme_quarterly_contracts(product)
+    return front, "raw_symbol"
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -124,14 +195,32 @@ class Config:
 
     @property
     def market(self) -> str:
-        """The name the picker shows. 'ES.c.0' -> 'ES'.
-
-        The subscription symbol carries Databento's continuous-contract
-        suffix, which is noise in a dropdown and would not match
-        anything a person types.
-        """
+        """The name the picker shows. 'ES.c.0' or 'ES.Z26' -> 'ES'."""
         raw = (self.symbols or ("ES",))[0]
         return raw.split(".")[0].upper()
+
+    @property
+    def resolved_symbols(self) -> tuple[list[str], str]:
+        """Return (symbols_list, effective_stype) after continuous->raw resolve.
+
+        Converts ``ES.c.0`` / continuous to the actual dated contract so the
+        live feed quotes match the IronBeam price tick-for-tick.
+        """
+        syms = list(self.symbols)
+        stype = self.stype_in
+        if len(syms) == 1:
+            sym, stype = resolve_cme_symbol(syms[0], stype)
+            syms = [sym]
+        return syms, stype
+
+    @property
+    def active_contracts(self) -> tuple[str, str | None]:
+        """Return (front_month, deferred) for the configured product.
+
+        Examples:  ("ES.Z26", "ES.H27")
+        """
+        product = self.market          # "ES"
+        return cme_quarterly_contracts(product)
 
     def blocked_by(self) -> str:
         """The first unmet condition, in words. '' when ready."""
@@ -183,7 +272,10 @@ class OfiService:
         # Candles from the same stream. Present whether or not the
         # engine ever connects, so a panel reading it gets an empty
         # tape rather than an attribute error.
-        self.tape = Tape(symbol=(self.config.symbols or ["ES"])[0])
+        # Resolve continuous-contract shorthand (ES.c.0) to the actual
+        # dated contract (ES.Z26) so the tape's symbol matches IronBeam.
+        resolved_syms, _ = self.config.resolved_symbols
+        self.tape = Tape(symbol=resolved_syms[0])
 
     # ------------------------------------------------------- lifecycle
 
@@ -241,9 +333,11 @@ class OfiService:
             ("1h",  200), # 200h of hourly bars   (~200)
         ]
 
-        symbol = (self.config.symbols or ["ES.c.0"])[0]
+        # Use the resolved dated symbol (e.g. "ES.Z26" with "raw_symbol")
+        # so the historical OHLCV prices match IronBeam's actual contract.
+        resolved_syms, stype_in = self.config.resolved_symbols
+        symbol = resolved_syms[0]
         dataset = self.config.dataset
-        stype_in = self.config.stype_in
 
         try:
             client = db.Historical()
@@ -310,13 +404,18 @@ class OfiService:
     def _run(self) -> None:
         from .ofi_live import LiveRace, reading_payload
         try:
+            # Use the resolved symbols and stype so the live feed
+            # uses the explicit dated contract (ES.Z26) rather than
+            # the continuous alias (ES.c.0).  Prices then match
+            # IronBeam tick-for-tick.
+            resolved_syms, resolved_stype = self.config.resolved_symbols
             self.engine = LiveRace(
-                symbols=list(self.config.symbols),
+                symbols=resolved_syms,
                 dataset=self.config.dataset,
                 window=self.config.window,
                 baseline=self.config.baseline,
                 z_enter=self.config.z_enter,
-                stype_in=self.config.stype_in,
+                stype_in=resolved_stype,
                 schema=self.config.schema,
                 tape=self.tape)
             for ev, rd in self.engine.run():
@@ -340,16 +439,22 @@ class OfiService:
     def snapshot(self, history: int = 0) -> dict:
         """Always answers, running or not."""
         cfg = self.config
+        resolved_syms, resolved_stype = cfg.resolved_symbols
+        front, deferred = cfg.active_contracts
         out = {
             "running": self.running,
             "enabled": cfg.enabled,
             "blocked_by": cfg.blocked_by(),
             "error": self.error,
             "symbols": list(cfg.symbols),
+            "active_contract": self.tape.symbol,  # resolved dated name
+            "front_month": front,
+            "deferred": deferred,
             "market": cfg.market,
             "dataset": cfg.dataset,
             "schema": cfg.schema,
             "schemas": cfg.schema_list,
+            "stype_in": resolved_stype,
             "window": cfg.window,
             "baseline": cfg.baseline,
             "z_enter": cfg.z_enter,

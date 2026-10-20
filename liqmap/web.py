@@ -507,7 +507,7 @@ class Runtime:
     MARKETS_TTL_S = 300.0
 
     def cme_market(self) -> dict[str, Any] | None:
-        """The CME row for the picker, or None when the engine is off.
+        """The CME front-month row for the picker, or None when the engine is off.
 
         Built from the tape rather than a quote request: the price is
         whatever last printed on the subscription we already hold, so
@@ -517,16 +517,66 @@ class Runtime:
         if svc is None or not svc.config.enabled:
             return None
         from .assetclass import label as _class_label
-        base = svc.config.market
-        return {"symbol": base, "base": base, "dex": "CME", "hip3": False,
+        base = svc.config.market               # "ES"
+        front, deferred = svc.config.active_contracts
+        active = svc.tape.symbol               # "ES.Z26" (resolved)
+        return {"symbol": front, "base": front, "dex": "CME", "hip3": False,
                 "price": svc.tape.last_px or 0.0, "klass": "index",
                 "klass_label": _class_label("index"),
-                "has_data": svc.tape.trades > 0, "source": "cme"}
+                "has_data": svc.tape.trades > 0, "source": "cme",
+                "active_contract": active,
+                "front_month": front,
+                "deferred": deferred}
+
+    def cme_markets(self) -> list[dict[str, Any]]:
+        """All CME contract rows for the picker: front month + deferred.
+
+        The front-month row has live data.  The deferred row is listed
+        so the user can see it exists and select it; has_data=False until
+        a second subscription is wired.
+        """
+        svc = getattr(self, "ofi", None)
+        if svc is None or not svc.config.enabled:
+            return []
+        from .assetclass import label as _class_label
+        front, deferred = svc.config.active_contracts
+        active = svc.tape.symbol
+        live = svc.tape.trades > 0
+        base_row = {
+            "dex": "CME", "hip3": False, "klass": "index",
+            "klass_label": _class_label("index"), "source": "cme",
+            "active_contract": active, "front_month": front,
+            "deferred": deferred,
+        }
+        rows = [
+            {**base_row, "symbol": front, "base": front,
+             "price": svc.tape.last_px or 0.0, "has_data": live,
+             "note": "front month"},
+        ]
+        if deferred:
+            rows.append(
+                {**base_row, "symbol": deferred, "base": deferred,
+                 "price": 0.0, "has_data": False,
+                 "note": "deferred — live price feed not yet subscribed"})
+        return rows
 
     def is_cme(self, coin: str) -> bool:
-        """Does this symbol belong to the CME source rather than HL?"""
-        row = self.cme_market()
-        return bool(row and str(coin).upper() == row["symbol"])
+        """Does this symbol belong to the CME source rather than HL?
+
+        Accepts the product name ("ES"), the front-month contract
+        ("ES.Z26"), and the deferred contract ("ES.H27") so the
+        chart and read routes work regardless of which form the user
+        types in the URL.
+        """
+        svc = getattr(self, "ofi", None)
+        if svc is None or not svc.config.enabled:
+            return False
+        c = str(coin).upper()
+        base = svc.config.market               # "ES"
+        if c == base:
+            return True
+        front, deferred = svc.config.active_contracts
+        return c in (front, deferred or "")
 
     def markets(self, force: bool = False) -> dict[str, Any]:
         """Every market you can actually trade, across every perp DEX.
@@ -553,15 +603,12 @@ class Runtime:
             # when that venue is unreachable. A picker that empties
             # because an unrelated exchange is down is a worse failure
             # than one that is short.
-            cme = self.cme_market()
-            return {"markets": [cme] if cme else [], "error": str(exc),
-                    "venues": ["CME"] if cme else []}
+            cme_rows = self.cme_markets()
+            return {"markets": cme_rows, "error": str(exc),
+                    "venues": ["CME"] if cme_rows else []}
 
         have = {r["coin"] for r in self.history.coins_with_data()}
-        rows = []
-        cme = self.cme_market()
-        if cme is not None:
-            rows.append(cme)
+        rows = list(self.cme_markets())   # front month + deferred
         for sym, px in mids.items():
             dex, base = split_symbol(sym)
             klass = classify(sym, dex)
@@ -2292,8 +2339,12 @@ class Runtime:
         tape = self.ofi.tape
         now = time.time()
         snap = tape.snapshot()
+        front, deferred = self.ofi.config.active_contracts
         out: dict[str, Any] = {
             "coin": self.ofi.config.market,
+            "active_contract": tape.symbol,   # "ES.Z26" — matches IronBeam
+            "front_month": front,
+            "deferred": deferred,
             "source": "cme",
             "server_time": datetime.now(timezone.utc).isoformat(),
             "server_epoch": now,

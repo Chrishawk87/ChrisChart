@@ -104,15 +104,25 @@ class TestPicker:
 
     def test_es_appears_when_enabled(self, rt_on):
         row = rt_on.cme_market()
-        assert row["symbol"] == "ES"
+        # symbol is now the resolved dated contract (e.g. "ES.Z26")
+        assert row["symbol"].startswith("ES.")
         assert row["dex"] == "CME"
         assert row["source"] == "cme"
 
     def test_the_subscription_suffix_is_stripped(self, rt_on):
-        """'ES.c.0' is Databento's continuous-contract name; nobody
-        types that into a picker."""
+        """'ES.c.0' (continuous alias) resolves to a dated contract
+        like 'ES.Z26' so the price matches IronBeam tick-for-tick."""
         assert rt_on.ofi.config.symbols == ("ES.c.0",)
-        assert rt_on.cme_market()["symbol"] == "ES"
+        front_month = rt_on.cme_market()["symbol"]
+        # Must be a dated quarterly contract, not the raw continuous alias.
+        assert front_month != "ES.c.0"
+        assert front_month.startswith("ES.")
+
+    def test_active_contract_is_exposed(self, rt_on):
+        row = rt_on.cme_market()
+        assert "active_contract" in row
+        assert "front_month" in row
+        assert "deferred" in row
 
     def test_has_data_is_false_before_any_print(self, rt_on):
         assert rt_on.cme_market()["has_data"] is False
@@ -130,8 +140,14 @@ class TestPicker:
 class TestRouting:
 
     def test_es_routes_to_cme(self, rt_on):
+        # Product name ("ES"), front-month ("ES.Z26"), and deferred
+        # ("ES.H27") must all route to the CME tape.
         assert rt_on.is_cme("ES") is True
         assert rt_on.is_cme("es") is True
+        front, deferred = rt_on.ofi.config.active_contracts
+        assert rt_on.is_cme(front) is True
+        if deferred:
+            assert rt_on.is_cme(deferred) is True
 
     def test_hyperliquid_coins_do_not(self, rt_on):
         for c in ("BTC", "ETH", "SOL", "ESX", "E"):
@@ -177,7 +193,8 @@ class TestStaleness:
         """A configured-but-not-connected engine still owns the
         symbol. Falling back to Hyperliquid for ES would ask an
         exchange that has never listed it."""
-        assert rt_blocked.cme_market()["symbol"] == "ES"
+        row = rt_blocked.cme_market()
+        assert row["symbol"].startswith("ES.")   # resolved dated contract
         assert rt_blocked.is_cme("ES") is True
         assert rt_blocked.now("ES")["source"] == "cme"
 
@@ -267,3 +284,80 @@ class TestChartRouting:
         result = cme.spread_trend(window_s=60.0)
         assert isinstance(result, dict)
         assert result["samples"] == 0
+
+
+# ------------------------------------------------ contract resolution & picker
+
+class TestContractResolution:
+    """ES.c.0 continuous → ES.Z26 raw_symbol for IronBeam price match."""
+
+    def test_resolve_continuous_to_raw_symbol(self):
+        from liqmap.ofi_service import resolve_cme_symbol
+        sym, stype = resolve_cme_symbol("ES.c.0", "continuous")
+        assert ".c." not in sym, "continuous alias must be resolved away"
+        assert stype == "raw_symbol"
+        assert sym.startswith("ES.")
+
+    def test_resolve_raw_symbol_unchanged(self):
+        from liqmap.ofi_service import resolve_cme_symbol
+        sym, stype = resolve_cme_symbol("ES.Z26", "raw_symbol")
+        assert sym == "ES.Z26"
+        assert stype == "raw_symbol"
+
+    def test_quarterly_contracts_returns_front_and_deferred(self):
+        from datetime import date
+        from liqmap.ofi_service import cme_quarterly_contracts
+        front, deferred = cme_quarterly_contracts("ES", today=date(2026, 10, 20))
+        assert front == "ES.Z26"
+        assert deferred == "ES.H27"
+
+    def test_quarterly_contracts_rolls_after_roll_date(self):
+        """After the roll date (early December) the front month flips."""
+        from datetime import date
+        from liqmap.ofi_service import cme_quarterly_contracts
+        front, deferred = cme_quarterly_contracts("ES", today=date(2026, 12, 10))
+        assert front == "ES.H27"
+        assert deferred == "ES.M27"
+
+    def test_tape_symbol_is_resolved_not_continuous(self, rt_on):
+        """The tape must report the dated contract, not ES.c.0."""
+        sym = rt_on.ofi.tape.symbol
+        assert sym != "ES.c.0", "continuous alias must not reach the tape"
+        assert sym.startswith("ES.")
+
+    def test_resolved_symbols_in_ofi_snapshot(self, rt_on):
+        snap = rt_on.ofi.snapshot()
+        assert "active_contract" in snap
+        assert "front_month" in snap
+        assert "deferred" in snap
+        assert snap["active_contract"].startswith("ES.")
+
+    def test_cme_markets_returns_front_and_deferred_rows(self, rt_on):
+        rows = rt_on.cme_markets()
+        assert len(rows) == 2, "should have front + deferred row"
+        symbols = {r["symbol"] for r in rows}
+        front, deferred = rt_on.ofi.config.active_contracts
+        assert front in symbols
+        assert deferred in symbols
+
+    def test_deferred_row_has_no_data(self, rt_on):
+        fill(rt_on)
+        rows = rt_on.cme_markets()
+        _, deferred = rt_on.ofi.config.active_contracts
+        def_row = next(r for r in rows if r["symbol"] == deferred)
+        assert def_row["has_data"] is False
+
+    def test_front_month_routes_through_is_cme(self, rt_on):
+        front, deferred = rt_on.ofi.config.active_contracts
+        assert rt_on.is_cme(front) is True
+
+    def test_deferred_routes_through_is_cme(self, rt_on):
+        _, deferred = rt_on.ofi.config.active_contracts
+        assert rt_on.is_cme(deferred) is True
+
+    def test_now_includes_active_contract(self, rt_on):
+        fill(rt_on)
+        out = rt_on.now("ES")
+        assert "active_contract" in out
+        assert "front_month" in out
+        assert "deferred" in out
