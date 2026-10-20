@@ -120,6 +120,12 @@ class Tape:
     # This fires hundreds of times per second in a live session and is
     # the hook that lets /ws/book push deltas at tape speed.
     _book_listeners: list = field(default_factory=list)
+    # Execution-track callbacks. Called on every TRADE with the decoded
+    # Trade object as the sole argument: fn(trade).  Separate from the
+    # no-arg _listeners because the execution track needs the raw trade
+    # data (price, size, aggressor) without another lookup, and keeping
+    # it separate keeps the visualization path free of execution logic.
+    _exec_listeners: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.flow is None:
@@ -175,6 +181,28 @@ class Tape:
     @property
     def book_listener_count(self) -> int:
         return len(self._book_listeners)
+
+    def on_trade_exec(self, fn: Callable) -> None:
+        """Register a callback fired on every trade, receiving the Trade object.
+
+        Called from the record-processing thread; fn must be fast and
+        non-blocking.  The Trade object carries ts, px, sz, and aggressor.
+        Separate from on_update (no-arg) so execution consumers get the raw
+        print data without a second lookup, and so the visualization path
+        never touches execution callbacks.
+        """
+        self._exec_listeners.append(fn)
+
+    def off_trade_exec(self, fn: Callable) -> None:
+        """Unregister an execution callback."""
+        try:
+            self._exec_listeners.remove(fn)
+        except ValueError:
+            pass
+
+    @property
+    def exec_listener_count(self) -> int:
+        return len(self._exec_listeners)
 
     # -------------------------------------------------- historical seed
 
@@ -257,6 +285,11 @@ class Tape:
         self.trades += 1
         self.last_px, self.last_side, self.last_ts = t.px, t.aggressor, t.ts
         self.flow.add(t)
+        for fn in list(self._exec_listeners):
+            try:
+                fn(t)
+            except Exception:                       # noqa: BLE001
+                pass
         if self.footprint is not None:
             self._to_footprint(t)
         for b in self.builders.values():

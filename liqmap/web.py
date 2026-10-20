@@ -183,6 +183,13 @@ class Runtime:
         # callbacks into the async WebSocket queue fan-out.  The event loop
         # reference is set in the FastAPI lifespan once the loop is running.
         self.book_broadcaster = BookBroadcaster()
+        # Execution track: independent from the visualization footprint.
+        # Receives raw Trade objects; emits Signals when stacked imbalance +
+        # diagonal delta agree.  Wired to the tape in lifespan after the
+        # event loop starts.
+        from .execution import ExecutionTrack as _ExecTrack
+        self.exec_track = _ExecTrack()
+        self.signal_broadcaster = SignalBroadcaster()
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -2843,6 +2850,53 @@ class BookBroadcaster:
             return len(self._queues)
 
 
+class SignalBroadcaster:
+    """Fan-out from the ExecutionTrack background thread to N async queues.
+
+    Mirrors BookBroadcaster exactly: the execution engine runs on the OFI
+    background thread; each /ws/exec WebSocket handler owns an asyncio.Queue
+    that receives Signal dicts pushed via call_soon_threadsafe.
+    """
+
+    def __init__(self, maxsize: int = 64) -> None:
+        self._queues: set = set()
+        self._lock = threading.Lock()
+        self._maxsize = maxsize
+        self._loop: Any = None
+        self.dropped: int = 0
+        self.sent: int = 0
+
+    def set_loop(self, loop: Any) -> None:
+        self._loop = loop
+
+    def add(self, q: Any) -> None:
+        with self._lock:
+            self._queues.add(q)
+
+    def remove(self, q: Any) -> None:
+        with self._lock:
+            self._queues.discard(q)
+
+    def notify(self, frame: dict) -> None:
+        """Called from the execution background thread. Must return immediately."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        with self._lock:
+            queues = list(self._queues)
+        for q in queues:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, frame)
+                self.sent += 1
+            except Exception:                           # noqa: BLE001
+                self.dropped += 1
+
+    @property
+    def connections(self) -> int:
+        with self._lock:
+            return len(self._queues)
+
+
 def _book_delta(tape) -> dict:
     """Snapshot the MBP-10 book as a WebSocket frame.
 
@@ -3008,6 +3062,7 @@ def create_app() -> FastAPI:
         # and removing it per-connection would race with the OFI thread.
         loop = _asyncio.get_running_loop()
         rt.book_broadcaster.set_loop(loop)
+        rt.signal_broadcaster.set_loop(loop)
         if rt.ofi is not None and rt.ofi.tape is not None:
             _tape = rt.ofi.tape
             _bc   = rt.book_broadcaster
@@ -3020,6 +3075,19 @@ def create_app() -> FastAPI:
                     _bc.notify(_book_delta(_tape))
 
             _tape.on_book_update(_book_notify)
+
+            # Wire the execution track: raw Trade objects -> ExecutionTrack.
+            # The ExecutionTrack fires Signals to the SignalBroadcaster,
+            # which pushes them to /ws/exec WebSocket queues.
+            _et = rt.exec_track
+            _sb = rt.signal_broadcaster
+
+            def _signal_notify(sig):
+                if _sb.connections:
+                    _sb.notify(sig.as_dict())
+
+            _et.on_signal(_signal_notify)
+            _tape.on_trade_exec(_et.on_trade)
 
         yield
 
@@ -3601,6 +3669,72 @@ def create_app() -> FastAPI:
                 await ws.send_json({"error": str(exc)})
             except Exception:
                 pass
+
+    @app.websocket("/ws/exec")
+    async def ws_exec(ws: WebSocket, coin: str = "ES", token: str = ""):
+        """Real-time execution signal stream (Execution Track).
+
+        Sends one JSON frame for each Signal the ExecutionTrack fires:
+            {ts, side, price, raw_delta, diagonal_delta,
+             unconfirmed, buy_flags, sell_flags,
+             stacked_side, stacked_low, stacked_high, stacked_run,
+             bar_age_s, reason}
+
+        A Signal fires only when stacked diagonal imbalance is present AND
+        the Diagonal Cumulative Delta agrees — no candle close required.
+
+        Authentication: token in the query string (browser WebSocket cannot
+        set Authorization headers).
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        if not rt.is_cme(coin_up):
+            await ws.accept()
+            await ws.send_json({"error": f"no CME tape for {coin_up!r} — "
+                                         f"execution track is CME-only"})
+            await ws.close()
+            return
+
+        await ws.accept()
+        # Send the current state immediately so the client has context.
+        try:
+            await ws.send_json(rt.exec_track.state().as_dict())
+        except Exception:                               # noqa: BLE001
+            pass
+
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=128)
+        rt.signal_broadcaster.add(q)
+        try:
+            while True:
+                frame = await q.get()
+                await ws.send_json(frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            rt.signal_broadcaster.remove(q)
+
+    @app.get("/api/exec/state", dependencies=[Depends(require_token)])
+    def api_exec_state(coin: str = "ES") -> dict[str, Any]:
+        """Point-in-time snapshot of the Execution Track state.
+
+        Returns the live pulse, diagonal delta, active stacked runs, and the
+        most recent signal.  Poll this at any rate; it is O(flags) and fast.
+        """
+        rt = runtime()
+        coin_up = coin.upper()
+        if not rt.is_cme(coin_up):
+            return {"error": f"no CME tape for {coin_up!r}"}
+        return rt.exec_track.state().as_dict()
 
     @app.get("/gl", response_class=HTMLResponse)
     def gl_page(coin: str = "ES", interval: str = "1m",
