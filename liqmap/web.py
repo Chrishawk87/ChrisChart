@@ -3317,6 +3317,43 @@ def create_app() -> FastAPI:
         order book doing right now, and which way is this candle going.
         """
         coin = rt.resolve_symbol(coin)[0] or coin
+
+        # CME (ES): the HL BookReader is not attached to the CME tape, but
+        # the live bid/ask snapshot is always there. Return what the book IS
+        # rather than pretending there is no book at all.
+        if rt.is_cme(coin):
+            svc = rt.ofi
+            bk = svc.tape.book if svc is not None else None
+            if bk is None or bk.empty or not bk.bids or not bk.asks:
+                return {"coin": coin, "source": "cme",
+                        "error": "no book yet — waiting for first CME record"}
+            mid = bk.mid
+            b0, a0 = bk.bids[0], bk.asks[0]
+            bid_sz = sum(lv.sz for lv in bk.bids[:5])
+            ask_sz = sum(lv.sz for lv in bk.asks[:5])
+            total = bid_sz + ask_sz
+            imb = (bid_sz - ask_sz) / total if total > 0 else 0.0
+            microprice = (b0.px * ask_sz + a0.px * bid_sz) / total if total > 0 else mid
+            direction = "up" if imb > 0.1 else "down" if imb < -0.1 else "flat"
+            return {
+                "coin": coin, "source": "cme",
+                "direction": direction, "score": round(imb, 4),
+                "conviction": "snapshot",
+                "mid": round(mid, 4), "microprice": round(microprice, 4),
+                "spread_bps": round(bk.spread_bps, 2),
+                "tilt": round(imb, 4), "imbalance": round(imb, 4),
+                "bid": b0.px, "ask": a0.px,
+                "bid_sz": b0.sz, "ask_sz": a0.sz,
+                "depletion": None, "replenish": None,
+                "mid_drift_bps": None, "aggression": None, "absorbed": None,
+                "samples": 1, "window_s": 0.0,
+                "components": [],
+                "verdict": direction,
+                "book_updates": svc.tape.books if svc else 0,
+                "age_s": svc.tape.last_ts and (time.time() - svc.tape.last_ts),
+                "note": "snapshot — book history not tracked at L1",
+            }
+
         feed = rt.feed_for(coin)
         if feed is None:
             return {"coin": coin,
