@@ -115,6 +115,11 @@ class Tape:
     # LiveFeed._listeners -- a snapshot copy before iterating makes
     # concurrent register/unregister safe enough under the GIL.
     _listeners: list = field(default_factory=list)
+    # Functions registered by WebSocket book streams; called on EVERY
+    # MBP-10 record that carries book levels, not only on trades.
+    # This fires hundreds of times per second in a live session and is
+    # the hook that lets /ws/book push deltas at tape speed.
+    _book_listeners: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.flow is None:
@@ -148,6 +153,28 @@ class Tape:
     @property
     def listener_count(self) -> int:
         return len(self._listeners)
+
+    def on_book_update(self, fn: Callable) -> None:
+        """Register a callback fired on every MBP-10 book record.
+
+        Unlike on_update (trades only), this fires on every record that
+        carries book levels -- Add, Modify, Delete, and Trade records all
+        update the book.  In a live CME session that is hundreds of times
+        per second.  The callback MUST be fast and non-blocking; use
+        asyncio.Queue + loop.call_soon_threadsafe for async consumers.
+        """
+        self._book_listeners.append(fn)
+
+    def off_book_update(self, fn: Callable) -> None:
+        """Unregister a book-update callback."""
+        try:
+            self._book_listeners.remove(fn)
+        except ValueError:
+            pass
+
+    @property
+    def book_listener_count(self) -> int:
+        return len(self._book_listeners)
 
     # -------------------------------------------------- historical seed
 
@@ -219,6 +246,11 @@ class Tape:
                 self.books += 1
             except Exception:                           # noqa: BLE001
                 pass
+            for _fn in list(self._book_listeners):
+                try:
+                    _fn()
+                except Exception:                       # noqa: BLE001
+                    pass
         t = dbn.trade_from(rec)
         if t is None:
             return False
