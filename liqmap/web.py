@@ -179,6 +179,10 @@ class Runtime:
         from .ofi_service import OfiService as _OfiService
         self.ofi = _OfiService()
         self.ofi.start()
+        # Real-time book broadcaster: wires the OFI tape's book-update
+        # callbacks into the async WebSocket queue fan-out.  The event loop
+        # reference is set in the FastAPI lifespan once the loop is running.
+        self.book_broadcaster = BookBroadcaster()
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,
@@ -2767,6 +2771,150 @@ def startup_report(rt: Runtime) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Real-time MBP-10 book broadcaster — threads → async WebSocket queues
+# --------------------------------------------------------------------------
+
+class BookBroadcaster:
+    """Fan-out from the OFI background thread to N async WebSocket queues.
+
+    WHY THIS SHAPE. The Databento OFI engine runs on a blocking background
+    thread; FastAPI WebSocket handlers run inside the asyncio event loop.
+    You cannot ``await`` from a thread and you cannot block the event loop.
+    The bridge: each WebSocket handler owns an ``asyncio.Queue``; when the
+    OFI thread has a new book update it schedules a non-blocking
+    ``queue.put_nowait`` onto the event loop with ``call_soon_threadsafe``.
+    The handler's ``await queue.get()`` wakes the moment the item lands.
+
+    MULTIPLE CONNECTIONS. Every connected client gets its own queue. The
+    broadcaster holds a set of queues and notifies all of them on each
+    update.  With a bounded ``maxsize`` a slow client accumulates at most
+    that many frames before the broadcaster starts dropping for it only
+    (``put_nowait`` raises ``QueueFull`` on overflow; we catch and count).
+
+    LOOP LIFECYCLE. ``set_loop`` is called once in the FastAPI lifespan,
+    before any WebSocket connects.  After that the loop reference is only
+    written from one place and read from the OFI thread, which is safe
+    under the GIL.
+    """
+
+    def __init__(self, maxsize: int = 128) -> None:
+        self._queues: set = set()
+        self._lock = threading.Lock()
+        self._maxsize = maxsize
+        self._loop: Any = None          # asyncio.AbstractEventLoop
+        self.dropped: int = 0
+        self.sent: int = 0
+
+    def set_loop(self, loop: Any) -> None:
+        """Call once from the asyncio lifespan before any client connects."""
+        self._loop = loop
+
+    def add(self, q: Any) -> None:
+        """Register a client queue (called from the event-loop thread)."""
+        with self._lock:
+            self._queues.add(q)
+
+    def remove(self, q: Any) -> None:
+        """Unregister a client queue on disconnect."""
+        with self._lock:
+            self._queues.discard(q)
+
+    def notify(self, frame: dict) -> None:
+        """Push one book-delta frame to every registered queue.
+
+        Called from the OFI background thread on every MBP-10 book record.
+        Must return in microseconds; no blocking, no awaiting.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        with self._lock:
+            queues = list(self._queues)
+        for q in queues:
+            try:
+                loop.call_soon_threadsafe(q.put_nowait, frame)
+                self.sent += 1
+            except Exception:                           # noqa: BLE001
+                self.dropped += 1
+
+    @property
+    def connections(self) -> int:
+        with self._lock:
+            return len(self._queues)
+
+
+def _book_delta(tape) -> dict:
+    """Snapshot the MBP-10 book as a WebSocket frame.
+
+    Format is a superset of the ``api_bookcall`` CME response so that
+    ``paintBookCall`` in the dashboard can consume it unchanged AND the new
+    depth-ladder renderer gets the raw bid/ask arrays it needs.
+    """
+    bk = tape.book
+    ts_now = time.time()
+
+    if bk is None or bk.empty:
+        return {
+            "ts": ts_now,
+            "source": "cme",
+            "px": tape.last_px or 0.0,
+            "bid": None, "ask": None,
+            "mid": None, "microprice": None,
+            "spread_bps": 0.0,
+            "imbalance": 0.0, "tilt": 0.0,
+            "direction": "flat", "score": 0.0,
+            "conviction": "snapshot",
+            "book_updates": tape.books,
+            "bids": [], "asks": [],
+            "samples": 0, "window_s": 0.0,
+            "components": [], "verdict": "flat",
+            "note": "waiting for first book record",
+        }
+
+    b0, a0 = bk.bids[0], bk.asks[0]
+    bid_sz5 = sum(lv.sz for lv in bk.bids[:5])
+    ask_sz5 = sum(lv.sz for lv in bk.asks[:5])
+    total5  = bid_sz5 + ask_sz5
+    imb = (bid_sz5 - ask_sz5) / total5 if total5 > 0 else 0.0
+    microprice = (
+        (b0.px * ask_sz5 + a0.px * bid_sz5) / total5
+        if total5 > 0 else bk.mid
+    )
+    direction = "up" if imb > 0.1 else "down" if imb < -0.1 else "flat"
+
+    return {
+        "ts": ts_now,
+        "source": "cme",
+        "px": tape.last_px or 0.0,
+        # bookcall-compatible surface (paintBookCall consumes these)
+        "coin": tape.symbol,
+        "direction": direction,
+        "score": round(imb, 4),
+        "conviction": "snapshot",
+        "mid": round(bk.mid, 4),
+        "microprice": round(microprice, 4),
+        "spread_bps": round(bk.spread_bps, 2),
+        "tilt": round(imb, 4),
+        "imbalance": round(imb, 4),
+        "bid": b0.px, "ask": a0.px,
+        "bid_sz": b0.sz, "ask_sz": a0.sz,
+        "depletion": None, "replenish": None,
+        "mid_drift_bps": None, "aggression": None, "absorbed": None,
+        "samples": 1, "window_s": 0.0,
+        "components": [],
+        "verdict": direction,
+        "book_updates": tape.books,
+        "age_s": (ts_now - tape.last_ts) if tape.last_ts else None,
+        "note": "live MBP-10 delta via /ws/book",
+        # Raw depth arrays for the ladder renderer
+        "bids": [{"px": lv.px, "sz": lv.sz, "n": lv.n}
+                 for lv in bk.bids[:10]],
+        "asks": [{"px": lv.px, "sz": lv.sz, "n": lv.n}
+                 for lv in bk.asks[:10]],
+    }
+
+
+# --------------------------------------------------------------------------
 # WebGL order flow snapshot helper (module-level so tests can import it)
 # --------------------------------------------------------------------------
 
@@ -2853,6 +3001,26 @@ def create_app() -> FastAPI:
         if rt.settings().auto_run and not rt.locked:
             start_worker(rt)
             print("[liqmap] background worker started", flush=True)
+
+        # Give the book broadcaster a reference to the running event loop
+        # so it can schedule queue.put_nowait from the OFI background thread.
+        # Wire it to the CME tape's book-update callbacks once here; adding
+        # and removing it per-connection would race with the OFI thread.
+        loop = _asyncio.get_running_loop()
+        rt.book_broadcaster.set_loop(loop)
+        if rt.ofi is not None and rt.ofi.tape is not None:
+            _tape = rt.ofi.tape
+            _bc   = rt.book_broadcaster
+
+            def _book_notify():
+                # Called from the OFI thread on every MBP-10 book record.
+                # Skip if nobody is connected — avoids building the frame
+                # for nothing during quiet stretches.
+                if _bc.connections:
+                    _bc.notify(_book_delta(_tape))
+
+            _tape.on_book_update(_book_notify)
+
         yield
 
     app = FastAPI(title=APP_TITLE, docs_url="/api/docs", redoc_url=None,
@@ -3335,6 +3503,63 @@ def create_app() -> FastAPI:
         # ------------------------------------------------------------------ WebGL
         # _flow_snapshot is defined at module level (below create_app) so tests
         # can import and call it directly without spinning up the full app.
+
+    @app.websocket("/ws/book")
+    async def ws_book(ws: WebSocket, coin: str = "ES",
+                      token: str = "", depth: int = 10):
+        """Real-time MBP-10 order book delta stream.
+
+        Sends a full 10-level bid/ask snapshot on EVERY Databento book
+        record, so the frontend receives the book update the instant the
+        exchange publishes it — no polling, no SSE coalescing lag.
+
+        Frame format (superset of api_bookcall so paintBookCall works):
+            {ts, source, px, bid, ask, mid, microprice, spread_bps,
+             imbalance, direction, score, conviction,
+             bids:[{px,sz,n}×10], asks:[{px,sz,n}×10],
+             book_updates, age_s, note}
+
+        Authentication follows /ws/flow: token in the query string because
+        the browser WebSocket API cannot set Authorization headers.
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        tape = rt.ofi.tape if rt.is_cme(coin_up) else None
+        if tape is None:
+            await ws.accept()
+            await ws.send_json({"error": f"no CME tape for {coin_up!r} — "
+                                         f"start the OFI engine first"})
+            await ws.close()
+            return
+
+        await ws.accept()
+
+        # Register this connection's queue with the broadcaster.
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=256)
+        rt.book_broadcaster.add(q)
+
+        # Send the current snapshot immediately so the ladder renders
+        # on connect without waiting for the next book record.
+        await ws.send_json(_book_delta(tape))
+
+        try:
+            while True:
+                frame = await q.get()
+                await ws.send_json(frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            rt.book_broadcaster.remove(q)
 
     @app.websocket("/ws/flow")
     async def ws_flow(ws: WebSocket, coin: str = "ES",
@@ -7373,7 +7598,15 @@ quiet.">volume over <input id="swEffort" value="200" size="3">% of
     <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
       <span class="stamp" id="bookStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">The order book is the structure.
-        No trend, no higher timeframe, no VWAP. Updates on every book push.</div>
+        No trend, no higher timeframe, no VWAP. Updates on every book push via
+        the real-time MBP-10 WebSocket stream.</div>
+      <div id="bookWsBar" class="msg" style="color:var(--dim);font-size:12px;margin-bottom:4px">
+        Press <b>Go live</b> to open the real-time book stream.
+      </div>
+
+      <!-- Live 10-level depth ladder — rendered by paintDepthLadder() from /ws/book -->
+      <div id="bookLadder" style="margin-bottom:12px"></div>
+
       <div id="bookHead" class="msg">Press <b>Go live</b> to open the book feed.</div>
       <div id="bookComps"></div>
       <div id="bookSay" class="say" style="display:none"></div>
@@ -9905,8 +10138,15 @@ function openStream() {
   // Price arrives on its own channel, on every batch of fills. The full read
   // is coalesced; the price is not, because in a fast market it is the number
   // that goes stale first and a stale price reads as a current one.
+  // For HL markets the SSE 'book' event is still the source; for CME the
+  // /ws/book WebSocket fires on every MBP-10 record instead.
   stream.addEventListener('book', (ev) => {
-    try { paintBookCall(JSON.parse(ev.data)); } catch (e) {}
+    try {
+      const d = JSON.parse(ev.data);
+      // Only paint from SSE when the WS book stream is not connected;
+      // both carry the same paintBookCall format.
+      if (!bookWs) paintBookCall(d);
+    } catch (e) {}
   });
 
   stream.addEventListener('px', (ev) => {
@@ -9926,10 +10166,107 @@ function openStream() {
     // EventSource reconnects on its own; say so rather than looking dead.
     $('feedBar').innerHTML = '<b>Stream interrupted</b> — reconnecting…';
   });
+
+  // Open the real-time MBP-10 book WebSocket alongside the SSE stream.
+  // For CME/ES this fires on every single book record (100s per second);
+  // for HL it will error gracefully and fall back to the SSE book event.
+  openBookStream();
 }
 
 function closeStream() {
   if (stream) { stream.close(); stream = null; }
+  closeBookStream();
+}
+
+// ---- Real-time MBP-10 book WebSocket (/ws/book) ---------------------------
+
+let bookWs = null;
+
+function _wsBase() {
+  // Build the ws:// / wss:// base URL from the current page origin.
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+}
+
+function openBookStream() {
+  closeBookStream();
+  const url = _wsBase() + '/ws/book?coin=' + encodeURIComponent(coin())
+            + '&token=' + encodeURIComponent(tok());
+  try {
+    bookWs = new WebSocket(url);
+  } catch (e) { return; }
+
+  bookWs.onopen = () => {
+    const bar = $('bookWsBar');
+    if (bar) bar.textContent = 'MBP-10 book stream live';
+  };
+
+  bookWs.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) {
+        // Non-CME coin: WS sends error and closes; SSE book event is fallback.
+        const bar = $('bookWsBar');
+        if (bar) bar.textContent = 'Book WS: ' + d.error;
+        return;
+      }
+      paintBookCall(d);
+      paintDepthLadder(d);
+    } catch (e) {}
+  };
+
+  bookWs.onclose = () => {
+    bookWs = null;
+    const bar = $('bookWsBar');
+    if (bar) bar.textContent = 'Book WS closed — SSE fallback active';
+  };
+
+  bookWs.onerror = () => {
+    // WS will fire onclose after onerror; log nothing extra.
+  };
+}
+
+function closeBookStream() {
+  if (bookWs) { bookWs.close(); bookWs = null; }
+}
+
+// ---- Depth ladder renderer ------------------------------------------------
+
+function paintDepthLadder(d) {
+  const el = $('bookLadder');
+  if (!el) return;
+  const bids = d.bids || [], asks = d.asks || [];
+  if (!bids.length && !asks.length) {
+    el.innerHTML = '<span style="color:var(--dim)">awaiting book data…</span>';
+    return;
+  }
+  const fmt  = px => Number(px).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+  const fmtS = sz => sz >= 1000 ? (sz/1000).toFixed(1)+'K' : sz.toFixed(0);
+
+  // Find the max size for bar scaling
+  const allSz = [...bids.map(l=>l.sz), ...asks.map(l=>l.sz)];
+  const maxSz = allSz.length ? Math.max(...allSz) : 1;
+
+  const row = (l, side) => {
+    const pct = Math.round(l.sz / maxSz * 100);
+    const bg  = side === 'bid'
+      ? `linear-gradient(to left, rgba(0,200,80,.18) ${pct}%, transparent ${pct}%)`
+      : `linear-gradient(to right, rgba(220,50,50,.18) ${pct}%, transparent ${pct}%)`;
+    const cls = side === 'bid' ? 'long' : 'short';
+    return `<tr style="background:${bg}">
+      <td style="text-align:right;padding:1px 6px"><b class="${cls}">${fmt(l.px)}</b></td>
+      <td style="padding:1px 8px;color:var(--dim)">${fmtS(l.sz)}${l.n ? ' ×'+l.n : ''}</td>
+    </tr>`;
+  };
+
+  const mid = d.mid ? `<tr><td colspan="2" style="text-align:center;padding:2px 0;font-size:11px;color:var(--dim)">
+    mid ${fmt(d.mid)} · spread ${(d.spread_bps||0).toFixed(2)}bps · imb ${(+(d.imbalance||0)*100).toFixed(1)}%
+  </td></tr>` : '';
+
+  el.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:13px;font-family:monospace">
+    ${asks.slice().reverse().map(l=>row(l,'ask')).join('')}
+    ${mid}
+    ${bids.map(l=>row(l,'bid')).join('')}
+  </table>`;
 }
 
 async function paintFeed() {
