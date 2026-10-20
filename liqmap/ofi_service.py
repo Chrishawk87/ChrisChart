@@ -107,23 +107,26 @@ def cme_quarterly_contracts(product: str = "ES", today=None):
 
 
 def resolve_cme_symbol(symbol: str, stype_in: str):
-    """Translate a continuous-contract symbol to a raw dated symbol.
+    """Return the (symbol, stype_in) pair to use for Databento subscriptions.
 
-    When the user (or the Railway env var) specifies ``ES.c.0`` with
-    ``stype_in=continuous``, Databento routes to the front-month
-    contract but may apply roll-adjusted prices that differ from the
-    actual exchange quotes IronBeam shows.  Resolving to the explicit
-    dated symbol (``ES.Z26``) with ``raw_symbol`` ensures the prices
-    match the actual contract tick-for-tick.
+    SUBSCRIPTION vs DISPLAY are kept separate:
+    - The live subscription always uses Databento's own continuous format
+      (``ES.c.0`` / ``continuous``) because that is the only format the
+      Live API reliably routes.  ``raw_symbol`` for GLBX.MDP3 requires the
+      CME native ticker (e.g. ``ESZ26``), NOT the dot-notation (``ES.Z26``);
+      sending the dot-notation silently produces an empty subscription.
+    - The display name (``tape.symbol``, ``active_contract``) is set
+      separately from ``cme_quarterly_contracts()`` so the UI can show
+      ``ES.Z26`` without that affecting the wire protocol.
 
     Symbols that are already explicit contracts (no ``.c.`` in the name)
-    are returned unchanged.
+    are returned unchanged so that a manually-configured raw symbol still
+    works.
     """
     if stype_in != "continuous" or ".c." not in symbol:
         return symbol, stype_in
-    product = symbol.split(".")[0].upper()   # "ES.c.0" -> "ES"
-    front, _ = cme_quarterly_contracts(product)
-    return front, "raw_symbol"
+    # Keep continuous — do NOT convert to raw_symbol here.
+    return symbol, stype_in
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -272,10 +275,13 @@ class OfiService:
         # Candles from the same stream. Present whether or not the
         # engine ever connects, so a panel reading it gets an empty
         # tape rather than an attribute error.
-        # Resolve continuous-contract shorthand (ES.c.0) to the actual
-        # dated contract (ES.Z26) so the tape's symbol matches IronBeam.
-        resolved_syms, _ = self.config.resolved_symbols
-        self.tape = Tape(symbol=resolved_syms[0])
+        # Display name: use the dated contract name (e.g. "ES.Z26") so the
+        # UI shows the user exactly which contract they're watching.
+        # The SUBSCRIPTION uses continuous (ES.c.0) unchanged — raw_symbol
+        # with dot-notation is not accepted by the Databento Live API.
+        front, _ = self.config.active_contracts
+        tape_sym = front if front else (self.config.symbols or ["ES"])[0].split(".")[0]
+        self.tape = Tape(symbol=tape_sym)
 
     # ------------------------------------------------------- lifecycle
 
@@ -333,10 +339,11 @@ class OfiService:
             ("1h",  200), # 200h of hourly bars   (~200)
         ]
 
-        # Use the resolved dated symbol (e.g. "ES.Z26" with "raw_symbol")
-        # so the historical OHLCV prices match IronBeam's actual contract.
-        resolved_syms, stype_in = self.config.resolved_symbols
-        symbol = resolved_syms[0]
+        # Use the configured symbol and stype (continuous / ES.c.0).
+        # raw_symbol with dot-notation (ES.Z26) is rejected by the historical
+        # API; continuous works and gives the same prices for live-feed context.
+        symbol = (self.config.symbols or ["ES.c.0"])[0]
+        stype_in = self.config.stype_in
         dataset = self.config.dataset
 
         try:

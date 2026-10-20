@@ -291,12 +291,18 @@ class TestChartRouting:
 class TestContractResolution:
     """ES.c.0 continuous → ES.Z26 raw_symbol for IronBeam price match."""
 
-    def test_resolve_continuous_to_raw_symbol(self):
+    def test_resolve_continuous_stays_continuous(self):
+        """resolve_cme_symbol must NOT switch to raw_symbol.
+
+        Databento's Live API rejects raw_symbol + dot-notation (ES.Z26);
+        only the continuous format (ES.c.0) reliably routes the stream.
+        The display name is set separately from cme_quarterly_contracts.
+        """
         from liqmap.ofi_service import resolve_cme_symbol
         sym, stype = resolve_cme_symbol("ES.c.0", "continuous")
-        assert ".c." not in sym, "continuous alias must be resolved away"
-        assert stype == "raw_symbol"
-        assert sym.startswith("ES.")
+        # Subscription must stay continuous / ES.c.0 unchanged.
+        assert sym == "ES.c.0"
+        assert stype == "continuous"
 
     def test_resolve_raw_symbol_unchanged(self):
         from liqmap.ofi_service import resolve_cme_symbol
