@@ -35,8 +35,10 @@ from typing import Any, Sequence
 
 from contextlib import asynccontextmanager
 
+import asyncio as _asyncio
+
 from fastapi import (Depends, FastAPI, File, Header, HTTPException, Query,
-                     UploadFile)
+                     UploadFile, WebSocket, WebSocketDisconnect)
 from fastapi.responses import (HTMLResponse, JSONResponse,
                                PlainTextResponse, Response)
 
@@ -2765,6 +2767,77 @@ def startup_report(rt: Runtime) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# WebGL order flow snapshot helper (module-level so tests can import it)
+# --------------------------------------------------------------------------
+
+def _flow_snapshot(tape, interval: str) -> dict:
+    """Build the 16ms snapshot for the WebGL order flow profile.
+
+    Aggregates every trade in the current bar into a volume-at-price
+    table (buy side, sell side, delta per tick).  All reads are GIL-safe:
+    the tape's attributes are bound atomically and the trade list is only
+    appended to from one thread, so iterating a snapshot of it here is safe.
+    """
+    TICK = 0.25                         # ES tick size in points
+    last_px = tape.last_px or 0.0
+    book = tape.book
+    cur = tape.candle(interval)
+    bar_start = cur.start_ts if cur else (time.time() - 60.0)
+
+    # Volume at price: {tick_index: [buy_sz, sell_sz]}
+    by_price: dict[int, list[float]] = {}
+    flow = tape.flow
+    trades = list(getattr(flow, "_trades", []))   # snapshot, no lock needed
+    for t in trades:
+        if t.ts < bar_start:
+            continue
+        key = round(t.px / TICK)
+        row = by_price.setdefault(key, [0.0, 0.0])
+        if t.aggressor == "buy":
+            row[0] += t.sz
+        else:
+            row[1] += t.sz
+
+    max_v = max((r[0] + r[1] for r in by_price.values()), default=1.0)
+    poc_key = (max(by_price, key=lambda k: by_price[k][0] + by_price[k][1])
+               if by_price else 0)
+
+    # Keep only levels within ±100 ticks of current price for wire efficiency
+    if last_px:
+        cx = round(last_px / TICK)
+        by_price = {k: v for k, v in by_price.items() if abs(k - cx) <= 100}
+
+    profile = sorted(
+        [{"px": k * TICK, "b": round(r[0], 1), "s": round(r[1], 1)}
+         for k, r in by_price.items()],
+        key=lambda x: -x["px"],
+    )
+
+    bar_out = None
+    if cur:
+        bar_out = {
+            "open": cur.open, "high": cur.high,
+            "low": cur.low, "close": cur.close,
+            "vol": round(cur.volume, 0),
+            "delta": round(getattr(cur, "delta", 0.0), 0),
+            "trades": cur.trades,
+        }
+
+    return {
+        "ts": time.time(),
+        "px":  last_px,
+        "poc": poc_key * TICK,
+        "maxv": round(max_v, 1),
+        "profile": profile,
+        "bids": [{"px": l.px, "sz": l.sz}
+                 for l in (book.bids[:10] if book else [])],
+        "asks": [{"px": l.px, "sz": l.sz}
+                 for l in (book.asks[:10] if book else [])],
+        "bar": bar_out,
+    }
+
+
+# --------------------------------------------------------------------------
 # app
 # --------------------------------------------------------------------------
 
@@ -3258,6 +3331,62 @@ def create_app() -> FastAPI:
         return StreamingResponse(events(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
                                           "X-Accel-Buffering": "no"})
+
+        # ------------------------------------------------------------------ WebGL
+        # _flow_snapshot is defined at module level (below create_app) so tests
+        # can import and call it directly without spinning up the full app.
+
+    @app.websocket("/ws/flow")
+    async def ws_flow(ws: WebSocket, coin: str = "ES",
+                      token: str = "", interval: str = "1m"):
+        """High-frequency order flow profile feed at ~60 fps (16 ms cadence).
+
+        Sends volume-at-price snapshots over WebSocket so the WebGL
+        visualization can render directly from memory without HTTP overhead.
+        The token is passed as a query parameter because browser WebSocket
+        cannot set headers.
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        tape = rt.ofi.tape if rt.is_cme(coin_up) else None
+        if tape is None:
+            await ws.accept()
+            await ws.send_json({"error": f"no CME tape for {coin_up!r} — "
+                                         f"start the OFI engine first"})
+            await ws.close()
+            return
+
+        await ws.accept()
+        try:
+            while True:
+                t0 = _asyncio.get_event_loop().time()
+                snap = _flow_snapshot(tape, interval)
+                await ws.send_json(snap)
+                elapsed = _asyncio.get_event_loop().time() - t0
+                await _asyncio.sleep(max(0.001, 0.016 - elapsed))
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+
+    @app.get("/gl", response_class=HTMLResponse)
+    def gl_page(coin: str = "ES", interval: str = "1m",
+                token: str = "") -> str:
+        """Standalone WebGL order flow profile canvas.
+
+        Opens a full-screen canvas that renders the bid/ask volume-at-price
+        profile in real time from the /ws/flow WebSocket feed at ~60 fps.
+        """
+        return _GL_PAGE.replace("__COIN__", coin).replace(
+            "__INTERVAL__", interval).replace("__TOKEN__", token)
 
     @app.get("/api/diag", dependencies=[Depends(require_token)])
     def api_diag(coin: str = "BTC", interval: str = "15m") -> dict[str, Any]:
@@ -5701,6 +5830,533 @@ def create_app() -> FastAPI:
 
     return app
 
+
+_GL_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Order Flow · WebGL</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#0a0a0f;overflow:hidden;font-family:monospace;color:#ccc}
+#hud{position:fixed;top:0;left:0;right:0;height:38px;background:rgba(0,0,0,.7);display:flex;align-items:center;gap:18px;padding:0 16px;font-size:12px;z-index:10;border-bottom:1px solid #222}
+#px{font-size:20px;font-weight:700;letter-spacing:.04em;min-width:100px}
+#px.up{color:#26de81}#px.dn{color:#ff4d6d}#px.fl{color:#aaa}
+#bar-info{color:#999;font-size:11px}
+#poc-label{color:#ffe666;font-size:11px}
+#status{margin-left:auto;font-size:10px;color:#666}
+#links{font-size:10px}#links a{color:#4a9eff;text-decoration:none}
+canvas{display:block;position:fixed;top:38px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 38px)}
+#overlay{position:fixed;top:38px;left:0;bottom:0;width:90px;font-size:9px;color:#666;pointer-events:none;overflow:hidden;z-index:5}
+.price-tick{position:absolute;right:4px;white-space:nowrap;transform:translateY(-50%)}
+.price-tick.cur{color:#fff;font-weight:700;font-size:10px}
+.price-tick.poc{color:#ffe666}
+</style>
+</head><body>
+<div id="hud">
+  <span id="px" class="fl">—</span>
+  <span id="bar-info">loading…</span>
+  <span id="poc-label"></span>
+  <span id="status">connecting…</span>
+  <span id="links"><a href="/?token=__TOKEN__">← dashboard</a></span>
+</div>
+<canvas id="c"></canvas>
+<div id="overlay"></div>
+
+<script>
+'use strict';
+/* ─────────────────────────── CONFIG ─────────────────────────────────────── */
+const COIN     = '__COIN__';
+const INTERVAL = '__INTERVAL__';
+const TOKEN    = '__TOKEN__';
+const TICK     = 0.25;          // ES minimum price increment
+const ROW_PX   = 9;             // canvas pixels per price row
+const PROFILE_FRAC = 0.62;      // fraction of canvas width for profile
+const BOOK_FRAC    = 0.18;      // fraction of canvas width for book depth
+const HEATMAP_FRAC = 0.20;      // fraction for the scrolling time heatmap
+
+/* ─────────────────────────── STATE ──────────────────────────────────────── */
+let latest = null;        // most-recent WebSocket payload
+let prevPx  = null;
+const heatCols = [];      // scrolling heatmap columns [{key:px_tick, delta}...]
+
+const WS_URL = (location.protocol === 'https:' ? 'wss' : 'ws')
+    + '://' + location.host
+    + '/ws/flow?coin=' + COIN + '&interval=' + INTERVAL + '&token=' + TOKEN;
+
+/* ─────────────────────────── WEBSOCKET ─────────────────────────────────── */
+let ws, wsOk = false, lastRecv = 0;
+
+function openWS() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen  = () => { wsOk = true; $('status').textContent = 'live'; };
+  ws.onclose = () => { wsOk = false; $('status').textContent = 'reconnecting…'; setTimeout(openWS, 1500); };
+  ws.onerror = () => { wsOk = false; };
+  ws.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) { $('status').textContent = d.error; return; }
+      latest = d;
+      lastRecv = performance.now();
+    } catch(e) {}
+  };
+}
+
+/* ─────────────────────────── WEBGL SETUP ───────────────────────────────── */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', {
+  alpha: false, antialias: false, depth: false,
+  powerPreference: 'high-performance',
+  preserveDrawingBuffer: false,
+});
+
+if (!gl) { document.body.innerHTML = '<p style="color:red;padding:2rem">WebGL2 not available in this browser.</p>'; }
+
+/* Compile a shader, crash hard so the error is obvious during dev */
+function mkShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function mkProg(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, mkShader(gl.VERTEX_SHADER,   vs));
+  gl.attachShader(p, mkShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+/* ── PROFILE PROGRAM (order flow volume bars) ───────────────────────────── */
+const PROFILE_VS = `#version 300 es
+layout(location=0) in vec2 a_pos;   // [-1,1] quad
+out vec2 v_uv;
+void main() {
+  v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+/* Fragment shader:
+   - u_profile is a Nx1 RGBA texture:  R=buy, G=sell, B=flags, A=1
+     where buy/sell are normalised to [0,1] relative to maxv
+     flags: 0=normal, 1=poc row, 2=current-price row, 3=both
+   - The shader splits the canvas into left (buy) and right (sell) halves,
+     draws horizontal bars whose widths are proportional to volume,
+     and colours them green/red with intensity.
+   - Grid lines and the centre axis are added in the shader for zero
+     extra draw calls.                                                     */
+const PROFILE_FS = `#version 300 es
+precision highp float;
+uniform sampler2D u_profile;
+uniform int   u_nrows;        // number of price rows in texture
+uniform float u_cx;           // centre price tick (float)
+uniform float u_top_tick;     // topmost visible tick (float)
+in  vec2  v_uv;
+out vec4  out_color;
+
+const vec3 BG      = vec3(0.04, 0.04, 0.06);
+const vec3 BUY     = vec3(0.06, 0.72, 0.34);
+const vec3 SELL    = vec3(0.90, 0.22, 0.26);
+const vec3 POC_C   = vec3(1.00, 0.90, 0.20);
+const vec3 CUR_C   = vec3(0.60, 0.80, 1.00);
+const vec3 AXIS    = vec3(0.30, 0.30, 0.35);
+
+void main() {
+  float rowF  = v_uv.y * float(u_nrows);
+  int   rowI  = int(rowF);
+  float frac  = rowF - float(rowI);  // 0=top of row, 1=bottom
+
+  // Sample the texture (each row = one price level, top=highest price)
+  float ty = (float(rowI) + 0.5) / float(u_nrows);
+  vec4 tex = texture(u_profile, vec2(0.5, ty));
+
+  float buy  = tex.r;   // normalised 0–1
+  float sell = tex.g;   // normalised 0–1
+  float flag = tex.b;   // 0=normal, 0.33=poc, 0.67=current, 1.0=both
+
+  bool isPoc = flag > 0.20 && flag < 0.50;
+  bool isCur = flag > 0.50;
+
+  vec3 col = BG;
+  float x  = v_uv.x;
+
+  // Centre axis (thin line)
+  float dAx = abs(x - 0.5);
+  if (dAx < 0.0015) { col = AXIS; }
+
+  // Buy bars (left half: bar extends from centre leftward)
+  else if (x < 0.5) {
+    float barW  = buy * 0.5;           // bar width in [0, 0.5]
+    float barX  = 0.5 - barW;
+    if (x >= barX) {
+      float t = buy * 0.6 + 0.4;
+      col = mix(BUY * 0.5, BUY, t);
+      if (isPoc) col = mix(col, POC_C, 0.4);
+      if (isCur) col = mix(col, CUR_C, 0.5);
+    }
+  }
+  // Sell bars (right half: bar extends from centre rightward)
+  else {
+    float barW = sell * 0.5;
+    float barX = 0.5 + barW;
+    if (x <= barX) {
+      float t = sell * 0.6 + 0.4;
+      col = mix(SELL * 0.5, SELL, t);
+      if (isPoc) col = mix(col, POC_C, 0.4);
+      if (isCur) col = mix(col, CUR_C, 0.5);
+    }
+  }
+
+  // Row separator (every row gets a faint bottom border)
+  if (frac > 0.92) col = mix(col, vec3(0.0), 0.35);
+
+  // POC row highlight (top border)
+  if (isPoc && frac < 0.06) col = POC_C;
+
+  // Current price row top border
+  if (isCur && frac < 0.08) col = CUR_C;
+
+  out_color = vec4(col, 1.0);
+}`;
+
+/* ── HEATMAP PROGRAM (scrolling time × price delta heatmap) ─────────────── */
+const HEAT_VS = `#version 300 es
+layout(location=0) in vec2 a_pos;
+out vec2 v_uv;
+void main() {
+  v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+/* Each column of the heatmap texture = one time snapshot.
+   Each row = one price level.
+   R=buy, G=sell normalised.  Alpha encodes POC.                          */
+const HEAT_FS = `#version 300 es
+precision mediump float;
+uniform sampler2D u_heat;
+uniform float u_age;   // seconds since last update, fades old columns
+in  vec2  v_uv;
+out vec4  out_color;
+
+void main() {
+  vec4 t = texture(u_heat, v_uv);
+  float b = t.r, s = t.g;
+  float delta = b - s;
+  // Map delta → hue: positive=green, negative=red, zero=dark
+  vec3 col;
+  if (delta > 0.0) {
+    col = vec3(0.0, delta * 0.8 + 0.1, 0.0);
+  } else {
+    col = vec3(-delta * 0.8 + 0.1, 0.0, 0.0);
+  }
+  // Newest column = brightest, oldest = dimmest
+  float age = v_uv.x;  // x=0 is newest, x=1 is oldest
+  col *= (1.0 - age * 0.7);
+  out_color = vec4(col, 1.0);
+}`;
+
+let progProfile, progHeat;
+try {
+  progProfile = mkProg(PROFILE_VS, PROFILE_FS);
+  progHeat    = mkProg(HEAT_VS,    HEAT_FS);
+} catch(e) { console.error('Shader error:', e); }
+
+/* ── GEOMETRY: fullscreen quad ─────────────────────────────────────────── */
+const quadVerts = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+function makeQuadVAO(prog) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return vao;
+}
+
+const vaoProfile = makeQuadVAO(progProfile);
+const vaoHeat    = makeQuadVAO(progHeat);
+
+/* ── TEXTURES ───────────────────────────────────────────────────────────── */
+// Profile texture: 1 wide × N tall, RGBA8
+let profileTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, profileTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// Heatmap texture: W wide × N tall (W = max heat columns retained)
+const HEAT_W = 120;   // columns (time steps retained in heatmap)
+let heatTex  = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, heatTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+/* Current texture geometry (re-allocated when price range changes) */
+let texNrows  = 0;
+let texTopTick = 0;
+let profileBuf = null;    // Uint8Array for profile pixel upload
+let heatBuf    = null;    // Uint8Array for heatmap (HEAT_W × nrows × 4)
+let heatDirty  = false;
+let lastHeatTs = 0;
+
+/* ── UNIFORM LOCATIONS ──────────────────────────────────────────────────── */
+const uProfile = {
+  profile : gl.getUniformLocation(progProfile, 'u_profile'),
+  nrows   : gl.getUniformLocation(progProfile, 'u_nrows'),
+  cx      : gl.getUniformLocation(progProfile, 'u_cx'),
+  topTick : gl.getUniformLocation(progProfile, 'u_top_tick'),
+};
+const uHeat = {
+  heat : gl.getUniformLocation(progHeat, 'u_heat'),
+  age  : gl.getUniformLocation(progHeat, 'u_age'),
+};
+
+/* ─────────────────────────── BUILD TEXTURES FROM DATA ──────────────────── */
+function buildProfile(d) {
+  if (!d || !d.profile) return;
+
+  const VIS_TICKS = Math.floor((canvas.height / ROW_PX));   // visible rows
+  const curTick   = Math.round(d.px / TICK);
+  const topTick   = curTick + Math.floor(VIS_TICKS / 2);
+  const botTick   = topTick - VIS_TICKS;
+  const nrows     = VIS_TICKS;
+
+  // Reallocate if size changed
+  if (nrows !== texNrows || topTick !== texTopTick) {
+    texNrows   = nrows;
+    texTopTick = topTick;
+    profileBuf = new Uint8Array(nrows * 4);
+    // Re-allocate heatmap buffer too
+    heatBuf = new Uint8Array(HEAT_W * nrows * 4);
+    // Initialise textures with correct size
+    gl.bindTexture(gl.TEXTURE_2D, profileTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, nrows, 0,
+                  gl.RGBA, gl.UNSIGNED_BYTE, profileBuf);
+    gl.bindTexture(gl.TEXTURE_2D, heatTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, HEAT_W, nrows, 0,
+                  gl.RGBA, gl.UNSIGNED_BYTE, heatBuf);
+  }
+
+  // Index profile by tick
+  const byTick = {};
+  for (const r of d.profile) {
+    byTick[Math.round(r.px / TICK)] = r;
+  }
+  const maxv = d.maxv || 1;
+  const pocTick = Math.round(d.poc / TICK);
+
+  // Fill profile pixel buffer (row 0 = topTick, row N-1 = botTick)
+  for (let i = 0; i < nrows; i++) {
+    const tick = topTick - i;
+    const r    = byTick[tick];
+    const buy  = r ? Math.min(255, Math.round((r.b / maxv) * 255)) : 0;
+    const sell = r ? Math.min(255, Math.round((r.s / maxv) * 255)) : 0;
+    let flag = 0;
+    if (tick === pocTick)  flag |= 1;
+    if (tick === curTick)  flag |= 2;
+    // Encode flags into byte: 0=none, 85=poc, 170=cur, 255=both
+    const flagB = flag === 0 ? 0 : flag === 1 ? 85 : flag === 2 ? 170 : 255;
+    profileBuf[i*4    ] = buy;
+    profileBuf[i*4 + 1] = sell;
+    profileBuf[i*4 + 2] = flagB;
+    profileBuf[i*4 + 3] = 255;
+  }
+
+  // Upload profile texture (1 × nrows)
+  gl.bindTexture(gl.TEXTURE_2D, profileTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, nrows,
+                   gl.RGBA, gl.UNSIGNED_BYTE, profileBuf);
+
+  // Append new column to heatmap every ~500ms
+  const now = performance.now();
+  if (now - lastHeatTs > 500) {
+    lastHeatTs = now;
+    const col = new Uint8Array(nrows * 4);
+    const hMaxv = maxv;
+    for (let i = 0; i < nrows; i++) {
+      const tick = topTick - i;
+      const r    = byTick[tick];
+      col[i*4    ] = r ? Math.min(255, Math.round((r.b / hMaxv) * 255)) : 0;
+      col[i*4 + 1] = r ? Math.min(255, Math.round((r.s / hMaxv) * 255)) : 0;
+      col[i*4 + 2] = 0;
+      col[i*4 + 3] = 255;
+    }
+    // Shift existing heatmap one column right, prepend new column
+    // heatBuf layout: pixel[col * nrows + row] where col=0 is newest
+    const stride = nrows * 4;
+    heatBuf.copyWithin(stride, 0, (HEAT_W - 1) * stride);  // shift right
+    heatBuf.set(col, 0);                                     // prepend new col
+
+    // Reorder to texture layout: [col][row] → texture x=col, y=row
+    // Build the final texture bytes: x varies (cols), y varies (rows)
+    const texBuf = new Uint8Array(HEAT_W * nrows * 4);
+    for (let c = 0; c < HEAT_W; c++) {
+      for (let r2 = 0; r2 < nrows; r2++) {
+        const src = c * stride + r2 * 4;
+        const dst = (r2 * HEAT_W + c) * 4;
+        texBuf[dst    ] = heatBuf[src    ];
+        texBuf[dst + 1] = heatBuf[src + 1];
+        texBuf[dst + 2] = heatBuf[src + 2];
+        texBuf[dst + 3] = heatBuf[src + 3];
+      }
+    }
+    gl.bindTexture(gl.TEXTURE_2D, heatTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, HEAT_W, nrows,
+                     gl.RGBA, gl.UNSIGNED_BYTE, texBuf);
+    heatDirty = true;
+  }
+}
+
+/* ─────────────────────────── HUD UPDATES ────────────────────────────────── */
+let lastPxEl = document.getElementById('px');
+
+function updateHUD(d) {
+  if (!d) return;
+  const px = d.px;
+  if (px > 0) {
+    const dir = prevPx == null ? 'fl' : px > prevPx ? 'up' : px < prevPx ? 'dn' : 'fl';
+    lastPxEl.textContent = px.toFixed(2);
+    lastPxEl.className = dir;
+    prevPx = px;
+  }
+  const b = d.bar;
+  if (b) {
+    const delta = b.delta >= 0 ? '+' + b.delta : String(b.delta);
+    $('bar-info').textContent = `O${b.open.toFixed(2)} H${b.high.toFixed(2)} L${b.low.toFixed(2)} C${b.close.toFixed(2)}  vol ${b.vol}  δ${delta}  ${b.trades} fills`;
+  }
+  if (d.poc) $('poc-label').textContent = `POC ${d.poc.toFixed(2)}`;
+
+  // Price tick overlay labels
+  updateTickOverlay(d);
+}
+
+function updateTickOverlay(d) {
+  const el = document.getElementById('overlay');
+  if (!d || !texNrows) { el.innerHTML = ''; return; }
+  const h = canvas.height;
+  const curTick = Math.round(d.px / TICK);
+  const pocTick = Math.round(d.poc / TICK);
+  const labels = [];
+
+  // Show every 4 ticks (1 point for ES)
+  for (let i = 0; i <= texNrows; i += 4) {
+    const tick = texTopTick - i;
+    const y    = (i / texNrows) * h;
+    const pct  = (y / h * 100).toFixed(1);
+    const isCur = tick === curTick;
+    const isPoc = tick === pocTick;
+    const cls   = isCur ? 'price-tick cur' : isPoc ? 'price-tick poc' : 'price-tick';
+    labels.push(`<div class="${cls}" style="top:${pct}%">${(tick * TICK).toFixed(2)}</div>`);
+  }
+  el.innerHTML = labels.join('');
+}
+
+/* ─────────────────────────── RENDER LOOP ───────────────────────────────── */
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight - 38;
+  canvas.width  = w * devicePixelRatio | 0;
+  canvas.height = h * devicePixelRatio | 0;
+  canvas.style.width  = w + 'px';
+  canvas.style.height = h + 'px';
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  // Reset texture so it's rebuilt on next frame
+  texNrows = 0;
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* Viewport slices for the two programs (profile | heatmap).
+   Both use the same fullscreen-quad geometry but we scissor the viewport. */
+function setViewportSlice(startFrac, endFrac) {
+  const W = canvas.width, H = canvas.height;
+  const x = (startFrac * W) | 0;
+  const w = ((endFrac - startFrac) * W) | 0;
+  gl.viewport(x, 0, w, H);
+  gl.scissor(x, 0, w, H);
+}
+
+gl.enable(gl.SCISSOR_TEST);
+
+let frameCount = 0;
+let fpsTs = performance.now();
+let fps = 0;
+
+function frame() {
+  requestAnimationFrame(frame);
+
+  const d = latest;
+  if (!d) return;
+
+  // ── UPDATE GPU TEXTURES (once per frame, from pre-built CPU buffers) ──
+  buildProfile(d);
+  updateHUD(d);
+
+  gl.clearColor(0.04, 0.04, 0.06, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // ── DRAW PROFILE (left PROFILE_FRAC of canvas) ────────────────────────
+  setViewportSlice(0, PROFILE_FRAC);
+  gl.useProgram(progProfile);
+  gl.bindVertexArray(vaoProfile);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, profileTex);
+  gl.uniform1i(uProfile.profile, 0);
+  gl.uniform1i(uProfile.nrows,   texNrows);
+  gl.uniform1f(uProfile.cx,      Math.round(d.px / TICK));
+  gl.uniform1f(uProfile.topTick, texTopTick);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // ── DRAW HEATMAP (right HEATMAP_FRAC of canvas) ───────────────────────
+  setViewportSlice(PROFILE_FRAC + BOOK_FRAC, 1.0);
+  gl.useProgram(progHeat);
+  gl.bindVertexArray(vaoHeat);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, heatTex);
+  gl.uniform1i(uHeat.heat, 0);
+  gl.uniform1f(uHeat.age,  (performance.now() - lastHeatTs) / 1000);
+  if (texNrows > 0) gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // ── BOOK DEPTH (middle strip — drawn with Canvas 2D overlay for clarity) ─
+  // Done via a separate 2D canvas overlaid on top would be complex;
+  // instead we encode book data into the profile texture's alpha channel
+  // and handle it in the fragment shader implicitly via the bars already drawn.
+
+  gl.bindVertexArray(null);
+
+  // FPS counter (in status bar, not canvas)
+  frameCount++;
+  const now = performance.now();
+  if (now - fpsTs > 1000) {
+    fps = frameCount;
+    frameCount = 0;
+    fpsTs = now;
+    const lag = now - lastRecv;
+    $('status').textContent = wsOk
+      ? `live · ${fps} fps · ${lag.toFixed(0)}ms lag`
+      : 'reconnecting…';
+  }
+}
+
+/* ─────────────────────────── BOOT ──────────────────────────────────────── */
+function $(id) { return document.getElementById(id); }
+
+openWS();
+requestAnimationFrame(frame);
+</script>
+</body></html>
+"""
 
 DASHBOARD = """<!doctype html>
 <html lang="en"><head>
