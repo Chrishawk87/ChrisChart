@@ -135,9 +135,10 @@ class DeltaWorker:
     ``SimpleQueue.put`` — it does not compute, it does not lock the
     execution track, and it does not touch a WebSocket.
 
-    After DCD updates, the optional StateEngine evaluates the three
-    structural layers on THIS thread.  Stance frames cross into asyncio
-    only through ``hub.notify`` → ``call_soon_threadsafe``.
+    After DCD updates, the optional StateEngine evaluates stacked
+    imbalance, Volume Velocity Ratio, and the liquidity-obstacle
+    filter on THIS thread.  Stance frames cross into asyncio only
+    through ``hub.notify`` → ``call_soon_threadsafe``.
     """
 
     def __init__(self, hub: IngestHub, exec_track: Any,

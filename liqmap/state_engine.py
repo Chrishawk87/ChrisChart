@@ -1,4 +1,4 @@
-"""Deterministic State Engine — in-memory stream processor on DeltaWorker.
+"""Deterministic State Engine — positional direction, on DeltaWorker.
 
 Sits on the DeltaWorker thread, immediately after Diagonal Cumulative
 Delta is updated, and nowhere else.  It does not read the visualization
@@ -18,16 +18,20 @@ says it was a reverse, not a flat-to-short entry.
 
 THREE LAYERS, ALL REQUIRED TO ENTER OR REVERSE
 
-    STACKED      3+ consecutive price levels whose |level DCD| exceeds
-                 a rolling standard deviation of recent print sizes.
-                 No hardcoded volume floor.
-    ABSORPTION   |effort| (signed size in a microsecond window) is
-                 anomalous vs the same rolling σ, and price extension
-                 inside that window is at most one tick.
-    LIQUIDITY    distance in points from last price to the largest
-                 resting block on the live MBP-10 book.
+    STACKED      3+ consecutive price levels whose level-DCD shares a
+                 sign.  Raw level counts never fire a stance on their
+                 own — they only nominate a side.
+    VVR          total traded volume inside those stacked nodes over a
+                 rolling 100 ms window, versus 1.5× the median volume
+                 of the last 20 candles.  Below that bar the print is
+                 retail noise and the signal is suppressed.
+    OBSTACLE     Liquidity Obstacle Ratio: aggressive DCD volume over
+                 resting MBP-10 size within 4 points of price.  A BUY
+                 is valid only when (aggressive buying DCD / ask
+                 obstacle) > 1.2.  Failures are Microsecond Absorption
+                 and the stance stays FLAT.
 
-Layer results are packed in a bitfield (STACK=1, ABSORB=2, LIQ=4).
+Layer results are packed in a bitfield (STACK=1, VVR=2, OBST=4).
 A directional vote is the bitfield equalling 7.
 
 HOT PATH RULES
@@ -47,7 +51,6 @@ NOTHING HERE PLACES, SIZES OR TIMES AN ORDER.
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 from array import array
@@ -92,58 +95,70 @@ ACT_NAME = (
 )
 
 L_STACK = 1
-L_ABSORB = 2
-L_LIQ = 4
-L_ALL = 7                     # STACK | ABSORB | LIQ
+L_VVR = 2
+L_OBST = 4
+L_ALL = 7                     # STACK | VVR | OBST
+
+# Structural gates.  Not σ.
+VVR_US = 100_000              # 100 ms stacked-node window
+VVR_MULT = 1.5                # vs median of last 20 candles
+CANDLE_N = 20
+BAR_S = 1.0                   # self-rolled candle length
+OBSTACLE_PTS = 4.0            # MBP-10 radius around last price
+OBSTACLE_RATIO = 1.2          # aggressive DCD / resting obstacle
+
+STATUS_DRIVE = "Positional Drive"
+STATUS_NOISE = "Micro Noise"
+STATUS_ABSORB = "Microsecond Absorption"
 
 
 # --------------------------------------------------------------------------
-# Rolling σ  — ring of doubles, running sum / sumsq, no list growth
+# Median ring — last N candle volumes, no list growth
 # --------------------------------------------------------------------------
 
-class RollingSigma:
-    """Population std of the last `cap` samples.  Fixed ring."""
+class MedianRing:
+    """Fixed ring of candle volumes.  Median via insertion-sort of a copy."""
 
-    __slots__ = ("cap", "buf", "i", "n", "total", "total_sq")
+    __slots__ = ("cap", "buf", "i", "n", "_sort")
 
-    def __init__(self, cap: int = 64) -> None:
+    def __init__(self, cap: int = CANDLE_N) -> None:
         self.cap = int(cap)
         self.buf = array("d", [0.0] * self.cap)
+        self._sort = array("d", [0.0] * self.cap)
         self.i = 0
         self.n = 0
-        self.total = 0.0
-        self.total_sq = 0.0
 
-    def push(self, x: float) -> float:
-        """Fold one sample.  Returns the current σ (0.0 until 2 samples)."""
-        cap = self.cap
-        if self.n == cap:
-            old = self.buf[self.i]
-            self.total -= old
-            self.total_sq -= old * old
-        else:
-            self.n += 1
+    def push(self, x: float) -> None:
         self.buf[self.i] = x
-        self.i = (self.i + 1) % cap
-        self.total += x
-        self.total_sq += x * x
-        return self.sigma()
+        self.i = (self.i + 1) % self.cap
+        if self.n < self.cap:
+            self.n += 1
 
-    def sigma(self) -> float:
+    def median(self) -> float:
         n = self.n
-        if n < 2:
+        if n == 0:
             return 0.0
-        mean = self.total / n
-        var = self.total_sq / n - mean * mean
-        return math.sqrt(var) if var > 0.0 else 0.0
+        buf = self.buf
+        out = self._sort
+        for k in range(n):
+            out[k] = buf[k]
+        for k in range(1, n):
+            v = out[k]
+            j = k
+            while j > 0 and out[j - 1] > v:
+                out[j] = out[j - 1]
+                j -= 1
+            out[j] = v
+        mid = n // 2
+        if n & 1:
+            return out[mid]
+        return 0.5 * (out[mid - 1] + out[mid])
 
     def reset(self) -> None:
         for k in range(self.cap):
             self.buf[k] = 0.0
         self.i = 0
         self.n = 0
-        self.total = 0.0
-        self.total_sq = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -253,7 +268,7 @@ class LevelMap:
 
 
 # --------------------------------------------------------------------------
-# Print ring — absorption window
+# Print ring — 100 ms stacked-node volume
 # --------------------------------------------------------------------------
 
 class PrintRing:
@@ -307,6 +322,27 @@ class PrintRing:
             idx = (idx - 1) % cap
         return effort, lo, hi, count
 
+    def volume_in(self, now_us: int, span_us: int,
+                  lo_tick: int, hi_tick: int, tick_size: float) -> float:
+        """Unsigned volume at stacked-node ticks over the rolling window."""
+        if self.n == 0 or lo_tick > hi_tick or tick_size <= 0.0:
+            return 0.0
+        cutoff = now_us - span_us
+        cap = self.cap
+        idx = (self.i - 1) % cap
+        total = 0.0
+        inv = 1.0 / tick_size
+        for _ in range(self.n):
+            t = self.ts[idx]
+            if t < cutoff:
+                break
+            tick = int(round(self.px[idx] * inv))
+            if lo_tick <= tick <= hi_tick:
+                s = self.sz[idx]
+                total += s if s >= 0.0 else -s
+            idx = (idx - 1) % cap
+        return total
+
     def reset(self) -> None:
         self.i = 0
         self.n = 0
@@ -322,8 +358,10 @@ class Transition:
     __slots__ = (
         "ts_ms", "frm", "to", "action",
         "px", "tgt_px", "tgt_side", "tgt_sz", "tgt_dist",
-        "stack_run", "stack_side", "dcd", "sigma",
-        "effort", "extension", "layers", "seq",
+        "stack_run", "stack_side", "dcd",
+        "vvr_vol", "median_vol", "vvr",
+        "obstacle_sz", "pos_weight", "status",
+        "layers", "seq",
     )
 
     def __init__(self) -> None:
@@ -339,9 +377,12 @@ class Transition:
         self.stack_run = 0
         self.stack_side = 0
         self.dcd = 0.0
-        self.sigma = 0.0
-        self.effort = 0.0
-        self.extension = 0.0
+        self.vvr_vol = 0.0
+        self.median_vol = 0.0
+        self.vvr = 0.0
+        self.obstacle_sz = 0.0
+        self.pos_weight = 0.0
+        self.status = STATUS_DRIVE
         self.layers = 0
         self.seq = 0
 
@@ -362,9 +403,12 @@ class Transition:
         dest["stack_side"] = ("buy" if self.stack_side > 0
                               else "sell" if self.stack_side < 0 else "")
         dest["dcd"] = self.dcd
-        dest["sigma"] = self.sigma
-        dest["effort"] = self.effort
-        dest["extension"] = self.extension
+        dest["vvr_vol"] = self.vvr_vol
+        dest["median_vol"] = self.median_vol
+        dest["vvr"] = self.vvr
+        dest["obstacle_sz"] = self.obstacle_sz
+        dest["pos_weight"] = self.pos_weight
+        dest["status"] = self.status
         dest["layers"] = self.layers
         dest["seq"] = self.seq
         return dest
@@ -382,10 +426,11 @@ _CLR = (
 )
 _RESET = b"\x1b[0m"
 _CYAN = b"\x1b[36m"
+_ARROW = b"\xe2\x96\xb6"  # ▶
 
 
 class AnsiRouter:
-    """Colour-coded line on stdout.  One reused bytearray."""
+    """Colour-coded positional line on stdout.  One reused bytearray."""
 
     __slots__ = ("enabled", "_buf", "_write")
 
@@ -400,31 +445,20 @@ class AnsiRouter:
     def emit(self, tr: Transition) -> None:
         if not self.enabled:
             return
-        # Build in a small local tuple of bytes pieces, then one join
-        # into the reused buffer.  The join allocates one bytes object
-        # per transition — acceptable, because this path is rare.
-        frm = STANCE_NAME[tr.frm].encode("ascii")
+        # One bytes join per validated transition — this path is rare.
         to = STANCE_NAME[tr.to].encode("ascii")
-        act = ACT_NAME[tr.action].encode("ascii")
-        side = b"ASK" if tr.tgt_side < 0 else (b"BID" if tr.tgt_side > 0 else b"-")
+        status = tr.status.encode("ascii")
+        pw = ("inf" if tr.pos_weight == float("inf")
+              else format(tr.pos_weight, ".2f"))
         line = (
-            b"[" + str(tr.ts_ms).encode("ascii") + b"ms] "
-            + _CLR[tr.frm] + frm + _RESET
-            + b"\xe2\x86\x92"                       # →
+            b"[" + str(tr.ts_ms).encode("ascii") + b"] "
+            + _ARROW + b" "
             + _CLR[tr.to] + to + _RESET
-            + b" " + _CYAN + act + _RESET
-            + b" px=" + format(tr.px, ".2f").encode("ascii")
-            + b" tgt=" + format(tr.tgt_px, ".2f").encode("ascii")
-            + b" " + side
-            + b" x" + format(tr.tgt_sz, ".0f").encode("ascii")
-            + b" \xce\x94=" + format(tr.tgt_dist, ".2f").encode("ascii")
-            + b" | stack=" + str(tr.stack_run).encode("ascii")
-            + b" \xcf\x83=" + format(tr.sigma, ".3f").encode("ascii")
-            + b" dcd=" + format(tr.dcd, "+.1f").encode("ascii")
-            + b" | absorb effort=" + format(tr.effort, "+.1f").encode("ascii")
-            + b" result=" + format(tr.extension, ".2f").encode("ascii")
-            + b" | layers=" + format(tr.layers, "#05b").encode("ascii")
-            + b" seq=" + str(tr.seq).encode("ascii")
+            + b" at " + format(tr.px, ".2f").encode("ascii")
+            + b" | " + _CYAN + b"POS_WEIGHT: " + _RESET
+            + pw.encode("ascii")
+            + b" | TARGET: " + format(tr.tgt_px, ".2f").encode("ascii")
+            + b" | STATUS: " + status
             + b"\n"
         )
         try:
@@ -449,17 +483,24 @@ class StateEngine:
     """
 
     __slots__ = (
-        "tick_size", "z", "window_us", "min_run",
+        "tick_size", "min_run",
+        "vvr_us", "vvr_mult", "bar_s",
+        "obstacle_pts", "obstacle_ratio",
         "stance", "seq", "transitions",
-        "_sigma", "_levels", "_prints",
+        "_candles", "_levels", "_prints",
         "_sort_k", "_sort_v",
         "_bid_px", "_bid_sz", "_ask_px", "_ask_sz",
         "_n_bid", "_n_ask",
         "_stack_run", "_stack_side", "_stack_lo", "_stack_hi",
         "_stack_run_long", "_stack_run_short",
-        "_effort", "_extension", "_absorb_side",
+        "_stack_lo_long", "_stack_hi_long",
+        "_stack_lo_short", "_stack_hi_short",
+        "_vvr_vol", "_vvr_vol_long", "_vvr_vol_short",
+        "_median_vol", "_vvr",
+        "_obstacle_sz", "_pos_weight", "_status",
         "_tgt_px", "_tgt_sz", "_tgt_side", "_tgt_dist",
-        "_sigma_now", "_dcd_now",
+        "_dcd_now",
+        "_bar_vol", "_bar_open_ts",
         "_last", "_frame",
         "router",
     )
@@ -467,26 +508,31 @@ class StateEngine:
     def __init__(
         self,
         tick_size: float = 0.25,
-        z: float = 1.0,
-        window_us: int = 250_000,
         min_run: int = 3,
-        ring: int = 64,
+        vvr_us: int = VVR_US,
+        vvr_mult: float = VVR_MULT,
+        candle_n: int = CANDLE_N,
+        bar_s: float = BAR_S,
+        obstacle_pts: float = OBSTACLE_PTS,
+        obstacle_ratio: float = OBSTACLE_RATIO,
         router: AnsiRouter | None = None,
+        **_ignored: Any,
     ) -> None:
         if tick_size <= 0:
             raise ValueError("tick_size must be positive")
-        if z <= 0:
-            raise ValueError("z must be positive")
         self.tick_size = float(tick_size)
-        self.z = float(z)
-        self.window_us = int(window_us)
         self.min_run = int(min_run)
+        self.vvr_us = int(vvr_us)
+        self.vvr_mult = float(vvr_mult)
+        self.bar_s = float(bar_s)
+        self.obstacle_pts = float(obstacle_pts)
+        self.obstacle_ratio = float(obstacle_ratio)
 
         self.stance = FLAT
         self.seq = 0
         self.transitions = 0
 
-        self._sigma = RollingSigma(ring)
+        self._candles = MedianRing(candle_n)
         self._levels = LevelMap(128)
         self._prints = PrintRing(256)
         self._sort_k = array("q", [0] * 128)
@@ -505,27 +551,48 @@ class StateEngine:
         self._stack_hi = 0
         self._stack_run_long = 0
         self._stack_run_short = 0
-        self._effort = 0.0
-        self._extension = 0.0
-        self._absorb_side = 0
+        self._stack_lo_long = 0
+        self._stack_hi_long = 0
+        self._stack_lo_short = 0
+        self._stack_hi_short = 0
+        self._vvr_vol = 0.0
+        self._vvr_vol_long = 0.0
+        self._vvr_vol_short = 0.0
+        self._median_vol = 0.0
+        self._vvr = 0.0
+        self._obstacle_sz = 0.0
+        self._pos_weight = 0.0
+        self._status = STATUS_NOISE
         self._tgt_px = 0.0
         self._tgt_sz = 0.0
         self._tgt_side = 0
         self._tgt_dist = 0.0
-        self._sigma_now = 0.0
         self._dcd_now = 0.0
+        self._bar_vol = 0.0
+        self._bar_open_ts = 0.0
 
         self._last = Transition()
         self._frame: dict = {
             "kind": "stance", "ts_ms": 0, "from": "FLAT", "to": "FLAT",
             "action": "NONE", "px": 0.0, "tgt_px": 0.0, "tgt_side": "",
             "tgt_sz": 0.0, "tgt_dist": 0.0, "stack_run": 0, "stack_side": "",
-            "dcd": 0.0, "sigma": 0.0, "effort": 0.0, "extension": 0.0,
+            "dcd": 0.0, "vvr_vol": 0.0, "median_vol": 0.0, "vvr": 0.0,
+            "obstacle_sz": 0.0, "pos_weight": 0.0, "status": STATUS_DRIVE,
             "layers": 0, "seq": 0,
         }
         self.router = router if router is not None else AnsiRouter()
 
     # -------------------------------------------------------------- feed
+
+    def observe_candle(self, vol: float) -> None:
+        """Push one completed candle volume into the median ring."""
+        if vol > 0.0:
+            self._candles.push(float(vol))
+
+    def seed_candles(self, vol: float = 20.0, n: int = CANDLE_N) -> None:
+        """Fill the median ring with `n` candles of `vol` (tests / warmup)."""
+        for _ in range(int(n)):
+            self.observe_candle(vol)
 
     def on_tick(self, trade: Any, dcd: float = 0.0,
                 book: Any = None) -> bool:
@@ -545,34 +612,42 @@ class StateEngine:
         tick = int(round(px / self.tick_size))
 
         self._dcd_now = float(dcd)
-        self._sigma_now = self._sigma.push(abs(signed))
+        self._roll_bar(ts, sz)
         self._levels.add(tick, signed)
         self._prints.push(ts_us, px, signed)
         if book is not None:
             self._capture_book(book)
 
-        thresh = self._sigma_now * self.z
-
         long_bits = 0
         short_bits = 0
+        self._status = STATUS_NOISE
 
-        if self._eval_stack(thresh):
+        if self._eval_stack():
             if self._stack_run_long >= self.min_run:
                 long_bits |= L_STACK
             if self._stack_run_short >= self.min_run:
                 short_bits |= L_STACK
 
-        if self._eval_absorb(ts_us, thresh):
-            if self._absorb_side > 0:
-                long_bits |= L_ABSORB
-            elif self._absorb_side < 0:
-                short_bits |= L_ABSORB
+        self._eval_liq(px)
 
-        if self._eval_liq(px):
-            if self._tgt_side < 0:          # ask block above → long target
-                long_bits |= L_LIQ
-            elif self._tgt_side > 0:        # bid block below → short target
-                short_bits |= L_LIQ
+        if long_bits & L_STACK:
+            if self._eval_vvr(ts_us, +1):
+                long_bits |= L_VVR
+                if self._eval_obstacle(px, +1, self._vvr_vol_long):
+                    long_bits |= L_OBST
+                else:
+                    self._status = STATUS_ABSORB
+            else:
+                self._status = STATUS_NOISE
+        if short_bits & L_STACK:
+            if self._eval_vvr(ts_us, -1):
+                short_bits |= L_VVR
+                if self._eval_obstacle(px, -1, self._vvr_vol_short):
+                    short_bits |= L_OBST
+                else:
+                    self._status = STATUS_ABSORB
+            else:
+                self._status = STATUS_NOISE
 
         vote = FLAT
         vote_bits = 0
@@ -583,9 +658,8 @@ class StateEngine:
             vote = SHORT
             vote_bits = short_bits
 
-        # Exit: stacked + absorb oppose the current stance (liquidity
-        # may still be the old target).  Reverse takes precedence when
-        # the opposite side has all three.
+        # Exit: stacked + VVR oppose the current stance but the opposite
+        # obstacle failed (absorption) so this is not a reverse.
         action = ACT_NONE
         new_stance = self.stance
         if vote == LONG and self.stance != LONG:
@@ -600,11 +674,13 @@ class StateEngine:
             else:
                 action = ACT_ENTER_SHORT
             new_stance = SHORT
-        elif self.stance == LONG and (short_bits & (L_STACK | L_ABSORB)) == (L_STACK | L_ABSORB):
+        elif (self.stance == LONG
+              and (short_bits & (L_STACK | L_VVR)) == (L_STACK | L_VVR)):
             action = ACT_EXIT_LONG
             new_stance = FLAT
             vote_bits = short_bits
-        elif self.stance == SHORT and (long_bits & (L_STACK | L_ABSORB)) == (L_STACK | L_ABSORB):
+        elif (self.stance == SHORT
+              and (long_bits & (L_STACK | L_VVR)) == (L_STACK | L_VVR)):
             action = ACT_EXIT_SHORT
             new_stance = FLAT
             vote_bits = long_bits
@@ -614,6 +690,7 @@ class StateEngine:
 
         self.seq += 1
         self.transitions += 1
+        self._status = STATUS_DRIVE
         tr = self._last
         tr.ts_ms = ts_us // 1000
         tr.frm = self.stance
@@ -627,9 +704,12 @@ class StateEngine:
         tr.stack_run = self._stack_run
         tr.stack_side = self._stack_side
         tr.dcd = self._dcd_now
-        tr.sigma = self._sigma_now
-        tr.effort = self._effort
-        tr.extension = self._extension
+        tr.vvr_vol = self._vvr_vol
+        tr.median_vol = self._median_vol
+        tr.vvr = self._vvr
+        tr.obstacle_sz = self._obstacle_sz
+        tr.pos_weight = self._pos_weight
+        tr.status = self._status
         tr.layers = vote_bits
         tr.seq = self.seq
         self.stance = new_stance
@@ -642,17 +722,27 @@ class StateEngine:
 
     # -------------------------------------------------------------- layers
 
-    def _eval_stack(self, thresh: float) -> bool:
+    def _roll_bar(self, ts: float, sz: float) -> None:
+        """Self-roll 1 s candles from print volume into the median ring."""
+        if self._bar_open_ts <= 0.0:
+            self._bar_open_ts = ts
+            self._bar_vol = sz
+            return
+        if ts - self._bar_open_ts >= self.bar_s:
+            self.observe_candle(self._bar_vol)
+            self._bar_open_ts = ts
+            self._bar_vol = sz
+        else:
+            self._bar_vol += sz
+
+    def _eval_stack(self) -> bool:
         n = self._levels.pack_sorted(self._sort_k, self._sort_v)
         long_run = short_run = 0
         long_lo = long_hi = short_lo = short_hi = 0
         i = 0
-        # A brand-new σ is 0 — refuse to flag on a zero threshold, or
-        # every first print would be a stack of one.
-        gate = thresh
         while i < n:
             v = self._sort_v[i]
-            if gate <= 0.0 or abs(v) <= gate:
+            if v == 0.0:
                 i += 1
                 continue
             sign = 1 if v > 0.0 else -1
@@ -660,7 +750,7 @@ class StateEngine:
             while j < n and self._sort_k[j] == self._sort_k[j - 1] + 1:
                 w = self._sort_v[j]
                 wsign = 1 if w > 0.0 else -1
-                if wsign != sign or abs(w) <= gate:
+                if w == 0.0 or wsign != sign:
                     break
                 j += 1
             run = j - i
@@ -675,6 +765,10 @@ class StateEngine:
             i = j
         self._stack_run_long = long_run
         self._stack_run_short = short_run
+        self._stack_lo_long = long_lo
+        self._stack_hi_long = long_hi
+        self._stack_lo_short = short_lo
+        self._stack_hi_short = short_hi
         if long_run >= short_run:
             self._stack_run = long_run
             self._stack_side = 1 if long_run >= self.min_run else 0
@@ -687,24 +781,59 @@ class StateEngine:
             self._stack_hi = short_hi
         return long_run >= self.min_run or short_run >= self.min_run
 
-    def _eval_absorb(self, now_us: int, thresh: float) -> bool:
-        effort, lo, hi, count = self._prints.window(now_us, self.window_us)
-        self._effort = effort
-        self._extension = (hi - lo) if count else 0.0
-        self._absorb_side = 0
-        if count < 3:
+    def _eval_vvr(self, now_us: int, side: int) -> bool:
+        """Stacked-node volume over 100 ms vs 1.5× 20-candle median."""
+        if side > 0:
+            lo, hi = self._stack_lo_long, self._stack_hi_long
+        else:
+            lo, hi = self._stack_lo_short, self._stack_hi_short
+        vol = self._prints.volume_in(
+            now_us, self.vvr_us, lo, hi, self.tick_size)
+        med = self._candles.median()
+        if side > 0:
+            self._vvr_vol_long = vol
+        else:
+            self._vvr_vol_short = vol
+        self._vvr_vol = vol
+        self._median_vol = med
+        if med <= 0.0:
+            self._vvr = 0.0
             return False
-        # Anomalous effort: |sum| exceeds z·σ·√n  (√n scales the print σ
-        # up to a window sum without a second hardcoded volume).
-        bar = thresh * math.sqrt(count)
-        if bar <= 0.0 or abs(effort) <= bar:
+        self._vvr = vol / med
+        return vol >= self.vvr_mult * med
+
+    def _sum_obstacle(self, px: float, side: int) -> float:
+        """Resting size within `obstacle_pts` of `px` on the opposing book."""
+        total = 0.0
+        radius = self.obstacle_pts
+        if side > 0:
+            for i in range(self._n_ask):
+                if abs(self._ask_px[i] - px) <= radius:
+                    total += self._ask_sz[i]
+        else:
+            for i in range(self._n_bid):
+                if abs(self._bid_px[i] - px) <= radius:
+                    total += self._bid_sz[i]
+        return total
+
+    def _eval_obstacle(self, px: float, side: int,
+                       aggressive: float) -> bool:
+        """True when aggressive DCD volume overwhelms nearby resting size."""
+        if self._n_bid == 0 and self._n_ask == 0:
+            self._obstacle_sz = 0.0
+            self._pos_weight = 0.0
             return False
-        if self._extension > self.tick_size:
+        obst = self._sum_obstacle(px, side)
+        self._obstacle_sz = obst
+        if obst <= 0.0:
+            # Book is live but no wall sits inside the radius.
+            self._pos_weight = float("inf")
+            return True
+        if aggressive <= 0.0:
+            self._pos_weight = 0.0
             return False
-        # Negative effort (sellers hitting) + no down-move → bids absorbed
-        # → LONG.  Positive effort + no up-move → asks absorbed → SHORT.
-        self._absorb_side = 1 if effort < 0.0 else -1
-        return True
+        self._pos_weight = aggressive / obst
+        return self._pos_weight > self.obstacle_ratio
 
     def _eval_liq(self, px: float) -> bool:
         best_sz = 0.0
@@ -758,7 +887,7 @@ class StateEngine:
         self.stance = FLAT
         self.seq = 0
         self.transitions = 0
-        self._sigma.reset()
+        self._candles.reset()
         self._levels.reset()
         self._prints.reset()
         self._n_bid = 0
@@ -767,6 +896,12 @@ class StateEngine:
         self._stack_side = 0
         self._stack_run_long = 0
         self._stack_run_short = 0
-        self._absorb_side = 0
+        self._vvr_vol = 0.0
+        self._median_vol = 0.0
+        self._obstacle_sz = 0.0
+        self._pos_weight = 0.0
+        self._status = STATUS_NOISE
         self._tgt_side = 0
         self._tgt_sz = 0.0
+        self._bar_vol = 0.0
+        self._bar_open_ts = 0.0
