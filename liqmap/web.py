@@ -189,6 +189,7 @@ class Runtime:
         # event loop starts.
         from .execution import ExecutionTrack as _ExecTrack
         from .pipeline import IngestHub as _IngestHub, DeltaWorker as _DeltaWorker
+        from .state_engine import StateEngine as _StateEngine
         self.exec_track = _ExecTrack()
         self.signal_broadcaster = SignalBroadcaster()
         # Unified micro-delta hub + DCD worker. Ingest (Tape.offer) only
@@ -196,7 +197,13 @@ class Runtime:
         # WebSocket fan-out happen on the worker, never on the UI thread
         # and never inside a 16ms poll loop.
         self.ingest_hub = _IngestHub()
-        self.delta_worker = _DeltaWorker(self.ingest_hub, self.exec_track)
+        # Deterministic state engine sits on the worker thread.  It
+        # reads tape.book (atomically rebound) and never takes a lock.
+        self.state_engine = _StateEngine()
+        self.delta_worker = _DeltaWorker(
+            self.ingest_hub, self.exec_track,
+            engine=self.state_engine,
+            tape=self.ofi.tape if self.ofi is not None else None)
         self.autopilot: dict[str, Any] = {
             "on": False, "coin": None, "interval": "15m", "mode": "scalp",
             "notional": 10_000.0, "fee_bps": 0.0,

@@ -51,6 +51,7 @@ class IngestHub:
         book    MBP-10 snapshot (same payload as /ws/book)
         ofi     latest OFI reading
         signal  execution Signal
+        stance  StateEngine transition (FLAT/LONG/SHORT)
         snap    full flow snapshot (connect only)
     """
 
@@ -133,11 +134,18 @@ class DeltaWorker:
     ``push_trade`` is the only method the ingest thread calls. It is a
     ``SimpleQueue.put`` — it does not compute, it does not lock the
     execution track, and it does not touch a WebSocket.
+
+    After DCD updates, the optional StateEngine evaluates the three
+    structural layers on THIS thread.  Stance frames cross into asyncio
+    only through ``hub.notify`` → ``call_soon_threadsafe``.
     """
 
-    def __init__(self, hub: IngestHub, exec_track: Any) -> None:
+    def __init__(self, hub: IngestHub, exec_track: Any,
+                 engine: Any = None, tape: Any = None) -> None:
         self.hub = hub
         self.exec_track = exec_track
+        self.engine = engine
+        self.tape = tape
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -179,6 +187,16 @@ class DeltaWorker:
             try:
                 self.exec_track.on_trade(trade)
                 self.processed += 1
+                eng = self.engine
+                if eng is not None:
+                    dcd_acc = getattr(self.exec_track, "_dcd", None)
+                    dcd = float(dcd_acc.diagonal) if dcd_acc is not None else 0.0
+                    book = getattr(self.tape, "book", None) if self.tape is not None else None
+                    fired = eng.on_tick(trade, dcd=dcd, book=book)
+                    if fired and self.hub.connections:
+                        # Reused dict; call_soon_threadsafe is the only
+                        # crossing from this thread into the event loop.
+                        self.hub.notify(eng.frame())
                 if self.hub.connections:
                     self.hub.notify(tick_frame(trade, self.exec_track))
             except Exception:                           # noqa: BLE001
