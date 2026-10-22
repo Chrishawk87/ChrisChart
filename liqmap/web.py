@@ -9474,8 +9474,8 @@ function mgChart(d, w, h) {
 
   let lo = Infinity, hi = -Infinity;
   for (const p of pts) {
-    lo = Math.min(lo, p.book, p.tape);
-    hi = Math.max(hi, p.book, p.tape);
+    lo = Math.min(lo, p.book, p.tape, p.bar || 0);
+    hi = Math.max(hi, p.book, p.tape, p.bar || 0);
   }
   const gate = d.enter || 0.4;
   lo = Math.min(lo, -gate); hi = Math.max(hi, gate);
@@ -9514,11 +9514,17 @@ function mgChart(d, w, h) {
   // relying on colour, so they must not overprint each other when the
   // lines converge -- which is exactly when a cross is about to
   // happen and the labels matter most.
-  let yB = Y(last.book), yT = Y(last.tape);
+  let yB = Y(last.book), yT = Y(last.tape), yR = Y(last.bar || 0);
   if (Math.abs(yB - yT) < 12) {
     const mid = (yB + yT) / 2;
     yB = mid + (yB <= yT ? -6 : 6);
     yT = mid + (yB <= yT ? 6 : -6);
+  }
+  // keep the third label off the other two as well
+  let guard = 0;
+  while (guard++ < 4 &&
+         (Math.abs(yR - yB) < 11 || Math.abs(yR - yT) < 11)) {
+    yR += (yR >= (yB + yT) / 2) ? 11 : -11;
   }
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"
       preserveAspectRatio="none" role="img"
@@ -9528,17 +9534,24 @@ function mgChart(d, w, h) {
       stroke-width="2" stroke-linejoin="round"></path>
     <path d="${line('tape')}" fill="none" stroke="var(--ink)"
       stroke-width="2" stroke-dasharray="6 3" stroke-linejoin="round"></path>
+    <path d="${line('bar')}" fill="none" stroke="var(--dim)"
+      stroke-width="2" stroke-dasharray="1 3" stroke-linecap="round"
+      stroke-linejoin="round"></path>
     ${marks}
     <text x="${padL + iw + 5}" y="${(yB + 4).toFixed(1)}"
       fill="var(--accent)" font-size="11">${last.book.toFixed(2)}</text>
     <text x="${padL + iw + 5}" y="${(yT + 4).toFixed(1)}"
       fill="var(--ink)" font-size="11">${last.tape.toFixed(2)}</text>
+    <text x="${padL + iw + 5}" y="${(yR + 4).toFixed(1)}"
+      fill="var(--dim)" font-size="11">${(last.bar || 0).toFixed(2)}</text>
   </svg>
   <div class="stamp" style="margin-top:4px">
     <span style="color:var(--accent)">&#9472;&#9472;</span> book CVD
     (the reader) &nbsp;
     <span style="color:var(--ink)">&#9476;&#9476;</span> traded CVD,
     smoothed ${d.tau_s}s (the confirmation) &nbsp;
+    <span style="color:var(--dim)">&#8943;</span> book CVD this bar
+    (${d.bars ? d.bars.seconds : '--'}s) &nbsp;
     <span style="color:var(--ink)">&#9679;</span> confirmed cross &nbsp;
     <span style="color:var(--dim)">&#9711;</span> unconfirmed &nbsp;
     &middot; ${pts.length} pts over ${span.toFixed(0)}s
@@ -9672,6 +9685,39 @@ function mgRow(d) {
 
    `enough` gates the verdict at twenty stretches a side. Under that
    the medians are printed but the difference is not called. */
+/* Can the readings call the bar before it closes?
+
+   Always shown against the BASE RATE. In a stretch where 56% of bars
+   close green, a caller scoring 56% has found nothing, and printing
+   "56% correct" on its own would read as though it had. `edge` is the
+   rate minus the better of always-up and always-down, so zero means
+   no better than the dumbest possible rule.
+
+   Split by how far into the bar the call was made, because a call at
+   80% already knows most of the bar. The 20% column is the one that
+   would be worth money. */
+function mgCallRow(cb) {
+  if (!cb || !cb.bars_settled) return '';
+  const cell = d => {
+    if (d.rate === null) return '<span class="stamp">--</span>';
+    const sig = d.enough && d.edge > 0;
+    return `<span class="${sig ? 'long' : ''}">${(d.rate * 100).toFixed(0)}%
+      <span class="stamp">(${d.edge >= 0 ? '+' : ''}${(d.edge * 100).toFixed(0)}
+      edge, n ${d.n}${d.enough ? '' : ', thin'})</span></span>`;
+  };
+  const line = (name, per) => `<span class="stamp">${name}</span>` +
+    cb.checkpoints.map(cp => `<span class="stamp">@${(cp * 100).toFixed(0)}%</span>`
+      + cell(per[String(cp)])).join(' ');
+  return `
+    <span class="stamp" style="width:100%">calling the
+      ${cb.bar_s}s bar before it closes &mdash; ${cb.bars_settled} bars
+      settled &middot; base rate ${(cb.base_up * 100).toFixed(0)}% up,
+      so always-one-way scores ${(cb.naive_rate * 100).toFixed(0)}%
+      &middot; edge is measured against that</span>
+    <span style="width:100%">${line('regime', cb.callers.regime)}</span>
+    <span style="width:100%">${line('bar CVD', cb.callers.bar_z)}</span>`;
+}
+
 function mgRegimeRow(rb) {
   if (!rb || !rb.episodes) return '';
   const row = (label, d) => `<span class="stamp">${label}
@@ -9879,6 +9925,7 @@ let mgLast = 0;
 let mgTick = 0;
 let mgBoard = null;
 let mgRegime = null;
+let mgCalls = null;
 const MG_CAP = 600;
 
 async function mgLoad() {
@@ -9906,6 +9953,7 @@ async function mgLoad() {
   }
   if (d.scoreboard) mgBoard = d.scoreboard;
   if (d.regime_board) mgRegime = d.regime_board;
+  if (d.call_board) mgCalls = d.call_board;
   if (d.continuous === false) { mgPts = []; }     // a hole: start clean
   const fresh = d.points || [];
   if (fresh.length) {
@@ -9915,7 +9963,7 @@ async function mgLoad() {
   }
   const view = {now: d.now, points: mgPts, crosses: d.crosses,
                 enter: d.enter, tau_s: d.tau_s, sample_s: d.sample_s,
-                tf: d.tf};
+                bars: d.bars};
   const w = Math.max(360, ($('mgChart').clientWidth || 900));
   $('mgStamp').textContent = mgPts.length
     ? mgPts.length + ' pts · ' + d.sample_s + 's sampling · '
@@ -9932,7 +9980,7 @@ async function mgLoad() {
                !!($('mgLine') && $('mgLine').checked))
       : '';
   }
-  $('mgCross').innerHTML = mgRegimeRow(mgRegime)
+  $('mgCross').innerHTML = mgCallRow(mgCalls) + mgRegimeRow(mgRegime)
     + mgCrossRow(view) + mgBoardRow(mgBoard);
 }
 

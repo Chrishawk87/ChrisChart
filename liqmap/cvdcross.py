@@ -298,6 +298,7 @@ class Point:
     ts: float
     book: float
     tape: float
+    bar: float
     px: float
 
 
@@ -348,14 +349,16 @@ class BookCVDBars:
     """
 
     __slots__ = ("seconds", "keep", "_open_ts", "cur", "hi", "lo",
-                 "bars", "closed")
+                 "bars", "closed", "_stats")
 
-    def __init__(self, seconds: float = 300.0, keep: int = 180) -> None:
+    def __init__(self, seconds: float = 300.0, keep: int = 180,
+                 window: int = 40) -> None:
         if seconds <= 0:
             raise ValueError("bar length must be positive")
         self.seconds = float(seconds)
         self.keep = int(keep)
         self.closed: deque = deque(maxlen=self.keep)
+        self._stats = RollingStats(max(2, int(window)))
         self.reset()
 
     def reset(self) -> None:
@@ -363,6 +366,7 @@ class BookCVDBars:
         self.cur = self.hi = self.lo = 0.0
         self.bars = 0
         self.closed.clear()
+        self._stats.reset()
 
     def _bar_open(self, ts: float) -> float:
         return ts - (ts % self.seconds)
@@ -383,6 +387,7 @@ class BookCVDBars:
                             "h": round(self.hi, 1),
                             "l": round(self.lo, 1),
                             "c": round(self.cur, 1)})
+        self._stats.add(self.cur)
         self.bars += 1
         self.cur = self.hi = self.lo = 0.0
         self._open_ts = o
@@ -397,6 +402,20 @@ class BookCVDBars:
             if self.cur < self.lo:
                 self.lo = self.cur
         return rolled
+
+    @property
+    def z(self) -> float:
+        """The running value against how closed bars of this size behave.
+
+        This is what lets the per-bar line sit on the same axis as the
+        two session-cumulative ones: raw, a bar's delta and a day's
+        delta are nowhere near each other, and a second y-axis would
+        be a lie that makes any two shapes look related.
+
+        Zero until a few bars have closed, so a first bar cannot read
+        as extreme merely for being first.
+        """
+        return self._stats.z(self.cur) if self._stats.n >= 3 else 0.0
 
     def elapsed(self, ts: float) -> float:
         if self._open_ts <= 0.0:
@@ -498,6 +517,50 @@ class Episode:
 
 
 @dataclass(slots=True)
+class BarCall:
+    """A call on the bar still forming, and what the bar actually did.
+
+    Made PART WAY THROUGH the bar, from readings that existed at that
+    moment, and settled against the bar's own close. That ordering is
+    the whole point: it is trivially easy to "predict" a bar using
+    numbers that already contain its outcome, and the result looks
+    excellent and means nothing.
+
+    `at_pct` is how far into the bar the call was made. A call at 80%
+    of a bar knows most of it already and should be expected to score
+    well -- which is exactly why the early checkpoints are the ones
+    worth reading.
+    """
+
+    bar_ts: float
+    bar_s: float
+    at_pct: float
+    caller: str                 # which reading made the call
+    call: str                   # "up" | "down"
+    open_px: float
+    book_z: float = 0.0
+    tape_z: float = 0.0
+    bar_z: float = 0.0
+    regime: str = "none"
+    close_px: float = 0.0
+    move_ticks: float = 0.0
+    settled: bool = False
+    correct: bool = False
+
+    def as_dict(self) -> dict:
+        return {"bar_ts": self.bar_ts, "bar_s": self.bar_s,
+                "at_pct": round(self.at_pct, 2), "caller": self.caller,
+                "call": self.call, "open_px": round(self.open_px, 4),
+                "close_px": round(self.close_px, 4),
+                "move_ticks": round(self.move_ticks, 2),
+                "book_z": round(self.book_z, 3),
+                "tape_z": round(self.tape_z, 3),
+                "bar_z": round(self.bar_z, 3),
+                "regime": self.regime, "settled": self.settled,
+                "correct": self.correct}
+
+
+@dataclass(slots=True)
 class Signal:
     """One cross, and what price has done since.
 
@@ -572,6 +635,7 @@ class Reading:
     bar_l: float = 0.0
     bar_dir: str = FLAT
     bar_elapsed: float = 0.0
+    bar_z: float = 0.0
     lcr: float = 0.0
     vpin: float = 0.0
     inside_bid: float = 0.0
@@ -601,6 +665,7 @@ class Reading:
                 "bar_l": round(self.bar_l, 1),
                 "bar_dir": self.bar_dir,
                 "bar_elapsed": round(self.bar_elapsed, 3),
+                "bar_z": round(self.bar_z, 3),
                 "lcr": round(self.lcr, 3), "vpin": round(self.vpin, 4),
                 "inside_bid": self.inside_bid, "inside_ask": self.inside_ask,
                 "warm": self.warm, "trades": self.trades,
@@ -664,6 +729,13 @@ class CVDCross:
         self.bars = BookCVDFrames()
         self.bar_seconds = float(bar_seconds)
         self._session_checked = 0.0
+        # Calling the forming bar's direction, checked against its close.
+        self.checkpoints = (0.2, 0.4, 0.6, 0.8)
+        self._calls: deque = deque(maxlen=1500)
+        self._bar_open_ts = 0.0
+        self._bar_open_px = 0.0
+        self._bar_taken: set = set()
+        self._bar_closes: deque = deque(maxlen=500)
         # The regime: agreement AND which line is on top.
         self._episodes: deque = deque(maxlen=int(episodes))
         self._regime = "none"
@@ -723,6 +795,11 @@ class CVDCross:
         self._episodes.clear()
         self._regime = "none"
         self._live = None
+        self._calls.clear()
+        self._bar_open_ts = 0.0
+        self._bar_open_px = 0.0
+        self._bar_taken = set()
+        self._bar_closes.clear()
         if not keep_session:
             self._session = ""
 
@@ -812,6 +889,7 @@ class CVDCross:
 
         self.bars.roll(ts)
         self._regime_step(ts, side, bz, tz)
+        self._call_step(ts, side, bz, tz)
 
         # The cross itself: the tape passing through the book.
         gap = tz - bz
@@ -839,6 +917,7 @@ class CVDCross:
             self._gap_sign = sign
 
         self._points.append(Point(ts=ts, book=bz, tape=tz,
+                                  bar=self.bars.get(self.bar_seconds).z,
                                   px=self.last_px))
         self._track(ts)
         self._publish(ts)
@@ -910,7 +989,7 @@ class CVDCross:
             bar_l=_live.lo,
             bar_dir=(UP if _live.cur > 0 else
                      (DOWN if _live.cur < 0 else FLAT)),
-            bar_elapsed=_live.elapsed(ts),
+            bar_elapsed=_live.elapsed(ts), bar_z=_live.z,
             lcr=self.lcr, vpin=self.vpin.value,
             inside_bid=self.book.inside_bid_sz,
             inside_ask=self.book.inside_ask_sz,
@@ -1029,6 +1108,121 @@ class CVDCross:
             }
         return out
 
+    # ---------------------------------------------------- bar calls
+
+    def _call_step(self, ts: float, side: str,
+                   bz: float, tz: float) -> None:
+        """Call the forming bar, then settle it against its own close.
+
+        Two callers are recorded side by side so they can be compared
+        against each other and against the market's own base rate:
+
+            regime   the two lines agreeing, up or down
+            bar_z    this bar's book CVD against how bars of this
+                     size usually behave
+
+        A call is only taken ONCE per checkpoint per bar, and only
+        from readings that existed at that moment. Nothing here looks
+        at the bar's close before the bar has closed.
+        """
+        f = self.bars.get(self.bar_seconds)
+        px = self.last_px
+        if px <= 0.0:
+            return
+        open_ts = f._open_ts
+        if open_ts <= 0.0:
+            return
+
+        if open_ts != self._bar_open_ts:
+            # the previous bar just ended: settle everything on it
+            self._settle(self._bar_open_ts, self._bar_open_px, px)
+            self._bar_open_ts = open_ts
+            self._bar_open_px = px
+            self._bar_taken = set()
+            return
+
+        pct = f.elapsed(ts)
+        for cp in self.checkpoints:
+            if pct < cp or cp in self._bar_taken:
+                continue
+            self._bar_taken.add(cp)
+            bar_z = f.z
+            for caller, call in (("regime", side),
+                                 ("bar_z", UP if bar_z > 0 else
+                                  (DOWN if bar_z < 0 else FLAT))):
+                if call == FLAT:
+                    continue
+                self._calls.append(BarCall(
+                    bar_ts=open_ts, bar_s=f.seconds, at_pct=cp,
+                    caller=caller, call=call,
+                    open_px=self._bar_open_px or px,
+                    book_z=bz, tape_z=tz, bar_z=bar_z,
+                    regime=self._regime))
+
+    def _settle(self, bar_ts: float, open_px: float,
+                close_px: float) -> None:
+        if bar_ts <= 0.0 or open_px <= 0.0:
+            return
+        move = (close_px - open_px) / self.tick_size
+        self._bar_closes.append(1 if move > 0 else (0 if move < 0 else -1))
+        for c in self._calls:
+            if c.settled or c.bar_ts != bar_ts:
+                continue
+            c.close_px = close_px
+            c.move_ticks = move
+            c.settled = True
+            c.correct = ((move > 0 and c.call == UP)
+                         or (move < 0 and c.call == DOWN))
+
+    def calls(self) -> list:
+        with self._lock:
+            return list(self._calls)
+
+    def call_board(self) -> dict:
+        """Can these readings call the bar before it closes?
+
+        Reported against the BASE RATE -- the share of bars that
+        closed up at all. That comparison is the whole measurement: in
+        a session where 56% of bars close green, a caller scoring 56%
+        has found nothing, and saying "56% correct" without the base
+        rate beside it would read as though it had.
+
+        `edge` is the caller's rate minus the better of always-up and
+        always-down, so zero means no better than the dumbest possible
+        rule and negative means worse.
+
+        Broken out by how far into the bar the call was made, because
+        a call at 80% already knows most of the bar. The early
+        checkpoints are the ones that would be worth money.
+        """
+        rows = [c for c in self.calls() if c.settled]
+        ups = [x for x in self._bar_closes if x >= 0]
+        base_up = (sum(1 for x in ups if x == 1) / len(ups)) if ups else 0.0
+        naive = max(base_up, 1.0 - base_up) if ups else 0.0
+        out = {"bars_settled": len(ups),
+               "base_up": round(base_up, 4),
+               "naive_rate": round(naive, 4),
+               "bar_s": self.bar_seconds,
+               "checkpoints": list(self.checkpoints),
+               "callers": {}}
+        for caller in ("regime", "bar_z"):
+            per = {}
+            for cp in self.checkpoints:
+                cs = [c for c in rows
+                      if c.caller == caller and c.at_pct == cp]
+                n = len(cs)
+                ok = sum(1 for c in cs if c.correct)
+                rate = (ok / n) if n else None
+                per[str(cp)] = {
+                    "n": n, "correct": ok,
+                    "rate": round(rate, 4) if rate is not None else None,
+                    "edge": (round(rate - naive, 4)
+                             if rate is not None and ups else None),
+                    "enough": n >= 100,
+                }
+            out["callers"][caller] = per
+        return out
+
     def _track(self, ts: float) -> None:
         """Walk the open signals forward against the last print.
 
@@ -1141,6 +1335,7 @@ class CVDCross:
                 "continuous": continuous,
                 "points": [{"ts": p.ts, "book": round(p.book, 3),
                             "tape": round(p.tape, 3),
+                            "bar": round(p.bar, 3),
                             "px": round(p.px, 4)} for p in pts],
                 "crosses": [c.as_dict() for c in self.crosses()],
                 "sample_s": self.sample_s, "tau_s": self.tau_s,
@@ -1155,6 +1350,7 @@ class CVDCross:
                 **({"signals": [g.as_dict() for g in self.signals()],
                     "scoreboard": self.scoreboard(target, stop),
                     "regime_board": self.regime_board(),
+                    "call_board": self.call_board(),
                     "episodes": [e.as_dict()
                                  for e in self.episodes()[-60:]]}
                    if with_signals else {})}

@@ -1055,3 +1055,177 @@ class TestTheRegimeBoardAnswersTheQuestion:
         r, _ = self._board()
         assert "regime_board" not in r.as_dict()
         assert "regime_board" in r.as_dict(with_signals=True)
+
+
+class TestThePerBarLineRidesWithTheOthers:
+    """It has to sit on the SAME axis as the two cumulative lines.
+
+    Raw, a bar's delta and a session's delta are nowhere near each
+    other, so a raw third line would flatten against the axis and the
+    usual dodge -- a second y-scale -- is a lie that makes any two
+    shapes look related. Z-scoring against closed bars of the same
+    size is what makes one axis honest.
+    """
+
+    def _fed(self, n=4000, **kw):
+        import random
+        kw.setdefault("sample_s", 0.25)
+        kw.setdefault("bar_seconds", 60.0)
+        r = CVDCross(**kw)
+        rng = random.Random(2)
+        sz = 40.0
+        for k in range(1, n):
+            sz = max(1.0, sz + rng.randint(-4, 4))
+            r.on_book(5800.00, sz, 5800.25, 40, T0 + k * 0.5)
+        return r
+
+    def test_every_chart_point_carries_all_three(self):
+        d = self._fed().as_dict()
+        assert set(d["points"][0]) >= {"ts", "book", "tape", "bar", "px"}
+
+    def test_the_per_bar_line_is_z_scored(self):
+        """Not raw contracts -- it would be off the chart."""
+        r = self._fed()
+        vals = [abs(p["bar"]) for p in r.as_dict()["points"]]
+        assert max(vals) < 20.0, "that is not a z-score"
+        assert any(v > 0.0 for v in vals), "the line never moved"
+
+    def test_it_waits_for_a_few_closed_bars(self):
+        r = self._fed(n=40)
+        assert r.snapshot().bar_z == 0.0
+
+    def test_the_chart_draws_three_lines_on_one_axis(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        fn = src[src.index("function mgChart("):]
+        fn = fn[:fn.index("\nfunction mgBars(")]
+        assert fn.count("const Y = v =>") == 1, "more than one y mapping"
+        for k in ("line('book')", "line('tape')", "line('bar')"):
+            assert k in fn, k
+
+    def test_the_third_line_is_in_the_range_calculation(self):
+        """Left out, it would run off the top or bottom unnoticed."""
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        fn = src[src.index("function mgChart("):]
+        fn = fn[:fn.index("\nfunction mgBars(")]
+        assert "p.bar || 0" in fn
+
+    def test_the_three_end_labels_cannot_overprint(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        fn = src[src.index("function mgChart("):]
+        fn = fn[:fn.index("\nfunction mgBars(")]
+        assert "Math.abs(yR - yB) < 11" in fn
+
+
+class TestCallingTheBarBeforeItCloses:
+    """Can these readings call a 5m bar during its own cycle?
+
+    The danger here is not a wrong answer, it is a flattering one. It
+    is trivially easy to "predict" a bar from numbers that already
+    contain its close, and the result looks superb and means nothing.
+    So: calls are taken part way through the bar from readings that
+    existed at that moment, and settled only once the bar has ended.
+    """
+
+    def _run(self, n=400_000, bar_s=300.0, seed=77):
+        import random
+        rng = random.Random(seed)
+        r = CVDCross(sample_s=0.25, stat_window=120, warm_at=10,
+                     bar_seconds=bar_s)
+        ts, bid, ask, bsz, asz, drift = T0, 5799.75, 5800.25, 40.0, 40.0, 0.0
+        for i in range(n):
+            ts += 0.004
+            drift += rng.gauss(0, 0.05)
+            up = drift > 0
+            bsz = max(1.0, bsz + rng.randint(-4, 4) + (2 if up else -2))
+            asz = max(1.0, asz + rng.randint(-4, 4) - (2 if up else -2))
+            if rng.random() < 0.012:
+                st = 0.25 if rng.random() < 0.5 + 0.09 * (1 if up else -1) \
+                    else -0.25
+                bid, ask = bid + st, ask + st
+            r.on_book(bid, bsz, ask, asz, ts)
+            if rng.random() < 0.09:
+                sd = BUY if rng.random() < 0.5 + 0.12 * (1 if up else -1) \
+                    else SELL
+                r.on_trade(ts, sd, rng.choice((1, 1, 2, 3, 5, 30)),
+                           ask if sd == BUY else bid)
+        return r
+
+    def test_a_call_is_made_before_its_bar_ends(self):
+        """The whole measurement rests on this."""
+        r = self._run()
+        for c in r.calls():
+            if c.settled:
+                assert c.bar_ts + c.bar_s >= c.bar_ts
+                # the call belongs to the bar it was made in
+                assert c.at_pct < 1.0
+
+    def test_a_call_settles_against_its_own_bars_close(self):
+        r = self._run()
+        done = [c for c in r.calls() if c.settled]
+        assert done, "nothing settled"
+        for c in done:
+            move = (c.close_px - c.open_px) / 0.25
+            assert c.move_ticks == pytest.approx(move)
+            assert c.correct == ((move > 0 and c.call == "up")
+                                 or (move < 0 and c.call == "down"))
+
+    def test_an_unfinished_bar_is_not_scored(self):
+        r = self._run(n=60_000)
+        board = r.call_board()
+        for per in board["callers"].values():
+            for d in per.values():
+                assert d["n"] <= len(r.calls())
+
+    def test_one_call_per_checkpoint_per_bar(self):
+        r = self._run()
+        seen = set()
+        for c in r.calls():
+            key = (c.bar_ts, c.caller, c.at_pct)
+            assert key not in seen, f"duplicate call {key}"
+            seen.add(key)
+
+    def test_the_base_rate_is_reported_beside_the_hit_rate(self):
+        """In a session where 56% of bars close green, a caller
+        scoring 56% has found nothing."""
+        board = self._run().call_board()
+        assert "base_up" in board and "naive_rate" in board
+        assert 0.0 <= board["base_up"] <= 1.0
+
+    def test_edge_is_measured_against_the_dumbest_rule(self):
+        board = self._run().call_board()
+        naive = board["naive_rate"]
+        for per in board["callers"].values():
+            for d in per.values():
+                if d["rate"] is not None and d["edge"] is not None:
+                    assert d["edge"] == pytest.approx(d["rate"] - naive)
+
+    def test_a_thin_sample_is_not_called_enough(self):
+        """A caller scoring 100% on ten bars is noise wearing a
+        rosette."""
+        board = self._run(n=120_000).call_board()
+        for per in board["callers"].values():
+            for d in per.values():
+                if d["n"] < 100:
+                    assert d["enough"] is False
+
+    def test_both_callers_are_reported(self):
+        board = self._run().call_board()
+        assert set(board["callers"]) == {"regime", "bar_z"}
+
+    def test_the_board_serialises(self):
+        import json
+        json.dumps(self._run(n=80_000).call_board())
+
+    def test_a_new_session_clears_the_calls(self):
+        r = self._run(n=80_000)
+        r.on_trade(T0 + 86_400 * 3, BUY, 1, 5800.25)
+        assert r.calls() == []
