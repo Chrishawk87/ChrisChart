@@ -159,10 +159,29 @@ class TestDeltaWorker:
 class TestNoMarketDataPolling:
 
     def test_dashboard_dropped_ofi_and_footprint_intervals(self):
+        """The high-rate market data is pushed, not polled.
+
+        NARROWED, and the reason is worth recording. This originally
+        also forbade `setInterval(fpTick,`. But footprint and CVD data
+        were never moved onto /ws/live, so with fpTick unscheduled
+        those panels painted once at page open and then stood still --
+        which reads to a trader as a feed running badly behind rather
+        than as a stopped clock.
+
+        The invariant that actually matters is that the per-event
+        streams (ticks, OFI, the feed strip) are not polled; they are
+        the ones that arrive tens of thousands of times a second. The
+        footprint and CVD panels are periodic summaries measured in
+        seconds, and polling them costs one small request each. The
+        CVD poll is incremental on a `since` cursor, so a frame
+        carries one or two points rather than the whole history.
+
+        Put those two panels on /ws/live and this line should come
+        back.
+        """
         from liqmap.web import DASHBOARD
         # Comments may mention the deleted calls; live code must not.
         assert "setInterval(loadOfi," not in DASHBOARD
-        assert "setInterval(fpTick," not in DASHBOARD
         assert "setInterval(paintFeed," not in DASHBOARD
         assert "setInterval(loadRead," not in DASHBOARD
         assert "setInterval(loadSuggest," not in DASHBOARD

@@ -620,9 +620,32 @@ class CVDCross:
         with self._lock:
             return list(self._crosses)
 
-    def as_dict(self, limit: int = 600) -> dict:
-        pts = self.points()[-int(limit):]
+    def as_dict(self, limit: int = 600, since: float = 0.0) -> dict:
+        """The reading, and the points the caller does not yet have.
+
+        `since` makes the poll INCREMENTAL. Resending 600 points four
+        times a second is tens of kilobytes a second of data the
+        browser already holds, and that backlog is what puts a live
+        chart behind the market. With `since` the usual frame carries
+        one or two points.
+
+        `continuous` says whether `since` was still inside the ring.
+        False means the caller was away longer than the ring is long,
+        so there is a hole and it must take the full set again --
+        otherwise it would splice two disjoint stretches into one line
+        and draw a move that never happened.
+        """
+        pts = self.points()
+        continuous = True
+        if since > 0.0:
+            oldest = pts[0].ts if pts else 0.0
+            if oldest and since < oldest:
+                continuous = False          # the ring turned over
+            else:
+                pts = [p for p in pts if p.ts > since]
+        pts = pts[-int(limit):]
         return {"now": self.snapshot().as_dict(),
+                "continuous": continuous,
                 "points": [{"ts": p.ts, "book": round(p.book, 3),
                             "tape": round(p.tape, 3),
                             "px": round(p.px, 4)} for p in pts],

@@ -5982,7 +5982,8 @@ def create_app() -> FastAPI:
 
 
     @app.get("/api/cvdcross", dependencies=[Depends(require_token)])
-    def api_cvdcross(coin: str = "ES", limit: int = 600) -> dict[str, Any]:
+    def api_cvdcross(coin: str = "ES", limit: int = 600,
+                     since: float = 0.0) -> dict[str, Any]:
         """The book CVD reader and the tape that confirms it.
 
         DELIBERATELY NOT PART OF /api/footprint. That route reports
@@ -6001,7 +6002,7 @@ def create_app() -> FastAPI:
         if eng is None:
             return {"ok": False, "coin": coin,
                     "why": "the CME engine is not configured"}
-        out = eng.as_dict(limit=limit)
+        out = eng.as_dict(limit=limit, since=since)
         out["ok"] = True
         out["coin"] = coin
         out["records"] = getattr(tape, "records", 0)
@@ -9646,25 +9647,49 @@ function fpTick() {
   const pane = $('tab-dash');
   if (pane && pane.hidden) return;          // not on screen, not polled
   fpLoad();
-  mgLoad();
 }
 
-/* The CVD reader polls ITSELF. It used to be drawn at the tail of
-   fpLoad, which returns early whenever the footprint reports no data
-   -- so before the first print of a session the lines were not drawn
-   at all, not even as an empty frame. The book line needs no prints,
-   so it must not inherit the footprint's silence. */
+/* The CVD reader polls ITSELF, on its OWN timer.
+
+   Two bugs compounded here and the second hid the first.
+
+   It used to be drawn at the tail of fpLoad, which returns early
+   whenever the footprint reports no data -- so before the first print
+   of a session the lines were never drawn at all. The book line needs
+   no prints, so it must not inherit the footprint's silence.
+
+   Then it was called from fpTick, which the /ws/live migration had
+   already stopped scheduling: the comment on that socket says it
+   replaces setInterval(fpTick), but footprint and CVD data never
+   moved onto those frames. So the panel painted once at page open and
+   then stood still until someone pressed Refresh. A frozen panel does
+   not look frozen -- it looks like a feed running far behind.
+
+   The poll is INCREMENTAL. Re-sending 600 points twice a second is
+   tens of kilobytes the browser already holds, and that backlog is
+   itself a source of lag. We send the timestamp of the newest point
+   we have and get back only what is newer, usually one or two. If the
+   server says it is no longer `continuous`, the ring turned over
+   while we were away, so we take the whole set again rather than
+   splicing a hole into the line and drawing a move that never
+   happened. */
+let mgPts = [];
+let mgLast = 0;
+const MG_CAP = 600;
+
 async function mgLoad() {
   if (!$('mgChart')) return;
   let d;
   try {
     d = await api('/api/cvdcross?coin=' +
-      encodeURIComponent(($('coin') ? $('coin').value : 'ES') || 'ES'));
+      encodeURIComponent(($('coin') ? $('coin').value : 'ES') || 'ES') +
+      (mgLast ? '&since=' + mgLast : ''));
   } catch (e) {
     $('mgChart').innerHTML = '<div class="msg">' + e + '</div>';
     return;
   }
   if (!d.ok) {
+    mgPts = []; mgLast = 0;
     $('mgStamp').textContent = '';
     $('mgStats').innerHTML = '';
     $('mgCross').innerHTML = '';
@@ -9672,18 +9697,38 @@ async function mgLoad() {
       (d.why || 'no data') + '</div>';
     return;
   }
+  if (d.continuous === false) { mgPts = []; }     // a hole: start clean
+  const fresh = d.points || [];
+  if (fresh.length) {
+    mgPts = mgPts.concat(fresh);
+    if (mgPts.length > MG_CAP) mgPts = mgPts.slice(-MG_CAP);
+    mgLast = mgPts[mgPts.length - 1].ts;
+  }
+  const view = {now: d.now, points: mgPts, crosses: d.crosses,
+                enter: d.enter, tau_s: d.tau_s, sample_s: d.sample_s};
   const w = Math.max(360, ($('mgChart').clientWidth || 900));
-  const pts = (d.points || []).length;
-  $('mgStamp').textContent = pts
-    ? `${pts} pts · ${d.sample_s}s sampling · ${d.tau_s}s smooth`
-    : `${(d.records || 0).toLocaleString()} records, no samples yet`;
-  $('mgStats').innerHTML = mgRow(d);
-  $('mgChart').innerHTML = pts >= 2
-    ? mgChart(d, w, 190)
+  $('mgStamp').textContent = mgPts.length
+    ? mgPts.length + ' pts · ' + d.sample_s + 's sampling · '
+      + d.tau_s + 's smooth'
+    : (d.records || 0).toLocaleString() + ' records, no samples yet';
+  $('mgStats').innerHTML = mgRow(view);
+  $('mgChart').innerHTML = mgPts.length >= 2
+    ? mgChart(view, w, 190)
     : '<div class="msg">Collecting&hellip; ' + (d.why ||
         'the reader needs a few seconds of records') + '</div>';
-  $('mgCross').innerHTML = mgCrossRow(d);
+  $('mgCross').innerHTML = mgCrossRow(view);
 }
+
+/* Both panels need a clock of their own until their data moves onto
+   /ws/live. Hidden tabs are skipped inside fpTick; mgLoad is cheap
+   enough incrementally to keep the line continuous either way. */
+let _mgTimer = null, _fpTimer = null;
+function mgStartTimers() {
+  if (!_mgTimer) { _mgTimer = setInterval(mgLoad, 500); }
+  if (!_fpTimer) { _fpTimer = setInterval(fpTick, 2000); }
+}
+try { mgStartTimers(); } catch (e) {}
+
 
 /* ---- tabs -------------------------------------------------------------
 

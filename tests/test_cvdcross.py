@@ -524,12 +524,94 @@ class TestTheLinesAreNotHostageToTheFootprint:
             "the reader is still drawn inside the footprint's loader, "
             "so its early return still blanks it")
 
-    def test_the_loader_runs_on_the_tick_and_at_startup(self):
+    def test_both_panels_are_actually_scheduled(self):
+        """The freeze that looked like lag.
+
+        The /ws/live migration removed setInterval(fpTick) -- its own
+        comment says it replaces it -- but footprint and CVD data
+        never moved onto those frames. Anything hanging off fpTick
+        therefore painted once at page open and then stood still. A
+        frozen panel does not look frozen; it looks like a feed
+        running far behind the market.
+        """
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        assert "setInterval(mgLoad," in src, "the reader has no clock"
+        assert "setInterval(fpTick," in src, (
+            "fpTick is defined but never scheduled, so the footprint "
+            "and obstacle panels only update on Refresh")
+        assert "try { mgStartTimers(); } catch (e) {}" in src
+
+    def test_the_reader_does_not_hang_off_the_footprints_tick(self):
+        """Its own timer, because fpTick skips hidden tabs and the
+        reader should keep its line continuous regardless."""
         import inspect
 
         from liqmap import web as w
         src = inspect.getsource(w)
         tick = src[src.index("function fpTick()"):]
         tick = tick[:tick.index("\n}")]
-        assert "mgLoad()" in tick
-        assert "try { mgLoad(); } catch (e) {}" in src
+        assert "mgLoad" not in tick
+
+
+class TestTheIncrementalPoll:
+    """Re-sending the whole history twice a second is tens of
+    kilobytes the browser already holds, and that backlog is itself a
+    source of lag."""
+
+    def _filled(self, n=400):
+        r = CVDCross(sample_s=0.25, warm_at=5)
+        ts = T0
+        for i in range(n):
+            ts += 0.25
+            r.on_book(5799.75, 40 + i % 7, 5800.25, 40, ts)
+        return r
+
+    def test_since_returns_only_what_is_newer(self):
+        r = self._filled()
+        full = r.as_dict()
+        cut = full["points"][-3]["ts"]
+        inc = r.as_dict(since=cut)
+        assert len(inc["points"]) == 2
+        assert all(p["ts"] > cut for p in inc["points"])
+
+    def test_a_fresh_caller_gets_everything(self):
+        r = self._filled()
+        assert len(r.as_dict()["points"]) == 400
+
+    def test_the_reading_always_comes_whole(self):
+        """Only the POINTS are incremental. The current reading is
+        small and must never be partial."""
+        r = self._filled()
+        inc = r.as_dict(since=r.as_dict()["points"][-1]["ts"])
+        assert inc["points"] == []
+        # Not book_cvd: this fixture walks bid size through a 7-step
+        # cycle, and 400 updates is a whole number of cycles, so the
+        # deltas telescope to exactly zero. The count cannot.
+        assert inc["now"]["books"] == 400
+        assert set(inc["now"]) == set(r.as_dict()["now"])
+
+    def test_a_caller_that_fell_out_of_the_ring_is_told(self):
+        """Splicing two disjoint stretches would draw a move that
+        never happened."""
+        r = self._filled()
+        stale = r.as_dict(since=T0 - 10_000)
+        assert stale["continuous"] is False
+        assert len(stale["points"]) == 400, "it must resend the lot"
+
+    def test_a_caller_inside_the_ring_is_continuous(self):
+        r = self._filled()
+        mid = r.as_dict()["points"][-5]["ts"]
+        assert r.as_dict(since=mid)["continuous"] is True
+
+    def test_the_client_starts_clean_on_a_discontinuity(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        fn = src[src.index("async function mgLoad()"):]
+        fn = fn[:fn.index("\n}")]
+        assert "d.continuous === false" in fn
+        assert "mgLast" in fn, "the client never sends a since cursor"
