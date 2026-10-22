@@ -285,6 +285,17 @@ class OfiService:
         front, _ = self.config.active_contracts
         tape_sym = front if front else (self.config.symbols or ["ES"])[0].split(".")[0]
         self.tape = Tape(symbol=tape_sym)
+        # The CVD reader is attached HERE, to the tape itself, rather
+        # than inside the footprint's setup. It has to start counting
+        # the moment records arrive: the book line moves on book
+        # updates alone and needs no prints at all, so gating it on
+        # the footprint would leave it empty through exactly the quiet
+        # stretches it is there to read.
+        try:
+            from .cvdcross import CVDCross
+            self.tape.cvdcross = CVDCross()
+        except Exception:                               # noqa: BLE001
+            pass            # a display must never stop the engine
 
     # ------------------------------------------------------- lifecycle
 

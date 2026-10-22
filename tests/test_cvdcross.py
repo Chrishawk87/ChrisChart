@@ -464,3 +464,72 @@ class TestThePanel:
     def test_warming_up_is_not_reported_as_a_reading(self):
         fn = self._fn("mgRow")
         assert "n.warm" in fn and "WARMING UP" in fn
+
+
+class TestTheLinesAreNotHostageToTheFootprint:
+    """The bug this class exists for: nothing was drawn at all.
+
+    The reader used to be rendered at the tail of the footprint's
+    loader, and that loader returns early whenever the footprint
+    reports no data -- which it does until the first print of the
+    session lands. So the panel stayed completely empty through
+    exactly the quiet stretches the book line is there to read.
+
+    The book line needs NO trades. It must not inherit the
+    footprint's silence.
+    """
+
+    def test_the_book_line_moves_with_no_trades_at_all(self):
+        r = CVDCross(sample_s=0.25, warm_at=10)
+        ts, bsz = T0, 40.0
+        for i in range(2000):
+            ts += 0.05
+            bsz = max(1.0, bsz + (3 if i % 7 else -5))
+            r.on_book(5799.75, bsz, 5800.25, 40.0, ts)
+        d = r.as_dict()
+        assert r.trades == 0
+        assert len(d["points"]) > 100, "no points without prints"
+        assert d["now"]["book_z"] != 0.0, "the reader never moved"
+
+    def test_the_engine_is_attached_where_the_tape_is_built(self):
+        """Not inside the footprint's setup -- it has to be counting
+        from the moment records arrive."""
+        import inspect
+
+        from liqmap import ofi_service
+        src = inspect.getsource(ofi_service)
+        i = src.index("self.tape = Tape(symbol=tape_sym)")
+        assert "cvdcross" in src[i:i + 700], (
+            "the reader is not attached at tape construction")
+
+    def test_the_route_does_not_read_the_footprint(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        i = src.index("def api_cvdcross(")
+        fn = src[i:src.index("\n    @app.", i)]
+        assert "rt.footprint(" not in fn
+        assert "stream" not in fn
+
+    def test_the_panel_has_its_own_loader(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        assert "async function mgLoad()" in src
+        fp = src[src.index("async function fpLoad()"):]
+        fp = fp[:fp.index("\nfunction fpTick(")]
+        assert "mgChart" not in fp, (
+            "the reader is still drawn inside the footprint's loader, "
+            "so its early return still blanks it")
+
+    def test_the_loader_runs_on_the_tick_and_at_startup(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        tick = src[src.index("function fpTick()"):]
+        tick = tick[:tick.index("\n}")]
+        assert "mgLoad()" in tick
+        assert "try { mgLoad(); } catch (e) {}" in src

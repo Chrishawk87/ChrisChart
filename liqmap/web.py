@@ -1015,9 +1015,6 @@ class Runtime:
             # The two drawn lines. Attached here with the rest, but NOT
             # scoped to the bar: the baseline is meant to be structural,
             # so it resets on the CME session day instead.
-            from .cvdcross import CVDCross
-            if svc.tape.cvdcross is None:
-                svc.tape.cvdcross = CVDCross()
             from .obstacle import Obstacles
             svc.tape.obstacles = Obstacles(
                 tick_size=0.25, reach_ticks=16, window_s=10.0)
@@ -5984,6 +5981,36 @@ def create_app() -> FastAPI:
         return clean or "dataset"
 
 
+    @app.get("/api/cvdcross", dependencies=[Depends(require_token)])
+    def api_cvdcross(coin: str = "ES", limit: int = 600) -> dict[str, Any]:
+        """The book CVD reader and the tape that confirms it.
+
+        DELIBERATELY NOT PART OF /api/footprint. That route reports
+        ok=False until the first print lands, and the panel built on
+        it returns early on that branch -- which left these lines
+        blank through exactly the quiet stretches they exist to read.
+        The book line moves on book updates alone and needs no trades
+        at all, so it gets its own route and its own poll.
+        """
+        if not rt.is_cme(coin):
+            return {"ok": False, "coin": coin,
+                    "why": f"{coin} is not a CME symbol"}
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc is not None else None
+        eng = getattr(tape, "cvdcross", None) if tape is not None else None
+        if eng is None:
+            return {"ok": False, "coin": coin,
+                    "why": "the CME engine is not configured"}
+        out = eng.as_dict(limit=limit)
+        out["ok"] = True
+        out["coin"] = coin
+        out["records"] = getattr(tape, "records", 0)
+        if not out["points"]:
+            feed = rt.cme_feed(coin)
+            out["why"] = (feed.missing() if feed is not None
+                          else "no records have arrived yet")
+        return out
+
     @app.get("/api/footprint", dependencies=[Depends(require_token)])
     def api_footprint(coin: str = "ES", rule: str = "1m",
                       volume: int = 0, min_volume: int = 0,
@@ -6070,9 +6097,6 @@ def create_app() -> FastAPI:
         # The two drawn lines, as their own key. Sampled on an interval
         # inside the engine, so this is a bounded list however long the
         # session has been running.
-        mg = getattr(tape, "cvdcross", None)
-        if mg is not None:
-            out["cvdcross"] = mg.as_dict(limit=600)
         return out
 
     @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
@@ -7390,7 +7414,7 @@ DASHBOARD = """<!doctype html>
         <label>min volume <input type="number" id="fpMin" value="0"
           style="width:64px"></label>
         <label><input type="checkbox" id="fpAuto" checked> live</label>
-        <button class="btn" onclick="fpLoad()">Refresh</button>
+        <button class="btn" onclick="fpLoad();mgLoad()">Refresh</button>
       </div>
 
       <div id="fpStats" class="fpstat"></div>
@@ -8274,6 +8298,7 @@ async function loadOfi() {
 // /ws/live then pushes ofi / tick / signal frames into the same painters.
 try { loadOfi(); } catch (e) {}
 try { fpLoad(); } catch (e) {}
+try { mgLoad(); } catch (e) {}
 
 
 
@@ -9612,17 +9637,6 @@ async function fpLoad() {
   $('fpStats').innerHTML = fpStats(d);
   $('fpBook').innerHTML = fpBookRow(d);
   $('fpClear').innerHTML = fpClearRow(d);
-  if ($('mgChart')) {
-    const m = d.cvdcross;
-    const w = Math.max(360, ($('mgChart').clientWidth || 900));
-    $('mgStamp').textContent = m
-      ? `${(m.points || []).length} pts · ${m.sample_s}s sampling` : '';
-    $('mgStats').innerHTML = m ? mgRow(m) : '';
-    $('mgChart').innerHTML = m
-      ? mgChart(m, w, 190)
-      : '<div class="msg">No merged engine on this tape.</div>';
-    $('mgCross').innerHTML = m ? mgCrossRow(m) : '';
-  }
   $('fpBody').innerHTML = fpTable(d);
   $('fpHist').innerHTML = fpHistory(d);
 }
@@ -9632,6 +9646,43 @@ function fpTick() {
   const pane = $('tab-dash');
   if (pane && pane.hidden) return;          // not on screen, not polled
   fpLoad();
+  mgLoad();
+}
+
+/* The CVD reader polls ITSELF. It used to be drawn at the tail of
+   fpLoad, which returns early whenever the footprint reports no data
+   -- so before the first print of a session the lines were not drawn
+   at all, not even as an empty frame. The book line needs no prints,
+   so it must not inherit the footprint's silence. */
+async function mgLoad() {
+  if (!$('mgChart')) return;
+  let d;
+  try {
+    d = await api('/api/cvdcross?coin=' +
+      encodeURIComponent(($('coin') ? $('coin').value : 'ES') || 'ES'));
+  } catch (e) {
+    $('mgChart').innerHTML = '<div class="msg">' + e + '</div>';
+    return;
+  }
+  if (!d.ok) {
+    $('mgStamp').textContent = '';
+    $('mgStats').innerHTML = '';
+    $('mgCross').innerHTML = '';
+    $('mgChart').innerHTML = '<div class="msg">' +
+      (d.why || 'no data') + '</div>';
+    return;
+  }
+  const w = Math.max(360, ($('mgChart').clientWidth || 900));
+  const pts = (d.points || []).length;
+  $('mgStamp').textContent = pts
+    ? `${pts} pts · ${d.sample_s}s sampling · ${d.tau_s}s smooth`
+    : `${(d.records || 0).toLocaleString()} records, no samples yet`;
+  $('mgStats').innerHTML = mgRow(d);
+  $('mgChart').innerHTML = pts >= 2
+    ? mgChart(d, w, 190)
+    : '<div class="msg">Collecting&hellip; ' + (d.why ||
+        'the reader needs a few seconds of records') + '</div>';
+  $('mgCross').innerHTML = mgCrossRow(d);
 }
 
 /* ---- tabs -------------------------------------------------------------
