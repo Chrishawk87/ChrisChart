@@ -1008,6 +1008,13 @@ class Runtime:
             # not modified.
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
+            # And whether the flow can get THROUGH that standing size.
+            # Sixteen ticks is four points; on a dense ES book MBP-10
+            # reaches about nine of them, and the reading says so
+            # rather than pretending the rest is empty.
+            from .obstacle import Obstacles
+            svc.tape.obstacles = Obstacles(
+                tick_size=0.25, reach_ticks=16, window_s=10.0)
             self._footprint = stream
             self._footprint_rule = key
             return stream
@@ -2816,6 +2823,39 @@ def startup_report(rt: Runtime) -> list[str]:
 # Real-time MBP-10 book broadcaster — threads → async WebSocket queues
 # --------------------------------------------------------------------------
 
+def _offer(q: Any, frame: dict, hub: Any) -> None:
+    """Hand one frame to one client queue. Runs ON the event loop.
+
+    THIS MUST BE THE CALLBACK, not ``q.put_nowait`` directly.
+    ``call_soon_threadsafe`` only SCHEDULES the call and returns, so a
+    ``try/except`` at the scheduling site never sees what the put does.
+    Passing ``q.put_nowait`` straight in leaves QueueFull to be raised
+    inside the loop's own Handle with no handler in reach: every
+    overflow becomes an unhandled exception, and the default handler
+    writes out the Handle's repr -- which carries the whole book frame.
+    On ES that is tens of thousands of times a second, and the process
+    dies of writing it down rather than of the exception itself.
+
+    A full queue means this client is behind. Drop its OLDEST frame
+    rather than the new one: a book snapshot is worth nothing once it
+    is stale, so a lagging client should see the latest book, not be
+    pinned to the first four it ever received.
+    """
+    try:
+        q.put_nowait(frame)
+        return
+    except _asyncio.QueueFull:
+        pass
+    except Exception:                                   # noqa: BLE001
+        return
+    try:
+        q.get_nowait()                                  # evict the oldest
+        q.put_nowait(frame)
+    except Exception:                                   # noqa: BLE001
+        pass
+    hub.dropped += 1
+
+
 class BookBroadcaster:
     """Fan-out from the OFI background thread to N async WebSocket queues.
 
@@ -2874,9 +2914,10 @@ class BookBroadcaster:
             queues = list(self._queues)
         for q in queues:
             try:
-                loop.call_soon_threadsafe(q.put_nowait, frame)
+                loop.call_soon_threadsafe(_offer, q, frame, self)
                 self.sent += 1
-            except Exception:                           # noqa: BLE001
+            except RuntimeError:
+                # the loop closed under us between the check and here
                 self.dropped += 1
 
     @property
@@ -2921,9 +2962,10 @@ class SignalBroadcaster:
             queues = list(self._queues)
         for q in queues:
             try:
-                loop.call_soon_threadsafe(q.put_nowait, frame)
+                loop.call_soon_threadsafe(_offer, q, frame, self)
                 self.sent += 1
-            except Exception:                           # noqa: BLE001
+            except RuntimeError:
+                # the loop closed under us between the check and here
                 self.dropped += 1
 
     @property
@@ -6010,6 +6052,14 @@ def create_app() -> FastAPI:
         bd = getattr(tape, "bookdiag", None)
         if bd is not None:
             out["book"] = bd.reading().as_dict()
+
+        # Whether anyone can get through it, each way. Also a separate
+        # key: the book reading says what is standing there, this says
+        # whether the flow is enough to eat it.
+        obs = getattr(tape, "obstacles", None)
+        if obs is not None:
+            out["clearance"] = {"buy": obs.clearance("buy").as_dict(),
+                                "sell": obs.clearance("sell").as_dict()}
         return out
 
     @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
@@ -7332,6 +7382,8 @@ DASHBOARD = """<!doctype html>
 
       <div id="fpStats" class="fpstat"></div>
       <div id="fpBook" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+      <div id="fpClear" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
       <div id="fpBody"><div class="msg">Loading&hellip;</div></div>
       <div id="fpHist" class="fphist"></div>
@@ -9228,6 +9280,57 @@ function fpBookRow(d) {
       ${b.spread_ticks.toFixed(1)}t</span>`;
 }
 
+/* ---- can the flow get THROUGH it -------------------------------
+   The row above says what is standing there. This says whether
+   anyone is paying fast enough to eat it, in SECONDS -- a unit you
+   can argue with, unlike a ratio of two numbers measured over
+   different windows.
+
+   Two honesty rules are in the display, not just the maths:
+
+   the depth actually seen is printed whenever it fell short of the
+   distance asked for, because a truncated obstacle UNDERSTATES
+   resistance and would otherwise read as an easier clear;
+
+   no visible size reports "can't tell", never "clear" -- icebergs
+   show at no depth, so an empty ladder is an unknown, not a road. */
+function fpClearRow(d) {
+  const c = d.clearance;
+  if (!c) return '';
+  const say = (side, k) => {
+    const o = k.obstacle || {};
+    let verdict, cls = '';
+    if (k.verdict === 'unknown') {
+      verdict = "CAN'T TELL &mdash; no visible size to measure";
+    } else if (k.verdict === 'clears') {
+      verdict = 'CLEARS &mdash; ' +
+        (k.seconds_to_clear === null ? 'at this rate'
+         : k.seconds_to_clear.toFixed(1) + 's to eat ' +
+           fpNum(o.size) + ' at ' + k.rate.toFixed(0) + '/s');
+      cls = side === 'buy' ? 'long' : 'short';
+    } else {
+      verdict = 'BLOCKED &mdash; ' + fpNum(o.size) + ' resting, ' +
+        (k.rate > 0 ? k.seconds_to_clear.toFixed(0) + 's at the current '
+                      + k.rate.toFixed(0) + '/s'
+                    : 'nothing is paying');
+    }
+    // Only ever a LOWER bound on resistance when the book ran out.
+    const seen = o.truncated
+      ? ` &middot; saw ${o.covered_ticks}t of ${o.asked_ticks}t asked
+          (book ran out &mdash; resistance is AT LEAST this)` : '';
+    // A wall that left is not a wall that was eaten.
+    const left = (k.pulled + k.consumed) > 0
+      ? ` &middot; ${(k.pulled_share * 100).toFixed(0)}% of the decline
+          was pulled, not traded` : '';
+    return `
+      <span class="stamp">${side} side</span>
+      <span class="${cls}" style="font-size:13px"><b>${verdict}</b></span>
+      <span class="stamp">${fpNum(k.flow)} paid vs ${fpNum(k.opposing)}
+        against over ${k.window_s.toFixed(1)}s${seen}${left}</span>`;
+  };
+  return say('buy', c.buy) + say('sell', c.sell);
+}
+
 function fpStats(d) {
   const p = d.pulse || {};
   const ratio = (p.ratio == null) ? '--' : p.ratio.toFixed(2);
@@ -9325,6 +9428,7 @@ async function fpLoad() {
     `${(d.tape_trades || 0).toLocaleString()} prints`;
   $('fpStats').innerHTML = fpStats(d);
   $('fpBook').innerHTML = fpBookRow(d);
+  $('fpClear').innerHTML = fpClearRow(d);
   $('fpBody').innerHTML = fpTable(d);
   $('fpHist').innerHTML = fpHistory(d);
 }

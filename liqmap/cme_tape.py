@@ -104,6 +104,9 @@ class Tape:
     # traded, the other what is standing there, and neither
     # substitutes for the other.
     bookdiag: object = None
+    # Whether the flow can actually get through that standing size.
+    # Scoped to the same candle as the footprint and the book reading.
+    obstacles: object = None
     last_px: float = 0.0
     last_side: str = ""
     last_ts: float = 0.0
@@ -280,6 +283,23 @@ class Tape:
                 except Exception:                       # noqa: BLE001
                     pass
         t = dbn.trade_from(rec)
+        if self.obstacles is not None:
+            # Trade FIRST, then the book from the same record. An
+            # MBP-10 trade record carries the book as it stands after
+            # the fill, so observing the book first would attribute
+            # every fill to a wall that withdrew rather than one that
+            # was eaten -- the exact confusion this module exists to
+            # resolve.
+            try:
+                if t is not None:
+                    sz = int(round(float(t.sz)))
+                    if sz > 0:
+                        self.obstacles.observe_trade(
+                            float(t.ts), t.aggressor, sz, float(t.px))
+                if dbn._get(rec, "levels"):
+                    self.obstacles.observe_book(rec)
+            except Exception:                           # noqa: BLE001
+                pass            # a display must not stop the tape
         if t is None:
             return False
         self.trades += 1
@@ -323,8 +343,11 @@ class Tape:
             # refresh rate instead of to the bar. The footprint is
             # not modified to do this; its return value already says
             # when a bar ended.
-            if closed and self.bookdiag is not None:
-                self.bookdiag.reset()
+            if closed:
+                if self.bookdiag is not None:
+                    self.bookdiag.reset()
+                if self.obstacles is not None:
+                    self.obstacles.reset()
         except Exception:                               # noqa: BLE001
             # The footprint is a display. It must never be able to
             # stop the tape that feeds the engine and the candles.

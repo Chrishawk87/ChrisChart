@@ -33,6 +33,7 @@ NOTHING HERE PLACES, SIZES OR TIMES AN ORDER.
 
 from __future__ import annotations
 
+import asyncio
 import queue
 import threading
 import time
@@ -42,6 +43,35 @@ from typing import Any, Callable
 # --------------------------------------------------------------------------
 # IngestHub — one fan-out for every micro-delta kind
 # --------------------------------------------------------------------------
+
+def _offer(q: Any, frame: dict, hub: Any) -> None:
+    """Hand one frame to one client queue. Runs ON the event loop.
+
+    THIS MUST BE THE CALLBACK, not ``q.put_nowait`` directly.
+    ``call_soon_threadsafe`` only SCHEDULES the call and returns, so a
+    ``try/except`` at the scheduling site never sees what the put does.
+    Passing ``q.put_nowait`` straight in leaves QueueFull to be raised
+    inside the loop's own Handle with no handler in reach, and the
+    default handler writes out the Handle's repr -- which carries the
+    whole frame -- on every single overflow.
+
+    A full queue means this client is behind. Drop its OLDEST frame
+    rather than the new one: a stale snapshot is worth nothing.
+    """
+    try:
+        q.put_nowait(frame)
+        return
+    except asyncio.QueueFull:
+        pass
+    except Exception:                                   # noqa: BLE001
+        return
+    try:
+        q.get_nowait()                                  # evict the oldest
+        q.put_nowait(frame)
+    except Exception:                                   # noqa: BLE001
+        pass
+    hub.dropped += 1
+
 
 class IngestHub:
     """Fan-out from ingest / worker threads to N async WebSocket queues.
@@ -81,9 +111,10 @@ class IngestHub:
             queues = list(self._queues)
         for q in queues:
             try:
-                loop.call_soon_threadsafe(q.put_nowait, frame)
+                loop.call_soon_threadsafe(_offer, q, frame, self)
                 self.sent += 1
-            except Exception:                           # noqa: BLE001
+            except RuntimeError:
+                # the loop closed under us between the check and here
                 self.dropped += 1
 
     @property

@@ -317,6 +317,24 @@ def _src():
     return inspect.getsource(w)
 
 
+def _css_block(src: str, marker: str) -> str:
+    """The <style>...</style> section containing `marker`.
+
+    web.py serves more than one page, so "the first <style>" stopped
+    meaning "the dashboard's CSS". A test that slices the wrong block
+    does not fail loudly -- it quietly stops checking anything.
+    """
+    at = 0
+    while True:
+        i = src.find("<style>", at)
+        assert i != -1, f"no <style> block contains {marker!r}"
+        j = src.index("</style>", i)
+        block = src[i:j]
+        if marker in block:
+            return block
+        at = j
+
+
 def test_the_panel_is_its_own_and_touches_neither_ladder_nor_read():
     src = _src()
     assert 'id="layerPanel"' in src and 'id="layerBody"' in src
@@ -352,7 +370,12 @@ def test_an_unmeasured_layer_is_dimmed_rather_than_shown_as_zero():
     fn = src[src.index("function paintLayers(d) {"):]
     fn = fn[:fn.index("\nfunction paintLadder(")]
     assert "part.measured ? '' : ' off'" in fn
-    css = src[src.index("<style>"):src.index("</style>")]
+    # The page is no longer the only one in this module -- the /gl
+    # canvas page added a second <style> block AHEAD of the
+    # dashboard's. Taking the FIRST one now reads the wrong page's
+    # CSS, which is how this assertion started failing while the rule
+    # it checks was still there. Find the block that styles the panel.
+    css = _css_block(src, ".lay{")
     assert ".lay.off{" in css
 
 

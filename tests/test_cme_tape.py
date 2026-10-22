@@ -620,3 +620,107 @@ class TestSeedInterval:
     def test_seed_with_unknown_interval_name_is_silent(self):
         t = Tape()
         t.seed_interval("99x", [self._candle(T0)])  # should not raise
+
+
+class TestTheTapeFeedsTheObstacles:
+    """Three readings off one record stream now: what traded, what is
+    resting, and whether the one can get through the other."""
+
+    def _rec(self, *a, **k):
+        return TestTheTapeFeedsTheBookDiagonal._rec(self, *a, **k)
+
+    def _wired(self, contracts=100):
+        from liqmap.footprint import VolumeRule
+        from liqmap.footprint_live import FootprintStream
+        from liqmap.obstacle import Obstacles
+        t = cme_tape.Tape(symbol="ES")
+        t.footprint = FootprintStream(tick_size=0.25,
+                                      rule=VolumeRule(contracts))
+        t.obstacles = Obstacles(tick_size=0.25, reach_ticks=16)
+        return t
+
+    def test_book_records_reach_it(self):
+        t = self._wired()
+        for i in range(5):
+            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100))
+        assert t.obstacles.obstacle("buy").size > 0
+
+    def test_trades_reach_it(self):
+        t = self._wired()
+        for i in range(5):
+            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
+                              trade_sz=5))
+        assert t.obstacles.clearance("buy").flow == 25
+
+    def test_a_fill_is_attributed_to_the_trade_not_to_a_pulled_wall(self):
+        """An MBP-10 trade record carries the book as of AFTER the
+        fill. Observing that book before recording the trade would
+        read every fill as size that withdrew -- the exact confusion
+        the module exists to resolve, arriving through the wiring
+        rather than the maths."""
+        t = self._wired()
+        base = 1_700_000_000.0
+        t.offer(self._rec(0, base, BASE, 400, 100))
+        r = self._rec(1, base + 1, BASE, 400, 50, trade_sz=50)
+        r.price = BASE + TICK
+        t.offer(r)
+        # The fixture thins every ask level at once, so most of the
+        # decline IS withdrawal. What matters is that the 50 lots
+        # that printed were credited to the level they printed at.
+        assert t.obstacles.clearance("buy").consumed == 50
+
+        # Same book change, no print: nothing is consumed. This is the
+        # ordering check -- if the book were observed before the trade
+        # were recorded, this and the case above would be identical.
+        q = self._wired()
+        q.offer(self._rec(0, base, BASE, 400, 100))
+        q.offer(self._rec(1, base + 1, BASE, 400, 50))
+        assert q.obstacles.clearance("buy").consumed == 0
+
+    def test_attribution_is_keyed_to_the_price_that_traded(self):
+        """A print cannot take credit for size that left somewhere
+        else. Attribution is per price level, so a trade away from a
+        level that emptied leaves that level counted as pulled --
+        which is the honest reading."""
+        t = self._wired()
+        base = 1_700_000_000.0
+        t.offer(self._rec(0, base, BASE, 400, 100))
+        r = self._rec(1, base + 1, BASE, 400, 50, trade_sz=50)
+        r.price = BASE + 9 * TICK          # a print nowhere near it
+        t.offer(r)
+        assert t.obstacles.clearance("buy").pulled > 0
+
+    def test_a_closing_bar_restarts_the_counters(self):
+        t = self._wired(contracts=20)
+        base = 1_700_000_000.0
+        for i in range(4):
+            t.offer(self._rec(i, base + i, BASE, 400, 100, trade_sz=5))
+        assert len(t.footprint.history) == 1
+        c = t.obstacles.clearance("buy")
+        assert c.flow == 0, "flow is scoped to the bar"
+        assert c.obstacle.size > 0, "the standing book is not"
+
+    def test_without_it_attached_nothing_changes(self):
+        t = cme_tape.Tape(symbol="ES")
+        for i in range(5):
+            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
+                              trade_sz=5))
+        assert t.trades == 5 and t.books == 5
+
+    def test_a_broken_reader_cannot_stop_the_tape(self):
+        class Boom:
+            def observe_trade(self, *a, **k):
+                raise RuntimeError("boom")
+
+            def observe_book(self, *a, **k):
+                raise RuntimeError("boom")
+
+            def reset(self):
+                raise RuntimeError("boom")
+
+        t = cme_tape.Tape(symbol="ES")
+        t.obstacles = Boom()
+        for i in range(5):
+            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
+                              trade_sz=5))
+        assert t.trades == 5
