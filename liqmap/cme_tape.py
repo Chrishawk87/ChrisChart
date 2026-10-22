@@ -107,6 +107,12 @@ class Tape:
     # Whether the flow can actually get through that standing size.
     # Scoped to the same candle as the footprint and the book reading.
     obstacles: object = None
+    # The two drawn lines: book CVD as the reader, time-smoothed
+    # traded CVD as the confirmation. Fed from the same decoded trade
+    # as everything else above, so the lines and the candles can never
+    # disagree about which prints existed. Nothing is pushed anywhere
+    # -- the panel polls.
+    cvdcross: object = None
     last_px: float = 0.0
     last_side: str = ""
     last_ts: float = 0.0
@@ -283,6 +289,25 @@ class Tape:
                 except Exception:                       # noqa: BLE001
                     pass
         t = dbn.trade_from(rec)
+        if self.cvdcross is not None:
+            # Book first here, deliberately, and the opposite way round
+            # from `obstacles` below. The LCR asks what size was
+            # standing at the level a print took, so the inside quote
+            # must be current before the trade is measured against it.
+            try:
+                bk = self.book
+                if bk is not None and dbn._get(rec, "levels"):
+                    bids, asks = (bk.bids or ()), (bk.asks or ())
+                    b, a = (bids[0] if bids else None), (asks[0] if asks else None)
+                    self.cvdcross.on_book(
+                        b.px if b else 0.0, b.sz if b else 0.0,
+                        a.px if a else 0.0, a.sz if a else 0.0,
+                        float(dbn.seconds(dbn._get(rec, "ts_event")) or 0.0))
+                if t is not None:
+                    self.cvdcross.on_trade(float(t.ts), t.aggressor,
+                                           float(t.sz), float(t.px))
+            except Exception:                           # noqa: BLE001
+                pass            # a display must not stop the tape
         if self.obstacles is not None:
             # Trade FIRST, then the book from the same record. An
             # MBP-10 trade record carries the book as it stands after

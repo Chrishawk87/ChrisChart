@@ -1012,6 +1012,12 @@ class Runtime:
             # Sixteen ticks is four points; on a dense ES book MBP-10
             # reaches about nine of them, and the reading says so
             # rather than pretending the rest is empty.
+            # The two drawn lines. Attached here with the rest, but NOT
+            # scoped to the bar: the baseline is meant to be structural,
+            # so it resets on the CME session day instead.
+            from .cvdcross import CVDCross
+            if svc.tape.cvdcross is None:
+                svc.tape.cvdcross = CVDCross()
             from .obstacle import Obstacles
             svc.tape.obstacles = Obstacles(
                 tick_size=0.25, reach_ticks=16, window_s=10.0)
@@ -6060,6 +6066,13 @@ def create_app() -> FastAPI:
         if obs is not None:
             out["clearance"] = {"buy": obs.clearance("buy").as_dict(),
                                 "sell": obs.clearance("sell").as_dict()}
+
+        # The two drawn lines, as their own key. Sampled on an interval
+        # inside the engine, so this is a bounded list however long the
+        # session has been running.
+        mg = getattr(tape, "cvdcross", None)
+        if mg is not None:
+            out["cvdcross"] = mg.as_dict(limit=600)
         return out
 
     @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
@@ -7387,6 +7400,25 @@ DASHBOARD = """<!doctype html>
            var(--line);padding-top:8px"></div>
       <div id="fpBody"><div class="msg">Loading&hellip;</div></div>
       <div id="fpHist" class="fphist"></div>
+    </div>
+
+    <div class="panel full" id="mgPanel"><h2>Book CVD &mdash; the reader,
+      and the tape that confirms it
+      <span class="stamp" id="mgStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px"><b>Book CVD</b> is the
+        reader: size added or pulled at the inside quotes, counted only
+        while the quote stands still, so it measures liquidity and not
+        price drift. <b>Traded CVD</b> is the confirmation: aggressor-signed
+        volume, smoothed on elapsed seconds rather than on trade count, so
+        it smooths the same amount at 03:00 as at the open. Both are shown
+        in standard deviations of their own recent behaviour &mdash; that is
+        what lets two different quantities share one axis honestly. A cross
+        counts as <b>held</b> only once the two have agreed for long enough
+        and are not flipping. It reports; it decides nothing.</div>
+      <div id="mgStats" class="fpstat"></div>
+      <div id="mgChart" style="margin-top:8px"></div>
+      <div id="mgCross" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
     </div>
 
     <div class="panel full" id="ofiPanel"><h2>Order flow imbalance &mdash; who is winning the book race
@@ -9331,6 +9363,157 @@ function fpClearRow(d) {
   return say('buy', c.buy) + say('sell', c.sell);
 }
 
+/* ---- the two lines ----------------------------------------------
+   ONE axis, and here it is honest rather than convenient: both series
+   are expressed in standard deviations of their OWN recent behaviour,
+   so they are dimensionless and directly comparable. Raw, the book
+   line and the traded line do not share a scale and would never meet;
+   the usual dodge is a second y-axis, which is a lie that makes any
+   two shapes look related.
+
+   Identity is not carried by colour alone -- the reader is solid, the
+   confirmation dashed, both labelled at the right-hand end. The
+   site's --up/--down sit about 5 deutan units apart, under the
+   readable floor, so a reader with common colour blindness would
+   otherwise see two identical grey lines.
+
+   Crossings are drawn differently depending on whether the agreement
+   had held at that moment: a filled ring for confirmed, a hollow one
+   for not. Both are shown, because how the unconfirmed ones behave is
+   the thing worth watching. */
+function mgChart(d, w, h) {
+  const pts = (d && d.points) || [];
+  if (pts.length < 2) return '<div class="msg">Collecting&hellip; ' +
+    'the reader needs a few seconds of tape.</div>';
+  const now = d.now || {};
+  const padL = 8, padR = 46, padT = 10, padB = 14;
+  const iw = w - padL - padR, ih = h - padT - padB;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const p of pts) {
+    lo = Math.min(lo, p.book, p.tape);
+    hi = Math.max(hi, p.book, p.tape);
+  }
+  const gate = d.enter || 0.4;
+  lo = Math.min(lo, -gate); hi = Math.max(hi, gate);
+  if (!(hi > lo)) hi = lo + 1;
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+
+  const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts;
+  const span = (t1 - t0) || 1;
+  const X = t => padL + ((t - t0) / span) * iw;
+  const Y = v => padT + (1 - (v - lo) / (hi - lo)) * ih;
+
+  const line = k => pts.map((p, i) =>
+    (i ? 'L' : 'M') + X(p.ts).toFixed(1) + ' ' + Y(p[k]).toFixed(1)).join(' ');
+
+  // the direction gates, so you can see what counts as a lean
+  const gates = [gate, -gate].map(g =>
+    `<line x1="${padL}" x2="${padL + iw}" y1="${Y(g).toFixed(1)}"
+       y2="${Y(g).toFixed(1)}" stroke="var(--dim)" stroke-width="1"
+       stroke-dasharray="1 4" opacity="0.5"></line>`).join('');
+  const zero = `<line x1="${padL}" x2="${padL + iw}" y1="${Y(0).toFixed(1)}"
+      y2="${Y(0).toFixed(1)}" stroke="var(--line)" stroke-width="1"></line>`;
+
+  const marks = (d.crosses || []).filter(c => c.ts >= t0 && c.ts <= t1)
+    .map(c => {
+      const x = X(c.ts).toFixed(1), y = Y(c.tape_z).toFixed(1);
+      return c.confirmed
+        ? `<circle cx="${x}" cy="${y}" r="4.5" fill="var(--ink)"
+             stroke="var(--panel)" stroke-width="1.5"></circle>`
+        : `<circle cx="${x}" cy="${y}" r="3.5" fill="none"
+             stroke="var(--dim)" stroke-width="1.5"></circle>`;
+    }).join('');
+
+  const last = pts[pts.length - 1];
+  // The two end labels are how a reader tells the lines apart without
+  // relying on colour, so they must not overprint each other when the
+  // lines converge -- which is exactly when a cross is about to
+  // happen and the labels matter most.
+  let yB = Y(last.book), yT = Y(last.tape);
+  if (Math.abs(yB - yT) < 12) {
+    const mid = (yB + yT) / 2;
+    yB = mid + (yB <= yT ? -6 : 6);
+    yT = mid + (yB <= yT ? 6 : -6);
+  }
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"
+      preserveAspectRatio="none" role="img"
+      aria-label="book CVD and time-smoothed traded CVD, in standard deviations">
+    ${gates}${zero}
+    <path d="${line('book')}" fill="none" stroke="var(--accent)"
+      stroke-width="2" stroke-linejoin="round"></path>
+    <path d="${line('tape')}" fill="none" stroke="var(--ink)"
+      stroke-width="2" stroke-dasharray="6 3" stroke-linejoin="round"></path>
+    ${marks}
+    <text x="${padL + iw + 5}" y="${(yB + 4).toFixed(1)}"
+      fill="var(--accent)" font-size="11">${last.book.toFixed(2)}</text>
+    <text x="${padL + iw + 5}" y="${(yT + 4).toFixed(1)}"
+      fill="var(--ink)" font-size="11">${last.tape.toFixed(2)}</text>
+  </svg>
+  <div class="stamp" style="margin-top:4px">
+    <span style="color:var(--accent)">&#9472;&#9472;</span> book CVD
+    (the reader) &nbsp;
+    <span style="color:var(--ink)">&#9476;&#9476;</span> traded CVD,
+    smoothed ${d.tau_s}s (the confirmation) &nbsp;
+    <span style="color:var(--ink)">&#9679;</span> confirmed cross &nbsp;
+    <span style="color:var(--dim)">&#9711;</span> unconfirmed &nbsp;
+    &middot; ${pts.length} pts over ${span.toFixed(0)}s
+    &middot; one axis, standard deviations</div>`;
+}
+
+function mgRow(d) {
+  const n = (d && d.now) || {};
+  let verdict, cls = '';
+  if (!n.warm) {
+    verdict = 'WARMING UP &mdash; not enough history to say what ' +
+              'normal looks like yet';
+  } else if (n.chop) {
+    verdict = 'CHOP &mdash; the two flipped ' + n.flips +
+              ' times in the last minute';
+  } else if (n.ok) {
+    verdict = (n.side === 'up' ? 'BOOK AND TAPE BOTH UP' :
+               'BOOK AND TAPE BOTH DOWN') + ' &mdash; held ' +
+              n.held_s.toFixed(0) + 's';
+    cls = n.side === 'up' ? 'long' : 'short';
+  } else if (n.agree) {
+    verdict = 'agreeing ' + n.side.toUpperCase() +
+              ' &mdash; not held long enough yet (' +
+              n.held_s.toFixed(0) + 's)';
+  } else {
+    verdict = 'NO AGREEMENT &mdash; book ' + n.book_dir +
+              ', tape ' + n.tape_dir;
+  }
+  return `
+    <span class="stamp">reading</span>
+    <span class="${cls}" style="font-size:13px"><b>${verdict}</b></span>
+    <span class="stamp">book z ${(n.book_z || 0).toFixed(2)}
+      &middot; tape z ${(n.tape_z || 0).toFixed(2)}
+      &middot; gap ${(n.spread_z || 0).toFixed(2)}
+      &middot; raw book ${fpNum(Math.round(n.book_cvd || 0))}
+      &middot; raw tape ${fpNum(Math.round(n.tape_cvd || 0))}
+      (smoothed ${fpNum(Math.round(n.tape_ema || 0))})
+      &middot; VPIN ${(n.vpin || 0).toFixed(3)}
+      &middot; LCR ${(n.lcr || 0).toFixed(2)}
+      &middot; ${(n.trades || 0).toLocaleString()} prints
+      &middot; ${n.session || '--'}</span>`;
+}
+
+function mgCrossRow(d) {
+  const cs = ((d && d.crosses) || []).slice(-7).reverse();
+  if (!cs.length) return '<span class="stamp">no crossings yet ' +
+    'this session</span>';
+  const conf = ((d.crosses || []).filter(c => c.confirmed)).length;
+  return `<span class="stamp">last crossings &mdash; ${conf} of
+    ${(d.crosses || []).length} held &middot; what price did next is
+    the question</span>` + cs.map(c => {
+      const t = new Date(c.ts * 1000).toLocaleTimeString();
+      const mark = c.confirmed ? '&#9679;' : '&#9711;';
+      return `<span>${mark} ${t}
+        <b class="${c.confirmed ? (c.direction === 'up' ? 'long' : 'short') : ''}">`
+        + `${c.direction.toUpperCase()}</b> @ ${c.px.toFixed(2)}</span>`;
+    }).join('');
+}
+
 function fpStats(d) {
   const p = d.pulse || {};
   const ratio = (p.ratio == null) ? '--' : p.ratio.toFixed(2);
@@ -9429,6 +9612,17 @@ async function fpLoad() {
   $('fpStats').innerHTML = fpStats(d);
   $('fpBook').innerHTML = fpBookRow(d);
   $('fpClear').innerHTML = fpClearRow(d);
+  if ($('mgChart')) {
+    const m = d.cvdcross;
+    const w = Math.max(360, ($('mgChart').clientWidth || 900));
+    $('mgStamp').textContent = m
+      ? `${(m.points || []).length} pts · ${m.sample_s}s sampling` : '';
+    $('mgStats').innerHTML = m ? mgRow(m) : '';
+    $('mgChart').innerHTML = m
+      ? mgChart(m, w, 190)
+      : '<div class="msg">No merged engine on this tape.</div>';
+    $('mgCross').innerHTML = m ? mgCrossRow(m) : '';
+  }
   $('fpBody').innerHTML = fpTable(d);
   $('fpHist').innerHTML = fpHistory(d);
 }
