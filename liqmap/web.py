@@ -5983,7 +5983,8 @@ def create_app() -> FastAPI:
 
     @app.get("/api/cvdcross", dependencies=[Depends(require_token)])
     def api_cvdcross(coin: str = "ES", limit: int = 600,
-                     since: float = 0.0) -> dict[str, Any]:
+                     since: float = 0.0, bar_seconds: float = 0.0,
+                     with_signals: bool = False) -> dict[str, Any]:
         """The book CVD reader and the tape that confirms it.
 
         DELIBERATELY NOT PART OF /api/footprint. That route reports
@@ -6002,7 +6003,10 @@ def create_app() -> FastAPI:
         if eng is None:
             return {"ok": False, "coin": coin,
                     "why": "the CME engine is not configured"}
-        out = eng.as_dict(limit=limit, since=since)
+        if bar_seconds:
+            eng.bar_seconds = float(bar_seconds)
+        out = eng.as_dict(limit=limit, since=since,
+                          with_signals=with_signals)
         out["ok"] = True
         out["coin"] = coin
         out["records"] = getattr(tape, "records", 0)
@@ -6011,6 +6015,47 @@ def create_app() -> FastAPI:
             out["why"] = (feed.missing() if feed is not None
                           else "no records have arrived yet")
         return out
+
+    @app.get("/api/cvd-signals", dependencies=[Depends(require_token)])
+    def api_cvd_signals(coin: str = "ES", target: float = 4.0,
+                        stop: float = 4.0) -> dict[str, Any]:
+        """Every cross this session, and what price did after it.
+
+        FOR THE AGENT TO READ. One record per cross -- confirmed and
+        unconfirmed, winners and losers -- each carrying its side, the
+        price it fired at, how far price has gone its way (`mfe`) and
+        against it (`mae`), both in ticks, and how long it has been
+        running. Nothing is filtered out: the poor ones are the only
+        evidence that the confirmation is worth anything.
+
+        `scoreboard` tallies them against the `target` and `stop` you
+        ask for and prints the BREAK-EVEN beside the hit rate, because
+        a hit rate without its break-even is not a result. At 4 ticks
+        each way that break-even is 50% before costs, and a tick of
+        cost on ES moves it to about 62.5%.
+
+        This is LIVE FORWARD TRACKING on prints that have already
+        arrived, not a backtest. `settled` says how many have run the
+        full horizon; a young sample says very little.
+
+        It reports. It suggests nothing and places nothing.
+        """
+        if not rt.is_cme(coin):
+            return {"ok": False, "coin": coin,
+                    "why": f"{coin} is not a CME symbol"}
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc is not None else None
+        eng = getattr(tape, "cvdcross", None) if tape is not None else None
+        if eng is None:
+            return {"ok": False, "coin": coin,
+                    "why": "the CME engine is not configured"}
+        return {"ok": True, "coin": coin,
+                "now": eng.snapshot().as_dict(),
+                "signals": [g.as_dict() for g in eng.signals()],
+                "scoreboard": eng.scoreboard(target=target, stop=stop),
+                "tick_size": eng.tick_size,
+                "note": ("live forward tracking, not a backtest; "
+                         "every cross is listed, nothing is filtered")}
 
     @app.get("/api/footprint", dependencies=[Depends(require_token)])
     def api_footprint(coin: str = "ES", rule: str = "1m",
@@ -7442,6 +7487,18 @@ DASHBOARD = """<!doctype html>
         and are not flipping. It reports; it decides nothing.</div>
       <div id="mgStats" class="fpstat"></div>
       <div id="mgChart" style="margin-top:8px"></div>
+      <div class="fpstat" style="border-top:1px solid var(--line);
+           padding-top:8px;margin-top:8px">
+        <span class="stamp">book CVD per bar</span>
+        <select id="mgTf" class="btn" onchange="mgPickTf()">
+          <option value="60">1m</option>
+          <option value="300" selected>5m</option>
+          <option value="900">15m</option>
+        </select>
+        <label><input type="checkbox" id="mgLine" onchange="mgLoad()">
+          line instead of candles</label>
+      </div>
+      <div id="mgBars"></div>
       <div id="mgCross" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
     </div>
@@ -9431,7 +9488,8 @@ function mgChart(d, w, h) {
   const Y = v => padT + (1 - (v - lo) / (hi - lo)) * ih;
 
   const line = k => pts.map((p, i) =>
-    (i ? 'L' : 'M') + X(p.ts).toFixed(1) + ' ' + Y(p[k]).toFixed(1)).join(' ');
+    (i ? 'L' : 'M') + X(p.ts).toFixed(1) + ' ' +
+    Y(p[k] || 0).toFixed(1)).join(' ');
 
   // the direction gates, so you can see what counts as a lean
   const gates = [gate, -gate].map(g =>
@@ -9487,8 +9545,80 @@ function mgChart(d, w, h) {
     &middot; one axis, standard deviations</div>`;
 }
 
+/* ---- book CVD, zeroed every bar, as candles -------------------
+   Each bar opens at zero and accumulates the adds and pulls at the
+   inside quotes; the candle records where that running value went
+   and where it finished. The WICKS are the reason this is drawn as
+   candles rather than a line: a bar closing at +40 having reached
+   +180 is bids stacked and then pulled, while a bar that climbed
+   straight to +40 is bids stacked and kept. A line shows both as the
+   same +40.
+
+   Up and down are not carried by colour alone -- a filled body is
+   down, a hollow one is up -- because the site's --up/--down sit
+   about five deutan units apart, under the readable floor. */
+function mgBars(d, w, h, asLine) {
+  const ser = (d && d.series) || [];
+  if (ser.length < 2) return '<div class="msg">Collecting ' +
+    'bars&hellip;</div>';
+  const padL = 8, padR = 46, padT = 8, padB = 12;
+  const iw = w - padL - padR, ih = h - padT - padB;
+  let lo = 0, hi = 0;
+  for (const b of ser) { lo = Math.min(lo, b.l); hi = Math.max(hi, b.h); }
+  if (!(hi > lo)) { hi = lo + 1; }
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+  const Y = v => padT + (1 - (v - lo) / (hi - lo)) * ih;
+  const n = ser.length;
+  const step = iw / n;
+  const bw = Math.max(1.5, Math.min(10, step * 0.62));
+
+  const zero = `<line x1="${padL}" x2="${padL + iw}" y1="${Y(0).toFixed(1)}"
+      y2="${Y(0).toFixed(1)}" stroke="var(--line)" stroke-width="1"></line>`;
+
+  let body;
+  if (asLine) {
+    const pts = ser.map((b, i) => (i ? 'L' : 'M') +
+      (padL + step * (i + 0.5)).toFixed(1) + ' ' + Y(b.c).toFixed(1));
+    body = `<path d="${pts.join(' ')}" fill="none" stroke="var(--accent)"
+      stroke-width="2" stroke-linejoin="round"></path>`;
+  } else {
+    body = ser.map((b, i) => {
+      const x = padL + step * (i + 0.5);
+      const up = b.c >= 0;
+      const col = up ? 'var(--up)' : 'var(--down)';
+      const yTop = Y(Math.max(0, b.c)), yBot = Y(Math.min(0, b.c));
+      const bh = Math.max(1, yBot - yTop);
+      return `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}"
+          y1="${Y(b.h).toFixed(1)}" y2="${Y(b.l).toFixed(1)}"
+          stroke="${col}" stroke-width="1"></line>
+        <rect x="${(x - bw / 2).toFixed(1)}" y="${yTop.toFixed(1)}"
+          width="${bw.toFixed(1)}" height="${bh.toFixed(1)}"
+          fill="${up ? 'none' : col}" stroke="${col}"
+          stroke-width="1.2"${b.live ? ' opacity="0.65"' : ''}></rect>`;
+    }).join('');
+  }
+  const last = ser[ser.length - 1];
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"
+      preserveAspectRatio="none" role="img"
+      aria-label="book CVD per bar, zeroed at each bar open">
+    ${zero}${body}
+    <text x="${padL + iw + 5}" y="${(Y(last.c) + 4).toFixed(1)}"
+      fill="var(--ink)" font-size="11">${Math.round(last.c)}</text>
+  </svg>
+  <div class="stamp" style="margin-top:4px">
+    book CVD, zeroed at each bar open &middot; ${ser.length} bars of
+    ${d.seconds}s &middot; hollow = closed up, filled = closed down,
+    faded = still forming &middot; wick shows what was given back
+    &middot; contracts</div>`;
+}
+
 function mgRow(d) {
   const n = (d && d.now) || {};
+  const REG = {
+    up_book_above: 'UP \u00b7 book leading the tape',
+    up_book_below: 'UP \u00b7 tape ahead of the book',
+    down_book_above: 'DOWN \u00b7 book leading the tape',
+    down_book_below: 'DOWN \u00b7 tape ahead of the book'};
   let verdict, cls = '';
   if (!n.warm) {
     verdict = 'WARMING UP &mdash; not enough history to say what ' +
@@ -9497,8 +9627,7 @@ function mgRow(d) {
     verdict = 'CHOP &mdash; the two flipped ' + n.flips +
               ' times in the last minute';
   } else if (n.ok) {
-    verdict = (n.side === 'up' ? 'BOOK AND TAPE BOTH UP' :
-               'BOOK AND TAPE BOTH DOWN') + ' &mdash; held ' +
+    verdict = (REG[n.regime] || n.regime) + ' &mdash; held ' +
               n.held_s.toFixed(0) + 's';
     cls = n.side === 'up' ? 'long' : 'short';
   } else if (n.agree) {
@@ -9518,10 +9647,82 @@ function mgRow(d) {
       &middot; raw book ${fpNum(Math.round(n.book_cvd || 0))}
       &middot; raw tape ${fpNum(Math.round(n.tape_cvd || 0))}
       (smoothed ${fpNum(Math.round(n.tape_ema || 0))})
+      &middot; this bar ${fpNum(Math.round(n.bar_c || 0))}
+      (hi ${fpNum(Math.round(n.bar_h || 0))},
+       lo ${fpNum(Math.round(n.bar_l || 0))},
+       ${((n.bar_elapsed || 0) * 100).toFixed(0)}% in)
       &middot; VPIN ${(n.vpin || 0).toFixed(3)}
       &middot; LCR ${(n.lcr || 0).toFixed(2)}
       &middot; ${(n.trades || 0).toLocaleString()} prints
       &middot; ${n.session || '--'}</span>`;
+}
+
+/* The live tally. A hit rate with no break-even beside it is not a
+   result, so the break-even is always printed -- and both arms are
+   shown, because if the unconfirmed crosses score like the confirmed
+   ones then the confirmation is costing signals and buying nothing. */
+/* The comparison he is actually making, printed as a number.
+
+   A regime is a STATE, so it is judged by what price does WHILE it
+   holds -- median net travel in ticks per stretch, not an outcome
+   measured from a moment. Both orderings are shown on each side
+   because the claim is comparative: if `book above` really runs
+   harder, it shows up as a bigger median than `book below` on the
+   SAME side, and nowhere else.
+
+   `enough` gates the verdict at twenty stretches a side. Under that
+   the medians are printed but the difference is not called. */
+function mgRegimeRow(rb) {
+  if (!rb || !rb.episodes) return '';
+  const row = (label, d) => `<span class="stamp">${label}
+    <b>${d.median_net > 0 ? '+' : ''}${d.median_net}t</b> net
+    (n ${d.n}, ${d.median_seconds}s, ${d.median_ticks_per_min}t/min,
+    worst ${d.median_adverse}t)</span>`;
+  const edge = side => {
+    const e = rb[side + '_edge'];
+    if (!e) return '';
+    if (!e.enough) return `<span class="stamp">${side}: not enough
+      stretches yet to compare (${e.n_above} above / ${e.n_below}
+      below, want 20 each)</span>`;
+    const d = e.difference;
+    const who = d > 0 ? 'book above runs further'
+                      : (d < 0 ? 'book BELOW runs further'
+                               : 'no difference');
+    return `<span class="${d > 0 ? 'long' : ''}"><b>${side}: ${who}</b>
+      <span class="stamp">(${e.book_above_net}t vs ${e.book_below_net}t,
+      difference ${d > 0 ? '+' : ''}${d}t)</span></span>`;
+  };
+  return `
+    <span class="stamp" style="width:100%">regime travel &mdash;
+      ${rb.episodes} stretches of at least ${rb.min_seconds}s
+      &middot; median ticks moved while the state held
+      &middot; forward tracking, not a backtest</span>
+    ${row('up &middot; book above', rb.up_book_above)}
+    ${row('up &middot; book below', rb.up_book_below)}
+    ${row('down &middot; book above', rb.down_book_above)}
+    ${row('down &middot; book below', rb.down_book_below)}
+    <span style="width:100%">${edge('up')} &nbsp; ${edge('down')}</span>`;
+}
+
+function mgBoardRow(sb) {
+  if (!sb || !sb.all || !sb.all.n) return '';
+  const be = (sb.break_even * 100).toFixed(1);
+  const arm = (name, d) => {
+    const r = d.rate === null ? '--' : (d.rate * 100).toFixed(1) + '%';
+    const good = d.rate !== null && d.rate > sb.break_even;
+    return `<span class="${good ? 'long' : ''}">${name}
+      <b>${r}</b> <span class="stamp">(${d.hit}/${d.hit + d.miss} done,
+      ${d.open} open, med +${d.median_mfe}/${d.median_mae}t)</span></span>`;
+  };
+  return `
+    <span class="stamp" style="width:100%">live tally &mdash;
+      ${sb.all.n} signals, ${sb.all.settled} settled over
+      ${sb.horizon_s}s &middot; ${sb.target_ticks}t target,
+      ${sb.stop_ticks}t stop &rArr; <b>break-even ${be}%</b>
+      &middot; forward tracking, not a backtest</span>
+    ${arm('all', sb.all)}
+    ${arm('confirmed', sb.confirmed)}
+    ${arm('unconfirmed', sb.unconfirmed)}`;
 }
 
 function mgCrossRow(d) {
@@ -9675,15 +9876,21 @@ function fpTick() {
    happened. */
 let mgPts = [];
 let mgLast = 0;
+let mgTick = 0;
+let mgBoard = null;
+let mgRegime = null;
 const MG_CAP = 600;
 
 async function mgLoad() {
   if (!$('mgChart')) return;
+  mgTick++;
   let d;
   try {
     d = await api('/api/cvdcross?coin=' +
       encodeURIComponent(($('coin') ? $('coin').value : 'ES') || 'ES') +
-      (mgLast ? '&since=' + mgLast : ''));
+      (mgLast ? '&since=' + mgLast : '') +
+      '&bar_seconds=' + (($('mgTf') && $('mgTf').value) || 300) +
+      (mgTick % 8 === 0 ? '&with_signals=1' : ''));
   } catch (e) {
     $('mgChart').innerHTML = '<div class="msg">' + e + '</div>';
     return;
@@ -9697,6 +9904,8 @@ async function mgLoad() {
       (d.why || 'no data') + '</div>';
     return;
   }
+  if (d.scoreboard) mgBoard = d.scoreboard;
+  if (d.regime_board) mgRegime = d.regime_board;
   if (d.continuous === false) { mgPts = []; }     // a hole: start clean
   const fresh = d.points || [];
   if (fresh.length) {
@@ -9705,7 +9914,8 @@ async function mgLoad() {
     mgLast = mgPts[mgPts.length - 1].ts;
   }
   const view = {now: d.now, points: mgPts, crosses: d.crosses,
-                enter: d.enter, tau_s: d.tau_s, sample_s: d.sample_s};
+                enter: d.enter, tau_s: d.tau_s, sample_s: d.sample_s,
+                tf: d.tf};
   const w = Math.max(360, ($('mgChart').clientWidth || 900));
   $('mgStamp').textContent = mgPts.length
     ? mgPts.length + ' pts · ' + d.sample_s + 's sampling · '
@@ -9716,8 +9926,21 @@ async function mgLoad() {
     ? mgChart(view, w, 190)
     : '<div class="msg">Collecting&hellip; ' + (d.why ||
         'the reader needs a few seconds of records') + '</div>';
-  $('mgCross').innerHTML = mgCrossRow(view);
+  if ($('mgBars')) {
+    $('mgBars').innerHTML = d.bars
+      ? mgBars(d.bars, w, 150,
+               !!($('mgLine') && $('mgLine').checked))
+      : '';
+  }
+  $('mgCross').innerHTML = mgRegimeRow(mgRegime)
+    + mgCrossRow(view) + mgBoardRow(mgBoard);
 }
+
+/* Changing the timeframe must not blank the panel while the next
+   poll is in flight, and it must not reset the line chart above --
+   the engine keeps all three frames fed at once, so the switch is
+   only a change of which one to ask for. */
+function mgPickTf() { mgLoad(); }
 
 /* Both panels need a clock of their own until their data moves onto
    /ws/live. Hidden tabs are skipped inside fpTick; mgLoad is cheap

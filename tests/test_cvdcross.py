@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from liqmap.cvdcross import (                            # noqa: E402
+    BookCVDBars, BookCVDFrames, Episode,
     BUY, DOWN, FLAT, LCR_MAX, SELL, UP, CVDCross, OrderBookDeltaTracker,
     RollingStats, VPINCalculator, liquidity_consumption_ratio)
 
@@ -615,3 +616,442 @@ class TestTheIncrementalPoll:
         fn = fn[:fn.index("\n}")]
         assert "d.continuous === false" in fn
         assert "mgLast" in fn, "the client never sends a since cursor"
+
+
+class TestEverySignalIsKept:
+    """"No matter how many come through."
+
+    Suppressing the crosses that look poor is how a reader flatters
+    itself: the unconfirmed ones and the losers are the only evidence
+    that the confirmation is worth anything.
+    """
+
+    def _fired(self, n=400, **kw):
+        kw.setdefault("sample_s", 0.0)
+        kw.setdefault("warm_at", 3)
+        kw.setdefault("dwell_s", 0.0)
+        r = CVDCross(**kw)
+        r.on_book(5800.00, 40, 5800.25, 40, T0)
+        px = 5800.25
+        for i in range(n):
+            buy = (i // 25) % 2 == 0
+            ts = T0 + i * 0.2
+            px += 0.25 if buy else -0.25
+            r.on_book(5800.00, 40, 5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50 if buy else 100, px)
+        return r
+
+    def test_every_cross_raises_a_signal(self):
+        r = self._fired()
+        assert len(r.signals()) == len(r.crosses())
+
+    def test_unconfirmed_crosses_are_kept_too(self):
+        r = self._fired(dwell_s=1e9)        # nothing can confirm
+        sigs = r.signals()
+        assert sigs, "no signals at all"
+        assert all(not g.confirmed for g in sigs)
+        assert r.scoreboard()["unconfirmed"]["n"] == len(sigs)
+
+    def test_a_long_tracks_price_upward_and_a_short_downward(self):
+        r = CVDCross(sample_s=0.0, warm_at=2, dwell_s=0.0, tick_size=0.25)
+        r.on_book(5800.00, 40, 5800.25, 40, T0)
+        for i in range(60):
+            buy = (i // 10) % 2 == 0
+            r.on_trade(T0 + i * 0.1, BUY if buy else SELL,
+                       50 if buy else 100, 5800.25)
+        for g in r.signals():
+            assert g.mfe >= 0.0, "best-case excursion went negative"
+            assert g.mae <= 0.0, "worst-case excursion went positive"
+
+    def test_excursions_are_measured_in_ticks(self):
+        r = CVDCross(sample_s=0.0, warm_at=2, dwell_s=0.0, tick_size=0.25)
+        r.on_book(5800.00, 40, 5800.25, 40, T0)
+        for i in range(40):
+            buy = (i // 10) % 2 == 0
+            r.on_trade(T0 + i * 0.1, BUY if buy else SELL,
+                       50 if buy else 100, 5800.00)
+        sigs = r.signals()
+        assert sigs
+        # drive price four ticks away and see it land on 4, not 1.0
+        g = sigs[0]
+        mv = 1.0 if g.side == "long" else -1.0
+        r.on_trade(T0 + 10, BUY, 1, g.px + mv)
+        assert g.mfe == pytest.approx(4.0)
+
+    def test_a_signal_settles_at_the_horizon(self):
+        r = self._fired(horizon_s=1.0)
+        assert any(g.settled for g in r.signals())
+
+    def test_the_signal_ring_is_bounded(self):
+        r = self._fired(n=4000, signals=20)
+        assert len(r.signals()) <= 20
+
+    def test_a_new_session_clears_them(self):
+        r = self._fired()
+        assert r.signals()
+        r.on_trade(T0 + 86_400 * 2, BUY, 1, 5800.25)
+        assert r.signals() == []
+
+    def test_they_serialise(self):
+        import json
+        json.dumps(self._fired().as_dict(with_signals=True))
+
+
+class TestTheScoreboardIsHonest:
+
+    def _r(self):
+        r = CVDCross(sample_s=0.0, warm_at=3, dwell_s=0.0, tick_size=0.25)
+        r.on_book(5800.00, 40, 5800.25, 40, T0)
+        px = 5800.25
+        for i in range(300):
+            buy = (i // 20) % 2 == 0
+            px += 0.25 if buy else -0.25
+            r.on_trade(T0 + i * 0.2, BUY if buy else SELL,
+                       50 if buy else 100, px)
+        return r
+
+    def test_the_break_even_is_printed_beside_the_rate(self):
+        """A hit rate without its break-even is not a result."""
+        sb = self._r().scoreboard(target=4.0, stop=4.0)
+        assert sb["break_even"] == pytest.approx(0.5)
+
+    def test_an_asymmetric_target_moves_the_break_even(self):
+        sb = self._r().scoreboard(target=16.0, stop=4.0)
+        assert sb["break_even"] == pytest.approx(0.2)
+
+    def test_confirmed_and_unconfirmed_are_tallied_separately(self):
+        sb = self._r().scoreboard()
+        assert (sb["confirmed"]["n"] + sb["unconfirmed"]["n"]
+                == sb["all"]["n"])
+
+    def test_an_unfinished_signal_counts_as_neither(self):
+        sb = self._r().scoreboard(target=1e9, stop=1e9)
+        for k in ("all", "confirmed", "unconfirmed"):
+            assert sb[k]["hit"] == 0 and sb[k]["miss"] == 0
+            assert sb[k]["open"] == sb[k]["n"]
+
+    def test_an_empty_scoreboard_says_none_rather_than_zero(self):
+        """A rate of 0.0 reads as 'it never wins'; None reads as
+        'nothing has finished', which is the truth."""
+        r = CVDCross(sample_s=0.0)
+        sb = r.scoreboard()
+        assert sb["all"]["rate"] is None and sb["all"]["n"] == 0
+
+    def test_settled_is_reported_apart_from_the_total(self):
+        sb = self._r().scoreboard()
+        assert "settled" in sb["all"]
+        assert sb["all"]["settled"] <= sb["all"]["n"]
+
+
+class TestTheAgentRoute:
+
+    def test_it_states_that_it_is_not_a_backtest(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        i = src.index("def api_cvd_signals(")
+        fn = src[i:src.index("\n    @app.", i)]
+        assert "not a backtest" in fn
+        assert "nothing is filtered" in fn
+
+    def test_it_places_nothing(self):
+        import inspect
+
+        from liqmap import web as w
+        src = inspect.getsource(w)
+        i = src.index("def api_cvd_signals(")
+        fn = src[i:src.index("\n    @app.", i)]
+        for w_ in ("submit", "place_order", "execute("):
+            assert w_ not in fn, w_
+
+    def test_the_light_poll_does_not_carry_the_signal_book(self):
+        """The panel polls twice a second; the agent asks explicitly."""
+        r = CVDCross(sample_s=0.0)
+        assert "signals" not in r.as_dict()
+        assert "signals" in r.as_dict(with_signals=True)
+
+
+class TestTheBookCVDBars:
+    """Book CVD zeroed at every bar, as OHLC.
+
+    The candle is the PATH, not the result. A bar closing at +40 after
+    reaching +180 is a different bar from one that climbed straight to
+    +40 -- bids stacked and pulled versus bids stacked and kept -- and
+    only the wick separates them.
+    """
+
+    def test_each_bar_opens_at_zero(self):
+        b = BookCVDBars(seconds=60.0)
+        b.add(T0 + 1, 50)
+        b.add(T0 + 61, 10)                  # rolls
+        assert list(b.closed)[-1]["o"] == 0.0
+        assert b.live(T0 + 61)["o"] == 0.0
+
+    def test_the_wick_records_what_was_given_back(self):
+        b = BookCVDBars(seconds=60.0)
+        for d in (60, 80, 40, -140):        # up to +180, back to +40
+            b.add(T0 + 1, d)
+        b.add(T0 + 61, 0)
+        bar = list(b.closed)[-1]
+        assert bar["h"] == 180.0 and bar["c"] == 40.0
+
+    def test_a_straight_climb_has_no_upper_wick(self):
+        b = BookCVDBars(seconds=60.0)
+        for d in (10, 10, 10, 10):
+            b.add(T0 + 1, d)
+        b.add(T0 + 61, 0)
+        bar = list(b.closed)[-1]
+        assert bar["h"] == bar["c"] == 40.0
+
+    def test_the_low_records_the_other_side(self):
+        b = BookCVDBars(seconds=60.0)
+        for d in (-90, 120):
+            b.add(T0 + 1, d)
+        b.add(T0 + 61, 0)
+        bar = list(b.closed)[-1]
+        assert bar["l"] == -90.0 and bar["c"] == 30.0
+
+    def test_boundaries_are_absolute_not_relative_to_startup(self):
+        b = BookCVDBars(seconds=300.0)
+        b.add(1_700_000_123.0, 10)
+        assert b._open_ts % 300.0 == 0.0
+
+    def test_a_silent_bar_still_closes(self):
+        """Driven by time, not by activity -- otherwise a quiet bar
+        merges into the next one."""
+        b = BookCVDBars(seconds=60.0)
+        b.add(T0 + 1, 50)
+        assert b.roll(T0 + 500) is True
+        assert b.bars == 1 and b.cur == 0.0
+
+    def test_it_zeroes_rather_than_carrying_forward(self):
+        b = BookCVDBars(seconds=60.0)
+        b.add(T0 + 1, 100)
+        b.add(T0 + 61, 5)
+        assert b.cur == 5.0, "the previous bar's total carried over"
+
+    def test_the_history_is_bounded(self):
+        b = BookCVDBars(seconds=1.0, keep=5)
+        for k in range(200):
+            b.add(T0 + k * 2, 3)
+        assert len(b.closed) == 5
+
+    def test_the_series_ends_with_the_live_bar(self):
+        b = BookCVDBars(seconds=60.0)
+        b.add(T0 + 1, 10)
+        b.add(T0 + 61, 7)
+        ser = b.series(ts=T0 + 70)
+        assert ser[-1]["live"] is True and ser[-1]["c"] == 7.0
+
+    def test_a_degenerate_bar_is_refused(self):
+        with pytest.raises(ValueError):
+            BookCVDBars(seconds=0.0)
+
+
+class TestAllThreeTimeframesAtOnce:
+    """Switching the selector must not lose history, which rebuilding
+    one series from scratch would."""
+
+    def test_every_frame_is_fed(self):
+        f = BookCVDFrames()
+        for k in range(1, 2000):
+            f.add(T0 + k, 1)
+        assert all(v.bars > 0 for v in f.frames.values())
+
+    def test_a_longer_frame_holds_fewer_bars(self):
+        f = BookCVDFrames()
+        for k in range(1, 2000):
+            f.add(T0 + k, 1)
+        assert f.get(60).bars > f.get(300).bars > f.get(900).bars
+
+    def test_an_unknown_choice_falls_back_rather_than_raising(self):
+        f = BookCVDFrames()
+        assert f.get(77).seconds == 300.0
+
+    def test_the_choices_are_published(self):
+        f = BookCVDFrames()
+        assert f.as_dict()["choices"] == [60, 300, 900]
+
+    def test_the_engine_feeds_them_from_book_updates_alone(self):
+        """No trades needed: this is the BOOK's CVD."""
+        r = CVDCross(sample_s=0.0, bar_seconds=60.0)
+        for k in range(1, 300):
+            r.on_book(5800.00, 40 + (k % 9), 5800.25, 40, T0 + k)
+        assert r.trades == 0
+        assert r.bars.get(60).bars > 0
+        assert r.snapshot().bar_s == 60.0
+
+    def test_a_new_session_clears_them(self):
+        r = CVDCross(sample_s=0.0)
+        for k in range(1, 200):
+            r.on_book(5800.00, 40 + (k % 9), 5800.25, 40, T0 + k)
+        r.on_trade(T0 + 86_400 * 2, BUY, 1, 5800.25)
+        assert r.bars.get(60).bars == 0
+
+    def test_the_light_poll_carries_the_selected_frame(self):
+        r = CVDCross(sample_s=0.0, bar_seconds=900.0)
+        for k in range(1, 300):
+            r.on_book(5800.00, 40 + (k % 9), 5800.25, 40, T0 + k)
+        d = r.as_dict()
+        assert d["bars"]["seconds"] == 900.0
+        assert d["bars"]["choices"] == [60, 300, 900]
+
+
+class TestTheRegimeIsAStateNotAnEvent:
+    """What he actually described: the two agreeing, AND which line is
+    on top. Judged by what price does WHILE it holds."""
+
+    def _r(self, **kw):
+        kw.setdefault("sample_s", 0.0)
+        kw.setdefault("warm_at", 3)
+        kw.setdefault("dwell_s", 0.0)
+        kw.setdefault("tick_size", 0.25)
+        r = CVDCross(**kw)
+        r.on_book(5800.00, 40, 5800.25, 40, T0)
+        return r
+
+    def test_the_four_states_are_named_by_side_and_order(self):
+        r = self._r()
+        px = 5800.25
+        for i in range(300):
+            buy = (i // 30) % 2 == 0
+            px += 0.25 if buy else -0.25
+            ts = T0 + i * 0.2
+            r.on_book(5800.00, 40 + (15 if buy else -15), 5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50, px)
+        seen = {e.regime for e in r.episodes()}
+        assert seen, "no regimes at all"
+        assert seen <= {"up_book_above", "up_book_below",
+                        "down_book_above", "down_book_below"}
+
+    def test_order_follows_which_z_is_higher(self):
+        r = self._r()
+        for i in range(80):
+            ts = T0 + i * 0.25
+            r.on_book(5800.00, 40 + i, 5800.25, 40, ts)
+            r.on_trade(ts, BUY, 10, 5800.25)
+        s = r.snapshot()
+        expect = "book_above" if s.book_z > s.tape_z else "book_below"
+        assert s.order == expect
+        if s.regime != "none":
+            assert s.regime.endswith(expect)
+
+    def test_no_agreement_is_not_a_regime(self):
+        r = self._r()
+        for i in range(60):          # bids stack while the tape sells
+            ts = T0 + i * 0.5
+            r.on_book(5800.00, 40 + i * 5, 5800.25, 40, ts)
+            r.on_trade(ts, SELL, 20, 5800.00)
+        s = r.snapshot()
+        if s.side == FLAT:
+            assert s.regime == "none"
+
+    def test_excursions_are_signed_by_the_regimes_own_direction(self):
+        r = self._r()
+        px = 5800.25
+        for i in range(400):
+            buy = (i // 40) % 2 == 0
+            px += 0.25 if buy else -0.25
+            ts = T0 + i * 0.2
+            r.on_book(5800.00, 40 + (15 if buy else -15), 5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50, px)
+        for e in r.episodes():
+            assert e.favour >= 0.0, f"{e.regime} favour went negative"
+            assert e.adverse <= 0.0, f"{e.regime} adverse went positive"
+
+    def test_a_regime_change_closes_the_stretch(self):
+        r = self._r()
+        px = 5800.25
+        for i in range(300):
+            buy = (i // 30) % 2 == 0
+            px += 0.25 if buy else -0.25
+            ts = T0 + i * 0.2
+            r.on_book(5800.00, 40 + (15 if buy else -15), 5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50, px)
+        eps = r.episodes()
+        assert len(eps) >= 2
+        assert all(not e.open for e in eps[:-1]), "a stale stretch stayed open"
+
+    def test_the_episode_ring_is_bounded(self):
+        r = self._r(episodes=10)
+        px = 5800.25
+        for i in range(2000):
+            buy = (i // 3) % 2 == 0
+            px += 0.25 if buy else -0.25
+            ts = T0 + i * 0.1
+            r.on_book(5800.00, 40 + (15 if buy else -15), 5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50, px)
+        assert len(r.episodes()) <= 10
+
+    def test_a_new_session_clears_them(self):
+        r = self._r()
+        for i in range(80):
+            ts = T0 + i * 0.25
+            r.on_book(5800.00, 40 + i, 5800.25, 40, ts)
+            r.on_trade(ts, BUY, 10, 5800.25)
+        r.on_trade(T0 + 86_400 * 2, BUY, 1, 5800.25)
+        assert r.episodes() == []
+
+
+class TestTheRegimeBoardAnswersTheQuestion:
+    """'When book CVD is above traded CVD the move tends to be
+    stronger' -- stated as a number, with the sample size beside it."""
+
+    def _board(self):
+        r = CVDCross(sample_s=0.0, warm_at=3, dwell_s=0.0, tick_size=0.25)
+        r.on_book(5800.00, 40, 5800.25, 40, T0)
+        px = 5800.25
+        for i in range(1200):
+            buy = (i // 25) % 2 == 0
+            px += 0.25 if buy else -0.25
+            ts = T0 + i * 0.3
+            r.on_book(5800.00, 40 + (15 if buy else -15), 5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50, px)
+        return r, r.regime_board()
+
+    def test_it_compares_above_against_below_on_each_side(self):
+        _, rb = self._board()
+        for side in (UP, DOWN):
+            e = rb[f"{side}_edge"]
+            assert set(e) >= {"book_above_net", "book_below_net",
+                              "difference", "n_above", "n_below", "enough"}
+            assert e["difference"] == pytest.approx(
+                e["book_above_net"] - e["book_below_net"])
+
+    def test_it_refuses_to_call_a_thin_sample_enough(self):
+        """Twenty stretches a side is already generous; fewer is not a
+        finding however clean the medians look."""
+        r = CVDCross(sample_s=0.0, warm_at=3, dwell_s=0.0)
+        r.on_book(5800.00, 40, 5800.25, 40, T0)
+        for i in range(40):
+            ts = T0 + i * 0.25
+            r.on_book(5800.00, 40 + i, 5800.25, 40, ts)
+            r.on_trade(ts, BUY, 10, 5800.25)
+        for side in (UP, DOWN):
+            assert r.regime_board()[f"{side}_edge"]["enough"] is False
+
+    def test_momentary_stretches_are_excluded(self):
+        """A regime that lasted one sample has no travel to measure
+        and would drag every median toward zero."""
+        r, _ = self._board()
+        loose = r.regime_board(min_seconds=0.0)["episodes"]
+        tight = r.regime_board(min_seconds=5.0)["episodes"]
+        assert tight <= loose
+
+    def test_every_regime_is_reported_even_when_empty(self):
+        r = CVDCross(sample_s=0.0)
+        rb = r.regime_board()
+        for key in ("up_book_above", "up_book_below",
+                    "down_book_above", "down_book_below"):
+            assert rb[key]["n"] == 0
+
+    def test_it_serialises(self):
+        import json
+        r, _ = self._board()
+        json.dumps(r.as_dict(with_signals=True))
+
+    def test_the_light_poll_still_does_not_carry_the_board(self):
+        r, _ = self._board()
+        assert "regime_board" not in r.as_dict()
+        assert "regime_board" in r.as_dict(with_signals=True)

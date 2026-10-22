@@ -77,6 +77,16 @@ from dataclasses import dataclass
 
 from . import levels
 
+
+def _median(xs: list) -> float:
+    if not xs:
+        return 0.0
+    ys = sorted(xs)
+    n = len(ys)
+    mid = n // 2
+    return ys[mid] if n % 2 else (ys[mid - 1] + ys[mid]) / 2.0
+
+
 BUY, SELL = "buy", "sell"
 UP, DOWN, FLAT = "up", "down", "flat"
 
@@ -318,6 +328,223 @@ class Cross:
                 "held_s": round(self.held_s, 1)}
 
 
+class BookCVDBars:
+    """Book CVD, zeroed at every bar, drawn as OHLC.
+
+    What this is, precisely: inside each bar the book CVD starts at
+    zero and accumulates every add and pull at the inside quotes. The
+    bar records where that running value opened (always zero), the
+    furthest it got each way, and where it finished.
+
+    So the candle is the PATH, not just the result. A bar that closes
+    at +40 having been to +180 is a different bar from one that
+    climbed straight to +40, and only the wicks tell them apart --
+    the first had resting bids stacked and then pulled, the second
+    had them stacked and kept.
+
+    Boundaries are absolute wall-clock: a 5m bar starts on the
+    5-minute mark, so these line up with the chart's candles rather
+    than with whenever the engine booted.
+    """
+
+    __slots__ = ("seconds", "keep", "_open_ts", "cur", "hi", "lo",
+                 "bars", "closed")
+
+    def __init__(self, seconds: float = 300.0, keep: int = 180) -> None:
+        if seconds <= 0:
+            raise ValueError("bar length must be positive")
+        self.seconds = float(seconds)
+        self.keep = int(keep)
+        self.closed: deque = deque(maxlen=self.keep)
+        self.reset()
+
+    def reset(self) -> None:
+        self._open_ts = 0.0
+        self.cur = self.hi = self.lo = 0.0
+        self.bars = 0
+        self.closed.clear()
+
+    def _bar_open(self, ts: float) -> float:
+        return ts - (ts % self.seconds)
+
+    def roll(self, ts: float) -> bool:
+        """Close the bar if `ts` has crossed its boundary.
+
+        Driven by time rather than by activity, so a silent bar still
+        closes instead of merging into the next one.
+        """
+        o = self._bar_open(ts)
+        if self._open_ts == 0.0:
+            self._open_ts = o
+            return False
+        if o <= self._open_ts:
+            return False
+        self.closed.append({"ts": self._open_ts, "o": 0.0,
+                            "h": round(self.hi, 1),
+                            "l": round(self.lo, 1),
+                            "c": round(self.cur, 1)})
+        self.bars += 1
+        self.cur = self.hi = self.lo = 0.0
+        self._open_ts = o
+        return True
+
+    def add(self, ts: float, delta: float) -> bool:
+        rolled = self.roll(ts)
+        if delta:
+            self.cur += float(delta)
+            if self.cur > self.hi:
+                self.hi = self.cur
+            if self.cur < self.lo:
+                self.lo = self.cur
+        return rolled
+
+    def elapsed(self, ts: float) -> float:
+        if self._open_ts <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, (ts - self._open_ts) / self.seconds))
+
+    def live(self, ts: float = 0.0) -> dict:
+        return {"ts": self._open_ts, "o": 0.0, "h": round(self.hi, 1),
+                "l": round(self.lo, 1), "c": round(self.cur, 1),
+                "live": True, "elapsed": round(self.elapsed(ts), 3)}
+
+    def series(self, limit: int = 120, ts: float = 0.0) -> list:
+        out = list(self.closed)[-int(limit):]
+        if self._open_ts > 0.0:
+            out = out + [self.live(ts)]
+        return out
+
+
+class BookCVDFrames:
+    """The same book CVD kept on 1m, 5m and 15m at once.
+
+    Every frame is fed the same deltas, so switching the panel's
+    timeframe is instant and loses no history -- which rebuilding a
+    single series from scratch on every change would.
+    """
+
+    __slots__ = ("frames",)
+    CHOICES = (60.0, 300.0, 900.0)
+
+    def __init__(self, keep: int = 180) -> None:
+        self.frames = {int(s): BookCVDBars(seconds=s, keep=keep)
+                       for s in self.CHOICES}
+
+    def reset(self) -> None:
+        for f in self.frames.values():
+            f.reset()
+
+    def add(self, ts: float, delta: float) -> None:
+        for f in self.frames.values():
+            f.add(ts, delta)
+
+    def roll(self, ts: float) -> None:
+        for f in self.frames.values():
+            f.roll(ts)
+
+    def get(self, seconds: float) -> BookCVDBars:
+        key = int(seconds)
+        return self.frames.get(key, self.frames[300])
+
+    def as_dict(self, seconds: float = 300.0, limit: int = 120,
+                ts: float = 0.0) -> dict:
+        f = self.get(seconds)
+        return {"seconds": f.seconds,
+                "choices": [int(c) for c in self.CHOICES],
+                "bars": f.bars, "elapsed": round(f.elapsed(ts), 3),
+                "series": f.series(limit, ts)}
+
+
+@dataclass(slots=True)
+class Episode:
+    """One stretch of a single regime, and what price did during it.
+
+    A regime is a STATE, not an event, so what it is worth is measured
+    by what price does WHILE it holds -- not by what happens after a
+    moment. `favour` and `adverse` are in ticks and signed from the
+    regime's own direction, so an "up" and a "down" regime are read
+    the same way.
+    """
+
+    regime: str
+    side: str
+    order: str
+    ts: float
+    px: float
+    end_ts: float = 0.0
+    end_px: float = 0.0
+    hi: float = 0.0
+    lo: float = 0.0
+    favour: float = 0.0         # ticks, best in the regime's direction
+    adverse: float = 0.0        # ticks, worst against (<= 0)
+    net: float = 0.0            # ticks, close minus open
+    seconds: float = 0.0
+    open: bool = True
+
+    @property
+    def ticks_per_min(self) -> float:
+        return (self.net / (self.seconds / 60.0)) if self.seconds > 0 else 0.0
+
+    def as_dict(self) -> dict:
+        return {"regime": self.regime, "side": self.side,
+                "order": self.order, "ts": self.ts,
+                "px": round(self.px, 4), "end_px": round(self.end_px, 4),
+                "favour": round(self.favour, 2),
+                "adverse": round(self.adverse, 2),
+                "net": round(self.net, 2),
+                "seconds": round(self.seconds, 1),
+                "ticks_per_min": round(self.ticks_per_min, 2),
+                "open": self.open}
+
+
+@dataclass(slots=True)
+class Signal:
+    """One cross, and what price has done since.
+
+    EVERY cross becomes one of these -- confirmed or not, good or
+    bad. Suppressing the ones that look poor is how a reader ends up
+    flattering itself: the unconfirmed and the losers are the only
+    evidence that the confirmation is worth anything.
+
+    Excursions are in TICKS and signed from the signal's own point of
+    view, so `mfe` is always "how far it went my way" whether the
+    signal was long or short. `mae` is negative or zero.
+
+    This is forward tracking on live prints, not a backtest. It knows
+    only what has happened since the cross, and it says how long that
+    has been so a half-formed result is not mistaken for a finished
+    one. It suggests nothing and places nothing.
+    """
+
+    id: int
+    ts: float
+    px: float
+    side: str                   # "long" | "short"
+    confirmed: bool
+    book_z: float
+    tape_z: float
+    held_s: float
+    last_px: float = 0.0
+    hi: float = 0.0
+    lo: float = 0.0
+    mfe: float = 0.0            # ticks, best in favour
+    mae: float = 0.0            # ticks, worst against (<= 0)
+    age_s: float = 0.0
+    settled: bool = False
+    result: float = 0.0         # ticks at the horizon
+
+    def as_dict(self) -> dict:
+        return {"id": self.id, "ts": self.ts, "px": round(self.px, 4),
+                "side": self.side, "confirmed": self.confirmed,
+                "book_z": round(self.book_z, 3),
+                "tape_z": round(self.tape_z, 3),
+                "held_s": round(self.held_s, 1),
+                "last_px": round(self.last_px, 4),
+                "mfe": round(self.mfe, 2), "mae": round(self.mae, 2),
+                "age_s": round(self.age_s, 1), "settled": self.settled,
+                "result": round(self.result, 2)}
+
+
 @dataclass(frozen=True, slots=True)
 class Reading:
     ts: float = 0.0
@@ -337,6 +564,14 @@ class Reading:
     chop: bool = False
     ok: bool = False
     spread_z: float = 0.0
+    regime: str = "none"
+    order: str = ""
+    bar_s: float = 0.0
+    bar_c: float = 0.0          # book CVD so far INSIDE this bar
+    bar_h: float = 0.0
+    bar_l: float = 0.0
+    bar_dir: str = FLAT
+    bar_elapsed: float = 0.0
     lcr: float = 0.0
     vpin: float = 0.0
     inside_bid: float = 0.0
@@ -359,6 +594,13 @@ class Reading:
                 "held_s": round(self.held_s, 1), "flips": self.flips,
                 "chop": self.chop, "ok": self.ok,
                 "spread_z": round(self.spread_z, 3),
+                "regime": self.regime, "order": self.order,
+                "bar_s": self.bar_s,
+                "bar_c": round(self.bar_c, 1),
+                "bar_h": round(self.bar_h, 1),
+                "bar_l": round(self.bar_l, 1),
+                "bar_dir": self.bar_dir,
+                "bar_elapsed": round(self.bar_elapsed, 3),
                 "lcr": round(self.lcr, 3), "vpin": round(self.vpin, 4),
                 "inside_bid": self.inside_bid, "inside_ask": self.inside_ask,
                 "warm": self.warm, "trades": self.trades,
@@ -375,7 +617,10 @@ class CVDCross:
                  dwell_s: float = 2.0, max_flips: int = 4,
                  flip_window_s: float = 60.0, history: int = 1200,
                  crosses: int = 60, bucket: int = 1000,
-                 vpin_window: int = 50, warm_at: int = 30) -> None:
+                 vpin_window: int = 50, warm_at: int = 30,
+                 tick_size: float = 0.25, horizon_s: float = 120.0,
+                 signals: int = 250, bar_seconds: float = 300.0,
+                 episodes: int = 400) -> None:
         if exit > enter:
             raise ValueError("exit threshold must not exceed enter")
         self.book = OrderBookDeltaTracker(price_move=price_move)
@@ -408,6 +653,22 @@ class CVDCross:
         self._tape_ema = 0.0
         self._ema_ts = 0.0
 
+        if tick_size <= 0:
+            raise ValueError("tick size must be positive")
+        self.tick_size = float(tick_size)
+        self.horizon_s = float(horizon_s)
+        self._signals: deque = deque(maxlen=int(signals))
+        self._next_id = 1
+        # The third reading: book CVD zeroed at every bar, as OHLC,
+        # kept on 1m / 5m / 15m at once so the selector is instant.
+        self.bars = BookCVDFrames()
+        self.bar_seconds = float(bar_seconds)
+        self._session_checked = 0.0
+        # The regime: agreement AND which line is on top.
+        self._episodes: deque = deque(maxlen=int(episodes))
+        self._regime = "none"
+        self._live: Episode | None = None
+
         self._lock = threading.Lock()
         self._read = Reading()
 
@@ -416,10 +677,20 @@ class CVDCross:
     def _roll_session(self, ts: float) -> None:
         """Both lines are cumulative, so they need a zero somewhere.
 
+        Called from the BOOK path as well as the trade path, because
+        the book line moves with no prints at all -- a quiet session
+        would otherwise never roll. Rate-limited to once a minute:
+        the date conversion is far too expensive to run on every one
+        of twenty-odd thousand book updates a second, and a boundary
+        found within a minute is found soon enough.
+
         The CME session day, not the calendar day: ES runs Sunday 17:00
         to Friday 16:00 Central and the post-settlement hour belongs to
         the session that follows.
         """
+        if ts - self._session_checked < 60.0:
+            return
+        self._session_checked = ts
         try:
             day = levels.trade_date(ts).isoformat()
         except Exception:                               # noqa: BLE001
@@ -446,6 +717,12 @@ class CVDCross:
         self._gap_sign = 0
         self._tape_ema = 0.0
         self._ema_ts = 0.0
+        self._session_checked = 0.0
+        self._signals.clear()
+        self.bars.reset()
+        self._episodes.clear()
+        self._regime = "none"
+        self._live = None
         if not keep_session:
             self._session = ""
 
@@ -453,7 +730,15 @@ class CVDCross:
 
     def on_book(self, bid_px: float, bid_sz: float, ask_px: float,
                 ask_sz: float, ts: float = 0.0) -> None:
+        if ts:
+            self._roll_session(ts)
+        before = self.book.book_cvd
         self.book.update(bid_px, bid_sz, ask_px, ask_sz)
+        # The bar series gets the INCREMENT, not the running total:
+        # each bar starts at zero, so what it accumulates is the
+        # change since the previous book, not the session's sum.
+        if ts:
+            self.bars.add(ts, self.book.book_cvd - before)
         self.books += 1
         if ts:
             self.last_ts = ts
@@ -525,20 +810,37 @@ class CVDCross:
             self._side = side
             self._since = ts if side != FLAT else 0.0
 
+        self.bars.roll(ts)
+        self._regime_step(ts, side, bz, tz)
+
         # The cross itself: the tape passing through the book.
         gap = tz - bz
         sign = 1 if gap > 0 else (-1 if gap < 0 else 0)
         if sign and self._gap_sign and sign != self._gap_sign:
             held = (ts - self._since) if self._since else 0.0
+            conf = self._ok(ts, side, held)
             self._crosses.append(Cross(
                 ts=ts, px=self.last_px,
                 direction=UP if sign > 0 else DOWN,
                 book_z=bz, tape_z=tz,
-                confirmed=self._ok(ts, side, held), held_s=held))
+                confirmed=conf, held_s=held))
+            # EVERY cross raises a signal, confirmed or not. The ones
+            # that look poor are the only evidence the confirmation is
+            # worth anything.
+            if self.last_px > 0.0:
+                self._signals.append(Signal(
+                    id=self._next_id, ts=ts, px=self.last_px,
+                    side="long" if sign > 0 else "short",
+                    confirmed=conf, book_z=bz, tape_z=tz, held_s=held,
+                    last_px=self.last_px,
+                    hi=self.last_px, lo=self.last_px))
+                self._next_id += 1
         if sign:
             self._gap_sign = sign
 
-        self._points.append(Point(ts=ts, book=bz, tape=tz, px=self.last_px))
+        self._points.append(Point(ts=ts, book=bz, tape=tz,
+                                  px=self.last_px))
+        self._track(ts)
         self._publish(ts)
 
     def _smooth_tape(self, ts: float) -> float:
@@ -581,6 +883,7 @@ class CVDCross:
                 and self.tape_stats.n >= self.warm_at)
 
     def _publish(self, ts: float) -> None:
+        _live = self.bars.get(self.bar_seconds)
         book_v = self.book.book_cvd
         tape_v = self._tape_ema
         bz = self.book_stats.z(book_v)
@@ -601,13 +904,201 @@ class CVDCross:
             side=self._side, agree=self._side != FLAT, held_s=held,
             flips=flips, chop=chop,
             ok=self._ok(ts, self._side, held),
-            spread_z=tz - bz, lcr=self.lcr, vpin=self.vpin.value,
+            spread_z=tz - bz, regime=self._regime,
+            order=("book_above" if bz > tz else "book_below"),
+            bar_s=_live.seconds, bar_c=_live.cur, bar_h=_live.hi,
+            bar_l=_live.lo,
+            bar_dir=(UP if _live.cur > 0 else
+                     (DOWN if _live.cur < 0 else FLAT)),
+            bar_elapsed=_live.elapsed(ts),
+            lcr=self.lcr, vpin=self.vpin.value,
             inside_bid=self.book.inside_bid_sz,
             inside_ask=self.book.inside_ask_sz,
             warm=self._warm(), trades=self.trades, books=self.books,
             session=self._session)
 
     # ----------------------------------------------------------- read
+
+    # -------------------------------------------------------- regime
+
+    def _regime_step(self, ts: float, side: str,
+                     bz: float, tz: float) -> None:
+        """The reading that matters: agreement AND which line is on top.
+
+        Four live states, not one event:
+
+            up_book_above     both lean up, book CVD above traded
+            up_book_below     both lean up, traded above book
+            down_book_above   both lean down, book above traded
+            down_book_below   both lean down, traded above book
+
+        plus `none` when the two do not agree. A regime is a STATE, so
+        it is judged by what price does WHILE it holds, which is why
+        each stretch is kept as an Episode with its own excursions
+        rather than as a moment with an outcome bolted on afterwards.
+        """
+        order = "book_above" if bz > tz else "book_below"
+        key = "none" if side == FLAT else f"{side}_{order}"
+        if key != self._regime:
+            self._close_episode(ts)
+            self._regime = key
+            if key != "none" and self.last_px > 0.0:
+                self._live = Episode(
+                    regime=key, side=side, order=order, ts=ts,
+                    px=self.last_px, hi=self.last_px, lo=self.last_px)
+                self._episodes.append(self._live)
+            else:
+                self._live = None
+        self._walk_episode(ts)
+
+    def _walk_episode(self, ts: float) -> None:
+        e = self._live
+        px = self.last_px
+        if e is None or px <= 0.0:
+            return
+        if px > e.hi:
+            e.hi = px
+        if px < e.lo:
+            e.lo = px
+        tick = self.tick_size
+        if e.side == UP:
+            e.favour = (e.hi - e.px) / tick
+            e.adverse = (e.lo - e.px) / tick
+            e.net = (px - e.px) / tick
+        else:
+            e.favour = (e.px - e.lo) / tick
+            e.adverse = (e.px - e.hi) / tick
+            e.net = (e.px - px) / tick
+        e.end_px = px
+        e.end_ts = ts
+        e.seconds = ts - e.ts
+
+    def _close_episode(self, ts: float) -> None:
+        if self._live is not None:
+            self._walk_episode(ts)
+            self._live.open = False
+            self._live = None
+
+    def episodes(self) -> list:
+        with self._lock:
+            return list(self._episodes)
+
+    def regime_board(self, min_seconds: float = 2.0) -> dict:
+        """What price actually does inside each regime.
+
+        The hypothesis this exists to test: that when the book line is
+        ABOVE the traded line the move runs harder, and likewise below.
+        If that is real it shows up as a higher median net travel and a
+        higher ticks-per-minute for the `book_above` regimes than the
+        `book_below` ones on the same side.
+
+        Stretches shorter than `min_seconds` are excluded: a regime
+        that existed for one sample has no travel to measure and would
+        other wise pull every median toward zero.
+
+        LIVE FORWARD TRACKING of real prints, not a backtest. `n` is
+        how many stretches, not how many trades, and a handful of
+        stretches says nothing however clean the numbers look.
+        """
+        rows = [e for e in self.episodes() if e.seconds >= min_seconds]
+        out = {"min_seconds": min_seconds, "episodes": len(rows),
+               "bar_s": self.bar_seconds}
+        for key in ("up_book_above", "up_book_below",
+                    "down_book_above", "down_book_below"):
+            es = [e for e in rows if e.regime == key]
+            out[key] = {
+                "n": len(es),
+                "median_net": round(_median([e.net for e in es]), 2),
+                "median_favour": round(_median([e.favour for e in es]), 2),
+                "median_adverse": round(_median([e.adverse for e in es]), 2),
+                "median_seconds": round(_median([e.seconds for e in es]), 1),
+                "median_ticks_per_min": round(
+                    _median([e.ticks_per_min for e in es]), 2),
+                "total_seconds": round(sum(e.seconds for e in es), 1),
+            }
+        # The comparison he is actually making, stated outright.
+        for side in (UP, DOWN):
+            a = out[f"{side}_book_above"]
+            b = out[f"{side}_book_below"]
+            out[f"{side}_edge"] = {
+                "book_above_net": a["median_net"],
+                "book_below_net": b["median_net"],
+                "difference": round(a["median_net"] - b["median_net"], 2),
+                "n_above": a["n"], "n_below": b["n"],
+                "enough": a["n"] >= 20 and b["n"] >= 20,
+            }
+        return out
+
+    def _track(self, ts: float) -> None:
+        """Walk the open signals forward against the last print.
+
+        Only the UNSETTLED ones are touched, so the cost per sample is
+        bounded by how many are still inside the horizon rather than
+        by how many have ever fired.
+        """
+        px = self.last_px
+        if px <= 0.0:
+            return
+        tick = self.tick_size
+        for g in self._signals:
+            if g.settled:
+                continue
+            g.last_px = px
+            if px > g.hi:
+                g.hi = px
+            if px < g.lo:
+                g.lo = px
+            if g.side == "long":
+                g.mfe = (g.hi - g.px) / tick
+                g.mae = (g.lo - g.px) / tick
+                g.result = (px - g.px) / tick
+            else:
+                g.mfe = (g.px - g.lo) / tick
+                g.mae = (g.px - g.hi) / tick
+                g.result = (g.px - px) / tick
+            g.age_s = ts - g.ts
+            if g.age_s >= self.horizon_s:
+                g.settled = True
+
+    def signals(self) -> list:
+        with self._lock:
+            return list(self._signals)
+
+    def scoreboard(self, target: float = 4.0, stop: float = 4.0) -> dict:
+        """What the signals have actually done, split by confirmation.
+
+        A LIVE FORWARD TALLY, not a backtest. It counts only what has
+        happened since each cross fired, so a young sample says little
+        -- which is why `settled` is reported separately from the
+        total, and why the break-even for the stop and target asked
+        for is printed beside the hit rate rather than left implied.
+
+        `hit` means the signal reached +target ticks before it reached
+        -stop. A signal still inside the horizon that has done neither
+        counts as neither.
+        """
+        rows = self.signals()
+        out = {"target_ticks": target, "stop_ticks": stop,
+               "break_even": round(stop / (target + stop), 4),
+               "horizon_s": self.horizon_s}
+        for name, sel in (("all", lambda g: True),
+                          ("confirmed", lambda g: g.confirmed),
+                          ("unconfirmed", lambda g: not g.confirmed)):
+            gs = [g for g in rows if sel(g)]
+            hit = sum(1 for g in gs if g.mfe >= target and g.mae > -stop)
+            miss = sum(1 for g in gs if g.mae <= -stop)
+            done = hit + miss
+            out[name] = {
+                "n": len(gs),
+                "settled": sum(1 for g in gs if g.settled),
+                "hit": hit, "miss": miss, "open": len(gs) - done,
+                "rate": round(hit / done, 4) if done else None,
+                "median_mfe": round(_median([g.mfe for g in gs]), 2),
+                "median_mae": round(_median([g.mae for g in gs]), 2),
+                "mean_result": round(
+                    sum(g.result for g in gs) / len(gs), 2) if gs else 0.0,
+            }
+        return out
 
     def snapshot(self) -> Reading:
         return self._read
@@ -620,7 +1111,9 @@ class CVDCross:
         with self._lock:
             return list(self._crosses)
 
-    def as_dict(self, limit: int = 600, since: float = 0.0) -> dict:
+    def as_dict(self, limit: int = 600, since: float = 0.0,
+                with_signals: bool = False, target: float = 4.0,
+                stop: float = 4.0) -> dict:
         """The reading, and the points the caller does not yet have.
 
         `since` makes the poll INCREMENTAL. Resending 600 points four
@@ -652,7 +1145,19 @@ class CVDCross:
                 "crosses": [c.as_dict() for c in self.crosses()],
                 "sample_s": self.sample_s, "tau_s": self.tau_s,
                 "enter": self.enter, "dwell_s": self.dwell_s,
-                "capacity": self._points.maxlen}
+                "capacity": self._points.maxlen,
+                # Opt-in: the panel polls this twice a second and does
+                # not want the whole signal book on every frame. The
+                # agent asks for it explicitly.
+                "bars": self.bars.as_dict(self.bar_seconds,
+                                          ts=self.last_ts),
+                "regime": self.snapshot().regime,
+                **({"signals": [g.as_dict() for g in self.signals()],
+                    "scoreboard": self.scoreboard(target, stop),
+                    "regime_board": self.regime_board(),
+                    "episodes": [e.as_dict()
+                                 for e in self.episodes()[-60:]]}
+                   if with_signals else {})}
 
 
 def _mock(seconds: float = 900.0, seed: int = 7) -> None:         # pragma: no cover
