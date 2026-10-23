@@ -2904,6 +2904,8 @@ class TestFootprintPanel:
                 tape.lead.on_trade(ts, round(px, 2), size, side)
             if tape.pace is not None:
                 tape.pace.on_trade(ts, size, side)
+            if tape.push is not None:
+                tape.push.on_trade(ts, round(px, 2), size, side)
             px += rng.choice((-0.25, 0.0, 0.0, 0.25))
         return stream
 
@@ -2924,6 +2926,51 @@ class TestFootprintPanel:
         assert "now" in v, "fpVerdictRow returns '' without this"
         assert v["now"]["side"] in ("buyers", "sellers", "balanced")
         assert "bars_held" in v
+
+    def test_the_payload_carries_the_push(self, client, monkeypatch):
+        """The leg reader rides on the same route. Its own key, and
+        not bar-scoped like the rest."""
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed_with_watchers(rt, tape)
+        v = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()["verdict"]
+        assert "push" in v
+        q = v["push"]
+        assert q["verdict"] in ("forming", "continuation", "absorbed")
+        assert q["scalp"] in ("long", "short", "")
+        if q["verdict"] == "forming":
+            assert q["scalp"] == "", "nothing to call yet"
+        else:
+            assert q["travel_ticks"] >= q["window"]
+
+    def test_the_push_window_is_tunable_from_the_panel(self, client,
+                                                       monkeypatch):
+        """The box beside `multiplier`. A 4-tick push is Chris's
+        number, and a number you cannot change without a ship is a
+        number you stop questioning."""
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed_with_watchers(rt, tape)
+        h = {"Authorization": f"Bearer {TOKEN}"}
+        wide = client.get("/api/footprint?coin=ES&push_ticks=40",
+                          headers=h).json()["verdict"]["push"]
+        assert wide["window"] == 40
+        assert wide["verdict"] == "forming", "40 ticks is a long way"
+        narrow = client.get("/api/footprint?coin=ES&push_ticks=1",
+                            headers=h).json()["verdict"]["push"]
+        assert narrow["window"] == 1
+
+    def test_the_push_names_a_level_that_proves_it_wrong(self, client,
+                                                        monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed_with_watchers(rt, tape)
+        q = client.get("/api/footprint?coin=ES&push_ticks=1",
+                       headers={"Authorization": f"Bearer {TOKEN}"}
+                       ).json()["verdict"]["push"]
+        if q["verdict"] == "continuation":
+            assert q["invalidated_at"] == q["pivot_px"]
+        elif q["verdict"] == "absorbed":
+            assert q["invalidated_at"] == q["extreme_px"]
 
     def test_the_payload_carries_the_lead_and_the_pace(self, client,
                                                        monkeypatch):

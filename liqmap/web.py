@@ -1011,6 +1011,9 @@ class Runtime:
                 svc.tape.lead = LeadWatcher()
             if svc.tape.pace is None:
                 svc.tape.pace = PaceWatcher()
+            from .push import PushWatcher
+            if svc.tape.push is None:
+                svc.tape.push = PushWatcher(tick_size=0.25)
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -6066,7 +6069,8 @@ def create_app() -> FastAPI:
     def api_footprint(coin: str = "ES", rule: str = "1m",
                       volume: int = 0, min_volume: int = 0,
                       multiplier: float = 4.0, rows: int = 40,
-                      history: int = 8) -> dict[str, Any]:
+                      history: int = 8,
+                      push_ticks: int = 4) -> dict[str, Any]:
         """The live footprint bar, its flags, and the bars behind it.
 
         Fed from the SAME decoded trades the CME candles are built
@@ -6178,6 +6182,16 @@ def create_app() -> FastAPI:
             # same clock, so the two are comparable.
             import time as _time
             verdict["pace"] = pace.reading(_time.time()).as_dict()
+
+        # The current leg. Its own key because it is NOT bar-scoped:
+        # it answers "price just went four ticks, who ate them and
+        # are they still being paid" while everything above answers
+        # "who is winning this bar".
+        push = getattr(tape, "push", None)
+        if push is not None:
+            if push.window != int(push_ticks) and push_ticks > 0:
+                push.window = int(push_ticks)
+            verdict["push"] = push.reading().as_dict()
 
         out["verdict"] = verdict
         return out
@@ -7496,6 +7510,8 @@ DASHBOARD = """<!doctype html>
           step="0.5" style="width:60px"></label>
         <label>min volume <input type="number" id="fpMin" value="0"
           style="width:64px"></label>
+        <label>push ticks <input type="number" id="fpPush" value="4"
+          min="1" style="width:56px"></label>
         <label><input type="checkbox" id="fpAuto" checked> live</label>
         <button class="btn" onclick="fpLoad();mgLoad()">Refresh</button>
       </div>
@@ -9843,6 +9859,57 @@ function fpPaceRow(p) {
       60s. Context for a decision you are making, not a trigger.</span>`;
 }
 
+function fpPushRow(q) {
+  /* The LEG, not the bar. Who ate the contracts that moved price the
+     last few ticks, and whether they are still being paid for them.
+     Absorption here is not "price stopped" -- price stops constantly
+     -- it is the driving side spending the going rate for another
+     tick and not being given it. */
+  if (!q || !q.direction) return '';
+  const up = q.direction === 'up';
+  const who = q.eater === 'buyers' ? 'BUYERS'
+            : (q.eater === 'sellers' ? 'SELLERS' : 'NEITHER SIDE');
+  const cls = s => s === 'long' ? 'long' : (s === 'short' ? 'short' : '');
+  let head, badge;
+  if (q.verdict === 'forming') {
+    badge = `<span class="stamp" style="font-size:15px;
+      border:1px solid currentColor;border-radius:3px;padding:1px 7px;
+      opacity:.55">FORMING</span>`;
+    head = `<b>${q.travel_ticks} of ${q.window} ticks</b> ${up ? 'up' : 'down'}`
+      + ` &mdash; not yet a push worth calling`;
+  } else {
+    badge = `<span class="${cls(q.scalp)}" style="font-size:15px;
+      font-weight:700;letter-spacing:.06em;border:1px solid currentColor;
+      border-radius:3px;padding:1px 7px">${q.scalp.toUpperCase()}</span>`;
+    if (q.verdict === 'absorbed') {
+      head = `<b class="${cls(q.scalp)}">ABSORBED</b> &mdash; ${who.toLowerCase()}`
+        + ` drove it ${q.travel_ticks} ticks ${up ? 'up' : 'down'} and are`
+        + ` being filled at ${q.extreme_px.toFixed(2)}`;
+    } else {
+      head = `<b class="${cls(q.scalp)}">${who} BROKE IT</b> &mdash;`
+        + ` ${q.travel_ticks} ticks ${up ? 'up' : 'down'}, still holding`;
+    }
+  }
+  return `
+    <span class="stamp" style="width:100%">the last push</span>
+    <span>${badge} &nbsp;${head}</span>
+    <span class="stamp">ate ${fpNum(q.eaten_buy)} bought /
+      ${fpNum(q.eaten_sell)} sold
+      &middot; ${q.per_tick.toFixed(0)}/tick to get here
+      &middot; ${fpNum(q.since_extreme)} spent since, no move
+      &middot; from ${q.pivot_px.toFixed(2)} to ${q.extreme_px.toFixed(2)}
+      ${q.give_back_ticks ? '&middot; back ' + q.give_back_ticks + 't' : ''}
+      ${q.agrees ? '' : '&middot; <b>drifted, not driven</b>'}</span>
+    ${q.verdict === 'forming' ? '' : `<span class="stamp"
+      style="width:100%">Wrong at ${q.invalidated_at.toFixed(2)}
+      &mdash; ${q.verdict === 'absorbed'
+        ? 'the fill there gave out' : 'the leg was given back'}.
+      Scalp band is your 1&ndash;2 points (4&ndash;8 ticks); the band is
+      a number you chose, not a measured expectancy. This leg reading
+      has NOT been through the study &mdash; section 11 is what would
+      settle whether it precedes anything.</span>`}`;
+}
+
 function fpLeadRow(l) {
   if (!l || !l.high_water) return '';
   const hw = Math.abs(l.high_water);
@@ -9900,6 +9967,7 @@ function fpVerdictRow(d) {
       ${fpNum(v.volume)} contracts over ${v.levels} levels</span>
     ${v.note ? '<span class="stamp" style="width:100%">&#9888; '
                + v.note + '</span>' : ''}
+    ${fpPushRow(d.verdict.push)}
     ${fpLeadRow(d.verdict.lead)}
     ${fpPaceRow(d.verdict.pace)}
     <span class="stamp" style="width:100%">It reports the state of the
@@ -9984,7 +10052,8 @@ async function fpLoad() {
     rule: rule === 'vol' ? '1m' : rule,
     volume: rule === 'vol' ? ($('fpVol').value || 0) : 0,
     multiplier: $('fpMult').value || 4,
-    min_volume: $('fpMin').value || 0 });
+    min_volume: $('fpMin').value || 0,
+    push_ticks: ($('fpPush') && $('fpPush').value) || 4 });
   let d;
   try { d = await api('/api/footprint?' + q.toString()); }
   catch (e) {

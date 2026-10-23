@@ -114,6 +114,11 @@ class Tape:
     # How FAST each side is accumulating, which is a different
     # question from who is ahead and the one that turns first.
     pace: object = None
+    # The current LEG of price -- who is driving it and whether they
+    # are still being paid for it. Not bar-scoped, unlike the two
+    # above: a leg starts where price last turned, which is usually
+    # not where a bar started.
+    push: object = None
     # The two drawn lines: book CVD as the reader, time-smoothed
     # traded CVD as the confirmation. Fed from the same decoded trade
     # as everything else above, so the lines and the candles can never
@@ -387,6 +392,11 @@ class Tape:
                 if closed:
                     self.pace.new_bar()
                 self.pace.on_trade(float(t.ts), size, t.aggressor)
+            if self.push is not None:
+                # NOT reset on `closed`. A leg is a price structure
+                # and does not care where the bar boundaries fall.
+                self.push.on_trade(float(t.ts), float(t.px), size,
+                                   t.aggressor)
             # The book reading is scoped to the footprint's candle,
             # driven by the footprint's OWN close events rather than
             # by a poll -- a reset at poll time would scope it to the
