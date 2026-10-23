@@ -274,6 +274,29 @@ class TestItDecidesNothing:
         for word in ("institution", "retail", "smart money", "whale"):
             assert word not in src, word
 
+    def test_the_panel_says_what_the_buy_sell_is_not(self):
+        """The call puts BUY or SELL on screen in a box. Nothing
+        else on the page does that, and a trader reading it at a
+        glance will take it for a signal unless the page says
+        plainly that it is not one.
+
+        So the disclaimer is not decoration -- it is the only thing
+        standing between a measured null and a trade. If a future
+        edit tidies it away, this fails.
+        """
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert "fpPaceRow" in src, "the panel itself must still exist"
+        lower = src.lower()
+        assert "it is not a forecast" in lower
+        assert "does not precede price" in lower
+        assert "not a trigger" in lower
+
+    def test_the_panel_has_no_order_code_either(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        for w in ("def submit(", "def execute(", "def place(",
+                  "def order("):
+            assert w not in src, w
+
 
 class TestItFindsTheFormingBarWhereverItLives:
     """Guessing one attribute name and getting a silent 'no live bar'
@@ -553,3 +576,102 @@ class TestSpeedNotLevel:
         w = PaceWatcher()
         ts = self._feed(w, 100, 0.0, buy=5, sell=9)
         json.dumps(w.reading(ts).as_dict())
+
+
+class TestThePaceCallNamesASideWithoutPredicting:
+    """A buy/sell in the language of a trade, over a measured null.
+
+    The call exists so the panel can say which side flow is on in
+    the words a trader uses. cvd_study section 10 established that
+    these states do not precede price at 15s, 30s or 60s over 102.5
+    hours of ES, so the one thing these tests must never let slip is
+    the call quietly becoming a forecast -- either in the code, by
+    disagreeing with the state it claims to describe, or on the
+    page, by losing the sentence that says what it is not.
+    """
+
+    def _feed(self, w, n, ts, buy, sell, step=0.25):
+        for _ in range(n):
+            ts += step
+            if buy:
+                w.on_trade(ts, buy, "buy")
+            if sell:
+                w.on_trade(ts, sell, "sell")
+        return ts
+
+    def test_buyers_taking_control_reads_buy(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 600, 0.0, buy=4, sell=8)
+        ts = self._feed(w, 60, ts, buy=20, sell=1)
+        r = w.reading(ts)
+        assert r.taking_control == BUYERS
+        assert r.call == "buy"
+        assert r.basis == "taking", "behind on totals, faster now"
+
+    def test_and_the_mirror_reads_sell(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 600, 0.0, buy=8, sell=4)
+        ts = self._feed(w, 60, ts, buy=1, sell=20)
+        r = w.reading(ts)
+        assert r.taking_control == SELLERS
+        assert r.call == "sell"
+        assert r.basis == "taking"
+
+    def test_a_side_already_ahead_and_still_faster_is_extending(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 400, 0.0, buy=10, sell=2)
+        r = w.reading(ts)
+        assert r.taking_control == ""
+        assert r.call == "buy"
+        assert r.basis == "extending", "ahead and pulling away is not a takeover"
+
+    def test_extending_mirrors_too(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 400, 0.0, buy=2, sell=10)
+        r = w.reading(ts)
+        assert r.call == "sell" and r.basis == "extending"
+
+    def test_balanced_pace_makes_no_call_at_all(self):
+        """The deadband exists so the reading does not flicker. A
+        call that flickered with it would be worse than none."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 300, 0.0, buy=10, sell=10)
+        r = w.reading(ts)
+        assert r.pace == BALANCED
+        assert r.call == "" and r.basis == ""
+
+    def test_lopsided_totals_do_not_force_a_call_when_pace_is_even(self):
+        """Who is AHEAD is not the question the call answers."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 600, 0.0, buy=12, sell=2)
+        ts = self._feed(w, 200, ts, buy=6, sell=6)
+        r = w.reading(ts)
+        assert r.level == BUYERS, "buyers are far ahead on the total"
+        assert r.pace == BALANCED
+        assert r.call == "", "even pace, so no side to name"
+
+    def test_the_call_can_never_contradict_taking_control(self):
+        """Both follow `pace`. If one is ever derived separately
+        the panel would show BUY beside SELLERS TAKING CONTROL."""
+        w = PaceWatcher(tau_s=8.0, dead=0.15)
+        ts = 0.0
+        seen = set()
+        for i in range(300):
+            ts += 0.2
+            w.on_trade(ts, 3 + (i % 11), "buy" if (i // 17) % 2 else "sell")
+            r = w.reading(ts)
+            seen.add(r.call)
+            if r.taking_control:
+                want = "buy" if r.taking_control == BUYERS else "sell"
+                assert r.call == want
+            if r.call:
+                assert r.pace == (BUYERS if r.call == "buy" else SELLERS)
+        assert {"buy", "sell"} <= seen, "the fixture should exercise both"
+
+    def test_it_is_carried_in_the_payload(self):
+        import json
+        w = PaceWatcher()
+        ts = self._feed(w, 200, 0.0, buy=12, sell=2)
+        d = w.reading(ts).as_dict()
+        assert d["call"] == "buy" and d["basis"] == "extending"
+        json.dumps(d)

@@ -120,6 +120,52 @@ class Pace:
     def diverging(self) -> bool:
         return bool(self.taking_control)
 
+    @property
+    def call(self) -> str:
+        """"buy", "sell", or "" -- A READING OF NOW, NOT A FORECAST.
+
+        This names the side the flow is currently on so it can be
+        said in the language of a trade. It does NOT mean the next
+        move goes that way, and nothing here should be read as a
+        prediction that it will.
+
+        That distinction is measured, not modest. cvd_study section
+        10 took 73,778 samples over 102.5 hours of ES and asked
+        whether these states precede price at 15s, 30s and 60s. They
+        do not: the five states partition the sample exactly, so the
+        apparent separation is forced by the balanced state sitting
+        high and is not evidence about any of the others. The one
+        cell that cleared the bar had a mean of -0.04 ticks against
+        a round trip that costs a full tick.
+
+        So: a description of the auction, in trade words, for a
+        decision the trader is already making. Not a trigger. The
+        panel says as much on screen, and that sentence stays.
+
+        It follows `pace` alone -- who is accumulating faster right
+        now -- which is also what `taking_control` reports when the
+        rates disagree with the totals, so the two can never
+        contradict each other.
+        """
+        if self.pace == BUYERS:
+            return "buy"
+        if self.pace == SELLERS:
+            return "sell"
+        return ""
+
+    @property
+    def basis(self) -> str:
+        """Why the call reads the way it does: "taking", "extending", or "".
+
+        `taking` is the side that is behind on the totals and
+        accumulating faster anyway. `extending` is the side already
+        ahead and still pulling away. They are different situations
+        and the panel names which one it is.
+        """
+        if not self.call:
+            return ""
+        return "taking" if self.taking_control else "extending"
+
     def as_dict(self) -> dict:
         return {"buy_rate": round(self.buy_rate, 2),
                 "sell_rate": round(self.sell_rate, 2),
@@ -129,6 +175,8 @@ class Pace:
                 "taking_control": self.taking_control,
                 "ratio": round(self.ratio, 3),
                 "diverging": self.diverging,
+                "call": self.call,
+                "basis": self.basis,
                 "tau_s": self.tau_s}
 
 

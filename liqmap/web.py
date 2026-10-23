@@ -9774,15 +9774,27 @@ function fpPaceRow(p) {
     head = `<b class="${cls(p.pace)}">${name(p.pace)} EXTENDING</b>`
       + ` &mdash; ahead and still ${p.ratio.toFixed(1)}x faster`;
   }
+  const badge = p.call
+    ? `<span class="${cls(p.call === 'buy' ? 'buyers' : 'sellers')}"
+         style="font-size:15px;font-weight:700;letter-spacing:.06em;
+                border:1px solid currentColor;border-radius:3px;
+                padding:1px 7px">${p.call.toUpperCase()}</span>`
+    : `<span class="stamp" style="font-size:15px;
+         border:1px solid currentColor;border-radius:3px;
+         padding:1px 7px;opacity:.55">NO CALL</span>`;
   return `
     <span class="stamp" style="width:100%">who is gaining</span>
-    <span>${head}</span>
+    <span>${badge} &nbsp;${head}</span>
     <span class="stamp">rate ${p.buy_rate.toFixed(0)}/s bought
       vs ${p.sell_rate.toFixed(0)}/s sold
       &middot; totals ${fpNum(p.buy_total)}/${fpNum(p.sell_total)}
       &middot; ahead on totals: ${name(p.level).toLowerCase()}
       &middot; faster: ${name(p.pace).toLowerCase()}
-      &middot; ${p.tau_s}s constant</span>`;
+      &middot; ${p.tau_s}s constant</span>
+    <span class="stamp" style="width:100%">The call names the side flow
+      is on RIGHT NOW. It is not a forecast: measured over 102.5 hours
+      of ES, this state does not precede price at 15s, 30s or 60s.
+      Context for a decision you are making, not a trigger.</span>`;
 }
 
 function fpLeadRow(l) {
