@@ -298,6 +298,7 @@ class Point:
     ts: float
     book: float
     tape: float
+    price: float                # price, z-scored on the book's window
     bar: float
     px: float
 
@@ -616,6 +617,7 @@ class Reading:
     tape_cvd: float = 0.0
     book_z: float = 0.0
     tape_z: float = 0.0
+    price_z: float = 0.0
     tape_ema: float = 0.0
     tau_s: float = 0.0
     book_dir: str = FLAT
@@ -651,6 +653,7 @@ class Reading:
                 "tape_cvd": round(self.tape_cvd, 1),
                 "book_z": round(self.book_z, 3),
                 "tape_z": round(self.tape_z, 3),
+                "price_z": round(self.price_z, 3),
                 "tape_ema": round(self.tape_ema, 1),
                 "tau_s": self.tau_s,
                 "book_dir": self.book_dir, "tape_dir": self.tape_dir,
@@ -692,6 +695,11 @@ class CVDCross:
         self.vpin = VPINCalculator(bucket=bucket, window=vpin_window)
         self.book_stats = RollingStats(stat_window)
         self.tape_stats = RollingStats(stat_window)
+        # Price, standardised over the SAME look-back as the book
+        # line. Matched on purpose: an unmatched window makes one
+        # line jumpier than the other, and the distance between them
+        # would then be measuring the mismatch rather than the market.
+        self.price_stats = RollingStats(stat_window)
         self.enter, self.exit = float(enter), float(exit)
         self.dwell_s = float(dwell_s)
         self.max_flips = int(max_flips)
@@ -736,6 +744,11 @@ class CVDCross:
         self._bar_open_px = 0.0
         self._bar_taken: set = set()
         self._bar_closes: deque = deque(maxlen=500)
+        # One z-pair per BAR, for drawing beside candles. At chart
+        # zoom a bar is a few pixels wide, so 250ms samples are
+        # sub-pixel -- per-bar IS the chart's resolution, and keeping
+        # it this way covers hours instead of the last two minutes.
+        self._bar_marks: deque = deque(maxlen=1500)
         # The regime: agreement AND which line is on top.
         self._episodes: deque = deque(maxlen=int(episodes))
         self._regime = "none"
@@ -778,6 +791,7 @@ class CVDCross:
         self.vpin.reset()
         self.book_stats.reset()
         self.tape_stats.reset()
+        self.price_stats.reset()
         self.tape_cvd = 0.0
         self.lcr = 0.0
         self._points.clear()
@@ -800,6 +814,7 @@ class CVDCross:
         self._bar_open_px = 0.0
         self._bar_taken = set()
         self._bar_closes.clear()
+        self._bar_marks.clear()
         if not keep_session:
             self._session = ""
 
@@ -863,7 +878,15 @@ class CVDCross:
         if ts <= 0.0:
             return
         last = self._points[-1].ts if self._points else 0.0
-        if last and (ts - last) < self.sample_s:
+        # NEVER SAMPLE THE SAME INSTANT TWICE. This runs from both
+        # on_book and on_trade, and an MBP-10 record carrying a print
+        # arrives with the book bearing the same ts_event -- so a
+        # single instant reached here twice. Price then entered its
+        # rolling window twice, which moved the z enough to flip the
+        # book-versus-price sign and record a SECOND crossing at an
+        # identical timestamp. Measured: 60 crossings at 30 distinct
+        # times.
+        if last and (ts <= last or (ts - last) < self.sample_s):
             self._publish(ts)
             return
 
@@ -871,8 +894,11 @@ class CVDCross:
         tape_v = self._smooth_tape(ts)
         self.book_stats.add(book_v)
         self.tape_stats.add(tape_v)
+        if self.last_px > 0.0:
+            self.price_stats.add(self.last_px)
         bz = self.book_stats.z(book_v)
         tz = self.tape_stats.z(tape_v)
+        pz = self.price_stats.z(self.last_px) if self.last_px > 0 else 0.0
 
         self._book_dir = self._direction(bz, self._book_dir)
         self._tape_dir = self._direction(tz, self._tape_dir)
@@ -891,8 +917,11 @@ class CVDCross:
         self._regime_step(ts, side, bz, tz)
         self._call_step(ts, side, bz, tz)
 
-        # The cross itself: the tape passing through the book.
-        gap = tz - bz
+        # The cross itself: PRICE passing through the book line.
+        # The drawn pair and the marked crossings have to be the same
+        # pair -- a ring sitting on a crossing you cannot see on the
+        # chart is worse than no ring at all.
+        gap = pz - bz
         sign = 1 if gap > 0 else (-1 if gap < 0 else 0)
         if sign and self._gap_sign and sign != self._gap_sign:
             held = (ts - self._since) if self._since else 0.0
@@ -900,7 +929,7 @@ class CVDCross:
             self._crosses.append(Cross(
                 ts=ts, px=self.last_px,
                 direction=UP if sign > 0 else DOWN,
-                book_z=bz, tape_z=tz,
+                book_z=bz, tape_z=pz,
                 confirmed=conf, held_s=held))
             # EVERY cross raises a signal, confirmed or not. The ones
             # that look poor are the only evidence the confirmation is
@@ -916,9 +945,10 @@ class CVDCross:
         if sign:
             self._gap_sign = sign
 
-        self._points.append(Point(ts=ts, book=bz, tape=tz,
+        self._points.append(Point(ts=ts, book=bz, tape=tz, price=pz,
                                   bar=self.bars.get(self.bar_seconds).z,
                                   px=self.last_px))
+        self._mark_bar(bz, tz)
         self._track(ts)
         self._publish(ts)
 
@@ -967,6 +997,8 @@ class CVDCross:
         tape_v = self._tape_ema
         bz = self.book_stats.z(book_v)
         tz = self.tape_stats.z(tape_v)
+        pz = (self.price_stats.z(self.last_px)
+              if self.last_px > 0 else 0.0)
         held = (ts - self._since) if self._since else 0.0
         flips = self._recent_flips(ts)
         chop = flips > self.max_flips
@@ -978,12 +1010,13 @@ class CVDCross:
             # thing a reader needs to see to trust the cross.
             ts=ts, px=self.last_px, book_cvd=book_v,
             tape_cvd=self.tape_cvd,
-            book_z=bz, tape_z=tz, tape_ema=tape_v, tau_s=self.tau_s,
+            book_z=bz, tape_z=tz, price_z=pz,
+            tape_ema=tape_v, tau_s=self.tau_s,
             book_dir=self._book_dir, tape_dir=self._tape_dir,
             side=self._side, agree=self._side != FLAT, held_s=held,
             flips=flips, chop=chop,
             ok=self._ok(ts, self._side, held),
-            spread_z=tz - bz, regime=self._regime,
+            spread_z=pz - bz, regime=self._regime,
             order=("book_above" if bz > tz else "book_below"),
             bar_s=_live.seconds, bar_c=_live.cur, bar_h=_live.hi,
             bar_l=_live.lo,
@@ -1109,6 +1142,32 @@ class CVDCross:
         return out
 
     # ---------------------------------------------------- bar calls
+
+    def _mark_bar(self, bz: float, tz: float) -> None:
+        """Hold one reading per bar, rewritten while the bar is live.
+
+        The forming bar's entry is updated in place rather than
+        appended to, so the line moves with the bar instead of growing
+        a tail of points inside it.
+        """
+        f = self.bars.get(self.bar_seconds)
+        open_ts = f._open_ts
+        if open_ts <= 0.0:
+            return
+        marks = self._bar_marks
+        if marks and marks[-1]["ts"] == open_ts:
+            marks[-1]["book"] = round(bz, 3)
+            marks[-1]["tape"] = round(tz, 3)
+            marks[-1]["bar"] = round(f.z, 3)
+            marks[-1]["price"] = round(
+                self.price_stats.z(self.last_px)
+                if self.last_px > 0 else 0.0, 3)
+        else:
+            marks.append({"ts": open_ts, "book": round(bz, 3),
+                          "tape": round(tz, 3), "bar": round(f.z, 3),
+                          "price": round(
+                              self.price_stats.z(self.last_px)
+                              if self.last_px > 0 else 0.0, 3)})
 
     def _call_step(self, ts: float, side: str,
                    bz: float, tz: float) -> None:
@@ -1335,6 +1394,7 @@ class CVDCross:
                 "continuous": continuous,
                 "points": [{"ts": p.ts, "book": round(p.book, 3),
                             "tape": round(p.tape, 3),
+                            "price": round(p.price, 3),
                             "bar": round(p.bar, 3),
                             "px": round(p.px, 4)} for p in pts],
                 "crosses": [c.as_dict() for c in self.crosses()],
@@ -1346,6 +1406,7 @@ class CVDCross:
                 # agent asks for it explicitly.
                 "bars": self.bars.as_dict(self.bar_seconds,
                                           ts=self.last_ts),
+                "bar_marks": list(self._bar_marks)[-400:],
                 "regime": self.snapshot().regime,
                 **({"signals": [g.as_dict() for g in self.signals()],
                     "scoreboard": self.scoreboard(target, stop),

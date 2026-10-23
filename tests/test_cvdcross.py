@@ -264,14 +264,19 @@ class TestConfirmationIsEarned:
 class TestTheCrossings:
 
     def _crossing(self):
+        """The second line is PRICE now, so price has to move or the
+        two can never meet. A fixture holding price flat tests
+        nothing."""
         r = CVDCross(sample_s=0.0, warm_at=3, dwell_s=0.0)
         r.on_book(5800.00, 40, 5800.25, 40, T0)
-        for i in range(300):
+        px = 5800.25
+        for i in range(400):
             buy = (i // 25) % 2 == 0
             ts = T0 + i * 0.2
-            r.on_book(5800.00, 40, 5800.25, 40, ts)
-            r.on_trade(ts, BUY if buy else SELL,
-                       50 if buy else 100, 5800.25 + i * 0.01)
+            px += 0.25 if buy else -0.25
+            r.on_book(5800.00, 40 + (20 if buy else -20),
+                      5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50, px)
         return r
 
     def test_crossings_are_recorded_with_price_and_direction(self):
@@ -637,12 +642,19 @@ class TestEverySignalIsKept:
             buy = (i // 25) % 2 == 0
             ts = T0 + i * 0.2
             px += 0.25 if buy else -0.25
-            r.on_book(5800.00, 40, 5800.25, 40, ts)
-            r.on_trade(ts, BUY if buy else SELL, 50 if buy else 100, px)
+            # the book must move too, or it is a flat line that price
+            # crosses once and never again
+            r.on_book(5800.00, 40 + (20 if buy else -20),
+                      5800.25, 40, ts)
+            r.on_trade(ts, BUY if buy else SELL, 50, px)
         return r
 
     def test_every_cross_raises_a_signal(self):
-        r = self._fired()
+        """Both are bounded rings, and the signal ring is the larger
+        of the two, so once crossings exceed the smaller cap the
+        counts stop matching. Compare inside the caps."""
+        r = self._fired(n=120)
+        assert r.crosses(), "no crossings at all"
         assert len(r.signals()) == len(r.crosses())
 
     def test_unconfirmed_crosses_are_kept_too(self):
@@ -653,30 +665,28 @@ class TestEverySignalIsKept:
         assert r.scoreboard()["unconfirmed"]["n"] == len(sigs)
 
     def test_a_long_tracks_price_upward_and_a_short_downward(self):
-        r = CVDCross(sample_s=0.0, warm_at=2, dwell_s=0.0, tick_size=0.25)
-        r.on_book(5800.00, 40, 5800.25, 40, T0)
-        for i in range(60):
-            buy = (i // 10) % 2 == 0
-            r.on_trade(T0 + i * 0.1, BUY if buy else SELL,
-                       50 if buy else 100, 5800.25)
+        r = self._fired(n=160)
         for g in r.signals():
             assert g.mfe >= 0.0, "best-case excursion went negative"
             assert g.mae <= 0.0, "worst-case excursion went positive"
 
     def test_excursions_are_measured_in_ticks(self):
-        r = CVDCross(sample_s=0.0, warm_at=2, dwell_s=0.0, tick_size=0.25)
-        r.on_book(5800.00, 40, 5800.25, 40, T0)
-        for i in range(40):
-            buy = (i // 10) % 2 == 0
-            r.on_trade(T0 + i * 0.1, BUY if buy else SELL,
-                       50 if buy else 100, 5800.00)
+        """Ticks, not price units. One dollar of ES is four ticks and
+        reporting 1.0 where 4.0 belongs understates every excursion
+        fourfold."""
+        r = self._fired(n=120)
         sigs = r.signals()
         assert sigs
-        # drive price four ticks away and see it land on 4, not 1.0
-        g = sigs[0]
-        mv = 1.0 if g.side == "long" else -1.0
-        r.on_trade(T0 + 10, BUY, 1, g.px + mv)
-        assert g.mfe == pytest.approx(4.0)
+        g = sigs[-1]
+        # push price a clear dollar beyond anything seen so far, at a
+        # timestamp AFTER the fixture ended
+        end = T0 + 120 * 0.2 + 5
+        far = (g.hi + 1.0) if g.side == "long" else (g.lo - 1.0)
+        r.on_trade(end, BUY, 1, far)
+        span = ((g.hi - g.px) if g.side == "long"
+                else (g.px - g.lo))
+        assert g.mfe == pytest.approx(span / 0.25)
+        assert g.mfe >= 4.0, "a dollar of ES is four ticks"
 
     def test_a_signal_settles_at_the_horizon(self):
         r = self._fired(horizon_s=1.0)
@@ -1102,7 +1112,7 @@ class TestThePerBarLineRidesWithTheOthers:
         fn = src[src.index("function mgChart("):]
         fn = fn[:fn.index("\nfunction mgBars(")]
         assert fn.count("const Y = v =>") == 1, "more than one y mapping"
-        for k in ("line('book')", "line('tape')", "line('bar')"):
+        for k in ("line('book')", "line('price')", "line('bar')"):
             assert k in fn, k
 
     def test_the_third_line_is_in_the_range_calculation(self):
@@ -1229,3 +1239,99 @@ class TestCallingTheBarBeforeItCloses:
         r = self._run(n=80_000)
         r.on_trade(T0 + 86_400 * 3, BUY, 1, 5800.25)
         assert r.calls() == []
+
+
+class TestThePaneBesideTheCandles:
+    """The two readings on the price chart, in their own pane."""
+
+    def _src(self):
+        import inspect
+
+        from liqmap import web as w
+        return inspect.getsource(w)
+
+    def test_one_reading_per_bar_not_one_per_sample(self):
+        """At chart zoom a bar is a few pixels wide, so 250ms samples
+        are sub-pixel. Per-bar IS the chart's resolution, and it
+        covers hours instead of the last two minutes."""
+        import random
+        r = CVDCross(sample_s=0.25, bar_seconds=60.0, warm_at=5)
+        rng = random.Random(3)
+        sz = 40.0
+        for k in range(1, 6000):
+            sz = max(1.0, sz + rng.randint(-4, 4))
+            r.on_book(5800.00, sz, 5800.25, 40, T0 + k * 0.5)
+        marks = r.as_dict()["bar_marks"]
+        assert marks
+        assert len({m["ts"] for m in marks}) == len(marks)
+
+    def test_the_forming_bar_is_rewritten_not_appended(self):
+        r = CVDCross(sample_s=0.0, bar_seconds=300.0, warm_at=2)
+        for k in range(1, 60):
+            r.on_book(5800.00, 40 + k, 5800.25, 40, T0 + k)
+        marks = r.as_dict()["bar_marks"]
+        assert len(marks) == 1, "the live bar grew a tail of points"
+
+    def test_marks_carry_the_bars_own_start_time(self):
+        r = CVDCross(sample_s=0.0, bar_seconds=60.0, warm_at=2)
+        for k in range(1, 400):
+            r.on_book(5800.00, 40 + (k % 11), 5800.25, 40, T0 + k)
+        for m in r.as_dict()["bar_marks"]:
+            assert m["ts"] % 60.0 == 0.0
+
+    def test_the_ring_is_bounded(self):
+        r = CVDCross(sample_s=0.0, bar_seconds=60.0)
+        for k in range(1, 200_000, 7):
+            r.on_book(5800.00, 40 + (k % 11), 5800.25, 40, T0 + k)
+        assert len(r.as_dict()["bar_marks"]) <= 400
+
+    def test_a_new_session_drops_the_old_sessions_marks(self):
+        r = CVDCross(sample_s=0.0, bar_seconds=60.0)
+        for k in range(1, 400):
+            r.on_book(5800.00, 40 + (k % 11), 5800.25, 40, T0 + k)
+        assert len(r.as_dict()["bar_marks"]) > 1
+        later = T0 + 86_400 * 3
+        r.on_trade(later, BUY, 1, 5800.25)
+        marks = r.as_dict()["bar_marks"]
+        # Not empty: the new session opens its own live bar at once.
+        # What matters is that nothing from yesterday survived.
+        assert all(m["ts"] > T0 + 86_400 for m in marks)
+        assert len(marks) == 1
+
+    def test_the_pane_is_its_own_not_an_overlay(self):
+        """Overlaying needs a second y-scale on the price pane, and
+        two scales on one pane make any two shapes look related."""
+        src = self._src()
+        assert "cvdTop" in src and "cvdH" in src
+        fn = src[src.index("function chartGeom()"):]
+        fn = fn[:fn.index("\n}")]
+        assert "cvdTop:" in fn, "the pane has no place in the layout"
+
+    def test_the_price_pane_keeps_its_floor(self):
+        """A fourth pane must not be able to squash the candles."""
+        src = self._src()
+        fn = src[src.index("function chartGeom()"):]
+        fn = fn[:fn.index("\n}")]
+        assert "v + pp + cd > room" in fn
+
+    def test_lines_are_matched_to_candles_by_time_not_position(self):
+        """Matching by index would let the two slide against each
+        other without ever looking wrong."""
+        src = self._src()
+        i = src.index("if (cvdPane) {")
+        fn = src[i:src.index("if (ppoOn) {", i)]
+        assert "cvdMarks.get(bars[i].ts)" in fn
+
+    def test_identity_is_not_carried_by_colour_alone(self):
+        src = self._src()
+        i = src.index("if (cvdPane) {")
+        fn = src[i:src.index("if (ppoOn) {", i)]
+        assert "strokeCvd('book', accent, []" in fn
+        assert "strokeCvd('price', ink, [5, 3]" in fn
+
+    def test_a_timeframe_mismatch_draws_nothing_rather_than_a_lie(self):
+        src = self._src()
+        assert "CVD_FRAMES" in src
+        fn = src[src.index("function cvdBarSeconds()"):]
+        fn = fn[:fn.index("\n}")]
+        assert "$('sInt')" in fn, "it never consults the chart's interval"

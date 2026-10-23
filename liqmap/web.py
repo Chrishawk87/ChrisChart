@@ -9474,8 +9474,8 @@ function mgChart(d, w, h) {
 
   let lo = Infinity, hi = -Infinity;
   for (const p of pts) {
-    lo = Math.min(lo, p.book, p.tape, p.bar || 0);
-    hi = Math.max(hi, p.book, p.tape, p.bar || 0);
+    lo = Math.min(lo, p.book, p.price || 0, p.bar || 0);
+    hi = Math.max(hi, p.book, p.price || 0, p.bar || 0);
   }
   const gate = d.enter || 0.4;
   lo = Math.min(lo, -gate); hi = Math.max(hi, gate);
@@ -9514,7 +9514,7 @@ function mgChart(d, w, h) {
   // relying on colour, so they must not overprint each other when the
   // lines converge -- which is exactly when a cross is about to
   // happen and the labels matter most.
-  let yB = Y(last.book), yT = Y(last.tape), yR = Y(last.bar || 0);
+  let yB = Y(last.book), yT = Y(last.price || 0), yR = Y(last.bar || 0);
   if (Math.abs(yB - yT) < 12) {
     const mid = (yB + yT) / 2;
     yB = mid + (yB <= yT ? -6 : 6);
@@ -9528,11 +9528,11 @@ function mgChart(d, w, h) {
   }
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"
       preserveAspectRatio="none" role="img"
-      aria-label="book CVD and time-smoothed traded CVD, in standard deviations">
+      aria-label="book CVD and price, both in standard deviations">
     ${gates}${zero}
     <path d="${line('book')}" fill="none" stroke="var(--accent)"
       stroke-width="2" stroke-linejoin="round"></path>
-    <path d="${line('tape')}" fill="none" stroke="var(--ink)"
+    <path d="${line('price')}" fill="none" stroke="var(--ink)"
       stroke-width="2" stroke-dasharray="6 3" stroke-linejoin="round"></path>
     <path d="${line('bar')}" fill="none" stroke="var(--dim)"
       stroke-width="2" stroke-dasharray="1 3" stroke-linecap="round"
@@ -9541,15 +9541,15 @@ function mgChart(d, w, h) {
     <text x="${padL + iw + 5}" y="${(yB + 4).toFixed(1)}"
       fill="var(--accent)" font-size="11">${last.book.toFixed(2)}</text>
     <text x="${padL + iw + 5}" y="${(yT + 4).toFixed(1)}"
-      fill="var(--ink)" font-size="11">${last.tape.toFixed(2)}</text>
+      fill="var(--ink)" font-size="11">${(last.price || 0).toFixed(2)}</text>
     <text x="${padL + iw + 5}" y="${(yR + 4).toFixed(1)}"
       fill="var(--dim)" font-size="11">${(last.bar || 0).toFixed(2)}</text>
   </svg>
   <div class="stamp" style="margin-top:4px">
     <span style="color:var(--accent)">&#9472;&#9472;</span> book CVD
     (the reader) &nbsp;
-    <span style="color:var(--ink)">&#9476;&#9476;</span> traded CVD,
-    smoothed ${d.tau_s}s (the confirmation) &nbsp;
+    <span style="color:var(--ink)">&#9476;&#9476;</span> price,
+    z-scored on the same look-back &nbsp;
     <span style="color:var(--dim)">&#8943;</span> book CVD this bar
     (${d.bars ? d.bars.seconds : '--'}s) &nbsp;
     <span style="color:var(--ink)">&#9679;</span> confirmed cross &nbsp;
@@ -9628,10 +9628,10 @@ function mgBars(d, w, h, asLine) {
 function mgRow(d) {
   const n = (d && d.now) || {};
   const REG = {
-    up_book_above: 'UP \u00b7 book leading the tape',
-    up_book_below: 'UP \u00b7 tape ahead of the book',
-    down_book_above: 'DOWN \u00b7 book leading the tape',
-    down_book_below: 'DOWN \u00b7 tape ahead of the book'};
+    up_book_above: 'UP \u00b7 book above price',
+    up_book_below: 'UP \u00b7 price above the book',
+    down_book_above: 'DOWN \u00b7 book above price',
+    down_book_below: 'DOWN \u00b7 price above the book'};
   let verdict, cls = '';
   if (!n.warm) {
     verdict = 'WARMING UP &mdash; not enough history to say what ' +
@@ -9655,7 +9655,7 @@ function mgRow(d) {
     <span class="stamp">reading</span>
     <span class="${cls}" style="font-size:13px"><b>${verdict}</b></span>
     <span class="stamp">book z ${(n.book_z || 0).toFixed(2)}
-      &middot; tape z ${(n.tape_z || 0).toFixed(2)}
+      &middot; price z ${(n.price_z || 0).toFixed(2)}
       &middot; gap ${(n.spread_z || 0).toFixed(2)}
       &middot; raw book ${fpNum(Math.round(n.book_cvd || 0))}
       &middot; raw tape ${fpNum(Math.round(n.tape_cvd || 0))}
@@ -9936,7 +9936,7 @@ async function mgLoad() {
     d = await api('/api/cvdcross?coin=' +
       encodeURIComponent(($('coin') ? $('coin').value : 'ES') || 'ES') +
       (mgLast ? '&since=' + mgLast : '') +
-      '&bar_seconds=' + (($('mgTf') && $('mgTf').value) || 300) +
+      '&bar_seconds=' + cvdBarSeconds() +
       (mgTick % 8 === 0 ? '&with_signals=1' : ''));
   } catch (e) {
     $('mgChart').innerHTML = '<div class="msg">' + e + '</div>';
@@ -9950,6 +9950,11 @@ async function mgLoad() {
     $('mgChart').innerHTML = '<div class="msg">' +
       (d.why || 'no data') + '</div>';
     return;
+  }
+  if (d.bar_marks) {
+    cvdMarks = new Map();
+    for (const r of d.bar_marks) cvdMarks.set(r.ts, r);
+    try { if (typeof drawChart === 'function') drawChart(); } catch (e) {}
   }
   if (d.scoreboard) mgBoard = d.scoreboard;
   if (d.regime_board) mgRegime = d.regime_board;
@@ -9989,6 +9994,18 @@ async function mgLoad() {
    the engine keeps all three frames fed at once, so the switch is
    only a change of which one to ask for. */
 function mgPickTf() { mgLoad(); }
+
+/* The bar size the engine aggregates to must match the chart's
+   interval, or the per-bar readings are keyed to timestamps no candle
+   has and the pane silently draws nothing. Nothing is what it should
+   draw in that case -- a mismatched line laid beside candles looks
+   perfectly plausible and is wrong. */
+const CVD_FRAMES = {'1m': 60, '5m': 300, '15m': 900};
+function cvdBarSeconds() {
+  const sel = $('mgTf') && $('mgTf').value;
+  const iv = $('sInt') && $('sInt').value;
+  return CVD_FRAMES[iv] || Number(sel) || 300;
+}
 
 /* Both panels need a clock of their own until their data moves onto
    /ws/live. Hidden tabs are skipped inside fpTick; mgLoad is cheap
@@ -11790,6 +11807,13 @@ const CH_GAP = 8;           // breathing room between panes
 const PANE_MIN = 0.08, PANE_MAX = 0.6, PRICE_MIN = 0.25;
 let volShare = 0.24;
 let ppoShare = 0.26;
+let cvdShare = 0.22;
+let cvdOn = true;
+/* One reading per bar, keyed by the bar's own start time. Keyed
+   rather than indexed because the chart can scroll and the two
+   series are produced by different clocks -- lining them up by
+   position would silently slide the CVD against the candles. */
+let cvdMarks = new Map();
 let chartPPO = true;        // Chris's Tick Counter PPO in its own pane
 let chartProjOn = true;     // the projected close on the forming bar
 /* One empty slot on the right when the projection is on, so the block it
@@ -11876,20 +11900,24 @@ function chartGeom() {
   // Whatever the lower panes are set to, the price pane keeps a floor.
   // Without this, dragging far enough leaves the candles a few pixels
   // tall and the chart stops being a chart.
-  let v = volShare, pp = on ? ppoShare : 0;
+  const cOn = cvdOn && cvdMarks.size > 1;
+  let v = volShare, pp = on ? ppoShare : 0, cd = cOn ? cvdShare : 0;
   const room = 1 - PRICE_MIN;
-  if (v + pp > room) {
-    const k = room / (v + pp);
-    v *= k; pp *= k;
+  if (v + pp + cd > room) {
+    const k = room / (v + pp + cd);
+    v *= k; pp *= k; cd *= k;
   }
   const volH = Math.round(inner * v);
   const ppoH = Math.round(inner * pp);
-  const gaps = on ? CH_GAP * 2 : CH_GAP;
-  const plotH = inner - volH - ppoH - gaps;
+  const cvdH = Math.round(inner * cd);
+  const gaps = CH_GAP * (1 + (on ? 1 : 0) + (cOn ? 1 : 0));
+  const plotH = inner - volH - ppoH - cvdH - gaps;
   const volTop = CH_PAD.t + plotH + CH_GAP;
+  const ppoTop = volTop + volH + CH_GAP;
   return {w, h, plotW: w - CH_PAD.l - CH_PAD.r, plotH,
-          volH, volTop, ppoH, ppoOn: !!on,
-          ppoTop: volTop + volH + CH_GAP};
+          volH, volTop, ppoH, ppoOn: !!on, ppoTop,
+          cvdH, cvdOn: cOn,
+          cvdTop: (on ? ppoTop + ppoH : volTop + volH) + CH_GAP};
 }
 
 /* How far past the newest bar you may scroll, as a share of the window.
@@ -12310,7 +12338,7 @@ function drawChart() {
   const cv = $('sugChart');
   const dpr = window.devicePixelRatio || 1;
   const {w, h, plotW, plotH, volH, volTop, ppoH, ppoTop,
-         ppoOn} = chartGeom();
+         ppoOn, cvdH, cvdTop, cvdOn: cvdPane} = chartGeom();
   cv.width = w * dpr; cv.height = h * dpr;
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -12400,7 +12428,8 @@ function drawChart() {
     g.strokeStyle = line; g.globalAlpha = 0.35;
     g.beginPath();
     g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
-    g.lineTo(Math.round(x) + 0.5, ppoOn ? ppoTop + ppoH : volTop + volH);
+    g.lineTo(Math.round(x) + 0.5, cvdPane ? cvdTop + cvdH
+             : (ppoOn ? ppoTop + ppoH : volTop + volH));
     g.stroke(); g.globalAlpha = 1;
     g.fillStyle = dim;
     const day = fmtDay(ts);
@@ -12665,7 +12694,8 @@ function drawChart() {
     g.strokeStyle = dim; g.globalAlpha = 0.55; g.setLineDash([3, 3]);
     g.beginPath();
     g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
-    g.lineTo(Math.round(x) + 0.5, ppoOn ? ppoTop + ppoH : volTop + volH);
+    g.lineTo(Math.round(x) + 0.5, cvdPane ? cvdTop + cvdH
+             : (ppoOn ? ppoTop + ppoH : volTop + volH));
     g.moveTo(CH_PAD.l, Math.round(chartHover.y) + 0.5);
     g.lineTo(CH_PAD.l + plotW, Math.round(chartHover.y) + 0.5);
     g.stroke();
@@ -12684,6 +12714,72 @@ function drawChart() {
   /* ---- Chris's Tick Counter PPO, in its own pane -------------------- */
 
   let readPPO = null;
+  /* ---- the two CVD readings, beside the candles that made them ----
+
+     Its OWN pane, sharing the x-axis with the price above. Not an
+     overlay: overlaying would need a second y-scale on the price
+     pane, and two scales on one pane make any two shapes look
+     related -- the lines would appear to track or diverge from price
+     in ways that are an artefact of the scaling.
+
+     Both lines are in standard deviations of their own recent
+     behaviour, which is what lets a book reading running to 244k
+     contracts and a traded one at 42k share a scale at all. The
+     y-axis therefore reads in sigma, and says so.
+
+     Lined up by the bar's OWN start time, not by position in the
+     array: the candles and the CVD come from different clocks, and
+     matching by index would let the two slide against each other
+     without ever looking wrong. */
+  if (cvdPane) {
+    divider(cvdTop);
+
+    let m = 1;
+    const vals = [];
+    for (let i = 0; i < bars.length; i++) {
+      const r = cvdMarks.get(bars[i].ts);
+      vals.push(r || null);
+      if (r) {
+        m = Math.max(m, Math.abs(r.book), Math.abs(r.tape));
+      }
+    }
+    const cy = v => cvdTop + cvdH / 2 - (v / m) * (cvdH / 2 - 3);
+
+    // the zero line and the lean gates, so the scale is readable
+    g.strokeStyle = line; g.globalAlpha = 0.8;
+    g.beginPath(); g.moveTo(CH_PAD.l, Math.round(cy(0)) + 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(cy(0)) + 0.5); g.stroke();
+    g.globalAlpha = 0.35; g.setLineDash([2, 3]);
+    for (const gate of [1, -1]) {
+      g.beginPath(); g.moveTo(CH_PAD.l, Math.round(cy(gate)) + 0.5);
+      g.lineTo(CH_PAD.l + plotW, Math.round(cy(gate)) + 0.5); g.stroke();
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    /* Identity is not colour alone: the reader is solid, the
+       confirmation dashed. The site's --up/--down sit about five
+       deutan units apart, under the readable floor. */
+    const strokeCvd = (key, col, dash, width) => {
+      g.strokeStyle = col; g.lineWidth = width;
+      g.setLineDash(dash); g.beginPath();
+      let open = false;
+      for (let i = 0; i < bars.length; i++) {
+        const r = vals[i];
+        if (!r) { open = false; continue; }
+        const x = xOf(i), yy = cy(r[key]);
+        if (open) g.lineTo(x, yy); else { g.moveTo(x, yy); open = true; }
+      }
+      g.stroke(); g.setLineDash([]);
+    };
+    strokeCvd('book', accent, [], 1.8);
+    strokeCvd('price', ink, [5, 3], 1.8);
+
+    g.fillStyle = dim; g.textAlign = 'left';
+    g.fillText('σ', CH_PAD.l + plotW + 6, cy(0) + 3);
+    g.fillText('book CVD — price ╌╌  (sigma)',
+               CH_PAD.l + 4, cvdTop + 11);
+  }
+
   if (ppoOn) {
     const t = chartData.tick_ppo;
     const from = s.all.length - s.offset - bars.length;
