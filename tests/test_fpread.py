@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from liqmap.footprint import FootprintCandle, TickScale     # noqa: E402
 from liqmap.fpread import (BALANCED, BUYERS, SELLERS, WEIGHTS,  # noqa: E402
+                           Lead, LeadWatcher,
                            FootprintReader, Verdict, read_candle)
 
 SC = TickScale(0.25)
@@ -316,3 +317,127 @@ class TestItFindsTheFormingBarWhereverItLives:
         from liqmap.footprint import FootprintEngine, VolumeRule
         e = FootprintEngine(tick_size=0.25, rule=VolumeRule(400))
         assert FootprintReader().live(e).side == BALANCED
+
+
+class TestTheLeadAndWhenItStops:
+    """The running total can say 'buyers +250' long after buyers
+    stopped winning at +400. The high-water mark is what notices."""
+
+    def _push(self, w, n, side, size=10, px0=5800.0, step=0.025, ts0=0.0):
+        ts, px = ts0, px0
+        for _ in range(n):
+            ts += 1.0
+            px += step if side == "buy" else -step
+            w.on_trade(ts, px, size, side)
+        return ts, px
+
+    def test_the_peak_is_remembered_after_it_is_given_back(self):
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        self._push(w, 40, "buy")
+        assert w.cur.peak == 400
+        self._push(w, 15, "sell", ts0=40)
+        assert w.cur.delta == 250, "the running total"
+        assert w.cur.peak == 400, "the high-water mark was forgotten"
+        assert w.cur.give_back == 150
+
+    def test_the_stall_fires_when_enough_is_given_back(self):
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        self._push(w, 40, "buy")
+        assert not w.cur.stalled
+        self._push(w, 15, "sell", ts0=40)
+        assert w.cur.stalled and w.cur.stall_side == BUYERS
+
+    def test_the_total_can_still_favour_the_side_that_stalled(self):
+        """The whole point: the ladder still reads buyers."""
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        self._push(w, 40, "buy")
+        self._push(w, 15, "sell", ts0=40)
+        assert w.cur.stalled
+        assert w.cur.delta > 0 and w.cur.leader == BUYERS
+
+    def test_sellers_stall_the_same_way(self):
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        self._push(w, 40, "sell")
+        assert w.cur.trough == -400
+        self._push(w, 15, "buy", ts0=40)
+        assert w.cur.stalled and w.cur.stall_side == SELLERS
+
+    def test_a_small_lead_cannot_stall(self):
+        """A lead of twelve giving back five is noise, not a turn."""
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        self._push(w, 3, "buy", size=4)       # lead of 12
+        self._push(w, 2, "sell", size=4, ts0=3)
+        assert not w.cur.stalled
+
+    def test_a_bigger_lead_must_give_back_more(self):
+        """The threshold is a fraction of the leader's own best, so a
+        quiet bar and a busy one are held to the same standard."""
+        # Identical give-back of 40 contracts against two very
+        # different leads: 40 is 40% of a 100 lead and 4% of a 1000
+        # one, so only the small lead has actually turned.
+        small = LeadWatcher(stall_frac=0.35, stall_min=50)
+        small.on_bar("a")
+        self._push(small, 10, "buy")          # peak 100
+        self._push(small, 4, "sell", ts0=10)  # gave back 40
+        big = LeadWatcher(stall_frac=0.35, stall_min=50)
+        big.on_bar("a")
+        self._push(big, 100, "buy")           # peak 1000
+        self._push(big, 4, "sell", ts0=100)   # gave back 40
+        assert small.cur.give_back == big.cur.give_back == 40
+        assert small.cur.stalled, "40 of a 100 lead is a turn"
+        assert not big.cur.stalled, "40 of a 1000 lead is noise"
+
+    def test_one_stall_per_bar(self):
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        self._push(w, 40, "buy")
+        self._push(w, 15, "sell", ts0=40)
+        first = w.cur.stall_ts
+        self._push(w, 20, "sell", ts0=60)
+        assert w.cur.stall_ts == first, "the stall was re-armed mid-bar"
+
+    def test_a_new_bar_starts_clean(self):
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        self._push(w, 40, "buy")
+        self._push(w, 15, "sell", ts0=40)
+        assert w.on_bar("b") is True
+        assert w.cur.peak == 0 and not w.cur.stalled
+        assert len(w.history) == 1
+
+    def test_the_same_bar_key_does_not_roll(self):
+        w = LeadWatcher()
+        w.on_bar("a")
+        assert w.on_bar("a") is False
+
+    def test_the_stall_records_where_it_happened(self):
+        w = LeadWatcher(stall_frac=0.35, stall_min=50)
+        w.on_bar("a")
+        _, top = self._push(w, 40, "buy")
+        self._push(w, 15, "sell", ts0=40)
+        assert w.cur.peak_px == pytest.approx(top)
+        assert w.cur.stall_px < top, "the stall price is not below the peak"
+
+    def test_a_degenerate_fraction_is_refused(self):
+        for bad in (0.0, 1.0, -0.2, 1.5):
+            with pytest.raises(ValueError):
+                LeadWatcher(stall_frac=bad)
+
+    def test_it_serialises(self):
+        import json
+        w = LeadWatcher()
+        w.on_bar("a")
+        self._push(w, 40, "buy")
+        json.dumps(w.cur.as_dict())
+
+    def test_the_history_is_bounded(self):
+        w = LeadWatcher(history=5)
+        for k in range(50):
+            w.on_bar(k)
+            self._push(w, 5, "buy")
+        assert len(w.history) <= 5

@@ -107,6 +107,10 @@ class Tape:
     # Whether the flow can actually get through that standing size.
     # Scoped to the same candle as the footprint and the book reading.
     obstacles: object = None
+    # Who is ahead inside the footprint's bar, and when they stop
+    # gaining. Fed from the same decoded trade as the footprint, so
+    # the lead and the ladder can never disagree about the prints.
+    lead: object = None
     # The two drawn lines: book CVD as the reader, time-smoothed
     # traded CVD as the confirmation. Fed from the same decoded trade
     # as everything else above, so the lines and the candles can never
@@ -362,6 +366,12 @@ class Tape:
             closed = self.footprint.on_tick(_FTick(
                 ts=float(t.ts), price=float(t.px), size=size,
                 aggressor=t.aggressor))
+            if self.lead is not None:
+                eng = getattr(self.footprint, "_engine", None)
+                cur = getattr(eng, "current", None) if eng else None
+                self.lead.on_bar(getattr(cur, "ts_open", None))
+                self.lead.on_trade(float(t.ts), float(t.px), size,
+                                   t.aggressor)
             # The book reading is scoped to the footprint's candle,
             # driven by the footprint's OWN close events rather than
             # by a poll -- a reset at poll time would scope it to the

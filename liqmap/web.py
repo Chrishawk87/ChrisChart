@@ -1006,6 +1006,9 @@ class Runtime:
             # here because the tape's reset is driven by the
             # footprint's own close event -- the footprint itself is
             # not modified.
+            from .fpread import LeadWatcher
+            if svc.tape.lead is None:
+                svc.tape.lead = LeadWatcher()
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -9734,6 +9737,38 @@ function mgCrossRow(d) {
    to be right about, and the study could not find one. So if the
    headline disagrees with the part you trust, the part is there to
    be trusted. */
+/* The lead inside this bar, and whether it is still growing.
+
+   The totals above say who is ahead. This says whether they are
+   still GAINING -- a bar can read "buyers +250" long after buyers
+   stopped winning at +400, and only the high-water mark notices.
+   `given back` is against the leader's own best, so a quiet bar and
+   a busy one are held to the same standard. */
+function fpLeadRow(l) {
+  if (!l || !l.high_water) return '';
+  const hw = Math.abs(l.high_water);
+  const frac = hw > 0 ? (l.give_back / hw) : 0;
+  const who = l.leader === 'buyers' ? 'BUYERS' :
+              (l.leader === 'sellers' ? 'SELLERS' : '--');
+  const cls = l.leader === 'buyers' ? 'long'
+            : (l.leader === 'sellers' ? 'short' : '');
+  const state = l.stalled
+    ? `<b class="${cls}">${l.stall_side.toUpperCase()} STOPPED GAINING</b>
+       at ${l.stall_px.toFixed(2)}`
+    : (frac > 0.15
+        ? `<b>${who} ahead but fading</b>`
+        : `<b class="${cls}">${who} still gaining</b>`);
+  return `
+    <span class="stamp" style="width:100%">the lead this bar</span>
+    <span>${state}</span>
+    <span class="stamp">now ${l.delta > 0 ? '+' : ''}${fpNum(l.delta)}
+      &middot; best ${l.high_water > 0 ? '+' : ''}${fpNum(l.high_water)}
+      at ${(l.high_water > 0 ? l.peak_px : l.trough_px).toFixed(2)}
+      &middot; given back ${fpNum(l.give_back)}
+      (${(frac * 100).toFixed(0)}% of their best)
+      &middot; ${fpNum(l.buy)} bought / ${fpNum(l.sell)} sold</span>`;
+}
+
 function fpVerdictRow(d) {
   const v = d.verdict && d.verdict.now;
   if (!v) return '';
@@ -9766,6 +9801,7 @@ function fpVerdictRow(d) {
       ${fpNum(v.volume)} contracts over ${v.levels} levels</span>
     ${v.note ? '<span class="stamp" style="width:100%">&#9888; '
                + v.note + '</span>' : ''}
+    ${fpLeadRow(d.verdict.lead)}
     <span class="stamp" style="width:100%">It reports the state of the
       auction; it does not predict. The weights behind the score are a
       choice &mdash; the five parts above are the measurements.</span>`;

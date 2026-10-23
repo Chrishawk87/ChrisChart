@@ -60,9 +60,10 @@ from liqmap import dbn                                   # noqa: E402
 from liqmap.cvdcross import BUY, DOWN, FLAT, UP, CVDCross  # noqa: E402
 
 CHECKS = (0.2, 0.4, 0.6, 0.8)
-VERSION = "2026-10-23f"
+VERSION = "2026-10-23h"
 SECTIONS = ("lead-lag", "up-vs-down", "regimes", "bar-calls",
-            "remaining-move", "travel", "divergence")
+            "remaining-move", "travel", "divergence", "stalls",
+            "pushback")
 
 
 def _median(xs):
@@ -147,6 +148,9 @@ class Study:
         self.g_bz: list = []        # book z at that instant
         self.g_tz: list = []        # tape z at that instant
         self.g_pz: list = []        # price z, filled by section 7
+        self.g_side: list = []      # who led at that instant
+        self.g_frac: list = []      # how much of their best they had given back
+        self.g_hw: list = []        # the size of that best, in contracts
         self._next_grid = 0.0
 
         # per-bar observations
@@ -154,6 +158,12 @@ class Study:
         self._open_ts = 0.0
         self._open_px = 0.0
         self._taken: dict = {}
+
+        # Who is ahead inside each bar, and when they stop gaining.
+        from liqmap.fpread import LeadWatcher
+        self.lead = LeadWatcher()
+        self.stalls: list = []          # (ts, px, side)
+        self._seen_stall = False
 
         self.records = 0
         self.trades = 0
@@ -191,6 +201,17 @@ class Study:
             self.eng.on_trade(float(t.ts), t.aggressor,
                               float(t.sz), float(t.px))
             self.trades += 1
+            # the lead inside the bar, from the SAME decoded trade
+            f = self.eng.bars.get(self.bar_s)
+            if self.lead.on_bar(f._open_ts):
+                self._seen_stall = False
+            self.lead.on_trade(float(t.ts), float(t.px),
+                               int(round(float(t.sz))), t.aggressor)
+            c = self.lead.cur
+            if c.stalled and not self._seen_stall:
+                self._seen_stall = True
+                self.stalls.append((c.stall_ts, c.stall_px,
+                                    c.stall_side))
 
         # A record that carried neither a book nor a print tells this
         # study nothing, and must not be allowed to advance the clock.
@@ -221,6 +242,11 @@ class Study:
         self.g_px.append(s.px)
         self.g_bz.append(s.book_z)
         self.g_tz.append(s.tape_z)
+        c = self.lead.cur
+        hw = abs(c.high_water)
+        self.g_side.append(c.leader)
+        self.g_hw.append(hw)
+        self.g_frac.append((c.give_back / hw) if hw > 0 else 0.0)
 
     def _bar(self, ts: float) -> None:
         f = self.eng.bars.get(self.bar_s)
@@ -757,6 +783,222 @@ def divergence(st: Study, out, dead: float = 0.5,
     p("  would mean no more than the last one did.")
 
 
+
+def stalls(st: Study, out) -> None:
+    """When the winning side stops winning, does price turn?
+
+    THE EVENT. Inside each bar the footprint totals aggressive buyers
+    against aggressive sellers. This watches the running difference
+    and marks the moment the side that is ahead stops making new
+    highs in its own lead -- giving back a third of its best. The
+    running total can still say "buyers +250" long after buyers
+    stopped winning at +400; the high-water mark is what notices.
+
+    THE QUESTION. From that moment, does price REVERSE against the
+    side that stalled, or CONTINUE their way anyway?
+
+        reverse%   share of stalls where price moved against the
+                   side that had been winning
+
+    Measured against the `all` control on the same horizon: what
+    price does from a random moment with no stall involved. If the
+    two match, a stall tells you nothing about what follows, however
+    satisfying it is to watch.
+
+    Sign convention: travel is measured in the STALLED LEADER's
+    direction, so a positive median means they kept winning despite
+    the stall and a negative one means the turn was real. Buyers and
+    sellers are then directly comparable, and a result that only
+    appears on one side is a warning rather than a finding.
+    """
+    p = out
+    p("\n" + "=" * 72)
+    p("8. WHEN THE WINNING SIDE STOPS WINNING")
+    p("=" * 72)
+
+    n = len(st.g_px)
+    step = st.grid_s
+    if n < 2000 or len(st.stalls) < 50:
+        p(f"  {len(st.stalls)} stalls over {n:,} samples; not enough.")
+        return
+
+    # index the grid by time so a stall can be placed on it
+    t0 = st.g_ts[0]
+    def at(ts):
+        i = int((ts - t0) / step)
+        return i if 0 <= i < n else -1
+
+    p(f"  {len(st.stalls):,} stalls in {len(st.bars):,} bars "
+      f"({len(st.stalls) / max(1, len(st.bars)):.0%} of bars)")
+    p(f"  a stall is the leader giving back "
+      f"{st.lead.stall_frac:.0%} of their own best lead, "
+      f"minimum {st.lead.stall_min} contracts\n")
+
+    for H in (15, 30, 60, 120):
+        k = int(round(H / step))
+        if k >= n // 10:
+            continue
+        # the control: every grid moment, unsigned
+        allv = [(st.g_px[i + k] - st.g_px[i]) / st.tick
+                for i in range(n - k)]
+        base_rev = sum(1 for v in allv if v < 0) / len(allv)
+
+        # STALLS ARE EVENTS, NOT A ROLLING WINDOW. The control walks
+        # every grid sample, so its windows overlap and its count has
+        # to be divided down. Stalls are discrete and usually minutes
+        # apart, so most of them ARE independent -- dividing them by
+        # the same factor threw away five sixths of a perfectly good
+        # sample and reported "too few to read" on 157 events.
+        # Instead: count a stall, then skip any that begin before its
+        # window has closed.
+        rows = {"buyers": [], "sellers": []}
+        indep = {"buyers": 0, "sellers": 0}
+        last_used = {"buyers": -1e18, "sellers": -1e18}
+        for ts, px, side in sorted(st.stalls):
+            i = at(ts)
+            if i < 0 or i + k >= n:
+                continue
+            mv = (st.g_px[i + k] - st.g_px[i]) / st.tick
+            # signed in the STALLED LEADER's direction
+            rows[side].append(mv if side == "buyers" else -mv)
+            if ts - last_used[side] >= H:
+                indep[side] += 1
+                last_used[side] = ts
+
+        overlap = max(1.0, H / step)
+        p(f"  ---- {H}s after the stall "
+          f"--------------------------------------")
+        p(f"    {'side':>9} {'n':>7} {'indep':>6} {'median':>8} "
+          f"{'mean':>8} {'reverse%':>9} {'z':>7}   verdict")
+        p(f"    {'control':>9} {len(allv):>7} "
+          f"{len(allv) / overlap:>6.0f} "
+          f"{_median(allv):>8.2f} {sum(allv) / len(allv):>8.2f} "
+          f"{base_rev:>8.1%} {'--':>7}   (no stall involved)")
+        for side in ("buyers", "sellers"):
+            v = rows[side]
+            eff = indep[side]
+            if eff < 30:
+                p(f"    {side:>9} {len(v):>7}   too few to read")
+                continue
+            rev = sum(1 for x in v if x < 0) / len(v)
+            se = math.sqrt(max(1e-9, base_rev * (1 - base_rev) / eff))
+            z = (rev - base_rev) / se
+            verdict = ("REAL" if abs(z) >= 3.0 else
+                       ("marginal" if abs(z) >= 2.0 else "nothing"))
+            p(f"    {side:>9} {len(v):>7} {eff:>6.0f} "
+              f"{_median(v):>8.2f} {sum(v) / len(v):>8.2f} "
+              f"{rev:>8.1%} {z:>7.2f}   {verdict}")
+        p("")
+
+    p("  Travel is signed in the stalled leader's direction, so a")
+    p("  NEGATIVE median means price turned against them -- the")
+    p("  reversal -- and a positive one means they carried on")
+    p("  regardless.")
+    p("")
+    p("  A result on one side only is a warning, not a finding: the")
+    p("  same event should behave the same way whichever side it")
+    p("  happens to, and one-sided results are usually the market's")
+    p("  drift over the sample rather than the event.")
+
+
+
+BUCKETS = ((0.00, 0.10), (0.10, 0.20), (0.20, 0.35),
+           (0.35, 0.50), (0.50, 0.75), (0.75, 2.00))
+
+
+def pushback(st: Study, out, min_lead: int = 50) -> None:
+    """How much offset does it take before price turns?
+
+    Price never stops moving, so the question is not whether the
+    other side is pushing back -- they always are -- but HOW MUCH
+    push-back the leader has absorbed before their move gives out.
+
+    At every instant with a meaningful lead, two numbers are taken:
+    how much of their own best lead the leader has handed back, and
+    what price then does over the next N seconds, signed in the
+    LEADER's direction. A negative median means price turned against
+    them; positive means they carried on.
+
+    Bucketing the give-back is the point. If there is a level at
+    which a move reliably gives out, it shows as a MONOTONE slide
+    down the buckets: carrying on while they are barely offset,
+    turning once they have handed back half. A flat column means the
+    amount of push-back does not matter, which is itself an answer
+    and the one to expect given everything above.
+
+    Each row is against the `all` control on the same horizon --
+    price's unconditional travel from a random moment. A bucket that
+    matches the control has told you nothing.
+    """
+    p = out
+    p("\n" + "=" * 72)
+    p("9. HOW MUCH PUSH-BACK BEFORE THE MOVE GIVES OUT")
+    p("=" * 72)
+
+    n = len(st.g_px)
+    step = st.grid_s
+    if n < 2000 or not st.g_side:
+        p(f"  only {n} samples; not enough.")
+        return
+    live = sum(1 for h in st.g_hw if h >= min_lead)
+    p(f"  {live:,} of {n:,} samples had a lead of at least "
+      f"{min_lead} contracts ({live / n:.0%})")
+    p(f"  give-back is measured against that leader's OWN best, so a")
+    p(f"  quiet bar and a busy one are held to the same standard\n")
+
+    for H in (15, 30, 60):
+        k = int(round(H / step))
+        if k >= n // 10:
+            continue
+        allv = [(st.g_px[i + k] - st.g_px[i]) / st.tick
+                for i in range(n - k)]
+        base_rev = sum(1 for v in allv if v < 0) / len(allv)
+        overlap = max(1.0, H / step)
+
+        p(f"  ---- {H}s forward "
+          f"------------------------------------------------")
+        p(f"    {'given back':>12} {'n':>7} {'indep':>6} {'median':>8} "
+          f"{'mean':>8} {'against%':>9} {'z':>7}   verdict")
+        p(f"    {'control':>12} {len(allv):>7} "
+          f"{len(allv) / overlap:>6.0f} {_median(allv):>8.2f} "
+          f"{sum(allv) / len(allv):>8.2f} {base_rev:>8.1%} "
+          f"{'--':>7}   (no leader involved)")
+        for lo_f, hi_f in BUCKETS:
+            v = []
+            for i in range(n - k):
+                if st.g_hw[i] < min_lead:
+                    continue
+                side = st.g_side[i]
+                if side not in ("buyers", "sellers"):
+                    continue
+                f = st.g_frac[i]
+                if not (lo_f <= f < hi_f):
+                    continue
+                mv = (st.g_px[i + k] - st.g_px[i]) / st.tick
+                v.append(mv if side == "buyers" else -mv)
+            eff = len(v) / overlap
+            label = f"{lo_f:.0%}-{min(hi_f, 1.0):.0%}"
+            if eff < 50:
+                p(f"    {label:>12} {len(v):>7}   too few to read")
+                continue
+            rev = sum(1 for x in v if x < 0) / len(v)
+            se = math.sqrt(max(1e-9, base_rev * (1 - base_rev) / eff))
+            z = (rev - base_rev) / se
+            verdict = ("REAL" if abs(z) >= 3.0 else
+                       ("marginal" if abs(z) >= 2.0 else "nothing"))
+            p(f"    {label:>12} {len(v):>7} {eff:>6.0f} "
+              f"{_median(v):>8.2f} {sum(v) / len(v):>8.2f} "
+              f"{rev:>8.1%} {z:>7.2f}   {verdict}")
+        p("")
+
+    p("  READ THE COLUMN, NOT THE ROWS. One bucket clearing the bar")
+    p("  on its own is one cell out of eighteen and will happen by")
+    p("  chance. What would be real is the median sliding steadily")
+    p("  DOWN as the give-back grows -- a move that carries on while")
+    p("  barely offset and turns once it has handed back half. A")
+    p("  flat column says the amount of push-back does not matter.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("files", nargs="*", help="MBP-10 .dbn or .dbn.zst")
@@ -843,6 +1085,8 @@ def main() -> int:
     remaining_move(st, p)
     travel(st, p, dead=a.dead)
     divergence(st, p, dead=a.gap_dead, win_s=a.pwin)
+    stalls(st, p)
+    pushback(st, p)
 
     p("\n" + "=" * 72)
     p("READ THIS PART")

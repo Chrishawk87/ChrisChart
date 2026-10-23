@@ -56,6 +56,7 @@ NOTHING HERE PLACES, SIZES OR TIMES AN ORDER.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 from .footprint import (BUY_IMBALANCE, DEFAULT_IMBALANCE, ImbalanceConfig,
@@ -77,6 +78,145 @@ WEIGHTS = {
 # Where the verdict stops being a shrug. Below `weak` the two sides
 # are close enough that calling a winner is a coin flip dressed up.
 BANDS = ((0.45, "strong"), (0.22, "moderate"), (0.08, "weak"))
+
+
+
+@dataclass(slots=True)
+class Lead:
+    """Who is ahead inside this bar, and whether they are still gaining.
+
+    The footprint already totals aggressive buyers against aggressive
+    sellers and starts again each bar. This watches the RUNNING
+    difference and, more importantly, watches the high-water mark of
+    it. The moment a side stops making new highs in its own lead is
+    the moment it stopped winning, whatever the total still says.
+
+    That distinction is the whole object. A bar can read "buyers
+    +800" right to the close and have stopped being a buyers' bar
+    four minutes earlier, when the lead peaked at +1400 and spent the
+    rest of the bar bleeding back. The total hides it; the high-water
+    mark does not.
+
+    WHAT IT DOES NOT CLAIM. Whether a stall is followed by a reversal
+    or a continuation is a question for measurement, not for this
+    class. It records the stall and the price it happened at; the
+    study says what tends to follow, and so far nothing in this
+    family has predicted anything.
+    """
+
+    buy: int = 0
+    sell: int = 0
+    peak: int = 0               # best lead buyers ever held this bar
+    peak_ts: float = 0.0
+    peak_px: float = 0.0
+    trough: int = 0             # best lead sellers ever held (<= 0)
+    trough_ts: float = 0.0
+    trough_px: float = 0.0
+    last_px: float = 0.0
+    stalled: bool = False
+    stall_ts: float = 0.0
+    stall_px: float = 0.0
+    stall_side: str = ""
+    # how far the leader has bled back from their own high-water mark
+    give_back: int = 0
+
+    @property
+    def delta(self) -> int:
+        return self.buy - self.sell
+
+    @property
+    def leader(self) -> str:
+        d = self.delta
+        return BUYERS if d > 0 else (SELLERS if d < 0 else BALANCED)
+
+    @property
+    def high_water(self) -> int:
+        """The leader's own best lead, signed."""
+        return self.peak if self.delta > 0 else self.trough
+
+    def as_dict(self) -> dict:
+        return {"buy": self.buy, "sell": self.sell, "delta": self.delta,
+                "leader": self.leader, "peak": self.peak,
+                "trough": self.trough, "high_water": self.high_water,
+                "give_back": self.give_back, "stalled": self.stalled,
+                "stall_side": self.stall_side,
+                "stall_px": round(self.stall_px, 4),
+                "stall_ts": self.stall_ts,
+                "peak_px": round(self.peak_px, 4),
+                "trough_px": round(self.trough_px, 4),
+                "last_px": round(self.last_px, 4)}
+
+
+class LeadWatcher:
+    """Tracks the lead inside each bar and calls the moment it stops.
+
+    `stall_frac` is of the leader's own high-water mark, so a bar
+    that ran to +2000 has to give back more than one that ran to
+    +200. A fixed contract threshold would fire constantly on a quiet
+    bar and never on a busy one.
+
+    `stall_min` keeps a trivially small lead from stalling at all --
+    a lead of 12 giving back 5 is noise, not a turn.
+    """
+
+    __slots__ = ("stall_frac", "stall_min", "cur", "_bar_key", "history")
+
+    def __init__(self, stall_frac: float = 0.35, stall_min: int = 50,
+                 history: int = 200) -> None:
+        if not 0.0 < stall_frac < 1.0:
+            raise ValueError("stall_frac must be between 0 and 1")
+        self.stall_frac = float(stall_frac)
+        self.stall_min = int(stall_min)
+        self.cur = Lead()
+        self._bar_key = None
+        self.history: deque = deque(maxlen=int(history))
+
+    def reset(self) -> None:
+        self.cur = Lead()
+        self._bar_key = None
+        self.history.clear()
+
+    def on_bar(self, key) -> bool:
+        """Start a new bar when `key` changes. Returns True on a roll."""
+        if key == self._bar_key:
+            return False
+        if self._bar_key is not None:
+            self.history.append(self.cur)
+        self.cur = Lead()
+        self._bar_key = key
+        return True
+
+    def on_trade(self, ts: float, px: float, size: int,
+                 aggressor: str) -> None:
+        c = self.cur
+        if size <= 0:
+            return
+        if aggressor == "buy":
+            c.buy += int(size)
+        else:
+            c.sell += int(size)
+        c.last_px = float(px)
+        d = c.delta
+        if d > c.peak:
+            c.peak, c.peak_ts, c.peak_px = d, ts, px
+        if d < c.trough:
+            c.trough, c.trough_ts, c.trough_px = d, ts, px
+
+        # Has the leader bled back from their own best?
+        hw = c.high_water
+        if hw == 0:
+            c.give_back = 0
+            return
+        c.give_back = abs(hw) - abs(d) if (hw > 0) == (d > 0) else abs(hw)
+        if c.stalled:
+            return
+        if abs(hw) < self.stall_min:
+            return
+        if c.give_back >= self.stall_frac * abs(hw):
+            c.stalled = True
+            c.stall_ts = ts
+            c.stall_px = px
+            c.stall_side = BUYERS if hw > 0 else SELLERS
 
 
 @dataclass(frozen=True, slots=True)
