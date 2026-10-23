@@ -618,6 +618,10 @@ class Reading:
     book_z: float = 0.0
     tape_z: float = 0.0
     price_z: float = 0.0
+    # The window price was standardised against, so a chart can turn
+    # a sigma level back into a dollar price for its axis.
+    price_mean: float = 0.0
+    price_sd: float = 0.0
     tape_ema: float = 0.0
     tau_s: float = 0.0
     book_dir: str = FLAT
@@ -654,6 +658,8 @@ class Reading:
                 "book_z": round(self.book_z, 3),
                 "tape_z": round(self.tape_z, 3),
                 "price_z": round(self.price_z, 3),
+                "price_mean": round(self.price_mean, 4),
+                "price_sd": round(self.price_sd, 5),
                 "tape_ema": round(self.tape_ema, 1),
                 "tau_s": self.tau_s,
                 "book_dir": self.book_dir, "tape_dir": self.tape_dir,
@@ -1011,6 +1017,8 @@ class CVDCross:
             ts=ts, px=self.last_px, book_cvd=book_v,
             tape_cvd=self.tape_cvd,
             book_z=bz, tape_z=tz, price_z=pz,
+            price_mean=self.price_stats.mean,
+            price_sd=self.price_stats.std,
             tape_ema=tape_v, tau_s=self.tau_s,
             book_dir=self._book_dir, tape_dir=self._tape_dir,
             side=self._side, agree=self._side != FLAT, held_s=held,

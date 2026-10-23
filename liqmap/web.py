@@ -9469,13 +9469,25 @@ function mgChart(d, w, h) {
   if (pts.length < 2) return '<div class="msg">Collecting&hellip; ' +
     'the reader needs a few seconds of tape.</div>';
   const now = d.now || {};
-  const padL = 8, padR = 46, padT = 10, padB = 14;
+  const padL = 8, padR = 62, padT = 10, padB = 14;
   const iw = w - padL - padR, ih = h - padT - padB;
 
+  /* ONE SCALE, AND PRICE STILL READABLE IN DOLLARS.
+
+     Both lines are in standard deviations of their own recent
+     behaviour, so they share one exact mapping and the distance
+     between them is a real quantity rather than a rendering choice.
+     That is what makes a crossing an event instead of an artefact.
+
+     The cost of z-scoring price used to be that nobody can look at
+     -0.32 and see 7768.50. So the right-hand axis inverts it: each
+     sigma level is printed as the dollar price it corresponds to,
+     using the same window price was standardised against. The axis
+     reads in real prices; the geometry stays honest. */
   let lo = Infinity, hi = -Infinity;
-  for (const p of pts) {
-    lo = Math.min(lo, p.book, p.price || 0, p.bar || 0);
-    hi = Math.max(hi, p.book, p.price || 0, p.bar || 0);
+  for (const q of pts) {
+    lo = Math.min(lo, q.book, q.price || 0);
+    hi = Math.max(hi, q.book, q.price || 0);
   }
   const gate = d.enter || 0.4;
   lo = Math.min(lo, -gate); hi = Math.max(hi, gate);
@@ -9486,18 +9498,33 @@ function mgChart(d, w, h) {
   const span = (t1 - t0) || 1;
   const X = t => padL + ((t - t0) / span) * iw;
   const Y = v => padT + (1 - (v - lo) / (hi - lo)) * ih;
+  const line = k => pts.map((q, i) =>
+    (i ? 'L' : 'M') + X(q.ts).toFixed(1) + ' ' +
+    Y(q[k] || 0).toFixed(1)).join(' ');
 
-  const line = k => pts.map((p, i) =>
-    (i ? 'L' : 'M') + X(p.ts).toFixed(1) + ' ' +
-    Y(p[k] || 0).toFixed(1)).join(' ');
+  // sigma grid, and the lean gates
+  let grid = '';
+  for (const v of [gate, 0, -gate]) {
+    const y = Y(v);
+    grid += `<line x1="${padL}" x2="${padL + iw}" y1="${y.toFixed(1)}"
+      y2="${y.toFixed(1)}" stroke="${v === 0 ? 'var(--line)' : 'var(--dim)'}"
+      stroke-width="1"${v === 0 ? '' : ' stroke-dasharray="1 4" opacity="0.4"'}
+    ></line>`;
+  }
 
-  // the direction gates, so you can see what counts as a lean
-  const gates = [gate, -gate].map(g =>
-    `<line x1="${padL}" x2="${padL + iw}" y1="${Y(g).toFixed(1)}"
-       y2="${Y(g).toFixed(1)}" stroke="var(--dim)" stroke-width="1"
-       stroke-dasharray="1 4" opacity="0.5"></line>`).join('');
-  const zero = `<line x1="${padL}" x2="${padL + iw}" y1="${Y(0).toFixed(1)}"
-      y2="${Y(0).toFixed(1)}" stroke="var(--line)" stroke-width="1"></line>`;
+  /* The right axis in DOLLARS. price_z = (px - mean) / sd, so a
+     sigma level maps back to mean + sigma*sd. The window moves, so
+     these are the prices those levels mean right now -- which is
+     what you want when you are reading a live chart. */
+  const mean = now.price_mean || 0, sd = now.price_sd || 0;
+  let axis = '';
+  if (sd > 0 && mean > 0) {
+    for (let k = 0; k <= 4; k++) {
+      const v = lo + (hi - lo) * k / 4;
+      axis += `<text x="${padL + iw + 6}" y="${(Y(v) + 3).toFixed(1)}"
+        fill="var(--dim)" font-size="10">${(mean + v * sd).toFixed(2)}</text>`;
+    }
+  }
 
   const marks = (d.crosses || []).filter(c => c.ts >= t0 && c.ts <= t1)
     .map(c => {
@@ -9510,119 +9537,26 @@ function mgChart(d, w, h) {
     }).join('');
 
   const last = pts[pts.length - 1];
-  // The two end labels are how a reader tells the lines apart without
-  // relying on colour, so they must not overprint each other when the
-  // lines converge -- which is exactly when a cross is about to
-  // happen and the labels matter most.
-  let yB = Y(last.book), yT = Y(last.price || 0), yR = Y(last.bar || 0);
-  if (Math.abs(yB - yT) < 12) {
-    const mid = (yB + yT) / 2;
-    yB = mid + (yB <= yT ? -6 : 6);
-    yT = mid + (yB <= yT ? 6 : -6);
-  }
-  // keep the third label off the other two as well
-  let guard = 0;
-  while (guard++ < 4 &&
-         (Math.abs(yR - yB) < 11 || Math.abs(yR - yT) < 11)) {
-    yR += (yR >= (yB + yT) / 2) ? 11 : -11;
-  }
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"
       preserveAspectRatio="none" role="img"
-      aria-label="book CVD and price, both in standard deviations">
-    ${gates}${zero}
+      aria-label="book CVD and price, both in standard deviations, axis in dollars">
+    ${grid}${axis}
     <path d="${line('book')}" fill="none" stroke="var(--accent)"
       stroke-width="2" stroke-linejoin="round"></path>
     <path d="${line('price')}" fill="none" stroke="var(--ink)"
       stroke-width="2" stroke-dasharray="6 3" stroke-linejoin="round"></path>
-    <path d="${line('bar')}" fill="none" stroke="var(--dim)"
-      stroke-width="2" stroke-dasharray="1 3" stroke-linecap="round"
-      stroke-linejoin="round"></path>
     ${marks}
-    <text x="${padL + iw + 5}" y="${(yB + 4).toFixed(1)}"
-      fill="var(--accent)" font-size="11">${last.book.toFixed(2)}</text>
-    <text x="${padL + iw + 5}" y="${(yT + 4).toFixed(1)}"
-      fill="var(--ink)" font-size="11">${(last.price || 0).toFixed(2)}</text>
-    <text x="${padL + iw + 5}" y="${(yR + 4).toFixed(1)}"
-      fill="var(--dim)" font-size="11">${(last.bar || 0).toFixed(2)}</text>
   </svg>
   <div class="stamp" style="margin-top:4px">
     <span style="color:var(--accent)">&#9472;&#9472;</span> book CVD
-    (the reader) &nbsp;
-    <span style="color:var(--ink)">&#9476;&#9476;</span> price,
-    z-scored on the same look-back &nbsp;
-    <span style="color:var(--dim)">&#8943;</span> book CVD this bar
-    (${d.bars ? d.bars.seconds : '--'}s) &nbsp;
+    &nbsp;
+    <span style="color:var(--ink)">&#9476;&#9476;</span> price
+    &mdash; last <b>${last.px ? last.px.toFixed(2) : '--'}</b> &nbsp;
     <span style="color:var(--ink)">&#9679;</span> confirmed cross &nbsp;
     <span style="color:var(--dim)">&#9711;</span> unconfirmed &nbsp;
     &middot; ${pts.length} pts over ${span.toFixed(0)}s
-    &middot; one axis, standard deviations</div>`;
-}
-
-/* ---- book CVD, zeroed every bar, as candles -------------------
-   Each bar opens at zero and accumulates the adds and pulls at the
-   inside quotes; the candle records where that running value went
-   and where it finished. The WICKS are the reason this is drawn as
-   candles rather than a line: a bar closing at +40 having reached
-   +180 is bids stacked and then pulled, while a bar that climbed
-   straight to +40 is bids stacked and kept. A line shows both as the
-   same +40.
-
-   Up and down are not carried by colour alone -- a filled body is
-   down, a hollow one is up -- because the site's --up/--down sit
-   about five deutan units apart, under the readable floor. */
-function mgBars(d, w, h, asLine) {
-  const ser = (d && d.series) || [];
-  if (ser.length < 2) return '<div class="msg">Collecting ' +
-    'bars&hellip;</div>';
-  const padL = 8, padR = 46, padT = 8, padB = 12;
-  const iw = w - padL - padR, ih = h - padT - padB;
-  let lo = 0, hi = 0;
-  for (const b of ser) { lo = Math.min(lo, b.l); hi = Math.max(hi, b.h); }
-  if (!(hi > lo)) { hi = lo + 1; }
-  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
-  const Y = v => padT + (1 - (v - lo) / (hi - lo)) * ih;
-  const n = ser.length;
-  const step = iw / n;
-  const bw = Math.max(1.5, Math.min(10, step * 0.62));
-
-  const zero = `<line x1="${padL}" x2="${padL + iw}" y1="${Y(0).toFixed(1)}"
-      y2="${Y(0).toFixed(1)}" stroke="var(--line)" stroke-width="1"></line>`;
-
-  let body;
-  if (asLine) {
-    const pts = ser.map((b, i) => (i ? 'L' : 'M') +
-      (padL + step * (i + 0.5)).toFixed(1) + ' ' + Y(b.c).toFixed(1));
-    body = `<path d="${pts.join(' ')}" fill="none" stroke="var(--accent)"
-      stroke-width="2" stroke-linejoin="round"></path>`;
-  } else {
-    body = ser.map((b, i) => {
-      const x = padL + step * (i + 0.5);
-      const up = b.c >= 0;
-      const col = up ? 'var(--up)' : 'var(--down)';
-      const yTop = Y(Math.max(0, b.c)), yBot = Y(Math.min(0, b.c));
-      const bh = Math.max(1, yBot - yTop);
-      return `<line x1="${x.toFixed(1)}" x2="${x.toFixed(1)}"
-          y1="${Y(b.h).toFixed(1)}" y2="${Y(b.l).toFixed(1)}"
-          stroke="${col}" stroke-width="1"></line>
-        <rect x="${(x - bw / 2).toFixed(1)}" y="${yTop.toFixed(1)}"
-          width="${bw.toFixed(1)}" height="${bh.toFixed(1)}"
-          fill="${up ? 'none' : col}" stroke="${col}"
-          stroke-width="1.2"${b.live ? ' opacity="0.65"' : ''}></rect>`;
-    }).join('');
-  }
-  const last = ser[ser.length - 1];
-  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"
-      preserveAspectRatio="none" role="img"
-      aria-label="book CVD per bar, zeroed at each bar open">
-    ${zero}${body}
-    <text x="${padL + iw + 5}" y="${(Y(last.c) + 4).toFixed(1)}"
-      fill="var(--ink)" font-size="11">${Math.round(last.c)}</text>
-  </svg>
-  <div class="stamp" style="margin-top:4px">
-    book CVD, zeroed at each bar open &middot; ${ser.length} bars of
-    ${d.seconds}s &middot; hollow = closed up, filled = closed down,
-    faded = still forming &middot; wick shows what was given back
-    &middot; contracts</div>`;
+    &middot; one scale (sigma); the axis shows what each level is
+    worth in dollars</div>`;
 }
 
 function mgRow(d) {
@@ -12771,8 +12705,10 @@ function drawChart() {
       }
       g.stroke(); g.setLineDash([]);
     };
+    // Book line only. Price is the candles directly above this
+    // pane; drawing it again here would be the same information
+    // twice, on a second scale, for no gain.
     strokeCvd('book', accent, [], 1.8);
-    strokeCvd('price', ink, [5, 3], 1.8);
 
     g.fillStyle = dim; g.textAlign = 'left';
     g.fillText('σ', CH_PAD.l + plotW + 6, cy(0) + 3);

@@ -446,26 +446,49 @@ class TestThePanel:
         i = src.index("function " + name + "(")
         return src[i:src.index("\nfunction ", i + 10)]
 
-    def test_it_draws_on_one_axis(self):
-        """Two y-scales would make any two shapes look related."""
+    def test_both_lines_share_one_exact_mapping(self):
+        """One Y. With two scales the distance between the lines, and
+        every crossing, would be a rendering choice rather than a
+        quantity."""
         fn = self._fn("mgChart")
         assert fn.count("const Y = v =>") == 1, "more than one y mapping"
+        assert "line('book')" in fn and "line('price')" in fn
+
+    def test_the_axis_turns_sigma_back_into_dollars(self):
+        """Nobody looks at -0.32 and sees 7768.50. price_z is
+        (px - mean) / sd, so a sigma level inverts to mean + v*sd."""
+        fn = self._fn("mgChart")
+        assert "mean + v * sd" in fn
+        assert "price_mean" in fn and "price_sd" in fn
+
+    def test_the_engine_publishes_the_window_the_axis_needs(self):
+        r = CVDCross(sample_s=0.0, warm_at=2)
+        for k in range(1, 60):
+            r.on_book(5800.00 + k * 0.25, 40 + k, 5800.25 + k * 0.25,
+                      40, T0 + k)
+            r.on_trade(T0 + k, BUY, 2, 5800.00 + k * 0.25)
+        d = r.snapshot().as_dict()
+        assert d["price_sd"] > 0 and d["price_mean"] > 0
+        # the inversion has to actually land on the price
+        back = d["price_mean"] + d["price_z"] * d["price_sd"]
+        assert back == pytest.approx(d["px"], rel=1e-3)
 
     def test_identity_is_not_carried_by_colour_alone(self):
         fn = self._fn("mgChart")
         assert "stroke-dasharray" in fn
-        assert "<text" in fn, "the lines are not labelled at the end"
+        assert "<text" in fn, "the lines are not labelled"
 
-    def test_the_end_labels_cannot_overprint(self):
-        """They converge exactly when a cross is imminent, which is
-        when telling the lines apart matters most."""
+    def test_the_last_price_is_shown_as_a_number(self):
+        """Reading a level off an axis is not the same as being told
+        where price is."""
         fn = self._fn("mgChart")
-        assert "Math.abs(yB - yT) < 12" in fn
+        assert "last.px.toFixed(2)" in fn
 
     def test_confirmed_and_unconfirmed_crosses_are_drawn_differently(self):
+        """Crossings mean something again now the two share a scale."""
         fn = self._fn("mgChart")
         assert "c.confirmed" in fn
-        assert "fill=\"none\"" in fn, "no hollow mark for unconfirmed"
+        assert 'fill="none"' in fn, "no hollow mark for unconfirmed"
 
     def test_warming_up_is_not_reported_as_a_reading(self):
         fn = self._fn("mgRow")
@@ -1104,35 +1127,11 @@ class TestThePerBarLineRidesWithTheOthers:
         r = self._fed(n=40)
         assert r.snapshot().bar_z == 0.0
 
-    def test_the_chart_draws_three_lines_on_one_axis(self):
-        import inspect
-
-        from liqmap import web as w
-        src = inspect.getsource(w)
-        fn = src[src.index("function mgChart("):]
-        fn = fn[:fn.index("\nfunction mgBars(")]
-        assert fn.count("const Y = v =>") == 1, "more than one y mapping"
-        for k in ("line('book')", "line('price')", "line('bar')"):
-            assert k in fn, k
-
-    def test_the_third_line_is_in_the_range_calculation(self):
-        """Left out, it would run off the top or bottom unnoticed."""
-        import inspect
-
-        from liqmap import web as w
-        src = inspect.getsource(w)
-        fn = src[src.index("function mgChart("):]
-        fn = fn[:fn.index("\nfunction mgBars(")]
-        assert "p.bar || 0" in fn
-
-    def test_the_three_end_labels_cannot_overprint(self):
-        import inspect
-
-        from liqmap import web as w
-        src = inspect.getsource(w)
-        fn = src[src.index("function mgChart("):]
-        fn = fn[:fn.index("\nfunction mgBars(")]
-        assert "Math.abs(yR - yB) < 11" in fn
+    def test_the_per_bar_reading_is_still_published(self):
+        """It left the strip when price took the second slot, but the
+        engine must still carry it for the pane and the agent."""
+        r = self._fed()
+        assert "bar" in r.as_dict()["points"][0]
 
 
 class TestCallingTheBarBeforeItCloses:
@@ -1322,12 +1321,15 @@ class TestThePaneBesideTheCandles:
         fn = src[i:src.index("if (ppoOn) {", i)]
         assert "cvdMarks.get(bars[i].ts)" in fn
 
-    def test_identity_is_not_carried_by_colour_alone(self):
+    def test_the_pane_draws_the_book_line_only(self):
+        """Price is the candles directly above this pane. Drawing it
+        again here would be the same information twice, on a second
+        scale, for no gain."""
         src = self._src()
         i = src.index("if (cvdPane) {")
         fn = src[i:src.index("if (ppoOn) {", i)]
         assert "strokeCvd('book', accent, []" in fn
-        assert "strokeCvd('price', ink, [5, 3]" in fn
+        assert "strokeCvd('price'" not in fn
 
     def test_a_timeframe_mismatch_draws_nothing_rather_than_a_lie(self):
         src = self._src()
