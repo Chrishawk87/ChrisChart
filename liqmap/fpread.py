@@ -110,7 +110,8 @@ class Pace:
     sell_rate: float = 0.0
     buy_total: int = 0
     sell_total: int = 0
-    level: str = BALANCED       # who is ahead on the totals
+    level: str = BALANCED       # who is ahead on the totals, at all
+    control: str = BALANCED     # who is ahead by ENOUGH to count
     pace: str = BALANCED        # who is faster right now
     taking_control: str = ""    # set when pace disagrees with level
     ratio: float = 1.0          # faster side over slower
@@ -119,6 +120,30 @@ class Pace:
     @property
     def diverging(self) -> bool:
         return bool(self.taking_control)
+
+    @property
+    def state(self) -> str:
+        """What the rates are doing INSIDE the control: "continuation",
+        "pullback", "holding", or "" when nobody is in control.
+
+        The totals say which way the bar is going. The rates say what
+        is happening inside that: the controlling side still faster
+        is a continuation, the other side coming in faster is a
+        pullback against it, and even rates mean control is holding
+        with nothing pushing back.
+
+        A PULLBACK IS NOT A REVERSAL, and the panel must not read
+        like one. It is counter-flow against a side that is still
+        ahead on the count. If it runs long enough the totals flip,
+        and then `control` flips with them and the next read is a
+        continuation of the new side -- so a takeover needs no state
+        of its own. It is just a pullback that won.
+        """
+        if self.control == BALANCED:
+            return ""
+        if self.pace == BALANCED:
+            return "holding"
+        return "continuation" if self.pace == self.control else "pullback"
 
     @property
     def call(self) -> str:
@@ -142,41 +167,34 @@ class Pace:
         decision the trader is already making. Not a trigger. The
         panel says as much on screen, and that sentence stays.
 
-        It follows `pace` alone -- who is accumulating faster right
-        now -- which is also what `taking_control` reports when the
-        rates disagree with the totals, so the two can never
-        contradict each other.
+        IT FOLLOWS `control`, NOT `pace`. It used to follow the
+        rates, and that was wrong in a way worth recording: the rates
+        go balanced inside their deadband whenever the two sides
+        happen to trade at a similar speed for a few seconds, so a
+        bar with sellers two thousand contracts ahead and in complete
+        control read NO CALL the moment the pace evened up. The
+        direction of a bar is who is winning it, which is a count.
+        The rates say what is happening inside that, and that is
+        `state` -- continuation or pullback -- not the side.
         """
-        if self.pace == BUYERS:
+        if self.control == BUYERS:
             return "buy"
-        if self.pace == SELLERS:
+        if self.control == SELLERS:
             return "sell"
         return ""
-
-    @property
-    def basis(self) -> str:
-        """Why the call reads the way it does: "taking", "extending", or "".
-
-        `taking` is the side that is behind on the totals and
-        accumulating faster anyway. `extending` is the side already
-        ahead and still pulling away. They are different situations
-        and the panel names which one it is.
-        """
-        if not self.call:
-            return ""
-        return "taking" if self.taking_control else "extending"
 
     def as_dict(self) -> dict:
         return {"buy_rate": round(self.buy_rate, 2),
                 "sell_rate": round(self.sell_rate, 2),
                 "buy_total": self.buy_total,
                 "sell_total": self.sell_total,
-                "level": self.level, "pace": self.pace,
+                "level": self.level, "control": self.control,
+                "pace": self.pace,
                 "taking_control": self.taking_control,
                 "ratio": round(self.ratio, 3),
                 "diverging": self.diverging,
                 "call": self.call,
-                "basis": self.basis,
+                "state": self.state,
                 "tau_s": self.tau_s}
 
 
@@ -195,17 +213,36 @@ class PaceWatcher:
     and the reading flickers between them several times a second.
     """
 
-    __slots__ = ("tau", "dead", "_buy", "_sell", "_ts",
+    __slots__ = ("tau", "dead", "min_lead", "min_share",
+                 "_buy", "_sell", "_ts",
                  "buy_total", "sell_total", "_pace")
 
-    def __init__(self, tau_s: float = 10.0, dead: float = 0.20) -> None:
+    def __init__(self, tau_s: float = 10.0, dead: float = 0.20,
+                 min_lead: int = 50, min_share: float = 0.02) -> None:
         if tau_s <= 0:
             raise ValueError("tau_s must be positive")
         if dead < 0:
             raise ValueError("dead must not be negative")
+        if min_lead < 0 or min_share < 0:
+            raise ValueError("the control threshold must not be negative")
         self.tau = float(tau_s)
         self.dead = float(dead)
+        # HOW FAR AHEAD IS "IN CONTROL". Both must be cleared: a
+        # count, because a bar's first few prints would otherwise
+        # set the direction and flip it on the next one, and a
+        # share, because 60 contracts means one thing in a bar of
+        # 300 and nothing at all in a bar of 10,000.
+        self.min_lead = int(min_lead)
+        self.min_share = float(min_share)
         self.reset()
+
+    def _control(self) -> str:
+        """Who is ahead by enough to be called in control."""
+        total = self.buy_total + self.sell_total
+        gap = abs(self.buy_total - self.sell_total)
+        if total <= 0 or gap < self.min_lead or gap < self.min_share * total:
+            return BALANCED
+        return BUYERS if self.buy_total > self.sell_total else SELLERS
 
     def reset(self) -> None:
         self._buy = 0.0
@@ -269,7 +306,8 @@ class PaceWatcher:
             taking = pace
         return Pace(buy_rate=b, sell_rate=s,
                     buy_total=self.buy_total, sell_total=self.sell_total,
-                    level=level, pace=pace, taking_control=taking,
+                    level=level, control=self._control(),
+                    pace=pace, taking_control=taking,
                     ratio=(ratio if ratio != float("inf") else 999.0),
                     tau_s=self.tau)
 

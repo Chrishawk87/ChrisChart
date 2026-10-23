@@ -288,7 +288,7 @@ class TestItDecidesNothing:
         assert "fpPaceRow" in src, "the panel itself must still exist"
         lower = src.lower()
         assert "it is not a forecast" in lower
-        assert "does not precede price" in lower
+        assert "precede price" in lower, "say what was measured"
         assert "not a trigger" in lower
 
     def test_the_panel_has_no_order_code_either(self):
@@ -578,16 +578,19 @@ class TestSpeedNotLevel:
         json.dumps(w.reading(ts).as_dict())
 
 
-class TestThePaceCallNamesASideWithoutPredicting:
-    """A buy/sell in the language of a trade, over a measured null.
+class TestTheCallFollowsControlNotPace:
+    """Direction is a count. What happens inside it is a rate.
 
-    The call exists so the panel can say which side flow is on in
-    the words a trader uses. cvd_study section 10 established that
-    these states do not precede price at 15s, 30s or 60s over 102.5
-    hours of ES, so the one thing these tests must never let slip is
-    the call quietly becoming a forecast -- either in the code, by
-    disagreeing with the state it claims to describe, or on the
-    page, by losing the sentence that says what it is not.
+    These were one reading and it was wrong in a way that showed up
+    immediately on live flow: the rates go balanced inside their
+    deadband whenever both sides trade at a similar speed for a few
+    seconds, so a bar with sellers two thousand contracts ahead read
+    NO CALL. The first test here is that exact bar.
+
+    A pullback is counter-flow against a side that is still ahead on
+    the count. It is NOT a reversal, and nothing here may let it read
+    as one -- the call stays with whoever is winning the bar until
+    the totals themselves flip.
     """
 
     def _feed(self, w, n, ts, buy, sell, step=0.25):
@@ -599,79 +602,135 @@ class TestThePaceCallNamesASideWithoutPredicting:
                 w.on_trade(ts, sell, "sell")
         return ts
 
-    def test_buyers_taking_control_reads_buy(self):
+    def test_a_dominant_side_still_calls_when_the_pace_evens_up(self):
+        """THE BUG. Sellers in complete control, rates level for a
+        few seconds, and the panel went blank."""
         w = PaceWatcher(tau_s=10.0, dead=0.20)
-        ts = self._feed(w, 600, 0.0, buy=4, sell=8)
-        ts = self._feed(w, 60, ts, buy=20, sell=1)
+        ts = self._feed(w, 600, 0.0, buy=2, sell=12)
+        ts = self._feed(w, 120, ts, buy=8, sell=8)
         r = w.reading(ts)
-        assert r.taking_control == BUYERS
-        assert r.call == "buy"
-        assert r.basis == "taking", "behind on totals, faster now"
+        assert r.pace == BALANCED, "the rates are level, as in the report"
+        assert r.control == SELLERS, "but sellers are far ahead"
+        assert r.call == "sell", "and the call must say so"
+        assert r.state == "holding"
 
-    def test_and_the_mirror_reads_sell(self):
+    def test_counter_flow_against_control_is_a_pullback_not_a_turn(self):
         w = PaceWatcher(tau_s=10.0, dead=0.20)
-        ts = self._feed(w, 600, 0.0, buy=8, sell=4)
-        ts = self._feed(w, 60, ts, buy=1, sell=20)
+        ts = self._feed(w, 600, 0.0, buy=2, sell=12)
+        ts = self._feed(w, 40, ts, buy=20, sell=1)
         r = w.reading(ts)
-        assert r.taking_control == SELLERS
-        assert r.call == "sell"
-        assert r.basis == "taking"
+        assert r.control == SELLERS, "sellers still hold the count"
+        assert r.pace == BUYERS, "buyers are the ones coming in"
+        assert r.state == "pullback"
+        assert r.call == "sell", "a pullback does not flip the call"
 
-    def test_a_side_already_ahead_and_still_faster_is_extending(self):
+    def test_and_the_mirror(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 600, 0.0, buy=12, sell=2)
+        ts = self._feed(w, 40, ts, buy=1, sell=20)
+        r = w.reading(ts)
+        assert r.control == BUYERS and r.pace == SELLERS
+        assert r.state == "pullback" and r.call == "buy"
+
+    def test_the_control_side_still_faster_is_a_continuation(self):
         w = PaceWatcher(tau_s=10.0, dead=0.20)
         ts = self._feed(w, 400, 0.0, buy=10, sell=2)
         r = w.reading(ts)
-        assert r.taking_control == ""
+        assert r.control == BUYERS and r.pace == BUYERS
+        assert r.state == "continuation" and r.call == "buy"
+
+    def test_a_pullback_that_wins_becomes_the_new_control(self):
+        """A takeover needs no state of its own: it is a pullback
+        that ran long enough to flip the count, and the read after
+        the flip is a continuation of the side that won."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 300, 0.0, buy=2, sell=12)
+        assert w.reading(ts).call == "sell"
+        ts = self._feed(w, 600, ts, buy=20, sell=1)
+        r = w.reading(ts)
+        assert r.control == BUYERS, "buyers now hold the count"
+        assert r.state == "continuation"
         assert r.call == "buy"
-        assert r.basis == "extending", "ahead and pulling away is not a takeover"
 
-    def test_extending_mirrors_too(self):
+    def test_a_margin_too_thin_to_mean_anything_is_no_control(self):
+        """Chris's own figures: 4932 against 4992 is 60 contracts out
+        of nearly ten thousand. That is not a side winning a bar."""
         w = PaceWatcher(tau_s=10.0, dead=0.20)
-        ts = self._feed(w, 400, 0.0, buy=2, sell=10)
-        r = w.reading(ts)
-        assert r.call == "sell" and r.basis == "extending"
+        w.buy_total, w.sell_total = 4932, 4992
+        r = w.reading(0.0)
+        assert r.level == SELLERS, "sellers ARE ahead, factually"
+        assert r.control == BALANCED, "but not by enough to call it"
+        assert r.call == "" and r.state == ""
 
-    def test_balanced_pace_makes_no_call_at_all(self):
-        """The deadband exists so the reading does not flicker. A
-        call that flickered with it would be worse than none."""
-        w = PaceWatcher(tau_s=10.0, dead=0.20)
-        ts = self._feed(w, 300, 0.0, buy=10, sell=10)
-        r = w.reading(ts)
-        assert r.pace == BALANCED
-        assert r.call == "" and r.basis == ""
+    def test_both_thresholds_must_clear_not_either(self):
+        w = PaceWatcher(min_lead=50, min_share=0.02)
+        # Share is fine (20%), the count is not: 10 of 50.
+        w.buy_total, w.sell_total = 30, 20
+        assert w.reading(0.0).control == BALANCED, "10 contracts"
+        # Count is fine (400), the share is not: 400 of 40,000 = 1%.
+        w.buy_total, w.sell_total = 20200, 19800
+        assert w.reading(0.0).control == BALANCED, "1% of the bar"
+        # Both clear.
+        w.buy_total, w.sell_total = 3000, 1000
+        assert w.reading(0.0).control == BUYERS
 
-    def test_lopsided_totals_do_not_force_a_call_when_pace_is_even(self):
-        """Who is AHEAD is not the question the call answers."""
-        w = PaceWatcher(tau_s=10.0, dead=0.20)
-        ts = self._feed(w, 600, 0.0, buy=12, sell=2)
-        ts = self._feed(w, 200, ts, buy=6, sell=6)
-        r = w.reading(ts)
-        assert r.level == BUYERS, "buyers are far ahead on the total"
-        assert r.pace == BALANCED
-        assert r.call == "", "even pace, so no side to name"
+    def test_an_empty_bar_is_not_a_side(self):
+        w = PaceWatcher()
+        r = w.reading(0.0)
+        assert r.control == BALANCED and r.call == "" and r.state == ""
 
-    def test_the_call_can_never_contradict_taking_control(self):
-        """Both follow `pace`. If one is ever derived separately
-        the panel would show BUY beside SELLERS TAKING CONTROL."""
+    def test_the_call_can_never_contradict_the_control_it_names(self):
+        """Both read the same field. Derived separately, the panel
+        would show BUY beside SELLERS IN CONTROL."""
         w = PaceWatcher(tau_s=8.0, dead=0.15)
         ts = 0.0
-        seen = set()
-        for i in range(300):
-            ts += 0.2
-            w.on_trade(ts, 3 + (i % 11), "buy" if (i // 17) % 2 else "sell")
-            r = w.reading(ts)
-            seen.add(r.call)
-            if r.taking_control:
-                want = "buy" if r.taking_control == BUYERS else "sell"
-                assert r.call == want
-            if r.call:
-                assert r.pace == (BUYERS if r.call == "buy" else SELLERS)
+        seen, states = set(), set()
+        # Swing the COUNT both ways, not just the rates: buyers take
+        # the bar, sellers overhaul them, buyers take it back. A
+        # fixture that only alternates sides leaves one of them ahead
+        # throughout and never exercises the other call.
+        plan = [(200, 9, 1), (700, 1, 9), (900, 9, 1)]
+        for n, b, s in plan:
+            for _ in range(n):
+                ts += 0.2
+                w.on_trade(ts, b, "buy")
+                w.on_trade(ts, s, "sell")
+                r = w.reading(ts)
+                seen.add(r.call)
+                states.add(r.state)
+                if r.call:
+                    assert r.control == (BUYERS if r.call == "buy"
+                                         else SELLERS)
+                    assert r.state in ("continuation", "pullback",
+                                       "holding")
+                else:
+                    assert r.control == BALANCED and r.state == ""
         assert {"buy", "sell"} <= seen, "the fixture should exercise both"
+        assert {"continuation", "pullback"} <= states, states
+
+    def test_a_pullback_is_never_reported_as_the_other_side(self):
+        """The one misreading that would cost money: counter-flow
+        inside a trend shown as a call for the counter side."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 800, 0.0, buy=1, sell=14)
+        for _ in range(30):
+            ts = self._feed(w, 10, ts, buy=25, sell=1)
+            r = w.reading(ts)
+            if r.control != SELLERS:
+                break                      # the count flipped; fair enough
+            assert r.call == "sell", "sellers still hold the bar"
 
     def test_it_is_carried_in_the_payload(self):
         import json
         w = PaceWatcher()
         ts = self._feed(w, 200, 0.0, buy=12, sell=2)
         d = w.reading(ts).as_dict()
-        assert d["call"] == "buy" and d["basis"] == "extending"
+        assert d["call"] == "buy" and d["state"] == "continuation"
+        assert d["control"] == "buyers" and d["level"] == "buyers"
         json.dumps(d)
+
+    def test_degenerate_thresholds_are_refused(self):
+        with pytest.raises(ValueError):
+            PaceWatcher(min_lead=-1)
+        with pytest.raises(ValueError):
+            PaceWatcher(min_share=-0.1)

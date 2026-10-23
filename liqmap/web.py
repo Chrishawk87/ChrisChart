@@ -9795,16 +9795,23 @@ function fpPaceRow(p) {
                   : (s === 'sellers' ? 'SELLERS' : 'NEITHER');
   const cls = s => s === 'buyers' ? 'long'
                  : (s === 'sellers' ? 'short' : '');
+  /* The totals say the DIRECTION. The rates say what is happening
+     inside it. These were one reading and that was wrong: the rates
+     go balanced whenever both sides trade at a similar speed for a
+     few seconds, so a bar with sellers far ahead read NO CALL. */
   let head;
-  if (p.taking_control) {
-    head = `<b class="${cls(p.taking_control)}">`
-      + `${name(p.taking_control)} TAKING CONTROL</b>`
-      + ` &mdash; behind on the total, ${p.ratio.toFixed(1)}x faster now`;
-  } else if (p.pace === 'balanced') {
-    head = '<b>EVEN PACE</b> &mdash; neither side pulling away';
+  if (p.control === 'balanced') {
+    head = '<b>NO CONTROL</b> &mdash; neither side clearly ahead yet';
+  } else if (p.state === 'pullback') {
+    head = `<b class="${cls(p.control)}">${name(p.control)} IN CONTROL</b>`
+      + ` &mdash; <b class="${cls(p.pace)}">${name(p.pace).toLowerCase()}`
+      + ` pulling back</b>, ${p.ratio.toFixed(1)}x faster right now`;
+  } else if (p.state === 'holding') {
+    head = `<b class="${cls(p.control)}">${name(p.control)} IN CONTROL</b>`
+      + ' &mdash; holding, neither side pulling away';
   } else {
-    head = `<b class="${cls(p.pace)}">${name(p.pace)} EXTENDING</b>`
-      + ` &mdash; ahead and still ${p.ratio.toFixed(1)}x faster`;
+    head = `<b class="${cls(p.control)}">${name(p.control)} IN CONTROL</b>`
+      + ` &mdash; continuation, still ${p.ratio.toFixed(1)}x faster`;
   }
   const badge = p.call
     ? `<span class="${cls(p.call === 'buy' ? 'buyers' : 'sellers')}"
@@ -9815,18 +9822,21 @@ function fpPaceRow(p) {
          border:1px solid currentColor;border-radius:3px;
          padding:1px 7px;opacity:.55">NO CALL</span>`;
   return `
-    <span class="stamp" style="width:100%">who is gaining</span>
+    <span class="stamp" style="width:100%">who is winning, and what is
+      happening inside it</span>
     <span>${badge} &nbsp;${head}</span>
     <span class="stamp">rate ${p.buy_rate.toFixed(0)}/s bought
       vs ${p.sell_rate.toFixed(0)}/s sold
       &middot; totals ${fpNum(p.buy_total)}/${fpNum(p.sell_total)}
-      &middot; ahead on totals: ${name(p.level).toLowerCase()}
+      &middot; in control: ${name(p.control).toLowerCase()}
       &middot; faster: ${name(p.pace).toLowerCase()}
+      &middot; ${p.state || 'no control'}
       &middot; ${p.tau_s}s constant</span>
-    <span class="stamp" style="width:100%">The call names the side flow
-      is on RIGHT NOW. It is not a forecast: measured over 102.5 hours
-      of ES, this state does not precede price at 15s, 30s or 60s.
-      Context for a decision you are making, not a trigger.</span>`;
+    <span class="stamp" style="width:100%">The call names the side
+      winning THIS BAR so far, and the state says whether the other
+      side is pushing back. It is not a forecast: measured over 102.5
+      hours of ES, these states do not precede price at 15s, 30s or
+      60s. Context for a decision you are making, not a trigger.</span>`;
 }
 
 function fpLeadRow(l) {

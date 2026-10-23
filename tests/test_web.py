@@ -2948,23 +2948,26 @@ class TestFootprintPanel:
         p = client.get("/api/footprint?coin=ES",
                        headers={"Authorization":
                                 f"Bearer {TOKEN}"}).json()["verdict"]["pace"]
-        assert "call" in p and "basis" in p
+        assert "call" in p and "state" in p and "control" in p
         assert p["call"] in ("buy", "sell", "")
         if p["call"]:
-            assert p["pace"] == ("buyers" if p["call"] == "buy"
-                                 else "sellers")
-            assert p["basis"] in ("taking", "extending")
+            assert p["control"] == ("buyers" if p["call"] == "buy"
+                                    else "sellers")
+            assert p["state"] in ("continuation", "pullback", "holding")
         else:
-            assert p["pace"] == "balanced" and p["basis"] == ""
+            assert p["control"] == "balanced" and p["state"] == ""
 
-    def test_the_rates_decay_rather_than_freezing_a_dead_tape(
+    def test_the_rates_decay_but_the_direction_does_not(
             self, client, monkeypatch):
-        """The fixture's prints are timestamped in 2023. Read at wall
-        clock, years of silence must have decayed the rates to
-        nothing -- while the totals, which are counts and not rates,
-        stay exactly where they were. Reading at the last print's
-        timestamp instead would report a tape that stopped years ago
-        as though it were still running."""
+        """The fixture's prints are timestamped in 2023, so read at
+        wall clock the RATES must have decayed to nothing -- reading
+        at the last print's timestamp instead would report a tape
+        that stopped years ago as though it were still running.
+
+        The DIRECTION must survive that, because it is a count and
+        not a rate. This is the distinction the whole panel turns
+        on: silence means nobody is pushing right now, not that the
+        bar stopped belonging to whoever won it."""
         rt, tape = self._as_cme(monkeypatch)
         self._feed_with_watchers(rt, tape)
         p = client.get("/api/footprint?coin=ES",
@@ -2972,7 +2975,10 @@ class TestFootprintPanel:
                                 f"Bearer {TOKEN}"}).json()["verdict"]["pace"]
         assert p["buy_rate"] == 0.0 and p["sell_rate"] == 0.0
         assert p["buy_total"] > 0 and p["sell_total"] > 0
-        assert p["call"] == "", "a silent tape names no side"
+        assert p["pace"] == "balanced", "nothing is being pushed"
+        if p["control"] != "balanced":
+            assert p["call"] in ("buy", "sell")
+            assert p["state"] == "holding", "control with no counter-flow"
 
     def test_a_non_cme_symbol_is_told_why(self, client, monkeypatch):
         self._as_cme(monkeypatch)
