@@ -6145,9 +6145,41 @@ def create_app() -> FastAPI:
             out["clearance"] = {"buy": obs.clearance("buy").as_dict(),
                                 "sell": obs.clearance("sell").as_dict()}
 
-        # The two drawn lines, as their own key. Sampled on an interval
-        # inside the engine, so this is a bounded list however long the
-        # session has been running.
+        # The READING of all of the above, as its own key. The
+        # footprint's own counts are untouched -- this reads them.
+        #
+        # THIS WAS MISSING AND THE PANEL WAS SILENTLY EMPTY. The page
+        # asks for `verdict.now` and renders nothing at all when it is
+        # absent, so a verdict that was never put in the payload looks
+        # exactly like a bar too quiet to call. Every test covered the
+        # reader and none covered the payload, which is why it shipped
+        # twice. The tests below this now assert the key is here.
+        from .footprint import ImbalanceConfig as _IC
+        from .fpread import FootprintReader as _FR
+        reader = _FR(cfg=_IC(multiplier=float(multiplier),
+                             min_volume=int(min_volume)))
+        verdict = reader.as_dict(stream)
+
+        # `lead` and `pace` ride on the TAPE, not on the stream: they
+        # are fed per decoded trade and reset on the footprint's own
+        # close event, so they cannot be rebuilt from a finished bar.
+        lead = getattr(tape, "lead", None)
+        cur = getattr(lead, "cur", None) if lead is not None else None
+        if cur is not None:
+            verdict["lead"] = cur.as_dict()
+
+        pace = getattr(tape, "pace", None)
+        if pace is not None:
+            # Read at WALL CLOCK, not at the last print's timestamp.
+            # The rates decay with elapsed time, so asking "as of the
+            # last trade" would freeze a dead tape at whatever it was
+            # doing when it stopped -- which is the one answer a rate
+            # must never give. The tape's clock is epoch seconds, the
+            # same clock, so the two are comparable.
+            import time as _time
+            verdict["pace"] = pace.reading(_time.time()).as_dict()
+
+        out["verdict"] = verdict
         return out
 
     @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])

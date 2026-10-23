@@ -2879,6 +2879,101 @@ class TestFootprintPanel:
             px += rng.choice((-0.25, 0.0, 0.0, 0.25))
         return stream
 
+    def _feed_with_watchers(self, rt, tape, n=400):
+        """Feed the stream AND the per-trade watchers, the way the
+        real tape does. `_feed` writes straight to the stream, which
+        is enough for the matrix but leaves `lead` and `pace` empty
+        -- and an empty pace renders as no panel at all."""
+        import random as _rnd
+        from liqmap.footprint import Tick as _T
+        stream = rt.footprint(rule="1m", volume=0, min_volume=0,
+                              multiplier=4.0)
+        rng = _rnd.Random(5)
+        ts, px = 1_700_000_000.0, 5800.0
+        for i in range(n):
+            ts += 0.2
+            tape.trades += 1
+            side = rng.choice(("buy", "sell"))
+            size = rng.randint(1, 25)
+            stream.on_tick(_T(ts=ts, price=round(px, 2),
+                              size=size, aggressor=side))
+            if tape.lead is not None:
+                eng = getattr(stream, "_engine", None)
+                cur = getattr(eng, "current", None) if eng else None
+                tape.lead.on_bar(getattr(cur, "ts_open", None))
+                tape.lead.on_trade(ts, round(px, 2), size, side)
+            if tape.pace is not None:
+                tape.pace.on_trade(ts, size, side)
+            px += rng.choice((-0.25, 0.0, 0.0, 0.25))
+        return stream
+
+    def test_the_payload_actually_carries_the_verdict(self, client,
+                                                      monkeypatch):
+        """THE BUG THIS EXISTS FOR. The page renders nothing at all
+        when `verdict` is absent, which looks identical to a bar too
+        quiet to call -- so the reader shipped twice with a full test
+        suite behind it and an empty panel on screen. Every one of
+        those tests covered the reader; none covered the payload."""
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed_with_watchers(rt, tape)
+        d = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization": f"Bearer {TOKEN}"}).json()
+        assert d["ok"] is True, d.get("why")
+        assert "verdict" in d, "the panel has nothing to render"
+        v = d["verdict"]
+        assert "now" in v, "fpVerdictRow returns '' without this"
+        assert v["now"]["side"] in ("buyers", "sellers", "balanced")
+        assert "bars_held" in v
+
+    def test_the_payload_carries_the_lead_and_the_pace(self, client,
+                                                       monkeypatch):
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed_with_watchers(rt, tape)
+        v = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()["verdict"]
+        assert "lead" in v and "pace" in v
+        p = v["pace"]
+        assert p["buy_total"] + p["sell_total"] > 0, "no trades reached it"
+        assert p["level"] in ("buyers", "sellers", "balanced")
+        assert p["pace"] in ("buyers", "sellers", "balanced")
+
+    def test_the_payload_carries_the_buy_sell_call(self, client,
+                                                   monkeypatch):
+        """The call is the whole point of the panel for the trader.
+        It must survive the trip to the browser, and it must agree
+        with the state it sits beside."""
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed_with_watchers(rt, tape)
+        p = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()["verdict"]["pace"]
+        assert "call" in p and "basis" in p
+        assert p["call"] in ("buy", "sell", "")
+        if p["call"]:
+            assert p["pace"] == ("buyers" if p["call"] == "buy"
+                                 else "sellers")
+            assert p["basis"] in ("taking", "extending")
+        else:
+            assert p["pace"] == "balanced" and p["basis"] == ""
+
+    def test_the_rates_decay_rather_than_freezing_a_dead_tape(
+            self, client, monkeypatch):
+        """The fixture's prints are timestamped in 2023. Read at wall
+        clock, years of silence must have decayed the rates to
+        nothing -- while the totals, which are counts and not rates,
+        stay exactly where they were. Reading at the last print's
+        timestamp instead would report a tape that stopped years ago
+        as though it were still running."""
+        rt, tape = self._as_cme(monkeypatch)
+        self._feed_with_watchers(rt, tape)
+        p = client.get("/api/footprint?coin=ES",
+                       headers={"Authorization":
+                                f"Bearer {TOKEN}"}).json()["verdict"]["pace"]
+        assert p["buy_rate"] == 0.0 and p["sell_rate"] == 0.0
+        assert p["buy_total"] > 0 and p["sell_total"] > 0
+        assert p["call"] == "", "a silent tape names no side"
+
     def test_a_non_cme_symbol_is_told_why(self, client, monkeypatch):
         self._as_cme(monkeypatch)
         d = client.get("/api/footprint?coin=BTC",
