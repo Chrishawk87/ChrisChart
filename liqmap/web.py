@@ -7464,6 +7464,8 @@ DASHBOARD = """<!doctype html>
       </div>
 
       <div id="fpStats" class="fpstat"></div>
+      <div id="fpVerdict" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
       <div id="fpBook" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
       <div id="fpClear" class="fpstat" style="border-top:1px solid
@@ -9721,6 +9723,54 @@ function mgCrossRow(d) {
     }).join('');
 }
 
+/* ---- who is winning this footprint, overall -------------------
+   The ladder below shows every level. This is the one line that
+   says what they add up to, recomputed from the same bar on every
+   read so the two can never disagree.
+
+   The five parts are printed beside the headline on purpose. The
+   weights that combine them are a choice, not a finding -- nobody
+   has shown they are right, because "right" would need an outcome
+   to be right about, and the study could not find one. So if the
+   headline disagrees with the part you trust, the part is there to
+   be trusted. */
+function fpVerdictRow(d) {
+  const v = d.verdict && d.verdict.now;
+  if (!v) return '';
+  const held = d.verdict.bars_held || 0;
+  const cls = v.side === 'buyers' ? 'long'
+            : (v.side === 'sellers' ? 'short' : '');
+  const head = v.side === 'balanced'
+    ? 'NO WINNER &mdash; the two sides are too close to call'
+    : v.side.toUpperCase() + ' ' + v.strength.toUpperCase()
+      + ' &mdash; score ' + (v.score > 0 ? '+' : '') + v.score.toFixed(2)
+      + (held ? ' &middot; held ' + held + ' bar' + (held > 1 ? 's' : '')
+              : '');
+  const part = (k, label) => {
+    const x = v.parts[k];
+    if (x === undefined) return '';
+    const c = Math.abs(x) < 0.08 ? '' : (x > 0 ? 'long' : 'short');
+    return `<span class="stamp">${label}
+      <b class="${c}">${x > 0 ? '+' : ''}${x.toFixed(2)}</b></span>`;
+  };
+  return `
+    <span class="stamp">overall</span>
+    <span class="${cls}" style="font-size:13px"><b>${head}</b></span>
+    ${part('delta', 'who paid')}
+    ${part('flags', 'imbalances')}
+    ${part('stacks', 'runs')}
+    ${part('location', 'where')}
+    ${part('follow', 'follow-through')}
+    <span class="stamp">${v.buy_flags}/${v.sell_flags} flags &middot;
+      ${v.buy_stacks}/${v.sell_stacks} runs &middot;
+      ${fpNum(v.volume)} contracts over ${v.levels} levels</span>
+    ${v.note ? '<span class="stamp" style="width:100%">&#9888; '
+               + v.note + '</span>' : ''}
+    <span class="stamp" style="width:100%">It reports the state of the
+      auction; it does not predict. The weights behind the score are a
+      choice &mdash; the five parts above are the measurements.</span>`;
+}
+
 function fpStats(d) {
   const p = d.pulse || {};
   const ratio = (p.ratio == null) ? '--' : p.ratio.toFixed(2);
@@ -9817,6 +9867,7 @@ async function fpLoad() {
   $('fpStamp').textContent = `${d.coin} · ${d.rule} · ` +
     `${(d.tape_trades || 0).toLocaleString()} prints`;
   $('fpStats').innerHTML = fpStats(d);
+  if ($('fpVerdict')) $('fpVerdict').innerHTML = fpVerdictRow(d);
   $('fpBook').innerHTML = fpBookRow(d);
   $('fpClear').innerHTML = fpClearRow(d);
   $('fpBody').innerHTML = fpTable(d);
