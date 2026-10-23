@@ -9802,6 +9802,10 @@ function fpPaceRow(p) {
   let head;
   if (p.control === 'balanced') {
     head = '<b>NO CONTROL</b> &mdash; neither side clearly ahead yet';
+  } else if (p.state === 'reversal') {
+    head = `<b class="${cls(p.control)}">${name(p.control)} REVERSAL</b>`
+      + ` &mdash; took the bar off ${name(p.took_from).toLowerCase()}`
+      + `, now ${fpNum(Math.abs(p.buy_total - p.sell_total))} ahead`;
   } else if (p.state === 'pullback') {
     head = `<b class="${cls(p.control)}">${name(p.control)} IN CONTROL</b>`
       + ` &mdash; <b class="${cls(p.pace)}">${name(p.pace).toLowerCase()}`

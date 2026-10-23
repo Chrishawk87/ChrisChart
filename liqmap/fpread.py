@@ -112,6 +112,7 @@ class Pace:
     sell_total: int = 0
     level: str = BALANCED       # who is ahead on the totals, at all
     control: str = BALANCED     # who is ahead by ENOUGH to count
+    took_from: str = ""         # the side this one just took it off
     pace: str = BALANCED        # who is faster right now
     taking_control: str = ""    # set when pace disagrees with level
     ratio: float = 1.0          # faster side over slower
@@ -123,24 +124,28 @@ class Pace:
 
     @property
     def state(self) -> str:
-        """What the rates are doing INSIDE the control: "continuation",
-        "pullback", "holding", or "" when nobody is in control.
+        """"reversal", "pullback", "continuation", "holding", or "".
 
-        The totals say which way the bar is going. The rates say what
-        is happening inside that: the controlling side still faster
-        is a continuation, the other side coming in faster is a
-        pullback against it, and even rates mean control is holding
-        with nothing pushing back.
+        Four readings off two numbers, and the difference between the
+        middle two is the difference between a pause and a turn:
 
-        A PULLBACK IS NOT A REVERSAL, and the panel must not read
-        like one. It is counter-flow against a side that is still
-        ahead on the count. If it runs long enough the totals flip,
-        and then `control` flips with them and the next read is a
-        continuation of the new side -- so a takeover needs no state
-        of its own. It is just a pullback that won.
+          reversal     the side that was in control is no longer the
+                       higher number -- it has actually lost the bar
+          pullback     the other side is gaining FASTER, but the side
+                       in control is still the higher number
+          continuation the side in control is also the faster one
+          holding      in control, with neither side pulling away
+          ""           nobody is clearly ahead yet
+
+        A pullback that keeps going becomes a reversal, and that is
+        the whole point of separating them: the first is counter-flow
+        inside a move, the second is the move changing hands. Reading
+        one as the other is the mistake this panel exists to avoid.
         """
         if self.control == BALANCED:
             return ""
+        if self.took_from:
+            return "reversal"
         if self.pace == BALANCED:
             return "holding"
         return "continuation" if self.pace == self.control else "pullback"
@@ -189,6 +194,7 @@ class Pace:
                 "buy_total": self.buy_total,
                 "sell_total": self.sell_total,
                 "level": self.level, "control": self.control,
+                "took_from": self.took_from,
                 "pace": self.pace,
                 "taking_control": self.taking_control,
                 "ratio": round(self.ratio, 3),
@@ -215,7 +221,8 @@ class PaceWatcher:
 
     __slots__ = ("tau", "dead", "min_lead", "min_share",
                  "_buy", "_sell", "_ts",
-                 "buy_total", "sell_total", "_pace")
+                 "buy_total", "sell_total", "_pace",
+                 "_held", "_flip_ts")
 
     def __init__(self, tau_s: float = 10.0, dead: float = 0.20,
                  min_lead: int = 50, min_share: float = 0.02) -> None:
@@ -251,6 +258,30 @@ class PaceWatcher:
         self.buy_total = 0
         self.sell_total = 0
         self._pace = BALANCED
+        self._held = BALANCED       # last side that actually held control
+        self._flip_ts = 0.0         # when it last changed hands
+
+    def new_bar(self) -> None:
+        """A new footprint bar: clear the TOTALS, keep the RATES.
+
+        THE TOTALS ARE PER BAR AND THIS IS NOT OPTIONAL. They are the
+        same numbers the footprint prints at the top of the panel --
+        `buyers 2,587 / sellers 2,710` -- and control is read off
+        them. Left to accumulate across a whole session they drift
+        into a different question entirely: after a few hours the
+        side that is ahead for the DAY can be the side losing the
+        bar in front of you, and the panel then names the wrong one
+        with complete confidence. That is exactly what it did.
+
+        The rates survive the boundary, because they are not counts.
+        A ten-second measure zeroed every five minutes would read
+        0/s at the top of every bar and be wrong there for as long
+        as it took to refill.
+        """
+        self.buy_total = 0
+        self.sell_total = 0
+        self._held = BALANCED
+        self._flip_ts = 0.0
 
     def _decay(self, ts: float) -> None:
         if self._ts <= 0.0:
@@ -304,9 +335,34 @@ class PaceWatcher:
         taking = ""
         if pace != BALANCED and level != BALANCED and pace != level:
             taking = pace
+
+        # DID IT CHANGE HANDS. Only a move from one real side to the
+        # other counts: coming out of BALANCED is control being
+        # established for the first time this bar, which is not a
+        # reversal of anything. `_held` therefore remembers the last
+        # side that actually held it, not the last value of control.
+        control = self._control()
+        now = self._ts if self._ts > 0.0 else ts
+        if control != BALANCED:
+            if self._held != BALANCED and control != self._held:
+                self._flip_ts = now
+            self._held = control
+
+        # A flip is an instant; the panel refreshes every two seconds
+        # and a trader looks up when they look up. So it is reported
+        # for `tau` after it happens -- the same window the rates are
+        # measured over, rather than another number invented for the
+        # purpose. After that the bar reads as whatever it has since
+        # become: a continuation if the new side kept going, a
+        # pullback if the old one started fighting back.
+        took = ""
+        if (control != BALANCED and self._flip_ts > 0.0
+                and 0.0 <= (now - self._flip_ts) < self.tau):
+            took = SELLERS if control == BUYERS else BUYERS
+
         return Pace(buy_rate=b, sell_rate=s,
                     buy_total=self.buy_total, sell_total=self.sell_total,
-                    level=level, control=self._control(),
+                    level=level, control=control, took_from=took,
                     pace=pace, taking_control=taking,
                     ratio=(ratio if ratio != float("inf") else 999.0),
                     tau_s=self.tau)

@@ -376,6 +376,16 @@ class Tape:
                 self.lead.on_trade(float(t.ts), float(t.px), size,
                                    t.aggressor)
             if self.pace is not None:
+                # ORDER MATTERS, AND IT IS OFF BY ONE PRINT IF WRONG.
+                # The tick that closes a bar is the FIRST tick of the
+                # next one -- the footprint counts it there. Clearing
+                # the totals after attributing it would drop it, so
+                # every bar would be short its opening print and the
+                # panel's counts would disagree with the ladder above
+                # it by exactly that much. `lead` is sequenced the
+                # same way, with on_bar before on_trade.
+                if closed:
+                    self.pace.new_bar()
                 self.pace.on_trade(float(t.ts), size, t.aggressor)
             # The book reading is scoped to the footprint's candle,
             # driven by the footprint's OWN close events rather than
@@ -388,6 +398,8 @@ class Tape:
                     self.bookdiag.reset()
                 if self.obstacles is not None:
                     self.obstacles.reset()
+                # `pace.new_bar()` is NOT here: it runs above, before
+                # the closing tick is attributed. See the note there.
         except Exception:                               # noqa: BLE001
             # The footprint is a display. It must never be able to
             # stop the tape that feeds the engine and the candles.

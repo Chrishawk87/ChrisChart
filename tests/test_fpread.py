@@ -649,7 +649,8 @@ class TestTheCallFollowsControlNotPace:
         ts = self._feed(w, 600, ts, buy=20, sell=1)
         r = w.reading(ts)
         assert r.control == BUYERS, "buyers now hold the count"
-        assert r.state == "continuation"
+        assert r.state == "reversal", "it won, so it has a name of its own"
+        assert r.took_from == SELLERS
         assert r.call == "buy"
 
     def test_a_margin_too_thin_to_mean_anything_is_no_control(self):
@@ -702,7 +703,7 @@ class TestTheCallFollowsControlNotPace:
                     assert r.control == (BUYERS if r.call == "buy"
                                          else SELLERS)
                     assert r.state in ("continuation", "pullback",
-                                       "holding")
+                                       "holding", "reversal")
                 else:
                     assert r.control == BALANCED and r.state == ""
         assert {"buy", "sell"} <= seen, "the fixture should exercise both"
@@ -734,3 +735,178 @@ class TestTheCallFollowsControlNotPace:
             PaceWatcher(min_lead=-1)
         with pytest.raises(ValueError):
             PaceWatcher(min_share=-0.1)
+
+
+class TestTheTotalsAreTheBarsTotals:
+    """The bug that made the panel name the wrong side outright.
+
+    `PaceWatcher` counted every print since the service started. The
+    footprint above it counts the prints in the current bar. Control
+    was read off the first and compared by eye against the second, so
+    after a few hours of a buyers' session the panel said BUYERS IN
+    CONTROL over a bar that sellers were plainly winning -- and it was
+    not a rounding error or a threshold, it was a different question.
+
+    Nothing here checks the arithmetic. It checks that the two
+    numbers are the SAME numbers.
+    """
+
+    def _tape(self):
+        from liqmap.cme_tape import Tape
+        from liqmap.footprint_live import FootprintStream
+        from liqmap.footprint import TimeRule
+        t = Tape(symbol="ES")
+        t.footprint = FootprintStream(tick_size=0.25, rule=TimeRule(60.0))
+        t.pace = PaceWatcher(tau_s=10.0)
+        return t
+
+    def _print(self, tape, ts, px, size, side):
+        from types import SimpleNamespace
+        tape.trades += 1
+        tape._to_footprint(SimpleNamespace(ts=ts, px=px, sz=size,
+                                           aggressor=side))
+
+    def test_the_counts_match_the_bar_on_screen(self):
+        tape = self._tape()
+        ts, px = 1_700_000_000.0, 5800.0
+        # Two full bars of buying, then half a bar of selling. The
+        # session favours buyers; the bar in front of you does not.
+        for i in range(600):
+            self._print(tape, ts, px, 9, "buy")
+            self._print(tape, ts, px, 1, "sell")
+            ts += 0.2
+        for i in range(150):
+            self._print(tape, ts, px, 1, "buy")
+            self._print(tape, ts, px, 9, "sell")
+            ts += 0.2
+
+        view = tape.footprint.view().as_dict()
+        pulse = view["pulse"]
+        r = tape.pace.reading(ts)
+        assert r.buy_total == pulse["ask_volume"], "buyers must agree"
+        assert r.sell_total == pulse["bid_volume"], "sellers must agree"
+
+    def test_and_so_the_control_matches_the_bar_not_the_session(self):
+        tape = self._tape()
+        ts, px = 1_700_000_000.0, 5800.0
+        for i in range(600):
+            self._print(tape, ts, px, 9, "buy")
+            self._print(tape, ts, px, 1, "sell")
+            ts += 0.2
+        for i in range(150):
+            self._print(tape, ts, px, 1, "buy")
+            self._print(tape, ts, px, 9, "sell")
+            ts += 0.2
+        r = tape.pace.reading(ts)
+        assert r.sell_total > r.buy_total, "this bar belongs to sellers"
+        assert r.control == SELLERS
+        assert r.call == "sell", "the session's buyers are a different bar"
+
+    def test_the_rates_survive_the_boundary_the_totals_do_not(self):
+        """Zeroing a ten-second measure every five minutes would make
+        the panel read 0/s at the top of every bar."""
+        w = PaceWatcher(tau_s=10.0)
+        ts = 0.0
+        for _ in range(400):
+            ts += 0.25
+            w.on_trade(ts, 10, "buy")
+        before = w.reading(ts)
+        assert before.buy_rate > 0 and before.buy_total > 0
+        w.new_bar()
+        after = w.reading(ts)
+        assert after.buy_total == 0 and after.sell_total == 0
+        assert after.buy_rate == pytest.approx(before.buy_rate), \
+            "the rate is not a count and does not belong to the bar"
+
+
+class TestAReversalIsNotAPullback:
+    """A pullback is counter-flow inside a move. A reversal is the
+    move changing hands. The first is a pause, the second is the
+    bar now belonging to somebody else, and the panel has to say
+    which -- reading one as the other is the costly mistake."""
+
+    def _feed(self, w, n, ts, buy, sell, step=0.25):
+        for _ in range(n):
+            ts += step
+            if buy:
+                w.on_trade(ts, buy, "buy")
+            if sell:
+                w.on_trade(ts, sell, "sell")
+            w.reading(ts)              # as the panel polls it
+        return ts
+
+    def test_losing_the_higher_number_is_a_reversal(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 200, 0.0, buy=1, sell=12)
+        assert w.reading(ts).control == SELLERS
+        ts = self._feed(w, 180, ts, buy=14, sell=1)
+        r = w.reading(ts)
+        assert r.control == BUYERS, "buyers now hold the higher number"
+        assert r.took_from == SELLERS
+        assert r.state == "reversal"
+        assert r.call == "buy"
+
+    def test_and_the_mirror(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 200, 0.0, buy=12, sell=1)
+        ts = self._feed(w, 180, ts, buy=1, sell=14)
+        r = w.reading(ts)
+        assert r.control == SELLERS and r.took_from == BUYERS
+        assert r.state == "reversal" and r.call == "sell"
+
+    def test_counter_flow_that_does_not_win_stays_a_pullback(self):
+        """The discriminator. Buyers come in hard and fast, but never
+        get the higher number -- that is a pullback and must never
+        read as a reversal."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 900, 0.0, buy=1, sell=14)
+        ts = self._feed(w, 60, ts, buy=20, sell=1)
+        r = w.reading(ts)
+        assert r.sell_total > r.buy_total, "sellers still hold the bar"
+        assert r.control == SELLERS and r.pace == BUYERS
+        assert r.state == "pullback" and r.took_from == ""
+        assert r.call == "sell"
+
+    def test_taking_control_for_the_first_time_is_not_a_reversal(self):
+        """Coming out of an even bar is control being established,
+        not taken off anybody."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 120, 0.0, buy=10, sell=10)
+        assert w.reading(ts).control == BALANCED
+        ts = self._feed(w, 200, ts, buy=12, sell=1)
+        r = w.reading(ts)
+        assert r.control == BUYERS
+        assert r.took_from == "" and r.state != "reversal"
+
+    def test_the_reversal_reading_does_not_stick_forever(self):
+        """It is an event. After the window it reads as whatever the
+        bar has since become."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 200, 0.0, buy=1, sell=12)
+        ts = self._feed(w, 180, ts, buy=14, sell=1)
+        assert w.reading(ts).state == "reversal"
+        ts = self._feed(w, 200, ts, buy=14, sell=1)   # 50s later
+        r = w.reading(ts)
+        assert r.control == BUYERS
+        assert r.took_from == "" and r.state == "continuation"
+
+    def test_a_new_bar_forgets_who_held_the_last_one(self):
+        """Control does not carry across bars, so the first side to
+        take a fresh bar has taken it off nobody."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 300, 0.0, buy=1, sell=12)
+        assert w.reading(ts).control == SELLERS
+        w.new_bar()
+        ts = self._feed(w, 300, ts, buy=12, sell=1)
+        r = w.reading(ts)
+        assert r.control == BUYERS
+        assert r.took_from == "", "a different bar, not a reversal"
+
+    def test_it_is_carried_in_the_payload(self):
+        import json
+        w = PaceWatcher(tau_s=10.0)
+        ts = self._feed(w, 200, 0.0, buy=1, sell=12)
+        ts = self._feed(w, 180, ts, buy=14, sell=1)
+        d = w.reading(ts).as_dict()
+        assert d["state"] == "reversal" and d["took_from"] == "sellers"
+        json.dumps(d)
