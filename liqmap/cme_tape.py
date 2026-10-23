@@ -111,6 +111,9 @@ class Tape:
     # gaining. Fed from the same decoded trade as the footprint, so
     # the lead and the ladder can never disagree about the prints.
     lead: object = None
+    # How FAST each side is accumulating, which is a different
+    # question from who is ahead and the one that turns first.
+    pace: object = None
     # The two drawn lines: book CVD as the reader, time-smoothed
     # traded CVD as the confirmation. Fed from the same decoded trade
     # as everything else above, so the lines and the candles can never
@@ -372,6 +375,8 @@ class Tape:
                 self.lead.on_bar(getattr(cur, "ts_open", None))
                 self.lead.on_trade(float(t.ts), float(t.px), size,
                                    t.aggressor)
+            if self.pace is not None:
+                self.pace.on_trade(float(t.ts), size, t.aggressor)
             # The book reading is scoped to the footprint's candle,
             # driven by the footprint's OWN close events rather than
             # by a poll -- a reset at poll time would scope it to the

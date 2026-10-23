@@ -56,6 +56,7 @@ NOTHING HERE PLACES, SIZES OR TIMES AN ORDER.
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -79,6 +80,150 @@ WEIGHTS = {
 # are close enough that calling a winner is a coin flip dressed up.
 BANDS = ((0.45, "strong"), (0.22, "moderate"), (0.08, "weak"))
 
+
+
+
+@dataclass(frozen=True, slots=True)
+class Pace:
+    """How FAST each side is accumulating, not how much they have.
+
+    The footprint's totals say who is ahead. They cannot say who is
+    gaining, and those are different questions with different
+    answers: buyers 4932 against sellers 4992 is a sellers' bar by
+    the total, and a buyers' bar if buyers are adding forty contracts
+    a second against the sellers' fifteen.
+
+    So two leaders are reported, and the interesting state is when
+    they disagree. `level` is who has traded more so far this bar.
+    `pace` is who is trading faster right now. When pace points away
+    from level, the side that is behind is taking control -- which is
+    the thing that happens BEFORE the total flips, and the only
+    reason to watch a rate at all.
+
+    RATES ARE PER SECOND, ON A TIME CONSTANT, not per trade. A
+    per-trade measure changes meaning with activity: twenty prints is
+    a moment at the open and several minutes overnight, so the same
+    market would read as two different ones depending on the hour.
+    """
+
+    buy_rate: float = 0.0       # contracts per second
+    sell_rate: float = 0.0
+    buy_total: int = 0
+    sell_total: int = 0
+    level: str = BALANCED       # who is ahead on the totals
+    pace: str = BALANCED        # who is faster right now
+    taking_control: str = ""    # set when pace disagrees with level
+    ratio: float = 1.0          # faster side over slower
+    tau_s: float = 0.0
+
+    @property
+    def diverging(self) -> bool:
+        return bool(self.taking_control)
+
+    def as_dict(self) -> dict:
+        return {"buy_rate": round(self.buy_rate, 2),
+                "sell_rate": round(self.sell_rate, 2),
+                "buy_total": self.buy_total,
+                "sell_total": self.sell_total,
+                "level": self.level, "pace": self.pace,
+                "taking_control": self.taking_control,
+                "ratio": round(self.ratio, 3),
+                "diverging": self.diverging,
+                "tau_s": self.tau_s}
+
+
+class PaceWatcher:
+    """Contracts per second each way, on a wall-clock time constant.
+
+    THE ESTIMATOR. Each side holds a decaying accumulator. Between
+    trades it decays by exp(-dt / tau); on a trade of size s it gains
+    s / tau. Steady flow of r contracts a second converges on exactly
+    r, and the result depends only on elapsed time -- a burst of
+    twenty prints and a trickle of twenty over the same seconds give
+    the same rate, which a per-trade average cannot do.
+
+    `dead` is how much faster one side must be before control is
+    called, as a fraction. Without it the two rates cross constantly
+    and the reading flickers between them several times a second.
+    """
+
+    __slots__ = ("tau", "dead", "_buy", "_sell", "_ts",
+                 "buy_total", "sell_total", "_pace")
+
+    def __init__(self, tau_s: float = 10.0, dead: float = 0.20) -> None:
+        if tau_s <= 0:
+            raise ValueError("tau_s must be positive")
+        if dead < 0:
+            raise ValueError("dead must not be negative")
+        self.tau = float(tau_s)
+        self.dead = float(dead)
+        self.reset()
+
+    def reset(self) -> None:
+        self._buy = 0.0
+        self._sell = 0.0
+        self._ts = 0.0
+        self.buy_total = 0
+        self.sell_total = 0
+        self._pace = BALANCED
+
+    def _decay(self, ts: float) -> None:
+        if self._ts <= 0.0:
+            self._ts = ts
+            return
+        dt = ts - self._ts
+        if dt <= 0.0:
+            return
+        f = math.exp(-dt / self.tau)
+        self._buy *= f
+        self._sell *= f
+        self._ts = ts
+
+    def on_trade(self, ts: float, size: int, aggressor: str) -> None:
+        if size <= 0:
+            return
+        self._decay(ts)
+        if aggressor == "buy":
+            self._buy += size / self.tau
+            self.buy_total += int(size)
+        else:
+            self._sell += size / self.tau
+            self.sell_total += int(size)
+
+    def reading(self, ts: float = 0.0) -> Pace:
+        """The state as of `ts`, decaying quiet time properly.
+
+        Passing the current time matters: without it a side that
+        stopped trading a minute ago still reads at the rate it had
+        when it stopped.
+        """
+        if ts > 0.0:
+            self._decay(ts)
+        b, s = self._buy, self._sell
+
+        level = (BUYERS if self.buy_total > self.sell_total
+                 else (SELLERS if self.sell_total > self.buy_total
+                       else BALANCED))
+        hi, loq = max(b, s), min(b, s)
+        ratio = (hi / loq) if loq > 0 else (float("inf") if hi > 0 else 1.0)
+        if loq > 0 and ratio < 1.0 + self.dead:
+            pace = BALANCED
+        elif b > s:
+            pace = BUYERS
+        elif s > b:
+            pace = SELLERS
+        else:
+            pace = BALANCED
+        self._pace = pace
+
+        taking = ""
+        if pace != BALANCED and level != BALANCED and pace != level:
+            taking = pace
+        return Pace(buy_rate=b, sell_rate=s,
+                    buy_total=self.buy_total, sell_total=self.sell_total,
+                    level=level, pace=pace, taking_control=taking,
+                    ratio=(ratio if ratio != float("inf") else 999.0),
+                    tau_s=self.tau)
 
 
 @dataclass(slots=True)

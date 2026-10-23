@@ -1006,9 +1006,11 @@ class Runtime:
             # here because the tape's reset is driven by the
             # footprint's own close event -- the footprint itself is
             # not modified.
-            from .fpread import LeadWatcher
+            from .fpread import LeadWatcher, PaceWatcher
             if svc.tape.lead is None:
                 svc.tape.lead = LeadWatcher()
+            if svc.tape.pace is None:
+                svc.tape.pace = PaceWatcher()
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -9744,6 +9746,45 @@ function mgCrossRow(d) {
    stopped winning at +400, and only the high-water mark notices.
    `given back` is against the leader's own best, so a quiet bar and
    a busy one are held to the same standard. */
+/* WHO IS GAINING, which is not who is ahead.
+
+   The totals say buyers 4932 against sellers 4992 and call it a
+   sellers' bar. If buyers are adding forty contracts a second and
+   sellers fifteen, it is a buyers' bar and the total has not caught
+   up yet. That gap is the whole reason to watch a rate.
+
+   Rates are per SECOND on a time constant, never per trade: twenty
+   prints is a moment at the open and several minutes overnight, and
+   a per-trade average would read the same market as two different
+   ones depending on the hour. */
+function fpPaceRow(p) {
+  if (!p || (!p.buy_rate && !p.sell_rate)) return '';
+  const name = s => s === 'buyers' ? 'BUYERS'
+                  : (s === 'sellers' ? 'SELLERS' : 'NEITHER');
+  const cls = s => s === 'buyers' ? 'long'
+                 : (s === 'sellers' ? 'short' : '');
+  let head;
+  if (p.taking_control) {
+    head = `<b class="${cls(p.taking_control)}">`
+      + `${name(p.taking_control)} TAKING CONTROL</b>`
+      + ` &mdash; behind on the total, ${p.ratio.toFixed(1)}x faster now`;
+  } else if (p.pace === 'balanced') {
+    head = '<b>EVEN PACE</b> &mdash; neither side pulling away';
+  } else {
+    head = `<b class="${cls(p.pace)}">${name(p.pace)} EXTENDING</b>`
+      + ` &mdash; ahead and still ${p.ratio.toFixed(1)}x faster`;
+  }
+  return `
+    <span class="stamp" style="width:100%">who is gaining</span>
+    <span>${head}</span>
+    <span class="stamp">rate ${p.buy_rate.toFixed(0)}/s bought
+      vs ${p.sell_rate.toFixed(0)}/s sold
+      &middot; totals ${fpNum(p.buy_total)}/${fpNum(p.sell_total)}
+      &middot; ahead on totals: ${name(p.level).toLowerCase()}
+      &middot; faster: ${name(p.pace).toLowerCase()}
+      &middot; ${p.tau_s}s constant</span>`;
+}
+
 function fpLeadRow(l) {
   if (!l || !l.high_water) return '';
   const hw = Math.abs(l.high_water);
@@ -9802,6 +9843,7 @@ function fpVerdictRow(d) {
     ${v.note ? '<span class="stamp" style="width:100%">&#9888; '
                + v.note + '</span>' : ''}
     ${fpLeadRow(d.verdict.lead)}
+    ${fpPaceRow(d.verdict.pace)}
     <span class="stamp" style="width:100%">It reports the state of the
       auction; it does not predict. The weights behind the score are a
       choice &mdash; the five parts above are the measurements.</span>`;

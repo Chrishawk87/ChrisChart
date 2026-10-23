@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from liqmap.footprint import FootprintCandle, TickScale     # noqa: E402
 from liqmap.fpread import (BALANCED, BUYERS, SELLERS, WEIGHTS,  # noqa: E402
-                           Lead, LeadWatcher,
+                           Lead, LeadWatcher, Pace, PaceWatcher,
                            FootprintReader, Verdict, read_candle)
 
 SC = TickScale(0.25)
@@ -441,3 +441,115 @@ class TestTheLeadAndWhenItStops:
             w.on_bar(k)
             self._push(w, 5, "buy")
         assert len(w.history) <= 5
+
+
+class TestSpeedNotLevel:
+    """buyers 4932 / sellers 4992 is a sellers' bar by the total and a
+    buyers' bar if buyers are adding forty a second against fifteen.
+    The rate is a different question from the level, and the useful
+    state is when the two disagree."""
+
+    def _feed(self, w, n, ts, buy=0, sell=0, every=0.1):
+        for i in range(n):
+            ts += every
+            if buy:
+                w.on_trade(ts, buy, "buy")
+            if sell:
+                w.on_trade(ts, sell, "sell")
+        return ts
+
+    def test_the_side_behind_on_totals_can_be_the_one_gaining(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 600, 0.0, buy=4, sell=8)
+        assert w.reading(ts).level == SELLERS
+        ts = self._feed(w, 60, ts, buy=20, sell=1)
+        r = w.reading(ts)
+        assert r.level == SELLERS, "the total should still favour sellers"
+        assert r.pace == BUYERS
+        assert r.taking_control == BUYERS
+
+    def test_and_the_mirror(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 600, 0.0, buy=8, sell=4)
+        assert w.reading(ts).level == BUYERS
+        ts = self._feed(w, 60, ts, buy=1, sell=20)
+        r = w.reading(ts)
+        assert r.level == BUYERS and r.pace == SELLERS
+        assert r.taking_control == SELLERS
+
+    def test_agreement_is_not_called_a_takeover(self):
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 400, 0.0, buy=10, sell=2)
+        r = w.reading(ts)
+        assert r.level == BUYERS and r.pace == BUYERS
+        assert r.taking_control == ""
+        assert r.diverging is False
+
+    def test_the_deadband_stops_it_flickering_at_the_crossover(self):
+        """Without it the two rates cross constantly and the reading
+        changes several times a second."""
+        w = PaceWatcher(tau_s=10.0, dead=0.20)
+        ts = self._feed(w, 300, 0.0, buy=10, sell=10)
+        assert w.reading(ts).pace == BALANCED
+
+    def test_a_rate_is_per_second_not_per_trade(self):
+        """Twenty prints is a moment at the open and minutes
+        overnight. The same flow delivered either way must read the
+        same."""
+        burst = PaceWatcher(tau_s=10.0)
+        trickle = PaceWatcher(tau_s=10.0)
+        ts = 0.0
+        for i in range(400):          # 40 contracts/sec, 1 print per 0.1s
+            ts += 0.1
+            burst.on_trade(ts, 4, "buy")
+        ts2 = 0.0
+        for i in range(40):           # 40 contracts/sec, 1 print per second
+            ts2 += 1.0
+            trickle.on_trade(ts2, 40, "buy")
+        a = burst.reading(ts).buy_rate
+        b = trickle.reading(ts2).buy_rate
+        assert a == pytest.approx(b, rel=0.15), (
+            f"same flow, different print counts, different rate: {a} vs {b}")
+
+    def test_a_steady_flow_converges_on_its_own_rate(self):
+        w = PaceWatcher(tau_s=5.0)
+        ts = 0.0
+        for i in range(2000):         # exactly 30 contracts a second
+            ts += 0.1
+            w.on_trade(ts, 3, "buy")
+        assert w.reading(ts).buy_rate == pytest.approx(30.0, rel=0.05)
+
+    def test_silence_decays_the_rate(self):
+        """A side that stopped a minute ago must not still read at the
+        rate it had when it stopped."""
+        w = PaceWatcher(tau_s=10.0)
+        ts = self._feed(w, 300, 0.0, buy=10)
+        hot = w.reading(ts).buy_rate
+        cold = w.reading(ts + 90).buy_rate
+        assert hot > 10.0 and cold < hot * 0.01
+
+    def test_the_totals_are_untouched_by_silence(self):
+        w = PaceWatcher(tau_s=10.0)
+        ts = self._feed(w, 300, 0.0, buy=10)
+        before = w.reading(ts).buy_total
+        assert w.reading(ts + 90).buy_total == before
+
+    def test_reset_clears_it(self):
+        w = PaceWatcher(tau_s=10.0)
+        ts = self._feed(w, 200, 0.0, buy=10, sell=3)
+        w.reset()
+        r = w.reading(ts + 1)
+        assert r.buy_total == 0 and r.buy_rate == 0.0
+        assert r.level == BALANCED
+
+    def test_degenerate_settings_are_refused(self):
+        with pytest.raises(ValueError):
+            PaceWatcher(tau_s=0.0)
+        with pytest.raises(ValueError):
+            PaceWatcher(dead=-0.1)
+
+    def test_it_serialises(self):
+        import json
+        w = PaceWatcher()
+        ts = self._feed(w, 100, 0.0, buy=5, sell=9)
+        json.dumps(w.reading(ts).as_dict())

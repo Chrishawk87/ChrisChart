@@ -60,10 +60,10 @@ from liqmap import dbn                                   # noqa: E402
 from liqmap.cvdcross import BUY, DOWN, FLAT, UP, CVDCross  # noqa: E402
 
 CHECKS = (0.2, 0.4, 0.6, 0.8)
-VERSION = "2026-10-23h"
+VERSION = "2026-10-23i"
 SECTIONS = ("lead-lag", "up-vs-down", "regimes", "bar-calls",
             "remaining-move", "travel", "divergence", "stalls",
-            "pushback")
+            "pushback", "control")
 
 
 def _median(xs):
@@ -160,8 +160,12 @@ class Study:
         self._taken: dict = {}
 
         # Who is ahead inside each bar, and when they stop gaining.
-        from liqmap.fpread import LeadWatcher
+        from liqmap.fpread import LeadWatcher, PaceWatcher
         self.lead = LeadWatcher()
+        self.pace = PaceWatcher()
+        self.g_take: list = []      # who was taking control, if anyone
+        self.g_pace: list = []      # who was faster
+        self.g_ratio: list = []     # how much faster
         self.stalls: list = []          # (ts, px, side)
         self._seen_stall = False
 
@@ -205,7 +209,12 @@ class Study:
             f = self.eng.bars.get(self.bar_s)
             if self.lead.on_bar(f._open_ts):
                 self._seen_stall = False
+                # The totals restart each bar, so the rates that are
+                # compared against them have to as well.
+                self.pace.reset()
             self.lead.on_trade(float(t.ts), float(t.px),
+                               int(round(float(t.sz))), t.aggressor)
+            self.pace.on_trade(float(t.ts),
                                int(round(float(t.sz))), t.aggressor)
             c = self.lead.cur
             if c.stalled and not self._seen_stall:
@@ -242,6 +251,10 @@ class Study:
         self.g_px.append(s.px)
         self.g_bz.append(s.book_z)
         self.g_tz.append(s.tape_z)
+        pr = self.pace.reading(ts)
+        self.g_take.append(pr.taking_control or "")
+        self.g_pace.append(pr.pace)
+        self.g_ratio.append(pr.ratio)
         c = self.lead.cur
         hw = abs(c.high_water)
         self.g_side.append(c.leader)
@@ -999,6 +1012,103 @@ def pushback(st: Study, out, min_lead: int = 50) -> None:
     p("  flat column says the amount of push-back does not matter.")
 
 
+
+def control(st: Study, out) -> None:
+    """Does the side that is GAINING tell you more than the side
+    that is AHEAD?
+
+    The footprint's totals name a leader. The rates name one too,
+    and when they disagree the side behind on the total is
+    accumulating faster -- taking control, in the sense that the
+    total has not caught up yet.
+
+    Four states, and the last two are the ones worth anything:
+
+        buyers_extend    buyers ahead AND faster
+        sellers_extend   sellers ahead AND faster
+        buyers_take      SELLERS ahead, buyers faster
+        sellers_take     BUYERS ahead, sellers faster
+
+    Travel is signed in the direction of whoever the state names, so
+    a positive median means that side got what the reading implied.
+    If `buyers_take` is positive and `sellers_take` negative --
+    mirror images, both clearing the control -- that is a real
+    effect. One without the other is the sample's drift.
+    """
+    p = out
+    p("\n" + "=" * 72)
+    p("10. WHO IS GAINING vs WHO IS AHEAD")
+    p("=" * 72)
+
+    n = len(st.g_px)
+    step = st.grid_s
+    if n < 2000 or not st.g_take:
+        p(f"  only {n} samples; not enough.")
+        return
+
+    takes = sum(1 for x in st.g_take if x)
+    p(f"  the rates disagreed with the totals in {takes:,} of "
+      f"{n:,} samples ({takes / n:.0%})")
+    p(f"  rate constant {st.pace.tau}s, deadband "
+      f"{st.pace.dead:.0%}\n")
+
+    def state(i):
+        take = st.g_take[i]
+        if take:
+            return f"{take}_take"
+        pc = st.g_pace[i]
+        if pc in ("buyers", "sellers"):
+            return f"{pc}_extend"
+        return "even"
+
+    names = ["buyers_extend", "sellers_extend",
+             "buyers_take", "sellers_take", "even"]
+
+    for H in (15, 30, 60):
+        k = int(round(H / step))
+        if k >= n // 10:
+            continue
+        allv = [(st.g_px[i + k] - st.g_px[i]) / st.tick
+                for i in range(n - k)]
+        base_up = sum(1 for v in allv if v > 0) / len(allv)
+        overlap = max(1.0, H / step)
+        p(f"  ---- {H}s forward "
+          f"------------------------------------------------")
+        p(f"    {'state':>15} {'n':>7} {'indep':>6} {'median':>8} "
+          f"{'mean':>8} {'their way%':>11} {'z':>7}   verdict")
+        p(f"    {'control':>15} {len(allv):>7} "
+          f"{len(allv) / overlap:>6.0f} {_median(allv):>8.2f} "
+          f"{sum(allv) / len(allv):>8.2f} {base_up:>10.1%} "
+          f"{'--':>7}   (unconditional, up)")
+        for nm in names:
+            v = []
+            for i in range(n - k):
+                if state(i) != nm:
+                    continue
+                mv = (st.g_px[i + k] - st.g_px[i]) / st.tick
+                v.append(mv if nm.startswith("buyers") else
+                         (-mv if nm.startswith("sellers") else mv))
+            eff = len(v) / overlap
+            if eff < 50:
+                p(f"    {nm:>15} {len(v):>7}   too few to read")
+                continue
+            their = sum(1 for x in v if x > 0) / len(v)
+            se = math.sqrt(max(1e-9, base_up * (1 - base_up) / eff))
+            z = (their - base_up) / se
+            verdict = ("REAL" if abs(z) >= 3.0 else
+                       ("marginal" if abs(z) >= 2.0 else "nothing"))
+            p(f"    {nm:>15} {len(v):>7} {eff:>6.0f} "
+              f"{_median(v):>8.2f} {sum(v) / len(v):>8.2f} "
+              f"{their:>10.1%} {z:>7.2f}   {verdict}")
+        p("")
+
+    p("  THE PAIR IS THE TEST. `buyers_take` and `sellers_take` are")
+    p("  the same event on opposite sides, so a real effect shows in")
+    p("  BOTH, with the same sign once each is read in its own")
+    p("  direction. One alone is the market's drift across this")
+    p("  sample wearing the reading's name.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("files", nargs="*", help="MBP-10 .dbn or .dbn.zst")
@@ -1087,6 +1197,7 @@ def main() -> int:
     divergence(st, p, dead=a.gap_dead, win_s=a.pwin)
     stalls(st, p)
     pushback(st, p)
+    control(st, p)
 
     p("\n" + "=" * 72)
     p("READ THIS PART")
