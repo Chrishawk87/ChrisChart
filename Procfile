@@ -11,7 +11,9 @@ worker: python -m liqmap.worker
 # The EVM arbitrage bot. A THIRD Railway service off this same repo: set the
 # root directory to `mev` and the start command to this. It shares nothing
 # with the Python package -- different market, different process, its own
-# variables. Deploy it only after setting EXECUTOR_ADDRESS, EXECUTION_KEY and
+# variables. It compiles with tsc at BUILD time and runs plain node, because
+# Nixpacks sets NODE_ENV=production and would not install tsx.
+# Deploy it only after setting EXECUTOR_ADDRESS, EXECUTION_KEY and
 # FLASHBOTS_AUTH_KEY, and leave DRY_RUN unset (it defaults to true) until you
 # have watched a week of simulations.
-mev: npx tsx src/mev-engine.ts
+mev: npm start
