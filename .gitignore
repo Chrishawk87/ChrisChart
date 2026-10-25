@@ -20,3 +20,10 @@ data/
 *.db-shm
 *.db-wal
 *.db-journal
+
+# Node artifacts for the mev/ service. node_modules is large and
+# platform-specific; dist/ is build output. Neither belongs in git, and
+# Railway installs them itself at build time.
+node_modules/
+mev/node_modules/
+mev/dist/
