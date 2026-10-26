@@ -9726,46 +9726,42 @@ function ofiChart(d, w, h) {
   const step = iw / n;
   const bw = Math.max(1.2, Math.min(9, step * 0.68));
 
-  /* TWO COLOURS PER BAR, AND THE DISAGREEMENT IS THE POINT.
+  /* ONE COLOUR PER CANDLE: the strength of intent in the direction the
+     bar is travelling.
 
-     The BODY is price aggression: how one-sided the price path was
-     while the bar was building. The OUTLINE is the order-flow
-     imbalance that closed it. Normally they match and the bar reads as
-     one colour.
+     The share of price movement that went up is a single number that
+     carries both facts at once. Above 0.5 the bar is travelling up,
+     below it down, and the distance from 0.5 is how one-sided the path
+     was getting there. So the colour is simply that number banded:
+     decisively up is green, decisively down is red, and a two-sided
+     path -- price went both ways and committed to neither -- is grey.
 
-     When they do not -- a green body in a red frame -- price went up
-     while the flow that ended the bar was selling, or the reverse.
-     That is the absorption state, drawn rather than inferred. Drawing
-     only one of the two would hide exactly the bars worth looking at. */
-  const aggColour = b => {
+     Grey is a reading, not a gap. It says the bar moved without intent,
+     which is a different statement from a small bar: a candle can span
+     six ticks and still be grey if it spent them going back and forth. */
+  const bodyColour = b => {
     const a = b.price_aggression;
     if (a === 'BUY_PRICE_AGGRESSIVE') return '#35c27a';
     if (a === 'SELL_PRICE_AGGRESSIVE') return '#e2574c';
-    return '#7f8a99';                       // balanced path
+    return '#8a929b';
   };
-  const ofiColour = dir => dir === 'green' ? '#35c27a'
-                         : dir === 'red' ? '#e2574c'
-                         : dir === 'forming' ? '#8aa0b4' : '#6b7682';
 
   let g = '';
-  let disagree = 0;
   all.forEach((b, i) => {
     const cx = padL + step * (i + 0.5);
-    const body = aggColour(b);
-    const edge = ofiColour(b.direction);
-    const mismatch = b.direction !== 'forming' && b.agrees === false;
-    if (mismatch) disagree++;
+    const c = bodyColour(b);
     const o = y(b.open), cl = y(b.close);
     const top = Math.min(o, cl), bot = Math.max(o, cl);
     const bodyH = Math.max(1, bot - top);
-    const dash = b.direction === 'forming' ? ' stroke-dasharray="2,2"' : '';
+    const forming = b.direction === 'forming';
+    const dash = forming ? ' stroke-dasharray="2,2"' : '';
+    // Wick and body share the colour. The candle is one object.
     g += `<line x1="${cx.toFixed(1)}" y1="${y(b.high).toFixed(1)}"
             x2="${cx.toFixed(1)}" y2="${y(b.low).toFixed(1)}"
-            stroke="${edge}" stroke-width="1"${dash}/>`;
+            stroke="${c}" stroke-width="1"${dash}/>`;
     g += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}"
             width="${bw.toFixed(1)}" height="${bodyH.toFixed(1)}"
-            fill="${body}" opacity="${b.direction === 'forming' ? 0.35 : 0.92}"
-            stroke="${edge}" stroke-width="${mismatch ? 1.4 : 0.5}"/>`;
+            fill="${c}" opacity="${forming ? 0.4 : 0.92}"/>`;
   });
 
   /* Price axis on the right, in dollars. Five levels, snapped to the
@@ -9784,22 +9780,24 @@ function ofiChart(d, w, h) {
   }
 
   const last = bars[bars.length - 1];
-  const greens = bars.filter(b => b.direction === 'green').length;
-  const reds = bars.filter(b => b.direction === 'red').length;
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
+  const nb = bars.length - ba - sa;
   return `<svg width="${w}" height="${h}" style="display:block">${ax}${g}</svg>
     <span class="stamp">${d.total.toLocaleString()} bars at target
       ${d.target.toLocaleString()}
       &middot; showing ${bars.length}
-      &middot; outline (flow) ${greens}g / ${reds}r
-      &middot; body (price) ${ba} buy-agg / ${sa} sell-agg
-      &middot; <b>${disagree} disagree</b></span>
+      &middot; <b class="long">${ba} up</b>
+      / <b class="short">${sa} down</b>
+      / ${nb} no intent
+      &middot; flow that closed them: ${bars.filter(b =>
+          b.direction === 'green').length}g / ${bars.filter(b =>
+          b.direction === 'red').length}r</span>
     <span class="stamp">last ${last.close.toFixed(2)}
-      &middot; flow ${last.direction} (OFI ${last.ofi > 0 ? '+' : ''}${last.ofi})
-      &middot; path ${(last.price_agg_ratio * 100).toFixed(0)}% up
-      (${(last.price_aggression || '').replace(/_/g, ' ').toLowerCase()})
-      &middot; ${last.updates} updates over ${last.seconds.toFixed(1)}s</span>`;
+      &middot; ${(last.price_agg_ratio * 100).toFixed(0)}% of its movement went up
+      &middot; closed by ${last.direction === 'green' ? 'buying' : 'selling'} flow
+      (OFI ${last.ofi > 0 ? '+' : ''}${last.ofi})
+      &middot; built from ${last.updates} book updates</span>`
 }
 
 let _ofiTarget = 250;
@@ -9834,22 +9832,23 @@ async function ofiTick() {
         contracts of net imbalance &middot; smaller = more bars
         (they scale as 1/target&sup2;)</span>
       ${ofiChart(d, w, 240)}
-      <span class="stamp" style="width:100%">BODY = price aggression, the
-        share of price movement that went up while the bar built. OUTLINE
-        = the order-flow imbalance that closed it. A green body in a red
-        frame (drawn with a thicker edge) is price rising on selling flow,
-        or the reverse &mdash; that is absorption, shown rather than
-        inferred. Grey body = the path was two-sided.</span>
-      <span class="stamp" style="width:100%">Aggression is measured across
-        the WHOLE bar, not a trailing 5ms window: at target 250 a bar runs
-        about twelve seconds, so 5ms is 0.04% of it and would colour the
-        candle from almost nothing. The burst figure is still carried in
-        the data as price_agg_burst. The dashed bar on the right is still
-        forming and can still change colour.</span>
-      <span class="stamp" style="width:100%">Outline colours should sit
-        near even over a long run. A long way off means the accumulator
-        is latching or the OFI sign is inverted &mdash; both make every
-        bar wrong in the same direction, and neither looks wrong.</span>`;
+      <span class="stamp" style="width:100%">Colour is the strength of
+        intent in the direction the bar travelled. GREEN: 70%+ of the
+        price movement went up. RED: 70%+ went down. GREY: the path was
+        two-sided and committed to neither &mdash; a bar can span six
+        ticks and still be grey if it spent them going back and forth.</span>
+      <span class="stamp" style="width:100%">Measured across the whole
+        bar &mdash; every book update it contains, start to finish. The
+        dashed bar on the right is still forming.</span>
+      <span class="stamp" style="width:100%">The bar BOUNDARIES still come
+        from order-flow imbalance &mdash; a bar ends when flow crosses
+        your target, never on a clock. Only the colour is price. Where
+        the two disagree is carried as &lsquo;agrees&rsquo; in the data.</span>
+      <span class="stamp" style="width:100%">The flow split above should
+        sit near even over a long run. A long way off means the
+        accumulator is latching or the OFI sign is inverted &mdash; both
+        put the bar boundaries in the wrong places, and neither looks
+        wrong on the chart.</span>`;
   } catch (e) {
     host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
       + e + '</span>';

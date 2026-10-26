@@ -212,38 +212,61 @@ class TestTheAggressionLayer:
         j = WEB.index("def api_dexarb")
         assert "live_pai" in WEB[i:j]
 
-    def test_the_body_is_coloured_by_aggression(self):
+    def test_the_whole_candle_is_one_colour(self):
+        """It was briefly two -- body from price, outline from flow --
+        which is a different chart from the one asked for. A candle is
+        one object and carries one reading."""
         i = WEB.index("function ofiChart")
         j = WEB.index("let _ofiTarget")
         body = WEB[i:j]
-        assert "aggColour" in body
-        assert "BUY_PRICE_AGGRESSIVE" in body
-        assert 'fill="${body}"' in body
+        assert "bodyColour" in body
+        assert "ofiColour" not in body, "the outline colour is gone"
+        assert "aggColour" not in body
+        # The rect must carry no stroke of its own.
+        rect = body[body.index("g += `<rect"):body.index("});", body.index("g += `<rect"))]
+        assert "stroke=" not in rect, "the body must not be outlined separately"
 
-    def test_the_outline_is_coloured_by_flow(self):
+    def test_the_wick_takes_the_same_colour_as_the_body(self):
         i = WEB.index("function ofiChart")
         j = WEB.index("let _ofiTarget")
         body = WEB[i:j]
-        assert "ofiColour" in body
-        assert 'stroke="${edge}"' in body
+        line = body[body.index("g += `<line"):body.index("g += `<rect")]
+        assert 'stroke="${c}"' in line
 
-    def test_a_disagreement_is_drawn_thicker(self):
-        """It is the one state worth spotting at a glance, so it must
-        be visible without reading the numbers."""
+    def test_weak_intent_is_grey(self):
         i = WEB.index("function ofiChart")
         j = WEB.index("let _ofiTarget")
         body = WEB[i:j]
-        assert "mismatch" in body
-        assert "b.agrees === false" in body
-        assert "mismatch ? 1.4" in body
+        assert "BUY_PRICE_AGGRESSIVE" in body and "SELL_PRICE_AGGRESSIVE" in body
+        # The fall-through case, with no label test, is the grey one.
+        assert "return '#8a929b'" in body
 
-    def test_the_panel_explains_both_colours(self):
-        assert "BODY = price aggression" in WEB
-        assert "OUTLINE" in WEB
-        assert "absorption" in WEB
+    def test_the_panel_explains_the_three_colours(self):
+        assert "GREEN" in WEB and "RED" in WEB and "GREY" in WEB
+        assert "two-sided" in WEB
 
-    def test_the_panel_says_why_the_window_is_the_whole_bar(self):
-        """Because the brief asked for 5ms and that would have been
-        0.04% of a bar at target 250."""
-        assert "0.04%" in WEB
-        assert "price_agg_burst" in WEB
+    def test_the_panel_says_the_boundaries_are_still_flow(self):
+        """Only the colour changed. A reader needs to know the bars
+        still END on order-flow imbalance, not on price."""
+        assert "BOUNDARIES still come" in WEB
+
+    def test_the_reasoning_for_the_whole_bar_window_is_recorded(self):
+        """The brief asked for a trailing 5ms window. At target 250
+        that is 0.04% of a bar, which would colour the candle from
+        almost nothing. The arithmetic belongs in the module, not on
+        the panel -- but it must not be lost."""
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        assert "0.04%" in src
+        assert "pai_burst" in src
+
+    def test_the_panel_does_not_read_like_a_timeframe_chart(self):
+        """These bars are not time. A duration in the readout makes an
+        OFI-paced chart look like a one-minute one, which is the single
+        thing it is not."""
+        i = WEB.index("function ofiChart")
+        j = WEB.index("function mgChart")
+        panel = WEB[i:j]
+        readout = panel[panel.index("return `<svg"):]
+        for w in ("seconds", "toFixed(1)}s", "minute", "timeframe"):
+            assert w not in readout, f"{w!r} in the on-screen readout"
+        assert "book updates" in readout
