@@ -6116,13 +6116,23 @@ def create_app() -> FastAPI:
                         "low": x.low * sc, "close": x.close * sc,
                         "direction": x.direction, "ofi": x.ofi,
                         "updates": x.updates,
+                        "price_agg_ratio": round(x.pai, 4),
+                        "price_aggression": x.aggression,
+                        "price_agg_burst": round(x.pai_burst, 4),
+                        "agrees": x.agrees,
                         "seconds": round(x.seconds, 3)})
         cur = b.current
         forming = None
         if cur is not None and cur.updates > 0:
+            _lp = b.live_pai
             forming = {"open": cur.open * sc, "high": cur.high * sc,
                        "low": cur.low * sc, "close": cur.close * sc,
                        "ofi": b.accumulated, "updates": cur.updates,
+                       "price_agg_ratio": round(_lp, 4),
+                       "price_aggression": (
+                           "BUY_PRICE_AGGRESSIVE" if _lp >= 0.70
+                           else "SELL_PRICE_AGGRESSIVE" if _lp <= 0.30
+                           else "BALANCED_PRICE_FLOW"),
                        "seconds": round(cur.seconds, 3)}
         return {"ok": True, "coin": coin, "target": t,
                 "targets": list(_OFI_LADDER),
@@ -9716,24 +9726,46 @@ function ofiChart(d, w, h) {
   const step = iw / n;
   const bw = Math.max(1.2, Math.min(9, step * 0.68));
 
-  const colour = dir => dir === 'green' ? '#35c27a'
-                      : dir === 'red' ? '#e2574c'
-                      : dir === 'forming' ? '#8aa0b4' : '#6b7682';
+  /* TWO COLOURS PER BAR, AND THE DISAGREEMENT IS THE POINT.
+
+     The BODY is price aggression: how one-sided the price path was
+     while the bar was building. The OUTLINE is the order-flow
+     imbalance that closed it. Normally they match and the bar reads as
+     one colour.
+
+     When they do not -- a green body in a red frame -- price went up
+     while the flow that ended the bar was selling, or the reverse.
+     That is the absorption state, drawn rather than inferred. Drawing
+     only one of the two would hide exactly the bars worth looking at. */
+  const aggColour = b => {
+    const a = b.price_aggression;
+    if (a === 'BUY_PRICE_AGGRESSIVE') return '#35c27a';
+    if (a === 'SELL_PRICE_AGGRESSIVE') return '#e2574c';
+    return '#7f8a99';                       // balanced path
+  };
+  const ofiColour = dir => dir === 'green' ? '#35c27a'
+                         : dir === 'red' ? '#e2574c'
+                         : dir === 'forming' ? '#8aa0b4' : '#6b7682';
 
   let g = '';
+  let disagree = 0;
   all.forEach((b, i) => {
     const cx = padL + step * (i + 0.5);
-    const c = colour(b.direction);
+    const body = aggColour(b);
+    const edge = ofiColour(b.direction);
+    const mismatch = b.direction !== 'forming' && b.agrees === false;
+    if (mismatch) disagree++;
     const o = y(b.open), cl = y(b.close);
     const top = Math.min(o, cl), bot = Math.max(o, cl);
     const bodyH = Math.max(1, bot - top);
     const dash = b.direction === 'forming' ? ' stroke-dasharray="2,2"' : '';
     g += `<line x1="${cx.toFixed(1)}" y1="${y(b.high).toFixed(1)}"
             x2="${cx.toFixed(1)}" y2="${y(b.low).toFixed(1)}"
-            stroke="${c}" stroke-width="1"${dash}/>`;
+            stroke="${edge}" stroke-width="1"${dash}/>`;
     g += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}"
             width="${bw.toFixed(1)}" height="${bodyH.toFixed(1)}"
-            fill="${c}" opacity="${b.direction === 'forming' ? 0.35 : 0.9}"/>`;
+            fill="${body}" opacity="${b.direction === 'forming' ? 0.35 : 0.92}"
+            stroke="${edge}" stroke-width="${mismatch ? 1.4 : 0.5}"/>`;
   });
 
   /* Price axis on the right, in dollars. Five levels, snapped to the
@@ -9754,14 +9786,20 @@ function ofiChart(d, w, h) {
   const last = bars[bars.length - 1];
   const greens = bars.filter(b => b.direction === 'green').length;
   const reds = bars.filter(b => b.direction === 'red').length;
+  const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
+  const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   return `<svg width="${w}" height="${h}" style="display:block">${ax}${g}</svg>
     <span class="stamp">${d.total.toLocaleString()} bars at target
       ${d.target.toLocaleString()}
       &middot; showing ${bars.length}
-      &middot; ${greens}g / ${reds}r
-      &middot; last ${last.close.toFixed(2)}
-      (${last.direction}, OFI ${last.ofi > 0 ? '+' : ''}${last.ofi},
-       ${last.updates} updates, ${last.seconds.toFixed(1)}s)</span>`;
+      &middot; outline (flow) ${greens}g / ${reds}r
+      &middot; body (price) ${ba} buy-agg / ${sa} sell-agg
+      &middot; <b>${disagree} disagree</b></span>
+    <span class="stamp">last ${last.close.toFixed(2)}
+      &middot; flow ${last.direction} (OFI ${last.ofi > 0 ? '+' : ''}${last.ofi})
+      &middot; path ${(last.price_agg_ratio * 100).toFixed(0)}% up
+      (${(last.price_aggression || '').replace(/_/g, ' ').toLowerCase()})
+      &middot; ${last.updates} updates over ${last.seconds.toFixed(1)}s</span>`;
 }
 
 let _ofiTarget = 250;
@@ -9796,10 +9834,22 @@ async function ofiTick() {
         contracts of net imbalance &middot; smaller = more bars
         (they scale as 1/target&sup2;)</span>
       ${ofiChart(d, w, 240)}
-      <span class="stamp" style="width:100%">Green and red should sit near
-        even over a long run. A long way off means the accumulator is
-        latching or the sign is inverted. The dashed bar on the right is
-        still forming and can still change colour.</span>`;
+      <span class="stamp" style="width:100%">BODY = price aggression, the
+        share of price movement that went up while the bar built. OUTLINE
+        = the order-flow imbalance that closed it. A green body in a red
+        frame (drawn with a thicker edge) is price rising on selling flow,
+        or the reverse &mdash; that is absorption, shown rather than
+        inferred. Grey body = the path was two-sided.</span>
+      <span class="stamp" style="width:100%">Aggression is measured across
+        the WHOLE bar, not a trailing 5ms window: at target 250 a bar runs
+        about twelve seconds, so 5ms is 0.04% of it and would colour the
+        candle from almost nothing. The burst figure is still carried in
+        the data as price_agg_burst. The dashed bar on the right is still
+        forming and can still change colour.</span>
+      <span class="stamp" style="width:100%">Outline colours should sit
+        near even over a long run. A long way off means the accumulator
+        is latching or the OFI sign is inverted &mdash; both make every
+        bar wrong in the same direction, and neither looks wrong.</span>`;
   } catch (e) {
     host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
       + e + '</span>';

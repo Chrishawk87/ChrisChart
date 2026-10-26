@@ -192,3 +192,58 @@ class TestItDecidesNothing:
         """The one diagnostic a reader needs: lopsided colour is a bug,
         not a market view."""
         assert "latching" in WEB
+
+
+class TestTheAggressionLayer:
+    """Body from price, outline from flow, and the gap between them."""
+
+    def test_the_route_carries_the_aggression_fields(self):
+        i = WEB.index("def api_ofibars")
+        j = WEB.index("def api_dexarb")
+        body = WEB[i:j]
+        for k in ("price_agg_ratio", "price_aggression",
+                  "price_agg_burst", "agrees"):
+            assert f'"{k}"' in body, k
+
+    def test_the_forming_bar_gets_a_live_ratio(self):
+        """Otherwise the bar in progress is drawn in a colour it does
+        not have, and flips the moment it closes."""
+        i = WEB.index("def api_ofibars")
+        j = WEB.index("def api_dexarb")
+        assert "live_pai" in WEB[i:j]
+
+    def test_the_body_is_coloured_by_aggression(self):
+        i = WEB.index("function ofiChart")
+        j = WEB.index("let _ofiTarget")
+        body = WEB[i:j]
+        assert "aggColour" in body
+        assert "BUY_PRICE_AGGRESSIVE" in body
+        assert 'fill="${body}"' in body
+
+    def test_the_outline_is_coloured_by_flow(self):
+        i = WEB.index("function ofiChart")
+        j = WEB.index("let _ofiTarget")
+        body = WEB[i:j]
+        assert "ofiColour" in body
+        assert 'stroke="${edge}"' in body
+
+    def test_a_disagreement_is_drawn_thicker(self):
+        """It is the one state worth spotting at a glance, so it must
+        be visible without reading the numbers."""
+        i = WEB.index("function ofiChart")
+        j = WEB.index("let _ofiTarget")
+        body = WEB[i:j]
+        assert "mismatch" in body
+        assert "b.agrees === false" in body
+        assert "mismatch ? 1.4" in body
+
+    def test_the_panel_explains_both_colours(self):
+        assert "BODY = price aggression" in WEB
+        assert "OUTLINE" in WEB
+        assert "absorption" in WEB
+
+    def test_the_panel_says_why_the_window_is_the_whole_bar(self):
+        """Because the brief asked for 5ms and that would have been
+        0.04% of a bar at target 250."""
+        assert "0.04%" in WEB
+        assert "price_agg_burst" in WEB

@@ -207,12 +207,15 @@ class TestTheEmitter:
         b.on_book(0.0, 20_000, 100, 20_001, 100)
         out = b.on_book(0.5, 20_000, 300, 20_001, 100)
         row = out.as_row()
-        assert len(row) == len(ROW_COLUMNS) == 7
-        ts, o, h, l, c, colour, strength = row
+        assert len(row) == len(ROW_COLUMNS) == 9
+        ts, o, h, l, c, colour, strength, pai, agg = row
         assert ts == pytest.approx(0.5), "stamped at the CLOSE"
         assert colour == GREEN
         assert strength == out.ofi
         assert l <= o <= h and l <= c <= h
+        assert 0.0 <= pai <= 1.0
+        assert agg in ("BUY_PRICE_AGGRESSIVE", "SELL_PRICE_AGGRESSIVE",
+                       "BALANCED_PRICE_FLOW")
 
     def test_it_serialises(self):
         import json
@@ -257,3 +260,137 @@ class TestItDecidesNothing:
                    {"max_s": 0}, {"min_updates": 0}):
             with pytest.raises(ValueError):
                 OfiBarBuilder(**kw)
+
+
+class TestPriceAggression:
+    """PAI colours the body. What it must not be is the body.
+
+    In order of how badly each would mislead:
+
+      measuring the last five milliseconds and calling it the bar. At
+      target 250 a bar runs twelve seconds, so that window is 0.04% of
+      it -- a candle coloured from almost nothing
+
+      measuring NET movement instead of the PATH, which makes PAI a
+      restatement of close-versus-open and adds nothing to a chart
+      that already draws the body
+
+      carrying aggression across a close, so every bar inherits the
+      first one's character
+    """
+
+    def _walk(self, path, threshold=10 ** 9):
+        b = OfiBarBuilder(threshold=threshold, max_s=10 ** 9)
+        ts = 0.0
+        for px in path:
+            ts += 0.1
+            b.on_book(ts, px, 100, px + 1, 100)
+        return b
+
+    def test_a_clean_climb_is_buy_aggressive(self):
+        b = self._walk(list(range(0, 12)))
+        assert b.live_pai == pytest.approx(1.0)
+
+    def test_a_clean_fall_is_sell_aggressive(self):
+        b = self._walk(list(range(0, -12, -1)))
+        assert b.live_pai == pytest.approx(0.0)
+
+    def test_it_measures_the_path_not_the_close(self):
+        """THE WHOLE POINT. Two bars with the same open and close: one
+        grinds there, one chops there. A measure that cannot tell them
+        apart is just the candle body again."""
+        clean = self._walk([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+        chop = self._walk([0, 4, 1, 6, 2, 8, 3, 9, 5, 10, 10])
+        assert clean.live_pai == pytest.approx(1.0)
+        assert 0.45 < chop.live_pai < 0.70
+        assert clean.live_pai > chop.live_pai + 0.3
+
+    def test_the_labels_sit_on_the_stated_thresholds(self):
+        from liqmap.ofibar import (BALANCED_FLOW, BUY_AGGRESSIVE,
+                                   SELL_AGGRESSIVE, OfiBar)
+        assert OfiBar._label(0.70) == BUY_AGGRESSIVE
+        assert OfiBar._label(0.6999) == BALANCED_FLOW
+        assert OfiBar._label(0.30) == SELL_AGGRESSIVE
+        assert OfiBar._label(0.3001) == BALANCED_FLOW
+        assert OfiBar._label(0.5) == BALANCED_FLOW
+
+    def test_a_bar_with_no_price_movement_is_balanced(self):
+        from liqmap.ofibar import BALANCED_FLOW
+        b = self._walk([5, 5, 5, 5, 5])
+        assert b.live_pai == pytest.approx(0.5)
+        bar = OfiBar()
+        assert bar.pai == pytest.approx(0.5)
+        assert bar.aggression == BALANCED_FLOW
+
+    def test_aggression_resets_with_the_accumulator(self):
+        """Carried forward, every bar inherits the first one's path."""
+        b = OfiBarBuilder(threshold=200, max_s=10 ** 9)
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        ts, px = 0.0, 20_000
+        closed = 0
+        while closed < 2 and ts < 400:
+            ts += 0.1
+            px += 1
+            if b.on_book(ts, px, 400, px + 1, 100) is not None:
+                closed += 1
+                assert b._buy_agg == 0.0 and b._sell_agg == 0.0
+
+    def test_the_burst_window_is_separate_from_the_bar(self):
+        """A bar that climbed all the way and then ticked DOWN once at
+        the close must read buy-aggressive overall and sell-aggressive
+        in the burst. One number cannot do both jobs."""
+        b = OfiBarBuilder(threshold=10 ** 9, max_s=10 ** 9)
+        ts = 0.0
+        for px in range(0, 40):
+            ts += 0.1
+            b.on_book(ts, px, 100, px + 1, 100)
+        # Ten milliseconds, so the preceding uptick falls OUT of the
+        # 5ms window. Spaced 1ms the window holds both and reads 0.5,
+        # which is correct behaviour and a useless fixture.
+        ts += 0.010
+        b.on_book(ts, 38, 100, 39, 100)      # one downtick, alone in the window
+        bar = b._close(GREEN, ts, b._bar.close)
+        assert bar.pai > 0.9, "the bar as a whole climbed"
+        assert bar.pai_burst == pytest.approx(0.0), "the last 5ms fell"
+        assert bar.aggression != bar.aggression_burst
+
+    def test_agrees_is_false_when_flow_and_path_conflict(self):
+        from liqmap.ofibar import SELL_AGGRESSIVE
+        bar = OfiBar(direction=GREEN, buy_agg=1.0, sell_agg=9.0)
+        assert bar.aggression == SELL_AGGRESSIVE
+        assert bar.agrees is False, "green flow, falling price: absorption"
+        mirror = OfiBar(direction=RED, buy_agg=9.0, sell_agg=1.0)
+        assert mirror.agrees is False
+
+    def test_agrees_is_true_when_they_match(self):
+        assert OfiBar(direction=GREEN, buy_agg=9.0, sell_agg=1.0).agrees
+        assert OfiBar(direction=RED, buy_agg=1.0, sell_agg=9.0).agrees
+        assert OfiBar(direction=CHOP, buy_agg=9.0, sell_agg=1.0).agrees
+
+    def test_a_balanced_path_never_counts_as_disagreement(self):
+        """Only an OPPOSITE path is absorption. A two-sided one is just
+        a quiet bar, and flagging it would bury the real cases."""
+        assert OfiBar(direction=GREEN, buy_agg=5.0, sell_agg=5.0).agrees
+        assert OfiBar(direction=RED, buy_agg=5.0, sell_agg=5.0).agrees
+
+    def test_the_ratio_needs_no_tick_size(self):
+        """Units cancel, so raw feed integers and tick indices give the
+        same answer -- which is why the live wiring can pass raw ints."""
+        small = self._walk([0, 1, 2, 3])
+        big = OfiBarBuilder(threshold=10 ** 9, max_s=10 ** 9)
+        ts = 0.0
+        for k in range(4):
+            ts += 0.1
+            px = 20_000_000_000 + k * 250_000_000
+            big.on_book(ts, px, 100, px + 250_000_000, 100)
+        assert small.live_pai == pytest.approx(big.live_pai)
+
+    def test_it_is_in_the_payload(self):
+        import json
+        b = self._walk([0, 1, 2, 3, 4])
+        bar = b._close(GREEN, 1.0, b._bar.close)
+        d = bar.as_dict()
+        for k in ("price_agg_ratio", "price_aggression",
+                  "price_agg_burst", "aggression_burst", "agrees"):
+            assert k in d, k
+        json.dumps(d)
