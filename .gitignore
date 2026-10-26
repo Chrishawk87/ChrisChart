@@ -27,3 +27,7 @@ data/
 node_modules/
 mev/node_modules/
 mev/dist/
+
+# Compiled contract output. Reproducible from source with `npm run compile`,
+# and a stale copy in git is worse than none.
+mev/MevArb.deploy.hex

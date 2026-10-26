@@ -1,0 +1,33 @@
+{
+  "name": "mev-arb",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/mev-engine.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/mev-engine.js",
+    "check": "node checkrpc.js",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run build && node dist/verify.js",
+    "dev": "tsx src/mev-engine.ts",
+    "compile": "node compile.js",
+    "testcontract": "node testcontract.mjs",
+    "deploy": "node deploy.js"
+  },
+  "comment": "typescript and @types live in dependencies, not devDependencies, on purpose. Railway's Nixpacks builder sets NODE_ENV=production, npm then skips devDependencies, and the build script finds no tsc. Versions are pinned exactly, with no caret: a range means two machines can resolve different trees, and the one that matters is Railway's, which you cannot inspect after the fact. ws 8.22 and ethers 6.17 are floors, not preferences -- everything below them carries GHSA-58qx-3vcg-4xpx, an uninitialized-memory disclosure in the WebSocket client this bot points at an RPC provider.",
+  "dependencies": {
+    "ethers": "6.17.0",
+    "ws": "8.22.0",
+    "typescript": "5.6.3",
+    "@types/node": "22.9.0",
+    "@types/ws": "8.5.13"
+  },
+  "devDependencies": {
+    "tsx": "4.23.15",
+    "solc": "0.8.30",
+    "@ethereumjs/evm": "3.1.0",
+    "@ethereumjs/common": "4.4.0",
+    "@ethereumjs/util": "9.1.0",
+    "@ethereumjs/statemanager": "2.4.0"
+  }
+}

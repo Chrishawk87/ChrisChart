@@ -125,7 +125,13 @@ say "staging"
 # NOTHING and exits non-zero. With the error swallowed that reads as a
 # successful run that shipped an empty commit, which is the exact failure
 # this script is here to prevent.
-for f in liqmap tests scripts README.md DEPLOY.md requirements.txt \
+# `mev` was missing from this list until 2026-10-25, and the failure was
+# quiet in the worst way: Procfile and .gitignore ARE on the list, so a
+# delivery that touched all three committed two of them and dropped the
+# whole directory. The commit message said "mev: build for railway" and the
+# commit contained no mev. Railway would then build a root directory that
+# does not exist in the repo.
+for f in liqmap tests scripts mev README.md DEPLOY.md requirements.txt \
          pyproject.toml Procfile railway.json .gitignore ship.sh; do
     [ -e "$f" ] && git add -- "$f"
 done
