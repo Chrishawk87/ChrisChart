@@ -394,3 +394,47 @@ class TestPriceAggression:
                   "price_agg_burst", "aggression_burst", "agrees"):
             assert k in d, k
         json.dumps(d)
+
+
+class TestTheHistoryIsBounded:
+    """A long-running service with five builders must not grow forever."""
+
+    def _fill(self, cap, n=600):
+        b = OfiBarBuilder(threshold=1, max_s=10 ** 9, max_bars=cap)
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        ts, px = 0.0, 20_000
+        for i in range(n):
+            ts += 0.01
+            px += 1 if i % 2 else -1
+            b.on_book(ts, px, 100 + (i % 7) * 50, px + 1, 100)
+        return b
+
+    def test_the_list_never_exceeds_the_cap(self):
+        b = self._fill(50, n=4000)
+        assert len(b.bars) <= 50
+        assert b.dropped > 0
+
+    def test_the_newest_bars_are_the_ones_kept(self):
+        b = self._fill(50, n=4000)
+        times = [x.ts_close for x in b.bars]
+        assert times == sorted(times)
+        assert b.bars[-1].ts_close == pytest.approx(max(times))
+
+    def test_dropped_counts_what_fell_off_the_front(self):
+        b = self._fill(50, n=4000)
+        assert b.dropped + len(b.bars) >= 50
+
+    def test_trimming_happens_in_blocks_not_one_at_a_time(self):
+        """Popping one per close copies the whole list every bar."""
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        assert "del self.bars[:cut]" in src
+        assert "self.bars.pop(0)" not in src
+
+    def test_reset_clears_the_dropped_count(self):
+        b = self._fill(50, n=2000)
+        b.reset()
+        assert b.dropped == 0 and b.bars == []
+
+    def test_a_tiny_cap_is_refused(self):
+        with pytest.raises(ValueError):
+            OfiBarBuilder(max_bars=5)

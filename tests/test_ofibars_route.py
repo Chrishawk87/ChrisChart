@@ -166,7 +166,10 @@ class TestTheRouteAndPanel:
                "onchange=\"ofiSetTarget(this.value)\"" in WEB
 
     def test_the_panel_has_its_own_timer(self):
-        assert "_ofiTimer" in WEB and "setInterval(ofiTick" in WEB
+        # The callback is wrapped so the tick knows it came from the
+        # timer and can decline to refetch while scrolled back.
+        assert "_ofiTimer" in WEB
+        assert "setInterval(() => ofiTick(true)" in WEB
 
     def test_the_panel_element_exists(self):
         assert 'id="ofiBars"' in WEB
@@ -270,3 +273,118 @@ class TestTheAggressionLayer:
         for w in ("seconds", "toFixed(1)}s", "minute", "timeframe"):
             assert w not in readout, f"{w!r} in the on-screen readout"
         assert "book updates" in readout
+
+
+class TestScrollback:
+    """Pan and zoom over what the service has recorded.
+
+    The failure worth guarding is a view that moves under you: an
+    offset that wraps, a forming bar stapled onto the end of the past,
+    or pivots that flicker in and out as you scroll because they were
+    computed only over the visible slice.
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_offset_is_clamped_not_wrapped(self):
+        """Scrolling past the beginning should stop at the beginning,
+        not jump to the other end of the history."""
+        r = self._route()
+        assert "max(0, min(int(offset), max(0, total - n)))" in r
+
+    def test_the_forming_bar_is_dropped_when_scrolled_back(self):
+        """It belongs at the live edge. Appended to a historical window
+        it staples the present onto the end of the past."""
+        r = self._route()
+        assert "if off > 0:" in r and "forming = None" in r
+
+    def test_pivots_are_found_over_a_wider_slice_than_the_window(self):
+        """Found only within the window, a swing near either edge
+        appears and disappears as you scroll, because its neighbours
+        were outside the slice."""
+        r = self._route()
+        assert "wide_lo = max(0, start - pv)" in r
+        assert "wide_hi = min(total, end + pv)" in r
+        assert "if start <= abs_i < end:" in r
+
+    def test_the_route_reports_where_the_window_sits(self):
+        r = self._route()
+        for k in ("at_live", "oldest", "offset", "window", "dropped"):
+            assert f'"{k}"' in r, k
+
+    def test_unsettled_is_only_reported_at_the_live_edge(self):
+        """Scrolled back there is no unsettled region -- every bar in
+        view has bars after it."""
+        r = self._route()
+        assert "if off == 0 else 0" in r
+
+    def test_the_window_size_is_bounded(self):
+        r = self._route()
+        assert "max(20, min(int(bars), 600))" in r
+
+    def test_the_pivot_window_is_bounded(self):
+        r = self._route()
+        assert "max(1, min(int(pivot), 20))" in r
+
+
+class TestThePanAndZoomControls:
+
+    def test_the_timer_does_not_refetch_while_scrolled_back(self):
+        """A refetch while you are reading history re-renders the same
+        window for nothing, and any drift in the offset arithmetic
+        would walk the view out from under you."""
+        assert "if (fromTimer && _ofiOffset > 0) return;" in WEB
+        assert "setInterval(() => ofiTick(true), 2000)" in WEB
+
+    def test_changing_target_snaps_back_to_live(self):
+        """Targets have wildly different bar counts, so an offset in
+        bars means something else on each one."""
+        i = WEB.index("function ofiSetTarget")
+        j = WEB.index("function ofiSetWindow")
+        assert "_ofiOffset = 0;" in WEB[i:j]
+
+    def test_zooming_holds_the_right_edge(self):
+        i = WEB.index("function ofiSetWindow")
+        j = WEB.index("function ofiPan")
+        assert "_ofiOffset + (was - _ofiWindow)" in WEB[i:j]
+
+    def test_pan_cannot_go_negative(self):
+        i = WEB.index("function ofiPan")
+        j = WEB.index("function ofiSetPivot")
+        assert "Math.max(0," in WEB[i:j]
+
+    def test_there_is_a_way_back_to_live(self):
+        assert "function ofiLive()" in WEB
+        assert "ofiLive()" in WEB and "AT LIVE EDGE" in WEB
+
+    def test_the_buttons_disable_at_the_ends(self):
+        assert "${d.oldest ? 'disabled' : ''}" in WEB
+        assert "${d.at_live ? 'disabled' : ''}" in WEB
+
+
+class TestThePivotMarks:
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTarget")]
+
+    def test_a_caret_is_drawn_for_each_pivot(self):
+        c = self._chart()
+        assert "<path" in c and "d.pivots" in c
+
+    def test_only_the_last_two_of_each_kind_extend_as_levels(self):
+        """Every pivot extended turns the chart into a grid and the
+        levels stop meaning anything."""
+        c = self._chart()
+        assert "slice(-2)" in c
+        assert "stroke-dasharray=\"3,3\"" in c
+
+    def test_a_level_off_the_top_or_bottom_is_not_drawn(self):
+        c = self._chart()
+        assert "if (yy < padT || yy > padT + ih) continue;" in c
+
+    def test_the_marks_are_bounds_checked(self):
+        c = self._chart()
+        assert "if (m.i < 0 || m.i >= all.length) continue;" in c

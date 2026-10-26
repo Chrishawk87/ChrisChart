@@ -204,12 +204,13 @@ class OfiBarBuilder:
     stops updating while looking like nothing is happening.
     """
 
-    __slots__ = ("tick", "threshold", "max_s", "min_updates",
-                 "_prev", "_acc", "_bar", "bars",
+    __slots__ = ("tick", "threshold", "max_s", "min_updates", "max_bars",
+                 "_prev", "_acc", "_bar", "bars", "dropped",
                  "_buy_agg", "_sell_agg", "_steps")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
-                 max_s: float = 30.0, min_updates: int = 1) -> None:
+                 max_s: float = 30.0, min_updates: int = 1,
+                 max_bars: int = 20_000) -> None:
         if tick_size <= 0:
             raise ValueError("tick_size must be positive")
         if threshold < 1:
@@ -218,6 +219,8 @@ class OfiBarBuilder:
             raise ValueError("max_s must be positive")
         if min_updates < 1:
             raise ValueError("min_updates must be at least 1")
+        if max_bars < 10:
+            raise ValueError("max_bars must be at least 10")
         self.tick = float(tick_size)
         self.threshold = int(threshold)
         self.max_s = float(max_s)
@@ -225,10 +228,20 @@ class OfiBarBuilder:
         # happens when one enormous size change clears the line by
         # itself and leaves a bar with open == high == low == close.
         self.min_updates = int(min_updates)
+        # HOW FAR BACK THE CHART CAN SCROLL, and the only thing standing
+        # between a long-running service and an unbounded list. At
+        # target 125 a bar is about three seconds, so 20,000 is roughly
+        # seventeen hours; at 500 it is over a week. Five targets run at
+        # once, so the real figure is five times this many objects.
+        self.max_bars = int(max_bars)
         self._prev: Touch | None = None
         self._acc = 0
         self._bar: OfiBar | None = None
         self.bars: list[OfiBar] = []
+        # Bars discarded off the front. Reported so the chart can say
+        # "this is where the history starts" rather than implying the
+        # session began there.
+        self.dropped = 0
         # Price-aggression accumulators for the bar in progress, and a
         # short trailing queue for the closing burst. The queue holds
         # only the last few milliseconds, so it stays a handful of
@@ -242,6 +255,7 @@ class OfiBarBuilder:
         self._acc = 0
         self._bar = None
         self.bars.clear()
+        self.dropped = 0
         self._buy_agg = 0.0
         self._sell_agg = 0.0
         self._steps.clear()
@@ -364,6 +378,13 @@ class OfiBarBuilder:
         bar.buy_burst = sum(x[1] for x in self._steps)
         bar.sell_burst = sum(x[2] for x in self._steps)
         self.bars.append(bar)
+        if len(self.bars) > self.max_bars:
+            # Trim in blocks. Popping one per close is O(n) each time
+            # and turns every bar into a list copy of twenty thousand
+            # elements; this pays that cost once per ten percent.
+            cut = max(1, self.max_bars // 10)
+            del self.bars[:cut]
+            self.dropped += cut
         # THE RESET. See the module docstring -- without this the
         # threshold latches and every bar after the first is green.
         # Aggression resets with it: it describes ONE bar's path, and

@@ -6075,9 +6075,14 @@ def create_app() -> FastAPI:
                 "note": ("live forward tracking, not a backtest; "
                          "every cross is listed, nothing is filtered")}
 
+    def _pivot_pending(n: int, right: int) -> int:
+        from .pivots import pending
+        return pending(n, right)
+
     @app.get("/api/ofibars", dependencies=[Depends(require_token)])
     def api_ofibars(coin: str = "ES", target: int = 250,
-                    bars: int = 120) -> dict[str, Any]:
+                    bars: int = 140, offset: int = 0,
+                    pivot: int = 3) -> dict[str, Any]:
         """OFI-closed candles for one target, newest last.
 
         Every target in the ladder is accumulating all the time, so
@@ -6104,8 +6109,38 @@ def create_app() -> FastAPI:
         if t not in builders:
             t = min(builders, key=lambda x: abs(x - t))
         b = builders[t]
-        n = max(10, min(int(bars), 400))
-        recent = b.bars[-n:]
+        n = max(20, min(int(bars), 600))
+        total = len(b.bars)
+        # `offset` is how many bars back from the live edge the window
+        # starts. Clamped rather than wrapped: asking to scroll past the
+        # beginning should stop at the beginning, not silently jump to
+        # the other end of the history.
+        off = max(0, min(int(offset), max(0, total - n)))
+        end = total - off
+        start = max(0, end - n)
+        window = b.bars[start:end]
+
+        # Pivots are found over a WIDER slice than the window and then
+        # filtered to it. Found only within the window, a swing sitting
+        # near either edge would appear and disappear as you scrolled,
+        # because its neighbours were outside the slice.
+        pv = max(1, min(int(pivot), 20))
+        wide_lo = max(0, start - pv)
+        wide_hi = min(total, end + pv)
+        wide = b.bars[wide_lo:wide_hi]
+        marks = []
+        if len(wide) > 2 * pv:
+            from . import pivots as _pv
+            found = _pv.find([x.high for x in wide], [x.low for x in wide],
+                             left=pv, right=pv,
+                             ts=[x.ts_close for x in wide])
+            for q in found:
+                abs_i = wide_lo + q.index
+                if start <= abs_i < end:
+                    marks.append({"i": abs_i - start, "kind": q.kind,
+                                  "price": q.price * 1e-9, "ts": q.ts})
+
+        recent = window
 
         # Raw integer feed units in, dollars out. One conversion, here.
         sc = 1e-9
@@ -6134,9 +6169,20 @@ def create_app() -> FastAPI:
                            else "SELL_PRICE_AGGRESSIVE" if _lp <= 0.30
                            else "BALANCED_PRICE_FLOW"),
                        "seconds": round(cur.seconds, 3)}
+        # The forming bar belongs only at the live edge. Scrolled back,
+        # appending it would staple the present onto the end of the past.
+        if off > 0:
+            forming = None
+
         return {"ok": True, "coin": coin, "target": t,
                 "targets": list(_OFI_LADDER),
-                "total": len(b.bars), "bars": out, "forming": forming,
+                "total": total, "offset": off, "window": n,
+                "dropped": getattr(b, "dropped", 0),
+                "at_live": off == 0,
+                "oldest": off >= max(0, total - n),
+                "pivot_n": pv, "pivots": marks,
+                "unsettled": _pivot_pending(len(window), pv) if off == 0 else 0,
+                "bars": out, "forming": forming,
                 "trades": getattr(tape, "trades", 0)}
 
     @app.get("/api/dexarb", dependencies=[Depends(require_token)])
@@ -9764,6 +9810,45 @@ function ofiChart(d, w, h) {
             fill="${c}" opacity="${forming ? 0.4 : 0.92}"/>`;
   });
 
+  /* Pivot marks: a caret above each swing high, below each swing low.
+     Only SETTLED ones arrive here -- the server withholds anything in
+     the last few bars, because the next bar can take a high out and
+     then the level never existed. A level that appears and vanishes is
+     worse than none, since you remember it was there and not that it
+     was provisional. */
+  let pv = '';
+  const marks = (d && d.pivots) || [];
+  for (const m of marks) {
+    if (m.i < 0 || m.i >= all.length) continue;
+    const cx = padL + step * (m.i + 0.5);
+    const hi = m.kind === 'high';
+    const yy = hi ? y(m.price) - 5 : y(m.price) + 5;
+    const dy = hi ? -4 : 4;
+    pv += `<path d="M ${(cx - 3.2).toFixed(1)} ${yy.toFixed(1)}
+             L ${cx.toFixed(1)} ${(yy + dy).toFixed(1)}
+             L ${(cx + 3.2).toFixed(1)} ${yy.toFixed(1)}"
+             fill="none" stroke="${hi ? '#e8c46a' : '#6fb6d6'}"
+             stroke-width="1.3"/>`;
+  }
+
+  /* The two most recent of each kind extended to the right edge. Every
+     pivot extended turns the chart into a grid and the levels stop
+     meaning anything. */
+  const lastHigh = marks.filter(m => m.kind === 'high').slice(-2);
+  const lastLow = marks.filter(m => m.kind === 'low').slice(-2);
+  for (const m of lastHigh.concat(lastLow)) {
+    const yy = y(m.price);
+    if (yy < padT || yy > padT + ih) continue;
+    const x0 = padL + step * (m.i + 0.5);
+    pv += `<line x1="${x0.toFixed(1)}" y1="${yy.toFixed(1)}"
+             x2="${(w - padR).toFixed(1)}" y2="${yy.toFixed(1)}"
+             stroke="${m.kind === 'high' ? '#e8c46a' : '#6fb6d6'}"
+             stroke-width="0.7" stroke-dasharray="3,3" opacity="0.5"/>`;
+    pv += `<text x="${(w - padR + 4).toFixed(1)}" y="${(yy + 3).toFixed(1)}"
+             font-size="9" fill="${m.kind === 'high' ? '#e8c46a' : '#6fb6d6'}"
+             >${m.price.toFixed(2)}</text>`;
+  }
+
   /* Price axis on the right, in dollars. Five levels, snapped to the
      tick grid so the labels are prices that can actually print. */
   let ax = '';
@@ -9783,7 +9868,7 @@ function ofiChart(d, w, h) {
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   const nb = bars.length - ba - sa;
-  return `<svg width="${w}" height="${h}" style="display:block">${ax}${g}</svg>
+  return `<svg width="${w}" height="${h}" style="display:block">${ax}${g}${pv}</svg>
     <span class="stamp">${d.total.toLocaleString()} bars at target
       ${d.target.toLocaleString()}
       &middot; showing ${bars.length}
@@ -9802,19 +9887,52 @@ function ofiChart(d, w, h) {
 
 let _ofiTarget = 250;
 let _ofiTimer = null;
+let _ofiWindow = 140;      // bars visible -- the zoom
+let _ofiOffset = 0;        // bars back from the live edge -- the pan
+let _ofiTotal = 0;
+let _ofiPivot = 3;        // bars either side a swing must clear
 
 function ofiSetTarget(v) {
   _ofiTarget = parseInt(v, 10) || 250;
+  // Targets have wildly different bar counts, so an offset measured in
+  // bars means something else on each one. Snapping to live is the only
+  // position that survives the switch.
+  _ofiOffset = 0;
   ofiTick();
 }
 
-async function ofiTick() {
+function ofiSetWindow(v) {
+  const was = _ofiWindow;
+  _ofiWindow = parseInt(v, 10) || 140;
+  // Zoom about the RIGHT edge of what is on screen, so the bar you were
+  // looking at stays put instead of the view jumping.
+  if (_ofiOffset > 0) _ofiOffset = Math.max(0, _ofiOffset + (was - _ofiWindow));
+  ofiTick();
+}
+
+function ofiPan(bars) {
+  _ofiOffset = Math.max(0, _ofiOffset + bars);
+  ofiTick();
+}
+
+function ofiSetPivot(v) { _ofiPivot = parseInt(v, 10) || 3; ofiTick(); }
+function ofiLive() { _ofiOffset = 0; ofiTick(); }
+function ofiOldest() { _ofiOffset = Math.max(0, _ofiTotal - _ofiWindow); ofiTick(); }
+
+async function ofiTick(fromTimer) {
   const pane = $('tab-dash');
   if (pane && pane.hidden) return;          // not on screen, not polled
+  // SCROLLED BACK MEANS FROZEN. A timer refetch while you are reading
+  // history re-renders the same window for no reason, and any drift in
+  // the offset arithmetic would walk the view out from under you.
+  if (fromTimer && _ofiOffset > 0) return;
   const host = $('ofiBars');
   if (!host) return;
   try {
-    const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget + '&bars=140');
+    const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget
+      + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
+      + '&pivot=' + _ofiPivot);
+    if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; }
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
         + (d.why || 'unavailable') + '</span>';
@@ -9829,8 +9947,35 @@ async function ofiTick() {
           style="margin:0 6px">${(d.targets || []).map(t =>
             `<option value="${t}"${t === d.target ? ' selected' : ''}>${t}</option>`
           ).join('')}</select>
-        contracts of net imbalance &middot; smaller = more bars
-        (they scale as 1/target&sup2;)</span>
+        contracts &middot; show
+        <select onchange="ofiSetWindow(this.value)"
+          style="margin:0 6px">${[60, 100, 140, 220, 320, 500].map(k =>
+            `<option value="${k}"${k === d.window ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        bars &middot; swing
+        <select onchange="ofiSetPivot(this.value)"
+          style="margin:0 6px">${[2, 3, 5, 8, 12].map(k =>
+            `<option value="${k}"${k === d.pivot_n ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        bars either side</span>
+      <span class="stamp" style="width:100%">
+        <button class="btn" onclick="ofiOldest()"
+          ${d.oldest ? 'disabled' : ''}>&laquo; oldest</button>
+        <button class="btn" onclick="ofiPan(${Math.round(d.window * 0.75)})"
+          ${d.oldest ? 'disabled' : ''}>&lsaquo;&lsaquo; page</button>
+        <button class="btn" onclick="ofiPan(10)"
+          ${d.oldest ? 'disabled' : ''}>&lsaquo; 10</button>
+        <button class="btn" onclick="ofiPan(-10)"
+          ${d.at_live ? 'disabled' : ''}>10 &rsaquo;</button>
+        <button class="btn" onclick="ofiPan(${-Math.round(d.window * 0.75)})"
+          ${d.at_live ? 'disabled' : ''}>page &rsaquo;&rsaquo;</button>
+        <button class="btn" onclick="ofiLive()"
+          ${d.at_live ? 'disabled' : ''}>live &raquo;</button>
+        &nbsp;${d.at_live ? '<b class="long">AT LIVE EDGE</b>'
+                          : '<b>' + d.offset.toLocaleString() +
+                            ' bars back</b> &mdash; not following'}
+        &middot; ${d.total.toLocaleString()} held${d.dropped
+          ? ' (' + d.dropped.toLocaleString() + ' older ones aged out)' : ''}</span>
       ${ofiChart(d, w, 240)}
       <span class="stamp" style="width:100%">Colour is the strength of
         intent in the direction the bar travelled. GREEN: 70%+ of the
@@ -10545,7 +10690,7 @@ function mgStartTimers() {
   if (!_dexTimer) { _dexTimer = setInterval(dexTick, 12000); dexTick(); }
   // Two seconds: fast enough that the forming bar moves, slow enough
   // that a 140-bar redraw is not the busiest thing on the page.
-  if (!_ofiTimer) { _ofiTimer = setInterval(ofiTick, 2000); ofiTick(); }
+  if (!_ofiTimer) { _ofiTimer = setInterval(() => ofiTick(true), 2000); ofiTick(); }
 }
 try { mgStartTimers(); } catch (e) {}
 
