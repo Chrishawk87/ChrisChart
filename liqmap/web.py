@@ -6065,6 +6065,53 @@ def create_app() -> FastAPI:
                 "note": ("live forward tracking, not a backtest; "
                          "every cross is listed, nothing is filtered")}
 
+    @app.get("/api/dexarb", dependencies=[Depends(require_token)])
+    def api_dexarb(asset: str = "WETH", limit: int = 8,
+                   impact_bps: int = 30) -> dict[str, Any]:
+        """Mispriced cycles between the DEX pools, as a reading.
+
+        GROSS IS NOT PROFIT and the panel says so. Taking one of these
+        would cost a flash-loan premium, gas, and -- the term that
+        actually decides it -- whatever had to be bid to a block
+        builder to be included ahead of everyone else watching the
+        same pools. On a contested path that bid approaches the whole
+        gross. A long list of large numbers here is evidence that they
+        are hard to take, not that they are free.
+
+        Nothing in this path signs or sends anything.
+        """
+        from .dexarb import MAINNET_POOLS, TOKENS, DexArb
+        from . import dexfeed
+
+        tok = TOKENS.get(asset.upper())
+        if tok is None:
+            return {"ok": False, "why": f"unknown asset {asset}",
+                    "assets": sorted(TOKENS)}
+        addr, decimals = tok
+
+        if not dexfeed.rpc_url():
+            return {"ok": False,
+                    "why": "no Ethereum RPC configured -- set ETH_RPC_URL"}
+
+        try:
+            states, block = dexfeed.fetch_states(MAINNET_POOLS)
+        except dexfeed.FeedError as e:
+            # The URL carries the API key, so the message never does.
+            return {"ok": False, "why": str(e)}
+
+        if not states:
+            return {"ok": False, "why": "no pool answered", "block": block}
+
+        g = DexArb(MAINNET_POOLS, max_impact_bps=max(1, min(impact_bps, 500)))
+        for k, st in states.items():
+            g.set_state(k, st)
+
+        found = g.find(addr, limit=max(1, min(limit, 25)))
+        return {"ok": True, "asset": asset.upper(), "block": block,
+                "pools_read": len(states), "pools_total": len(MAINNET_POOLS),
+                "decimals": decimals,
+                "cycles": [c.as_dict(decimals) for c in found]}
+
     @app.get("/api/footprint", dependencies=[Depends(require_token)])
     def api_footprint(coin: str = "ES", rule: str = "1m",
                       volume: int = 0, min_volume: int = 0,
@@ -7520,6 +7567,8 @@ DASHBOARD = """<!doctype html>
       <div id="fpVerdict" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
       <div id="fpBook" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+      <div id="dexArb" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
       <div id="fpClear" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
@@ -9464,6 +9513,56 @@ function fpBookRow(d) {
 
    no visible size reports "can't tell", never "clear" -- icebergs
    show at no depth, so an empty ladder is an unknown, not a road. */
+function dexArbRow(d) {
+  if (!d) return '';
+  if (!d.ok) {
+    return `<span class="stamp" style="width:100%">dex arbitrage &mdash;
+      ${d.why || 'unavailable'}</span>`;
+  }
+  const cy = d.cycles || [];
+  const head = cy.length === 0
+    ? '<b>POOLS AGREE</b> &mdash; no cycle clears its own fees'
+    : `<b class="long">${cy.length} CYCLE${cy.length > 1 ? 'S' : ''}</b>`
+      + ` &mdash; best ${cy[0].gross_f.toFixed(5)} ${d.asset}`
+      + ` (${cy[0].bps.toFixed(1)} bps)`;
+  const rows = cy.slice(0, 5).map(c =>
+    `<span class="stamp">${c.labels.join(' &rarr; ')}
+      &middot; in ${c.amount_in_f.toFixed(4)}
+      &middot; gross <b>${c.gross_f > 0 ? '+' : ''}${c.gross_f.toFixed(5)}</b>
+      &middot; ${c.bps.toFixed(1)} bps</span>`).join('');
+  return `
+    <span class="stamp" style="width:100%">dex arbitrage &mdash; where the
+      pools disagree</span>
+    <span>${head}</span>
+    ${rows}
+    <span class="stamp">block ${d.block.toLocaleString()}
+      &middot; ${d.pools_read}/${d.pools_total} pools read
+      &middot; quoting ${d.asset}</span>
+    <span class="stamp" style="width:100%">GROSS IS NOT PROFIT. Taking one
+      of these costs the flash-loan premium, gas, and whatever had to be
+      bid to a block builder to be included ahead of everyone else
+      watching the same pools &mdash; on a contested path that bid
+      approaches the whole gross. Read this as how far apart the pools
+      drift, not as money on the table.</span>`;
+}
+
+let _dexTimer = null;
+async function dexTick() {
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return;          // not on screen, not polled
+  if (!$('dexArb')) return;
+  try {
+    // Its own timer, NOT fpLoad's. The footprint returns early whenever
+    // the CME tape is silent, and a panel drawn at its tail would go
+    // dark outside RTH while the DEX pools carry on trading.
+    const d = await api('/api/dexarb?asset=WETH&limit=8');
+    $('dexArb').innerHTML = dexArbRow(d);
+  } catch (e) {
+    $('dexArb').innerHTML = '<span class="stamp" style="width:100%">' +
+      'dex arbitrage &mdash; ' + e + '</span>';
+  }
+}
+
 function fpClearRow(d) {
   const c = d.clearance;
   if (!c) return '';
@@ -10204,6 +10303,9 @@ let _mgTimer = null, _fpTimer = null;
 function mgStartTimers() {
   if (!_mgTimer) { _mgTimer = setInterval(mgLoad, 500); }
   if (!_fpTimer) { _fpTimer = setInterval(fpTick, 2000); }
+  // Twelve seconds: one Ethereum block. Polling faster re-reads the
+  // same state and spends RPC quota to redraw an identical panel.
+  if (!_dexTimer) { _dexTimer = setInterval(dexTick, 12000); dexTick(); }
 }
 try { mgStartTimers(); } catch (e) {}
 
