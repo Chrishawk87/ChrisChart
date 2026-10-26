@@ -306,7 +306,7 @@ class TestScrollback:
         were outside the slice."""
         r = self._route()
         assert "wide_lo = max(0, start - pv)" in r
-        assert "wide_hi = min(total, end + pv)" in r
+        assert "wide_hi = min(total, end + cf)" in r
         assert "if start <= abs_i < end:" in r
 
     def test_the_route_reports_where_the_window_sits(self):
@@ -387,4 +387,82 @@ class TestThePivotMarks:
 
     def test_the_marks_are_bounds_checked(self):
         c = self._chart()
-        assert "if (m.i < 0 || m.i >= all.length) continue;" in c
+        assert "if (m.i < 0 || m.i >= all.length) return '';" in c
+
+
+class TestMarksArriveOnTime:
+    """Symmetric confirmation put the carets thirty-six seconds late."""
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_left_and_right_are_set_separately(self):
+        """Left establishes structure and wants to be wide; right is
+        pure latency and wants to be narrow. One number cannot do both
+        jobs."""
+        r = self._route()
+        assert "pivot: int = 5, confirm: int = 1" in r
+        assert "left=pv, right=cf" in r
+
+    def test_provisional_marks_are_returned(self):
+        r = self._route()
+        assert "find_provisional" in r
+        assert '"provisional": prov' in r
+
+    def test_provisional_marks_only_exist_at_the_live_edge(self):
+        """Scrolled back, every bar has bars after it and the settled
+        pass has already judged them all."""
+        r = self._route()
+        i = r.index("find_provisional")
+        assert "if off == 0:" in r[max(0, i - 400):i]
+
+    def test_the_unsettled_count_uses_the_confirm_window(self):
+        r = self._route()
+        assert "_pivot_pending(len(window), cf)" in r
+
+    def test_provisional_carets_are_drawn_differently(self):
+        """They can still be taken out, so they must not look settled."""
+        i = WEB.index("function ofiChart")
+        c = WEB[i:WEB.index("let _ofiTimer")]
+        assert "d.provisional" in c
+        assert "stroke-dasharray=\"1.5,1.5\"" in c
+        assert "caret(m, true)" in c and "caret(m, false)" in c
+
+    def test_the_panel_warns_that_dotted_marks_can_vanish(self):
+        assert "not confirmed yet and can vanish" in WEB
+
+
+class TestSettingsSurviveAReload:
+
+    def test_the_chart_settings_are_saved(self):
+        assert "liqmap_ofi" in WEB
+        assert "localStorage.setItem('liqmap_ofi'" in WEB
+
+    def test_they_are_restored_on_load(self):
+        assert "localStorage.getItem('liqmap_ofi'" in WEB
+        i = WEB.index("localStorage.getItem('liqmap_ofi'")
+        blk = WEB[i - 200:i + 400]
+        for k in ("_s.t", "_s.w", "_s.p", "_s.c"):
+            assert k in blk, k
+
+    def test_every_setter_persists(self):
+        i = WEB.index("function _ofiSave")
+        blk = WEB[i:WEB.index("async function ofiTick")]
+        for fn in ("ofiSetTarget", "ofiSetWindow", "ofiSetPivot",
+                   "ofiSetConfirm"):
+            k = blk.index("function " + fn)
+            assert "_ofiSave()" in blk[k:k + 340], fn
+
+    def test_the_scroll_position_is_NOT_saved(self):
+        """Coming back to a page scrolled into history, with nothing
+        saying why it is not moving, reads as broken."""
+        i = WEB.index("function _ofiSave")
+        blk = WEB[i:WEB.index("let _ofiTarget")]
+        assert "_ofiOffset" not in blk
+
+    def test_storage_failures_do_not_break_the_panel(self):
+        """Private mode, blocked storage and quota all throw."""
+        i = WEB.index("function _ofiSave")
+        blk = WEB[i:WEB.index("async function ofiTick")]
+        assert blk.count("catch") >= 2

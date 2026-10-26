@@ -25,7 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from liqmap.pivots import HIGH, LOW, Pivot, find, levels, pending  # noqa: E402
+from liqmap.pivots import (HIGH, LOW, Pivot, find,  # noqa: E402
+                            find_provisional, levels, pending)
 
 
 def hl(seq):
@@ -201,5 +202,68 @@ class TestHousekeeping:
     def test_it_does_not_claim_to_predict(self):
         src = (ROOT / "liqmap" / "pivots.py").read_text().lower()
         assert "predict" in src and "nothing here predicts" in src
-        for w in ("support", "resistance", "will hold", "target"):
+        # "target" on its own means the OFI threshold throughout this
+        # package, so only the trading sense of it is forbidden.
+        for w in ("support", "resistance", "will hold",
+                  "price target", "profit target", "take profit"):
             assert w not in src, w
+
+
+class TestProvisionalPivots:
+    """The ones that show up on time, and can still be taken out."""
+
+    def test_a_fresh_peak_is_provisional_immediately(self):
+        """Symmetric confirmation marks this three bars later. At
+        target 250 that is half a minute after the turn."""
+        h, l = hl([1, 2, 3, 4, 9])
+        assert find(h, l, 3, 1) == [], "nothing settled yet"
+        prov = [p for p in find_provisional(h, l, 3, 1) if p.kind == HIGH]
+        assert len(prov) == 1 and prov[0].index == 4
+
+    def test_a_provisional_peak_is_withdrawn_when_taken_out(self):
+        h, l = hl([1, 2, 3, 4, 9, 10])
+        prov = [p for p in find_provisional(h, l, 3, 1) if p.kind == HIGH]
+        assert not any(p.index == 4 for p in prov), "the 9 was exceeded"
+
+    def test_it_still_has_to_clear_everything_to_its_left(self):
+        h, l = hl([1, 9, 3, 4, 5])
+        prov = [p for p in find_provisional(h, l, 3, 1) if p.kind == HIGH]
+        assert prov == [], "5 does not clear the 9 behind it"
+
+    def test_bars_to_the_right_that_exist_must_still_be_cleared(self):
+        h, l = hl([1, 2, 3, 9, 4])
+        prov = find_provisional(h, l, 3, 2)
+        highs = [p for p in prov if p.kind == HIGH]
+        assert any(p.index == 3 for p in highs), "4 did not take out 9"
+
+    def test_the_mirror_for_lows(self):
+        h, l = hl([9, 8, 7, 6, 1])
+        prov = [p for p in find_provisional(h, l, 3, 1) if p.kind == LOW]
+        assert len(prov) == 1 and prov[0].index == 4
+
+    def test_provisional_and_settled_do_not_overlap(self):
+        """They are drawn differently, so a pivot appearing in both
+        would be stamped on the chart twice."""
+        import random
+        rng = random.Random(7)
+        seq = [100.0]
+        for _ in range(300):
+            seq.append(seq[-1] + rng.choice((-1, 0, 1)))
+        h, l = hl(seq)
+        a = {(p.index, p.kind) for p in find(h, l, 5, 2)}
+        b = {(p.index, p.kind) for p in find_provisional(h, l, 5, 2)}
+        assert not (a & b), sorted(a & b)
+
+    def test_the_default_is_asymmetric(self):
+        """Wide left to establish structure, narrow right because every
+        bar of it is latency."""
+        import inspect
+        sig = inspect.signature(find)
+        assert sig.parameters["left"].default > sig.parameters["right"].default
+
+    def test_degenerate_windows_are_refused(self):
+        h, l = hl([1, 2, 3, 4, 5])
+        with pytest.raises(ValueError):
+            find_provisional(h, l, 0, 1)
+        with pytest.raises(ValueError):
+            find_provisional(h, l, 1, 0)

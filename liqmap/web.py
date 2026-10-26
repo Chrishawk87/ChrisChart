@@ -6082,7 +6082,7 @@ def create_app() -> FastAPI:
     @app.get("/api/ofibars", dependencies=[Depends(require_token)])
     def api_ofibars(coin: str = "ES", target: int = 250,
                     bars: int = 140, offset: int = 0,
-                    pivot: int = 3) -> dict[str, Any]:
+                    pivot: int = 5, confirm: int = 1) -> dict[str, Any]:
         """OFI-closed candles for one target, newest last.
 
         Every target in the ladder is accumulating all the time, so
@@ -6124,21 +6124,36 @@ def create_app() -> FastAPI:
         # filtered to it. Found only within the window, a swing sitting
         # near either edge would appear and disappear as you scrolled,
         # because its neighbours were outside the slice.
+        # LEFT and RIGHT do different jobs. Left establishes that a bar
+        # is a local extreme; right is purely how long you wait before
+        # believing it, and every bar of it is latency on the chart.
         pv = max(1, min(int(pivot), 20))
+        cf = max(1, min(int(confirm), 10))
         wide_lo = max(0, start - pv)
-        wide_hi = min(total, end + pv)
+        wide_hi = min(total, end + cf)
         wide = b.bars[wide_lo:wide_hi]
         marks = []
-        if len(wide) > 2 * pv:
+        prov = []
+        if len(wide) > pv + cf:
             from . import pivots as _pv
-            found = _pv.find([x.high for x in wide], [x.low for x in wide],
-                             left=pv, right=pv,
-                             ts=[x.ts_close for x in wide])
-            for q in found:
+            hs = [x.high for x in wide]
+            ls = [x.low for x in wide]
+            tss = [x.ts_close for x in wide]
+            for q in _pv.find(hs, ls, left=pv, right=cf, ts=tss):
                 abs_i = wide_lo + q.index
                 if start <= abs_i < end:
                     marks.append({"i": abs_i - start, "kind": q.kind,
                                   "price": q.price * 1e-9, "ts": q.ts})
+            # Provisional marks only mean anything at the live edge --
+            # scrolled back, every bar has bars after it and the
+            # settled pass has already judged them all.
+            if off == 0:
+                for q in _pv.find_provisional(hs, ls, left=pv, right=cf,
+                                              ts=tss):
+                    abs_i = wide_lo + q.index
+                    if start <= abs_i < end:
+                        prov.append({"i": abs_i - start, "kind": q.kind,
+                                     "price": q.price * 1e-9, "ts": q.ts})
 
         recent = window
 
@@ -6180,8 +6195,9 @@ def create_app() -> FastAPI:
                 "dropped": getattr(b, "dropped", 0),
                 "at_live": off == 0,
                 "oldest": off >= max(0, total - n),
-                "pivot_n": pv, "pivots": marks,
-                "unsettled": _pivot_pending(len(window), pv) if off == 0 else 0,
+                "pivot_n": pv, "confirm_n": cf,
+                "pivots": marks, "provisional": prov,
+                "unsettled": _pivot_pending(len(window), cf) if off == 0 else 0,
                 "bars": out, "forming": forming,
                 "trades": getattr(tape, "trades", 0)}
 
@@ -9818,18 +9834,28 @@ function ofiChart(d, w, h) {
      was provisional. */
   let pv = '';
   const marks = (d && d.pivots) || [];
-  for (const m of marks) {
-    if (m.i < 0 || m.i >= all.length) continue;
+  const prov = (d && d.provisional) || [];
+  const caret = (m, settled) => {
+    if (m.i < 0 || m.i >= all.length) return '';
     const cx = padL + step * (m.i + 0.5);
     const hi = m.kind === 'high';
     const yy = hi ? y(m.price) - 5 : y(m.price) + 5;
     const dy = hi ? -4 : 4;
-    pv += `<path d="M ${(cx - 3.2).toFixed(1)} ${yy.toFixed(1)}
+    const col = hi ? '#e8c46a' : '#6fb6d6';
+    /* Provisional marks are drawn faint and dotted. They appear the
+       moment a bar is a local extreme against everything behind it,
+       which is when they are useful -- and they can still be taken
+       out by the next bar, which is why they do not look settled. */
+    return `<path d="M ${(cx - 3.2).toFixed(1)} ${yy.toFixed(1)}
              L ${cx.toFixed(1)} ${(yy + dy).toFixed(1)}
              L ${(cx + 3.2).toFixed(1)} ${yy.toFixed(1)}"
-             fill="none" stroke="${hi ? '#e8c46a' : '#6fb6d6'}"
-             stroke-width="1.3"/>`;
-  }
+             fill="none" stroke="${col}"
+             stroke-width="${settled ? 1.3 : 1.1}"
+             opacity="${settled ? 1 : 0.55}"
+             ${settled ? '' : 'stroke-dasharray="1.5,1.5"'}/>`;
+  };
+  for (const m of marks) pv += caret(m, true);
+  for (const m of prov) pv += caret(m, false);
 
   /* The two most recent of each kind extended to the right edge. Every
      pivot extended turns the chart into a grid and the levels stop
@@ -9885,12 +9911,33 @@ function ofiChart(d, w, h) {
       &middot; built from ${last.updates} book updates</span>`
 }
 
-let _ofiTarget = 250;
 let _ofiTimer = null;
-let _ofiWindow = 140;      // bars visible -- the zoom
 let _ofiOffset = 0;        // bars back from the live edge -- the pan
 let _ofiTotal = 0;
-let _ofiPivot = 3;        // bars either side a swing must clear
+
+/* SETTINGS SURVIVE A RELOAD. Everything below is a choice about how to
+   look at the data, and losing it on every refresh makes the chart feel
+   like it reset even though the bars themselves are held on the server
+   and never went anywhere. The offset is deliberately NOT saved: coming
+   back to a page scrolled into history, with no indication why it is
+   not moving, reads as broken. */
+function _ofiSave() {
+  try {
+    localStorage.setItem('liqmap_ofi', JSON.stringify({
+      t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm }));
+  } catch (e) { /* private mode, quota, blocked -- not worth a failure */ }
+}
+let _ofiTarget = 250;
+let _ofiWindow = 140;      // bars visible -- the zoom
+let _ofiPivot = 5;         // bars to the LEFT a swing must clear
+let _ofiConfirm = 1;       // bars to the RIGHT before it is settled
+try {
+  const _s = JSON.parse(localStorage.getItem('liqmap_ofi') || '{}');
+  if (_s.t) _ofiTarget = _s.t;
+  if (_s.w) _ofiWindow = _s.w;
+  if (_s.p) _ofiPivot = _s.p;
+  if (_s.c) _ofiConfirm = _s.c;
+} catch (e) { /* nothing saved, or unreadable -- the defaults stand */ }
 
 function ofiSetTarget(v) {
   _ofiTarget = parseInt(v, 10) || 250;
@@ -9898,6 +9945,7 @@ function ofiSetTarget(v) {
   // bars means something else on each one. Snapping to live is the only
   // position that survives the switch.
   _ofiOffset = 0;
+  _ofiSave();
   ofiTick();
 }
 
@@ -9907,15 +9955,18 @@ function ofiSetWindow(v) {
   // Zoom about the RIGHT edge of what is on screen, so the bar you were
   // looking at stays put instead of the view jumping.
   if (_ofiOffset > 0) _ofiOffset = Math.max(0, _ofiOffset + (was - _ofiWindow));
+  _ofiSave();
   ofiTick();
 }
 
 function ofiPan(bars) {
   _ofiOffset = Math.max(0, _ofiOffset + bars);
+  _ofiSave();
   ofiTick();
 }
 
-function ofiSetPivot(v) { _ofiPivot = parseInt(v, 10) || 3; ofiTick(); }
+function ofiSetPivot(v) { _ofiPivot = parseInt(v, 10) || 5; _ofiSave(); ofiTick(); }
+function ofiSetConfirm(v) { _ofiConfirm = parseInt(v, 10) || 1; _ofiSave(); ofiTick(); }
 function ofiLive() { _ofiOffset = 0; ofiTick(); }
 function ofiOldest() { _ofiOffset = Math.max(0, _ofiTotal - _ofiWindow); ofiTick(); }
 
@@ -9931,7 +9982,7 @@ async function ofiTick(fromTimer) {
   try {
     const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget
       + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
-      + '&pivot=' + _ofiPivot);
+      + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm);
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; }
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
@@ -9954,10 +10005,15 @@ async function ofiTick(fromTimer) {
           ).join('')}</select>
         bars &middot; swing
         <select onchange="ofiSetPivot(this.value)"
-          style="margin:0 6px">${[2, 3, 5, 8, 12].map(k =>
+          style="margin:0 6px">${[3, 5, 8, 12, 20].map(k =>
             `<option value="${k}"${k === d.pivot_n ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
-        bars either side</span>
+        left, confirm after
+        <select onchange="ofiSetConfirm(this.value)"
+          style="margin:0 6px">${[1, 2, 3, 5].map(k =>
+            `<option value="${k}"${k === d.confirm_n ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        &middot; dotted carets are not confirmed yet and can vanish</span>
       <span class="stamp" style="width:100%">
         <button class="btn" onclick="ofiOldest()"
           ${d.oldest ? 'disabled' : ''}>&laquo; oldest</button>

@@ -4,6 +4,20 @@ A pivot high is a bar whose high stands above the `left` bars before it
 and the `right` bars after it. A pivot low is the mirror. That is the
 whole definition; the care is all in the edges.
 
+LEFT AND RIGHT DO DIFFERENT JOBS, so they are set separately.
+
+`left` is how many bars must be cleared to establish that a bar is a
+local extreme at all -- that is a statement about structure, and it
+wants to be wide. `right` is only how long you are willing to wait
+before believing it, and every bar of it is pure latency: at three
+bars either side on target 250 a swing is marked about thirty-six
+seconds after it happened, which is far too late to be looking at.
+
+So the default is asymmetric -- wide left, narrow right -- and
+`find_provisional` reports the turns in the unsettled region as well,
+clearing whatever bars exist after them so far. The caller draws those
+differently, because they can still be taken out.
+
 A PIVOT IS NOT CONFIRMED UNTIL `right` BARS HAVE PASSED. The most
 recent bars cannot be evaluated -- the next one may take out the high
 and the pivot never existed. Drawing one there would put a level on the
@@ -52,7 +66,7 @@ class Pivot:
 
 
 def find(highs: list[float], lows: list[float],
-         left: int = 3, right: int = 3,
+         left: int = 5, right: int = 1,
          ts: list[float] | None = None) -> list[Pivot]:
     """Settled pivots in `highs`/`lows`, oldest first.
 
@@ -107,7 +121,49 @@ def find(highs: list[float], lows: list[float],
     return out
 
 
-def pending(n: int, right: int = 3) -> int:
+def find_provisional(highs: list[float], lows: list[float],
+                     left: int = 5, right: int = 1,
+                     ts: list[float] | None = None) -> list[Pivot]:
+    """Turns in the unsettled region, cleared only by the bars so far.
+
+    These appear the moment a bar is a local extreme against everything
+    to its left, without waiting out the confirmation window. They are
+    the ones that show up on time -- and the ones that can still be
+    taken out by the next bar, which is why they come back separately
+    from `find` rather than mixed in with it.
+    """
+    if left < 1 or right < 1:
+        raise ValueError("left and right must be at least 1")
+    n = len(highs)
+    if len(lows) != n:
+        raise ValueError("highs and lows must be the same length")
+    if ts is not None and len(ts) != n:
+        raise ValueError("ts must match the series length")
+
+    out: list[Pivot] = []
+    start = max(left, n - right)
+    for i in range(start, n):
+        h, lo = highs[i], lows[i]
+        is_high = all(highs[k] <= h for k in range(i - left, i))
+        is_low = all(lows[k] >= lo for k in range(i - left, i))
+        # Whatever bars DO exist to the right still have to be cleared.
+        for k in range(i + 1, n):
+            if highs[k] >= h:
+                is_high = False
+            if lows[k] <= lo:
+                is_low = False
+        when = ts[i] if ts else 0.0
+        if is_high:
+            out.append(Pivot(index=i, kind=HIGH, price=h, ts=when,
+                             left=left, right=n - 1 - i))
+        if is_low:
+            out.append(Pivot(index=i, kind=LOW, price=lo, ts=when,
+                             left=left, right=n - 1 - i))
+    out.sort(key=lambda p: p.index)
+    return out
+
+
+def pending(n: int, right: int = 1) -> int:
     """Bars at the right edge that cannot be judged yet."""
     return min(n, max(0, right))
 
