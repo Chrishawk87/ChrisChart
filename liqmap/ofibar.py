@@ -44,6 +44,15 @@ GREEN = "green"
 RED = "red"
 CHOP = "chop"
 
+# The thresholds the live chart can switch between, all accumulating at
+# once so a switch is instant and carries its whole history.
+#
+# Bars scale as 1/target^2 -- the accumulator is a random walk and first
+# passage to +/-L goes as L squared. Measured on 55M real ES book
+# updates, 4,000 produced one bar every 52 minutes, so this ladder spans
+# roughly three seconds to thirteen minutes a bar.
+LADDER: tuple[int, ...] = (125, 250, 500, 1000, 2000)
+
 
 @dataclass(slots=True)
 class OfiBar:

@@ -119,6 +119,13 @@ class Tape:
     # above: a leg starts where price last turned, which is usually
     # not where a bar started.
     push: object = None
+    # OFI-closed candles, one builder PER TARGET. Several run at once
+    # on the same stream so the chart can switch threshold instantly
+    # and still have full history behind it -- rebuilding on a change
+    # would need the raw book retained and would show an empty chart
+    # until it refilled, which is useless for eyeballing a session.
+    # The cost is a handful of integer adds per book update.
+    ofibars: dict | None = None
     # The two drawn lines: book CVD as the reader, time-smoothed
     # traded CVD as the confirmation. Fed from the same decoded trade
     # as everything else above, so the lines and the candles can never
@@ -301,6 +308,26 @@ class Tape:
                 except Exception:                       # noqa: BLE001
                     pass
         t = dbn.trade_from(rec)
+        if self.ofibars:
+            # Fed from the RAW integer levels, not from the decoded
+            # float book above. The OFI formula compares prices for
+            # exact equality -- "the bid did not move" is a different
+            # branch from "the bid moved" -- and float equality on a
+            # value that round-tripped through a division is a branch
+            # that silently takes itself.
+            try:
+                lv = dbn._get(rec, "levels")
+                if lv:
+                    l0 = lv[0]
+                    bts = float(dbn.seconds(dbn._get(rec, "ts_event")) or 0.0)
+                    bpx = int(dbn._get(l0, "bid_px", 0) or 0)
+                    apx = int(dbn._get(l0, "ask_px", 0) or 0)
+                    bsz = int(dbn._get(l0, "bid_sz", 0) or 0)
+                    asz = int(dbn._get(l0, "ask_sz", 0) or 0)
+                    for _b in self.ofibars.values():
+                        _b.on_book(bts, bpx, bsz, apx, asz)
+            except Exception:                           # noqa: BLE001
+                pass            # a display must not stop the tape
         if self.cvdcross is not None:
             # Book first here, deliberately, and the opposite way round
             # from `obstacles` below. The LCR asks what size was

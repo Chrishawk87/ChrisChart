@@ -1014,6 +1014,16 @@ class Runtime:
             from .push import PushWatcher
             if svc.tape.push is None:
                 svc.tape.push = PushWatcher(tick_size=0.25)
+            # OFI-closed candles. One builder per target so the chart can
+            # change threshold without losing its history. `max_s` caps a
+            # chop bar so a dead session still terminates its last bar --
+            # a termination condition, not a polling interval.
+            from .ofibar import LADDER as _OFI_LADDER, OfiBarBuilder
+            if not svc.tape.ofibars:
+                svc.tape.ofibars = {
+                    t: OfiBarBuilder(tick_size=0.25, threshold=t,
+                                     max_s=900.0, min_updates=2)
+                    for t in _OFI_LADDER}
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -6065,6 +6075,60 @@ def create_app() -> FastAPI:
                 "note": ("live forward tracking, not a backtest; "
                          "every cross is listed, nothing is filtered")}
 
+    @app.get("/api/ofibars", dependencies=[Depends(require_token)])
+    def api_ofibars(coin: str = "ES", target: int = 250,
+                    bars: int = 120) -> dict[str, Any]:
+        """OFI-closed candles for one target, newest last.
+
+        Every target in the ladder is accumulating all the time, so
+        switching is instant and carries its whole history. Nothing
+        here decides anything -- a green bar says buying pressure
+        crossed a line you chose, and whether that precedes price is
+        not asserted anywhere.
+        """
+        from .ofibar import LADDER as _OFI_LADDER
+        if not rt.is_cme(coin):
+            return {"ok": False, "why": f"{coin} is not a CME symbol"}
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc else None
+        builders = getattr(tape, "ofibars", None) if tape else None
+        if not builders:
+            # Attaching happens when the footprint is first built.
+            rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+            builders = getattr(tape, "ofibars", None) if tape else None
+        if not builders:
+            return {"ok": False, "why": "the CME engine is not configured",
+                    "targets": list(_OFI_LADDER)}
+
+        t = int(target)
+        if t not in builders:
+            t = min(builders, key=lambda x: abs(x - t))
+        b = builders[t]
+        n = max(10, min(int(bars), 400))
+        recent = b.bars[-n:]
+
+        # Raw integer feed units in, dollars out. One conversion, here.
+        sc = 1e-9
+        out = []
+        for x in recent:
+            out.append({"ts_open": x.ts_open, "ts_close": x.ts_close,
+                        "open": x.open * sc, "high": x.high * sc,
+                        "low": x.low * sc, "close": x.close * sc,
+                        "direction": x.direction, "ofi": x.ofi,
+                        "updates": x.updates,
+                        "seconds": round(x.seconds, 3)})
+        cur = b.current
+        forming = None
+        if cur is not None and cur.updates > 0:
+            forming = {"open": cur.open * sc, "high": cur.high * sc,
+                       "low": cur.low * sc, "close": cur.close * sc,
+                       "ofi": b.accumulated, "updates": cur.updates,
+                       "seconds": round(cur.seconds, 3)}
+        return {"ok": True, "coin": coin, "target": t,
+                "targets": list(_OFI_LADDER),
+                "total": len(b.bars), "bars": out, "forming": forming,
+                "trades": getattr(tape, "trades", 0)}
+
     @app.get("/api/dexarb", dependencies=[Depends(require_token)])
     def api_dexarb(asset: str = "WETH", limit: int = 8,
                    impact_bps: int = 30) -> dict[str, Any]:
@@ -7564,6 +7628,8 @@ DASHBOARD = """<!doctype html>
       </div>
 
       <div id="fpStats" class="fpstat"></div>
+      <div id="ofiBars" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
       <div id="fpVerdict" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
       <div id="fpBook" class="fpstat" style="border-top:1px solid
@@ -9618,6 +9684,128 @@ function fpClearRow(d) {
    had held at that moment: a filled ring for confirmed, a hollow one
    for not. Both are shown, because how the unconfirmed ones behave is
    the thing worth watching. */
+function ofiChart(d, w, h) {
+  /* OFI-closed candlesticks.
+
+     The x axis is NOT time and must not be drawn as though it were.
+     Every bar carries the same quantity of imbalance, so bars are
+     evenly spaced by INDEX -- a quiet hour is one candle and a violent
+     minute is twenty, and that unevenness in the clock is the whole
+     point of the chart. Spacing them by timestamp would squeeze the
+     interesting stretches into a sliver and stretch the dead ones. */
+  const bars = (d && d.bars) || [];
+  if (bars.length < 2) {
+    return '<div class="msg">Collecting&hellip; ' +
+      (d && d.total ? d.total + ' bars so far at this target.' :
+       'no bar has closed at this target yet.') + '</div>';
+  }
+  const all = bars.slice();
+  if (d.forming) all.push(Object.assign({direction: 'forming'}, d.forming));
+
+  const padL = 6, padR = 58, padT = 8, padB = 16;
+  const iw = w - padL - padR, ih = h - padT - padB;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const b of all) { if (b.low < lo) lo = b.low; if (b.high > hi) hi = b.high; }
+  if (!(hi > lo)) { hi = lo + 0.25; }
+  const pad = (hi - lo) * 0.06;
+  lo -= pad; hi += pad;
+  const y = v => padT + ih - ((v - lo) / (hi - lo)) * ih;
+
+  const n = all.length;
+  const step = iw / n;
+  const bw = Math.max(1.2, Math.min(9, step * 0.68));
+
+  const colour = dir => dir === 'green' ? '#35c27a'
+                      : dir === 'red' ? '#e2574c'
+                      : dir === 'forming' ? '#8aa0b4' : '#6b7682';
+
+  let g = '';
+  all.forEach((b, i) => {
+    const cx = padL + step * (i + 0.5);
+    const c = colour(b.direction);
+    const o = y(b.open), cl = y(b.close);
+    const top = Math.min(o, cl), bot = Math.max(o, cl);
+    const bodyH = Math.max(1, bot - top);
+    const dash = b.direction === 'forming' ? ' stroke-dasharray="2,2"' : '';
+    g += `<line x1="${cx.toFixed(1)}" y1="${y(b.high).toFixed(1)}"
+            x2="${cx.toFixed(1)}" y2="${y(b.low).toFixed(1)}"
+            stroke="${c}" stroke-width="1"${dash}/>`;
+    g += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}"
+            width="${bw.toFixed(1)}" height="${bodyH.toFixed(1)}"
+            fill="${c}" opacity="${b.direction === 'forming' ? 0.35 : 0.9}"/>`;
+  });
+
+  /* Price axis on the right, in dollars. Five levels, snapped to the
+     tick grid so the labels are prices that can actually print. */
+  let ax = '';
+  for (let k = 0; k <= 4; k++) {
+    const v = lo + (hi - lo) * (k / 4);
+    const snapped = Math.round(v * 4) / 4;
+    const yy = y(snapped);
+    if (yy < padT || yy > padT + ih) continue;
+    ax += `<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${(w - padR).toFixed(1)}"
+             y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="0.5"
+             opacity="0.4"/>`;
+    ax += `<text x="${(w - padR + 4).toFixed(1)}" y="${(yy + 3).toFixed(1)}"
+             font-size="10" fill="var(--muted)">${snapped.toFixed(2)}</text>`;
+  }
+
+  const last = bars[bars.length - 1];
+  const greens = bars.filter(b => b.direction === 'green').length;
+  const reds = bars.filter(b => b.direction === 'red').length;
+  return `<svg width="${w}" height="${h}" style="display:block">${ax}${g}</svg>
+    <span class="stamp">${d.total.toLocaleString()} bars at target
+      ${d.target.toLocaleString()}
+      &middot; showing ${bars.length}
+      &middot; ${greens}g / ${reds}r
+      &middot; last ${last.close.toFixed(2)}
+      (${last.direction}, OFI ${last.ofi > 0 ? '+' : ''}${last.ofi},
+       ${last.updates} updates, ${last.seconds.toFixed(1)}s)</span>`;
+}
+
+let _ofiTarget = 250;
+let _ofiTimer = null;
+
+function ofiSetTarget(v) {
+  _ofiTarget = parseInt(v, 10) || 250;
+  ofiTick();
+}
+
+async function ofiTick() {
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return;          // not on screen, not polled
+  const host = $('ofiBars');
+  if (!host) return;
+  try {
+    const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget + '&bars=140');
+    if (!d.ok) {
+      host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
+        + (d.why || 'unavailable') + '</span>';
+      return;
+    }
+    const w = Math.max(320, host.clientWidth || 900);
+    host.innerHTML = `
+      <span class="stamp" style="width:100%">organic OFI candles &mdash;
+        a bar ends when flow crosses the line, never on a clock</span>
+      <span class="stamp" style="width:100%">target
+        <select onchange="ofiSetTarget(this.value)"
+          style="margin:0 6px">${(d.targets || []).map(t =>
+            `<option value="${t}"${t === d.target ? ' selected' : ''}>${t}</option>`
+          ).join('')}</select>
+        contracts of net imbalance &middot; smaller = more bars
+        (they scale as 1/target&sup2;)</span>
+      ${ofiChart(d, w, 240)}
+      <span class="stamp" style="width:100%">Green and red should sit near
+        even over a long run. A long way off means the accumulator is
+        latching or the sign is inverted. The dashed bar on the right is
+        still forming and can still change colour.</span>`;
+  } catch (e) {
+    host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
+      + e + '</span>';
+  }
+}
+
 function mgChart(d, w, h) {
   const pts = (d && d.points) || [];
   if (pts.length < 2) return '<div class="msg">Collecting&hellip; ' +
@@ -10306,6 +10494,9 @@ function mgStartTimers() {
   // Twelve seconds: one Ethereum block. Polling faster re-reads the
   // same state and spends RPC quota to redraw an identical panel.
   if (!_dexTimer) { _dexTimer = setInterval(dexTick, 12000); dexTick(); }
+  // Two seconds: fast enough that the forming bar moves, slow enough
+  // that a 140-bar redraw is not the busiest thing on the page.
+  if (!_ofiTimer) { _ofiTimer = setInterval(ofiTick, 2000); ofiTick(); }
 }
 try { mgStartTimers(); } catch (e) {}
 
