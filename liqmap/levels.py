@@ -91,6 +91,8 @@ class Kind(str, Enum):
     IBH = "IBH"                    # initial balance high, first 60m of RTH
     IBL = "IBL"                    # initial balance low
     PRIOR_CLOSE = "PRIOR_CLOSE"    # prior RTH close, for gap measurement
+    SWING_HIGH = "SWING_HIGH"      # a pivot high the chart has marked
+    SWING_LOW = "SWING_LOW"        # a pivot low the chart has marked
 
 
 class State(str, Enum):
@@ -270,6 +272,46 @@ def _as_bar(c) -> Bar:
                volume=float(getattr(c, "volume", 0.0)))
 
 
+def resolve(lv: Level, bar: Bar) -> None:
+    """Apply the one rule, in one place.
+
+    Order matters. A confirmed close beyond is checked first, because a
+    bar that closes through also touched on its way, and reporting that
+    as a touch would lose the break entirely.
+    """
+    if lv.above_at_set is None:
+        # First look decides which side we are reading from. Use the
+        # open, not the close: the close has already been influenced by
+        # whatever happened at the level during this very bar.
+        lv.above_at_set = bar.open > lv.price
+
+    started_above = lv.above_at_set
+    broke = (State.BROKEN_BELOW if started_above else State.BROKEN_ABOVE)
+
+    closed_through = (bar.close < lv.price if started_above
+                      else bar.close > lv.price)
+    closed_back = (bar.close > lv.price if started_above
+                   else bar.close < lv.price)
+    wicked = bar.low <= lv.price <= bar.high
+
+    if lv.state in (State.BROKEN_ABOVE, State.BROKEN_BELOW):
+        if closed_back:
+            lv.reclaims += 1
+            lv._go(State.RECLAIMED, bar.ts, bar.close,
+                   "confirmed close back on the original side")
+        return
+
+    if closed_through:
+        lv.breaks += 1
+        lv._go(broke, bar.ts, bar.close, "confirmed close beyond")
+        return
+
+    if wicked:
+        lv.touches += 1
+        lv._go(State.TOUCHED, bar.ts, bar.close,
+               "traded through intrabar, closed back")
+
+
 # ------------------------------------------------------------- the book
 
 class LevelBook:
@@ -338,43 +380,10 @@ class LevelBook:
     # -- the wick/close rule --------------------------------------------
 
     def _resolve(self, lv: Level, bar: Bar) -> None:
-        """Apply the one rule, in one place.
-
-        Order matters. A confirmed close beyond is checked first, because a
-        bar that closes through also touched on its way, and reporting that
-        as a touch would lose the break entirely.
-        """
-        if lv.above_at_set is None:
-            # First look decides which side we are reading from. Use the
-            # open, not the close: the close has already been influenced by
-            # whatever happened at the level during this very bar.
-            lv.above_at_set = bar.open > lv.price
-
-        started_above = lv.above_at_set
-        broke = (State.BROKEN_BELOW if started_above else State.BROKEN_ABOVE)
-
-        closed_through = (bar.close < lv.price if started_above
-                          else bar.close > lv.price)
-        closed_back = (bar.close > lv.price if started_above
-                       else bar.close < lv.price)
-        wicked = bar.low <= lv.price <= bar.high
-
-        if lv.state in (State.BROKEN_ABOVE, State.BROKEN_BELOW):
-            if closed_back:
-                lv.reclaims += 1
-                lv._go(State.RECLAIMED, bar.ts, bar.close,
-                       "confirmed close back on the original side")
-            return
-
-        if closed_through:
-            lv.breaks += 1
-            lv._go(broke, bar.ts, bar.close, "confirmed close beyond")
-            return
-
-        if wicked:
-            lv.touches += 1
-            lv._go(State.TOUCHED, bar.ts, bar.close,
-                   "traded through intrabar, closed back")
+        """The one rule, in one place -- see `resolve` at module scope.
+        Swing levels off the OFI chart go through the same function, so
+        the rule cannot drift apart between kinds of level."""
+        resolve(lv, bar)
 
     def _age(self, lv: Level, bar: Bar) -> None:
         """Expire a level price has plainly left behind."""
@@ -516,3 +525,183 @@ class LevelBook:
                 for lv in self.active()
             ],
         }
+
+
+# ------------------------------------------------------- swing levels
+
+# The chart's own levels, as opposed to the session's.
+#
+# A pivot the OFI chart has marked is a price the market turned at, and
+# the question that matters afterwards is the same one PDH asks: did
+# price come back to it, and did it get through? So it is the same
+# machinery -- the same `Level`, the same `resolve`, the same rule that
+# a wick is a touch and only a confirmed close is a break. Nothing here
+# re-implements that rule, because two copies of it would eventually
+# disagree and the chart would say one thing while the ledger said
+# another.
+#
+# What is different is where the level comes from and when it retires.
+# A session level is published by the clock and expires when price has
+# plainly left it behind. A swing level is published by a pivot and
+# retires when a newer swing pushes it off the back of the list -- the
+# chart carries a fixed number of them, because every pivot extended
+# turns the chart into a grid and the lines stop meaning anything.
+#
+# Nothing here predicts. A level that has turned price away four times
+# carries no claim at all about the fifth.
+
+SWING_KEEP = 4
+
+
+@dataclass(frozen=True)
+class Swing:
+    """A swing level, plus where its events sit on the chart."""
+
+    level: Level
+    index: int                 # bar the pivot formed at
+    broke_at: int = -1         # bar that closed through it, -1 if none
+    back_at: int = -1          # bar that closed back after a break
+    observed: int = 0          # bars that have had the chance to test it
+
+    @property
+    def state(self) -> State:
+        return self.level.state
+
+    @property
+    def outcome(self) -> Outcome:
+        return self.level.outcome
+
+    @property
+    def price(self) -> float:
+        return self.level.price
+
+    @property
+    def high_side(self) -> bool:
+        """A swing high is approached from below; a low from above."""
+        return self.level.kind is Kind.SWING_HIGH
+
+    def as_dict(self) -> dict:
+        lv = self.level
+        return {"kind": lv.kind.value, "price": lv.price,
+                "state": lv.state.value, "outcome": lv.outcome.value,
+                "touches": lv.touches, "breaks": lv.breaks,
+                "reclaims": lv.reclaims, "index": self.index,
+                "broke_at": self.broke_at, "back_at": self.back_at,
+                "observed": self.observed, "ts": lv.set_ts}
+
+
+def swing_pick(pivots: Sequence, keep: int = SWING_KEEP) -> list:
+    """The last `keep` DISTINCT swing prices, oldest first.
+
+    Two pivots at one price on one side are a single line on the chart,
+    so without this a run of equal highs would spend every slot on the
+    same level and the rest would fall off the back. The earliest of a
+    repeated price is the one kept: it has been there longer, so its
+    record is the longer one.
+    """
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+    seen: dict[tuple[str, float], object] = {}
+    for p in sorted(pivots, key=lambda q: q.index):
+        key = (p.kind, p.price)
+        if key not in seen:
+            seen[key] = p
+    return sorted(seen.values(), key=lambda q: q.index)[-keep:]
+
+
+def swing_levels(pivots: Sequence, bars: Sequence,
+                 keep: int = SWING_KEEP) -> list[Swing]:
+    """What has happened to the last `keep` swing levels since they formed.
+
+    `pivots` must be SETTLED pivots found over `bars` -- their `index`
+    reads straight into it. A provisional pivot has no business here: it
+    can be taken out by the next bar, and a level that appears and then
+    vanishes is worse than no level, because you remember that it was
+    there and not that it was provisional.
+
+    The scan starts one bar AFTER the pivot. Its own bar is what made
+    the level, so counting it would touch every level on arrival.
+    """
+    out: list[Swing] = []
+    n = len(bars)
+    for p in swing_pick(pivots, keep):
+        if not 0 <= p.index < n:
+            raise ValueError(f"pivot index {p.index} is outside the bars")
+        up = p.kind == "high"
+        lv = Level(kind=Kind.SWING_HIGH if up else Kind.SWING_LOW,
+                   price=float(p.price), session=trade_date(p.ts),
+                   set_ts=p.ts, last_ts=p.ts,
+                   # The pivot itself says which side price came from, so
+                   # this is known rather than inferred from the next bar
+                   # -- which gets it wrong on the bar that gaps through.
+                   above_at_set=not up)
+        broke_at = back_at = -1
+        observed = 0
+        for i in range(p.index + 1, n):
+            bar = _as_bar(bars[i])
+            before = lv.state
+            resolve(lv, bar)
+            lv.last_ts = bar.ts
+            observed += 1
+            if (before is not lv.state
+                    and lv.state in (State.BROKEN_ABOVE, State.BROKEN_BELOW)):
+                broke_at = i
+                back_at = -1
+            elif before is not lv.state and lv.state is State.RECLAIMED:
+                back_at = i
+        out.append(Swing(level=lv, index=p.index, broke_at=broke_at,
+                         back_at=back_at, observed=observed))
+    return out
+
+
+SWING_UNTESTED = "untested"
+SWING_HELD = "held"
+SWING_BROKEN = "broken"
+SWING_FAILED = "failed"
+
+SWING_STATUS: tuple[str, ...] = (SWING_UNTESTED, SWING_HELD,
+                                 SWING_BROKEN, SWING_FAILED)
+
+
+def swing_status(sw: Swing) -> str:
+    """Four words for the chart, and they partition.
+
+    Read from the COUNTERS and not the current state alone, because the
+    current state cannot tell "never closed through" apart from "closed
+    through, closed back, and has been touched since" -- and those are
+    opposite readings at the same price.
+    """
+    lv = sw.level
+    if lv.state in (State.BROKEN_ABOVE, State.BROKEN_BELOW):
+        return SWING_BROKEN
+    if lv.breaks > 0:
+        return SWING_FAILED
+    if lv.touches > 0:
+        return SWING_HELD
+    return SWING_UNTESTED
+
+
+def describe(sw: Swing) -> str:
+    """One plain line for a readout. Past tense, on purpose.
+
+    `touches` counts BARS that traded through and closed back, which is
+    what `resolve` has always counted for every kind of level. So the
+    wording says bars: price resting on a level for five bars is five
+    touched bars and one approach, and calling it five approaches would
+    make a level look tested by nothing more than hovering next to it.
+    """
+    side = "high" if sw.high_side else "low"
+    lv = sw.level
+    bars = "1 bar" if lv.touches == 1 else f"{lv.touches} bars"
+    st = swing_status(sw)
+    if st == SWING_BROKEN:
+        return (f"{lv.price:.2f} {side} -- closed through "
+                f"{sw.broke_at - sw.index} bars after it formed")
+    if st == SWING_FAILED:
+        extra = f", touched on {bars} since" if lv.touches else ""
+        return (f"{lv.price:.2f} {side} -- closed through, then closed "
+                f"back{extra}")
+    if st == SWING_HELD:
+        return (f"{lv.price:.2f} {side} -- touched on {bars}, "
+                f"nothing closed through")
+    return f"{lv.price:.2f} {side} -- not reached in {sw.observed} bars"

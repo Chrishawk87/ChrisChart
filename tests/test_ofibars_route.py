@@ -374,12 +374,15 @@ class TestThePivotMarks:
         c = self._chart()
         assert "<path" in c and "d.pivots" in c
 
-    def test_only_the_last_two_of_each_kind_extend_as_levels(self):
+    def test_only_a_few_pivots_extend_as_levels(self):
         """Every pivot extended turns the chart into a grid and the
-        levels stop meaning anything."""
+        levels stop meaning anything. Which few is now the server's
+        decision, because it also carries their history."""
         c = self._chart()
-        assert "slice(-2)" in c
-        assert "stroke-dasharray=\"3,3\"" in c
+        assert "d.levels" in c
+        assert "0.42, '3,3'" in c, "an untested level is drawn dashed"
+        # The chart extends what it was given and chooses nothing.
+        assert "marks.filter" not in c
 
     def test_a_level_off_the_top_or_bottom_is_not_drawn(self):
         c = self._chart()
@@ -443,14 +446,14 @@ class TestSettingsSurviveAReload:
         assert "localStorage.getItem('liqmap_ofi'" in WEB
         i = WEB.index("localStorage.getItem('liqmap_ofi'")
         blk = WEB[i - 200:i + 400]
-        for k in ("_s.t", "_s.w", "_s.p", "_s.c"):
+        for k in ("_s.t", "_s.w", "_s.p", "_s.c", "_s.k"):
             assert k in blk, k
 
     def test_every_setter_persists(self):
         i = WEB.index("function _ofiSave")
         blk = WEB[i:WEB.index("async function ofiTick")]
         for fn in ("ofiSetTarget", "ofiSetWindow", "ofiSetPivot",
-                   "ofiSetConfirm"):
+                   "ofiSetConfirm", "ofiSetKeep"):
             k = blk.index("function " + fn)
             assert "_ofiSave()" in blk[k:k + 340], fn
 
@@ -466,3 +469,191 @@ class TestSettingsSurviveAReload:
         i = WEB.index("function _ofiSave")
         blk = WEB[i:WEB.index("async function ofiTick")]
         assert blk.count("catch") >= 2
+
+class TestTheLevelLayer:
+    """The last few swings, and what happened to each one since.
+
+    In order of how badly each would mislead:
+
+      replay leaking the future. Scrolled back, a level must be judged
+      only by the bars that had printed at that point -- judged against
+      the whole session, every level on a historical screen already
+      knows how it ended, and the replay teaches you nothing
+
+      a second copy of the wick/close rule. The chart and the session
+      ledger would eventually disagree about what happened at a price,
+      and nothing on either would say which one was wrong
+
+      reading the state off the current state alone, which cannot tell
+      "never closed through" from "closed through, closed back, and has
+      been touched since" -- opposite readings at the same price
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTimer")]
+
+    def test_the_route_takes_a_level_count(self):
+        assert "keep: int = 4" in self._route()
+
+    def test_the_levels_are_returned(self):
+        r = self._route()
+        assert '"levels": lvls' in r and '"keep_n": keep_n' in r
+
+    def test_it_uses_the_shared_rule_and_does_not_restate_it(self):
+        """One implementation, or the chart and the ledger drift."""
+        r = self._route()
+        assert "_lv.swing_levels(" in r
+        for w in ("bar.close >", "closed_through", "wicked"):
+            assert w not in r, w
+
+    def test_they_are_judged_only_by_bars_that_had_printed(self):
+        r = self._route()
+        assert "hist = b.bars[look:end]" in r
+        assert "b.bars[look:total]" not in r
+
+    def test_the_lookback_runs_further_back_than_the_window(self):
+        """The last four swings are not always on screen."""
+        assert "look = max(0, end - max(n, 300) - pv)" in self._route()
+
+    def test_only_settled_pivots_become_levels(self):
+        """A provisional one can be taken out, and a level that appears
+        and then vanishes is worse than no level."""
+        r = self._route()
+        blk = r[r.index("lvls: list[dict[str, Any]] = []"):]
+        assert "_pvm.find(hh, ll, left=pv, right=cf" in blk
+        assert "find_provisional" not in blk
+
+    def test_pivots_are_found_on_the_numbers_they_are_judged_against(self):
+        """Raw units on one side and dollars on the other would make a
+        level that no bar can ever equal."""
+        r = self._route()
+        assert "hh = [x.high * sc for x in hist]" in r
+        assert "high=x.high * sc" in r
+
+    def test_the_count_is_clamped(self):
+        assert "keep_n = max(1, min(int(keep), 8))" in self._route()
+
+    def test_the_event_indices_are_window_relative_like_everything_else(self):
+        r = self._route()
+        assert '"break_i": (brk_i - start) if brk_i >= 0 else -1' in r
+        assert '"back_i": (bak_i - start) if bak_i >= 0 else -1' in r
+
+    def test_the_state_is_not_carried_by_colour_alone(self):
+        """Colour says which side the level came from. The line style
+        and the label say what happened to it."""
+        c = self._chart()
+        for s in ("'broken'", "'held'", "'failed'"):
+            assert "L.state === " + s in c, s
+        assert "0.42, '3,3'" in c, "an untested level is drawn dashed"
+        assert "L.touches" in c
+
+    def test_a_broken_level_is_dimmed_only_after_the_break(self):
+        """Up to that bar it WAS a level, and erasing that erases the
+        part that mattered."""
+        import re
+        c = self._chart()
+        blk = c[c.index("L.state === 'broken'"):][:900]
+        ops = [float(m) for m in
+               re.findall(r"rail\(.*?,\s*[\d.]+,\s*([\d.]+),\s*'", blk)]
+        assert len(ops) == 2, ops
+        assert ops[0] > ops[1], "the part after the break must be fainter"
+
+    def test_a_failed_break_is_marked_where_it_failed(self):
+        c = self._chart()
+        blk = c[c.index("L.state === 'failed'"):][:700]
+        assert "L.back_i" in blk and "<circle" in blk
+
+    def test_a_level_formed_off_screen_still_rules_the_screen(self):
+        assert "L.i < 0 ? padL" in self._chart()
+
+    def test_the_readout_states_every_count(self):
+        c = self._chart()
+        for w in ("held", "closed through", "broke and came back",
+                  "not reached"):
+            assert w in c, w
+
+    def test_the_panel_carries_the_count_control(self):
+        assert "ofiSetKeep" in WEB and "levels forward" in WEB
+
+    def test_the_panel_states_the_rule_rather_than_offering_a_choice(self):
+        """The module settled it, with a reason. A toggle here would
+        quietly let the chart disagree with the ledger."""
+        assert "only a\n        CLOSE through is a break" in WEB
+        assert "ofiSetBreak" not in WEB
+
+
+class TestLevelsOnBarsTheBuilderMade:
+    """The same composition the route does, on real builder output."""
+
+    def _bars(self, n=20000, seed=17, target=250):
+        import random
+        from liqmap import levels as L
+        rng = random.Random(seed)
+        b = OfiBarBuilder(tick_size=0.25, threshold=target,
+                          max_s=900.0, min_updates=2)
+        bid, ts = 20_000, 0.0
+        for _ in range(n):
+            if rng.random() < 0.08:
+                bid += 1 if rng.random() < 0.5 else -1
+            ts += 0.01
+            b.on_book(ts, bid, rng.randint(50, 600),
+                      bid + 1, rng.randint(50, 600))
+        sc = 1e-9
+        return [L.Bar(ts=x.ts_close, open=x.open * sc, high=x.high * sc,
+                      low=x.low * sc, close=x.close * sc) for x in b.bars]
+
+    def _levels(self, rows, keep=4, left=5, right=1):
+        from liqmap import levels as L
+        from liqmap import pivots as P
+        ps = P.find([r.high for r in rows], [r.low for r in rows],
+                    left, right)
+        return L.swing_levels(ps, rows, keep=keep)
+
+    def test_it_produces_levels_and_every_one_has_a_status(self):
+        from liqmap import levels as L
+        rows = self._bars()
+        assert len(rows) > 40, "the feed should close plenty of bars"
+        got = self._levels(rows)
+        assert 1 <= len(got) <= 4
+        assert all(L.swing_status(s) in L.SWING_STATUS for s in got)
+
+    def test_the_status_agrees_with_the_counters(self):
+        from liqmap import levels as L
+        for s in self._levels(self._bars(), keep=8):
+            st = L.swing_status(s)
+            if st == L.SWING_UNTESTED:
+                assert s.level.touches == 0 and s.level.breaks == 0
+            if st == L.SWING_HELD:
+                assert s.level.touches > 0 and s.level.breaks == 0
+            if st == L.SWING_FAILED:
+                assert s.level.breaks > 0 and s.broke_at >= 0
+            if st == L.SWING_BROKEN:
+                assert s.broke_at >= 0
+
+    def test_a_break_cannot_un_happen_when_more_bars_arrive(self):
+        """Replay honesty, as the route composes it."""
+        from liqmap import levels as L
+        from liqmap import pivots as P
+        rows = self._bars()
+        cut = len(rows) - 40
+        part = rows[:cut]
+        ps = P.find([r.high for r in part], [r.low for r in part], 5, 1)
+        early = {s.index: s for s in L.swing_levels(ps, part, keep=8)}
+        later = {s.index: s for s in L.swing_levels(ps, rows, keep=8)}
+        for i, e in early.items():
+            if e.level.breaks:
+                assert later[i].level.breaks >= e.level.breaks, i
+            assert later[i].level.touches >= e.level.touches, i
+
+    def test_every_level_the_chart_draws_can_be_described(self):
+        from liqmap import levels as L
+        for s in self._levels(self._bars(), keep=8):
+            line = L.describe(s)
+            assert f"{s.price:.2f}" in line
+            for w in ("will", "should", "expect", "likely"):
+                assert w not in line.lower(), line

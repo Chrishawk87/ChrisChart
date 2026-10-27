@@ -382,3 +382,204 @@ def test_no_level_is_ever_published_at_zero():
     book = LevelBook()
     book._publish(Kind.PDH, 0.0, 0.0)
     assert Kind.PDH not in book.levels
+
+
+# --------------------------------------------------------- swing levels
+#
+# The chart's own levels: the pivots the OFI candles mark, carried
+# forward and read with the same rule as PDH and PDL.
+#
+# In order of how badly each would mislead:
+#
+#   a second copy of the wick/close rule. The chart would eventually
+#   disagree with the session ledger about what happened at a price,
+#   and nothing on either would say which one was wrong
+#
+#   inferring which side a swing level is read from. A bar that opens
+#   straight through a swing high would set the side to "above", and
+#   the level would then report a break in the wrong direction forever
+#
+#   reading the state off the current state alone, which cannot tell
+#   "never closed through" from "closed through, closed back, and has
+#   been touched since"
+
+from liqmap.pivots import HIGH as _PH, LOW as _PL, Pivot as _Pivot  # noqa: E402
+
+
+def _ph(i, price):
+    return _Pivot(index=i, kind=_PH, price=price, left=2, right=1)
+
+
+def _pl(i, price):
+    return _Pivot(index=i, kind=_PL, price=price, left=2, right=1)
+
+
+def _rows(seq):
+    """(open, high, low, close) tuples -> bars one second apart."""
+    return [bar(float(i), o, h, lo, c) for i, (o, h, lo, c)
+            in enumerate(seq)]
+
+
+def test_the_rule_is_shared_not_copied():
+    """Two implementations of 'a wick is a touch' drift apart, and the
+    chart and the ledger then disagree about the same price."""
+    src = (L.__file__)
+    text = open(src).read()
+    assert "def resolve(lv: Level, bar: Bar) -> None:" in text
+    body = text[text.index("def _resolve(self"):]
+    body = body[:body.index("def _age")]
+    assert "resolve(lv, bar)" in body
+    assert "closed_through" not in body, "the rule lives in one place"
+
+
+def test_a_swing_high_is_read_from_below_without_being_told():
+    rows = _rows([(10, 10, 9, 9), (10, 12, 9, 9), (10, 10, 9, 9)])
+    sw = L.swing_levels([_ph(0, 12)], rows)[0]
+    assert sw.level.above_at_set is False
+    assert sw.high_side
+
+
+def test_a_bar_that_opens_through_a_swing_high_still_breaks_upward():
+    """Inferring the side from the next bar's open gets this backwards
+    and the level reports a break in the wrong direction forever."""
+    rows = _rows([(10, 12, 9, 9), (13, 14, 13, 13.5)])
+    sw = L.swing_levels([_ph(0, 12)], rows)[0]
+    assert sw.level.state is L.State.BROKEN_ABOVE
+    assert L.swing_status(sw) == L.SWING_BROKEN
+
+
+def test_the_pivot_s_own_bar_is_not_a_test_of_itself():
+    rows = _rows([(10, 12, 9, 9), (10, 10, 9, 9)])
+    sw = L.swing_levels([_ph(0, 12)], rows)[0]
+    assert sw.level.touches == 0
+    assert L.swing_status(sw) == L.SWING_UNTESTED
+    assert sw.observed == 1
+
+
+def test_a_wick_through_a_swing_high_that_closes_back_is_a_touch():
+    rows = _rows([(10, 12, 9, 9), (10, 13, 9, 11)])
+    sw = L.swing_levels([_ph(0, 12)], rows)[0]
+    assert sw.level.touches == 1 and sw.level.breaks == 0
+    assert L.swing_status(sw) == L.SWING_HELD
+    assert sw.broke_at == -1
+
+
+def test_a_close_through_a_swing_high_is_a_break():
+    rows = _rows([(10, 12, 9, 9), (10, 13, 9, 12.5)])
+    sw = L.swing_levels([_ph(0, 12)], rows)[0]
+    assert sw.level.breaks == 1 and sw.broke_at == 1
+    assert L.swing_status(sw) == L.SWING_BROKEN
+
+
+def test_closing_exactly_on_a_swing_high_has_not_passed_it():
+    rows = _rows([(10, 12, 9, 9), (10, 12, 9, 12)])
+    sw = L.swing_levels([_ph(0, 12)], rows)[0]
+    assert L.swing_status(sw) == L.SWING_HELD
+
+
+def test_a_swing_low_mirrors():
+    rows = _rows([(10, 11, 8, 10), (10, 11, 7, 9)])
+    sw = L.swing_levels([_pl(0, 8)], rows)[0]
+    assert sw.level.above_at_set is True
+    assert sw.level.touches == 1 and L.swing_status(sw) == L.SWING_HELD
+
+
+def test_a_swing_low_closed_under_is_broken_below():
+    rows = _rows([(10, 11, 8, 10), (9, 9, 7, 7.5)])
+    sw = L.swing_levels([_pl(0, 8)], rows)[0]
+    assert sw.level.state is L.State.BROKEN_BELOW
+
+
+def test_breaking_then_closing_back_is_a_failed_break():
+    rows = _rows([(10, 12, 9, 9),
+                  (10, 13, 9, 12.5),      # closed through
+                  (12, 13, 10, 10.5)])    # closed back
+    sw = L.swing_levels([_ph(0, 12)], rows)[0]
+    assert L.swing_status(sw) == L.SWING_FAILED
+    assert sw.broke_at == 1 and sw.back_at == 2
+    assert sw.outcome is Outcome.FAILED_BREAK
+
+
+def test_a_failed_break_still_says_it_was_closed_through():
+    """The current state alone would read 'nothing closed through',
+    which is the opposite of what happened."""
+    rows = _rows([(10, 12, 9, 9), (10, 13, 9, 12.5),
+                  (12, 13, 10, 10.5), (10, 12, 9, 11)])
+    line = L.describe(L.swing_levels([_ph(0, 12)], rows)[0])
+    assert "closed through, then closed back" in line
+
+
+def test_the_statuses_partition():
+    import random
+    rng = random.Random(5)
+    px, rows = 100.0, []
+    for i in range(400):
+        px += rng.choice((-0.25, 0.0, 0.25))
+        rows.append(bar(float(i), px, px + 0.25, px - 0.25, px))
+    from liqmap import pivots as P
+    ps = P.find([r.high for r in rows], [r.low for r in rows], 5, 1)
+    got = L.swing_levels(ps, rows, keep=8)
+    assert got
+    for sw in got:
+        assert L.swing_status(sw) in L.SWING_STATUS
+
+
+def test_the_most_recent_levels_are_the_ones_carried():
+    ps = [_ph(i, 10 + i) for i in range(10)]
+    assert [p.index for p in L.swing_pick(ps, 4)] == [6, 7, 8, 9]
+
+
+def test_one_price_does_not_take_two_slots():
+    """A run of equal highs is one line on the chart."""
+    ps = [_ph(1, 10), _ph(3, 10), _ph(5, 10), _ph(7, 12), _ph(9, 14)]
+    got = L.swing_pick(ps, 4)
+    assert sorted(p.price for p in got) == [10, 12, 14]
+
+
+def test_the_earliest_of_a_repeated_price_is_kept():
+    """It has been there longer, so its record is the longer one."""
+    assert L.swing_pick([_ph(1, 10), _ph(8, 10)], 4)[0].index == 1
+
+
+def test_a_high_and_a_low_at_one_price_are_two_levels():
+    assert len(L.swing_pick([_ph(1, 10), _pl(4, 10)], 4)) == 2
+
+
+def test_levels_come_back_oldest_first():
+    ps = [_ph(9, 19), _ph(2, 12), _pl(5, 5)]
+    assert [p.index for p in L.swing_pick(ps, 3)] == [2, 5, 9]
+
+
+def test_no_pivots_means_no_levels():
+    assert L.swing_pick([], 4) == []
+    assert L.swing_levels([], _rows([(1, 1, 1, 1)])) == []
+
+
+def test_a_nonsense_count_is_refused():
+    with pytest.raises(ValueError):
+        L.swing_pick([_ph(1, 10)], 0)
+
+
+def test_a_pivot_outside_the_bars_is_refused():
+    with pytest.raises(ValueError):
+        L.swing_levels([_ph(9, 10)], _rows([(1, 1, 1, 1)]))
+
+
+def test_a_swing_level_serialises():
+    import json
+    rows = _rows([(10, 12, 9, 9), (10, 10, 9, 9)])
+    json.dumps([s.as_dict() for s in L.swing_levels([_ph(0, 12)], rows)])
+
+
+def test_the_readout_claims_nothing_about_what_comes_next():
+    rows = _rows([(10, 12, 9, 9), (10, 13, 9, 11), (10, 13, 9, 11)])
+    for sw in L.swing_levels([_ph(0, 12)], rows):
+        line = L.describe(sw).lower()
+        for w in ("will", "should", "expect", "likely", "bounce"):
+            assert w not in line, line
+
+
+def test_swing_levels_place_no_orders():
+    text = open(L.__file__).read()
+    for w in ("def submit(", "def execute(", "def place(", "def order("):
+        assert w not in text, w

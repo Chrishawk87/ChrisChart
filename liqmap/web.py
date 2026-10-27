@@ -6082,7 +6082,8 @@ def create_app() -> FastAPI:
     @app.get("/api/ofibars", dependencies=[Depends(require_token)])
     def api_ofibars(coin: str = "ES", target: int = 250,
                     bars: int = 140, offset: int = 0,
-                    pivot: int = 5, confirm: int = 1) -> dict[str, Any]:
+                    pivot: int = 5, confirm: int = 1,
+                    keep: int = 4) -> dict[str, Any]:
         """OFI-closed candles for one target, newest last.
 
         Every target in the ladder is accumulating all the time, so
@@ -6159,6 +6160,56 @@ def create_app() -> FastAPI:
 
         # Raw integer feed units in, dollars out. One conversion, here.
         sc = 1e-9
+
+        # WHAT HAPPENED TO THE LAST FEW SWING LEVELS SINCE THEY FORMED.
+        #
+        # Judged only by bars that had printed at `end`. Scrolled back,
+        # that means the chart shows what the levels looked like THEN,
+        # not what the rest of the session went on to do to them --
+        # otherwise replay would quietly leak the future into every
+        # level you looked at.
+        #
+        # The lookback runs further back than the window, because the
+        # last four swings are not always inside the bars on screen.
+        # Only SETTLED pivots become levels: a provisional one can be
+        # taken out by the next bar, and a level that appears and
+        # vanishes is worse than no level at all.
+        # A wick is a touch; only a confirmed close is a break. That rule
+        # lives in liqmap.levels and is applied by the same function the
+        # session levels use, so the chart and the ledger cannot drift
+        # apart about what happened at a price.
+        keep_n = max(1, min(int(keep), 8))
+        lvls: list[dict[str, Any]] = []
+        look = max(0, end - max(n, 300) - pv)
+        hist = b.bars[look:end]
+        if len(hist) > pv + cf:
+            from . import levels as _lv
+            from . import pivots as _pvm
+            hh = [x.high * sc for x in hist]
+            ll = [x.low * sc for x in hist]
+            tt = [x.ts_close for x in hist]
+            # Found on the SAME numbers the levels are judged against,
+            # so a pivot price and the bar that made it stay equal.
+            found = _pvm.find(hh, ll, left=pv, right=cf, ts=tt)
+            rows = [_lv.Bar(ts=x.ts_close, open=x.open * sc,
+                            high=x.high * sc, low=x.low * sc,
+                            close=x.close * sc) for x in hist]
+            for sw in _lv.swing_levels(found, rows, keep=keep_n):
+                abs_i = look + sw.index
+                brk_i = (look + sw.broke_at) if sw.broke_at >= 0 else -1
+                bak_i = (look + sw.back_at) if sw.back_at >= 0 else -1
+                lvls.append({
+                    "i": abs_i - start,
+                    "break_i": (brk_i - start) if brk_i >= 0 else -1,
+                    "back_i": (bak_i - start) if bak_i >= 0 else -1,
+                    "kind": "high" if sw.high_side else "low",
+                    "price": sw.price,
+                    "state": _lv.swing_status(sw),
+                    "outcome": sw.outcome.value,
+                    "touches": sw.level.touches,
+                    "breaks": sw.level.breaks,
+                    "observed": sw.observed,
+                    "say": _lv.describe(sw)})
         out = []
         for x in recent:
             out.append({"ts_open": x.ts_open, "ts_close": x.ts_close,
@@ -6196,6 +6247,7 @@ def create_app() -> FastAPI:
                 "at_live": off == 0,
                 "oldest": off >= max(0, total - n),
                 "pivot_n": pv, "confirm_n": cf,
+                "keep_n": keep_n, "levels": lvls,
                 "pivots": marks, "provisional": prov,
                 "unsettled": _pivot_pending(len(window), cf) if off == 0 else 0,
                 "bars": out, "forming": forming,
@@ -9857,22 +9909,76 @@ function ofiChart(d, w, h) {
   for (const m of marks) pv += caret(m, true);
   for (const m of prov) pv += caret(m, false);
 
-  /* The two most recent of each kind extended to the right edge. Every
-     pivot extended turns the chart into a grid and the levels stop
-     meaning anything. */
-  const lastHigh = marks.filter(m => m.kind === 'high').slice(-2);
-  const lastLow = marks.filter(m => m.kind === 'low').slice(-2);
-  for (const m of lastHigh.concat(lastLow)) {
-    const yy = y(m.price);
+  /* THE LEVELS, AND WHAT HAS HAPPENED TO THEM.
+
+     Only the last few swings are extended. Every pivot extended turns
+     the chart into a grid and the lines stop meaning anything.
+
+     The line STYLE carries the state, so it is never colour alone:
+
+       dashed, faint   nothing has come back to it yet
+       solid           price reached it and did not close through,
+                       and the label counts the bars that touched it
+       solid then dim  it was a level until the marked bar closed
+                       through it; the dim part is where it used to be
+       solid, hollow   it closed through and then closed back -- the
+         marker        break failed, and the level is live again
+
+     A wick through that closed back is a touch, not a break. That is
+     the one genuinely informative thing that can happen to a level --
+     price went there and came back -- and calling it a break would
+     file it with the bars that cut straight through. The rule comes
+     from the server and is the same one the session levels use. */
+  const lvls = (d && d.levels) || [];
+  const lvlY = [];          // so the price axis can get out of their way
+  const rail = (x1, x2, yy, col, wid, op, dash) =>
+    `<line x1="${x1.toFixed(1)}" y1="${yy.toFixed(1)}"
+       x2="${x2.toFixed(1)}" y2="${yy.toFixed(1)}" stroke="${col}"
+       stroke-width="${wid}" opacity="${op}"
+       ${dash ? 'stroke-dasharray="' + dash + '"' : ''}/>`;
+  const xEdge = w - padR;
+  for (const L of lvls) {
+    const yy = y(L.price);
     if (yy < padT || yy > padT + ih) continue;
-    const x0 = padL + step * (m.i + 0.5);
-    pv += `<line x1="${x0.toFixed(1)}" y1="${yy.toFixed(1)}"
-             x2="${(w - padR).toFixed(1)}" y2="${yy.toFixed(1)}"
-             stroke="${m.kind === 'high' ? '#e8c46a' : '#6fb6d6'}"
-             stroke-width="0.7" stroke-dasharray="3,3" opacity="0.5"/>`;
-    pv += `<text x="${(w - padR + 4).toFixed(1)}" y="${(yy + 3).toFixed(1)}"
-             font-size="9" fill="${m.kind === 'high' ? '#e8c46a' : '#6fb6d6'}"
-             >${m.price.toFixed(2)}</text>`;
+    const col = L.kind === 'high' ? '#e8c46a' : '#6fb6d6';
+    /* A level formed before the left edge still rules the whole
+       screen, so its line starts at the edge rather than nowhere. */
+    const x0 = L.i < 0 ? padL : padL + step * (L.i + 0.5);
+    let tag = L.price.toFixed(2);
+    if (L.state === 'broken') {
+      const xb = (L.break_i >= 0 && L.break_i < all.length)
+        ? padL + step * (L.break_i + 0.5) : xEdge;
+      pv += rail(x0, Math.max(x0, xb), yy, col, 1.2, 0.85, '');
+      pv += rail(Math.max(x0, xb), xEdge, yy, col, 0.7, 0.3, '1,4');
+      if (xb < xEdge) {
+        pv += `<path d="M ${(xb - 3).toFixed(1)} ${(yy - 3).toFixed(1)}
+                 L ${(xb + 3).toFixed(1)} ${(yy + 3).toFixed(1)}
+                 M ${(xb - 3).toFixed(1)} ${(yy + 3).toFixed(1)}
+                 L ${(xb + 3).toFixed(1)} ${(yy - 3).toFixed(1)}"
+                 stroke="${col}" stroke-width="1.2" fill="none"/>`;
+      }
+      tag += ' ✕';
+    } else if (L.state === 'failed') {
+      /* It closed through and closed back, so the line is live again.
+         The hollow marker is where the break failed -- a different
+         event from a break, and the one worth seeing. */
+      pv += rail(x0, xEdge, yy, col, 1.2, 0.9, '');
+      const xf = (L.back_i >= 0 && L.back_i < all.length)
+        ? padL + step * (L.back_i + 0.5) : -1;
+      if (xf >= 0) {
+        pv += `<circle cx="${xf.toFixed(1)}" cy="${yy.toFixed(1)}" r="3.2"
+                 fill="none" stroke="${col}" stroke-width="1.2"/>`;
+      }
+      tag += ' ↺';
+    } else if (L.state === 'held') {
+      pv += rail(x0, xEdge, yy, col, 1.2, 0.9, '');
+      tag += ' ×' + L.touches;
+    } else {
+      pv += rail(x0, xEdge, yy, col, 0.7, 0.42, '3,3');
+    }
+    lvlY.push(yy);
+    pv += `<text x="${(xEdge + 4).toFixed(1)}" y="${(yy + 3).toFixed(1)}"
+             font-size="9" fill="${col}">${tag}</text>`;
   }
 
   /* Price axis on the right, in dollars. Five levels, snapped to the
@@ -9886,15 +9992,34 @@ function ofiChart(d, w, h) {
     ax += `<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${(w - padR).toFixed(1)}"
              y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="0.5"
              opacity="0.4"/>`;
+    /* A level label and an axis label at the same height print on top
+       of each other and neither is readable. The level label is the one
+       carrying information, so the axis gives way -- the gridline stays
+       either way, so the scale is not lost. */
+    if (lvlY.some(ly => Math.abs(ly - yy) < 12)) continue;
     ax += `<text x="${(w - padR + 4).toFixed(1)}" y="${(yy + 3).toFixed(1)}"
              font-size="10" fill="var(--muted)">${snapped.toFixed(2)}</text>`;
   }
+
+  /* The same four lines in words, because the chart can only show the
+     state and not the history behind it. */
+  const nState = s => lvls.filter(L => L.state === s).length;
+  const readout = lvls.length
+    ? '<span class="stamp" style="width:100%">levels &mdash; '
+      + nState('held') + ' held / ' + nState('broken') + ' closed through / '
+      + nState('failed') + ' broke and came back / '
+      + nState('untested') + ' not reached &middot; '
+      + lvls.slice().reverse().map(L => L.say).join(' &middot; ')
+      + '</span>'
+    : '<span class="stamp" style="width:100%">levels &mdash; no settled '
+      + 'swing has formed yet at this target</span>';
 
   const last = bars[bars.length - 1];
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   const nb = bars.length - ba - sa;
   return `<svg width="${w}" height="${h}" style="display:block">${ax}${g}${pv}</svg>
+    ${readout}
     <span class="stamp">${d.total.toLocaleString()} bars at target
       ${d.target.toLocaleString()}
       &middot; showing ${bars.length}
@@ -9924,19 +10049,22 @@ let _ofiTotal = 0;
 function _ofiSave() {
   try {
     localStorage.setItem('liqmap_ofi', JSON.stringify({
-      t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm }));
+      t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm,
+      k: _ofiKeep }));
   } catch (e) { /* private mode, quota, blocked -- not worth a failure */ }
 }
 let _ofiTarget = 250;
 let _ofiWindow = 140;      // bars visible -- the zoom
 let _ofiPivot = 5;         // bars to the LEFT a swing must clear
 let _ofiConfirm = 1;       // bars to the RIGHT before it is settled
+let _ofiKeep = 4;          // how many swing levels are carried forward
 try {
   const _s = JSON.parse(localStorage.getItem('liqmap_ofi') || '{}');
   if (_s.t) _ofiTarget = _s.t;
   if (_s.w) _ofiWindow = _s.w;
   if (_s.p) _ofiPivot = _s.p;
   if (_s.c) _ofiConfirm = _s.c;
+  if (_s.k) _ofiKeep = _s.k;
 } catch (e) { /* nothing saved, or unreadable -- the defaults stand */ }
 
 function ofiSetTarget(v) {
@@ -9967,6 +10095,7 @@ function ofiPan(bars) {
 
 function ofiSetPivot(v) { _ofiPivot = parseInt(v, 10) || 5; _ofiSave(); ofiTick(); }
 function ofiSetConfirm(v) { _ofiConfirm = parseInt(v, 10) || 1; _ofiSave(); ofiTick(); }
+function ofiSetKeep(v) { _ofiKeep = parseInt(v, 10) || 4; _ofiSave(); ofiTick(); }
 function ofiLive() { _ofiOffset = 0; ofiTick(); }
 function ofiOldest() { _ofiOffset = Math.max(0, _ofiTotal - _ofiWindow); ofiTick(); }
 
@@ -9982,7 +10111,8 @@ async function ofiTick(fromTimer) {
   try {
     const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget
       + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
-      + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm);
+      + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm
+      + '&keep=' + _ofiKeep);
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; }
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
@@ -10014,6 +10144,15 @@ async function ofiTick(fromTimer) {
             `<option value="${k}"${k === d.confirm_n ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
         &middot; dotted carets are not confirmed yet and can vanish</span>
+      <span class="stamp" style="width:100%">carry
+        <select onchange="ofiSetKeep(this.value)"
+          style="margin:0 6px">${[2, 4, 6, 8].map(k =>
+            `<option value="${k}"${k === d.keep_n ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        levels forward &middot; a wick through is a touch, only a
+        CLOSE through is a break &middot; dashed = not reached yet,
+        solid = reached and held, &#10005; = where it was closed
+        through, &#8634; = a break that closed back</span>
       <span class="stamp" style="width:100%">
         <button class="btn" onclick="ofiOldest()"
           ${d.oldest ? 'disabled' : ''}>&laquo; oldest</button>
