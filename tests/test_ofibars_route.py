@@ -269,7 +269,7 @@ class TestTheAggressionLayer:
         i = WEB.index("function ofiChart")
         j = WEB.index("function mgChart")
         panel = WEB[i:j]
-        readout = panel[panel.index("return `<svg"):]
+        readout = panel[panel.index("return `${dPane}"):]
         for w in ("seconds", "toFixed(1)}s", "minute", "timeframe"):
             assert w not in readout, f"{w!r} in the on-screen readout"
         assert "book updates" in readout
@@ -657,3 +657,195 @@ class TestLevelsOnBarsTheBuilderMade:
             assert f"{s.price:.2f}" in line
             for w in ("will", "should", "expect", "likely"):
                 assert w not in line.lower(), line
+
+
+class TestTheDeltaPane:
+    """Paid-for flow, drawn directly above the candles.
+
+    In order of how badly each would mislead:
+
+      a pane on its own x-axis. It is not a second chart, it is a
+      second reading of the SAME bars, and any drift between the two
+      grids puts a column over the wrong candle -- which looks fine
+
+      delta wired to the price path or the book. Three columns exist
+      because they come apart; sourcing two of them from one place
+      destroys exactly what makes them worth having
+
+      an empty bar drawn as a conflict. At the larger targets plenty
+      of bars contain no prints at all
+    """
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTimer")]
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_pane_shares_the_candles_grid(self):
+        c = self._chart()
+        blk = c[c.index("const dh = 64"):c.index("Pivot marks")]
+        assert "padL + step * (i + 0.5)" in blk, "same column centres"
+        assert "bw / 2" in blk and "bw.toFixed" in blk, "same column width"
+        assert "w - padR" in blk, "same right edge"
+
+    def test_the_pane_is_drawn_above_the_candles(self):
+        c = self._chart()
+        i = c.index("return `${dPane}")
+        assert i > 0
+        assert c.index("${dPane}", i) < c.index("<svg width=", i + 10)
+
+    def test_the_route_sends_delta_per_bar(self):
+        r = self._route()
+        assert '"delta": x.delta' in r
+        assert '"trade_count": x.trade_count' in r
+        assert '"delta_agrees": x.delta_agrees' in r
+
+    def test_the_forming_bar_carries_live_delta(self):
+        """Otherwise the newest column is always a bar behind."""
+        r = self._route()
+        assert '"delta": b.live_delta' in r
+
+    def test_a_disagreement_is_marked_on_the_zero_line(self):
+        """A column can be one pixel wide, and an outline on it is
+        invisible exactly when the bar is quiet enough to notice."""
+        c = self._chart()
+        assert "L.delta_agrees" in c or "b.delta_agrees === false" in c
+        blk = c[c.index("delta_agrees === false"):][:420]
+        assert "dy0 - 3" in blk and "dy0 + 3" in blk
+
+    def test_a_bar_with_no_delta_draws_no_column(self):
+        c = self._chart()
+        blk = c[c.index("const dh = 64"):c.index("Pivot marks")]
+        assert "if (v) {" in blk
+
+    def test_the_pane_says_when_the_window_has_no_prints(self):
+        c = self._chart()
+        assert "no prints in this window" in c
+
+    def test_the_readout_separates_this_bar_from_the_window(self):
+        c = self._chart()
+        assert "this bar" in c and "window" in c
+
+    def test_delta_is_not_sourced_from_the_price_path(self):
+        c = self._chart()
+        blk = c[c.index("const dh = 64"):c.index("Pivot marks")]
+        for w in ("price_agg", "aggression", "bodyColour"):
+            assert w not in blk, w
+
+
+class TestHigherTargetLevels:
+    """The structure you cannot see from inside the target you trade."""
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTimer")]
+
+    def test_the_route_returns_them(self):
+        r = self._route()
+        assert '"higher_levels": hi' in r
+
+    def test_the_cut_is_by_time_not_by_bar_count(self):
+        """Each builder has its own bar count, so the same index is a
+        different moment on every target. Cutting by index would put a
+        level on the screen before it had formed."""
+        r = self._route()
+        assert "edge_ts = window[-1].ts_close" in r
+        assert "key=lambda x: x.ts_close" in r
+
+    def test_only_two_targets_above_and_two_levels_each(self):
+        """Every target at once is the grid this is avoiding."""
+        r = self._route()
+        assert "[x for x in sorted(builders) if x > t][:2]" in r
+        i = r.index("_lv.swing_levels(found2, rows2")
+        assert "keep=2" in r[i:i + 80]
+
+    def test_they_use_the_same_rule_as_the_rest(self):
+        r = self._route()
+        assert "_lv.swing_levels(found2" in r
+        assert "_lv.swing_status(sw)" in r
+
+    def test_they_are_drawn_edge_to_edge_with_no_column(self):
+        """A price is comparable across targets. A bar index is not."""
+        c = self._chart()
+        blk = c[c.index("d.higher_levels"):][:900]
+        assert "rail(padL, xEdge" in blk
+        assert "L.i" not in blk, "a higher-target level has no column here"
+
+    def test_the_label_names_the_target_it_came_from(self):
+        c = self._chart()
+        blk = c[c.index("d.higher_levels"):][:900]
+        assert "@${L.target" in blk
+
+    def test_they_are_fainter_than_this_target_s_own(self):
+        import re
+        c = self._chart()
+        blk = c[c.index("d.higher_levels"):][:900]
+        ops = [float(m) for m in
+               re.findall(r"rail\(padL, xEdge, yy, col, [\d.]+, ([\d.]+)",
+                          blk)]
+        assert ops and max(ops) < 0.8, ops
+
+    def test_they_can_be_turned_off(self):
+        assert "ofiSetHigher" in WEB
+        assert "higher: int = 1" in self._route()
+
+    def test_the_choice_is_remembered(self):
+        i = WEB.index("function _ofiSave")
+        blk = WEB[i:WEB.index("async function ofiTick")]
+        assert "h: _ofiHigher" in blk
+        k = blk.index("function ofiSetHigher")
+        assert "_ofiSave()" in blk[k:k + 200]
+
+    def test_hidden_really_means_not_computed(self):
+        """Four extra pivot scans a poll for lines nobody is looking
+        at."""
+        r = self._route()
+        assert "if want_higher and window:" in r
+
+
+class TestTheHistorySurvivesARestart:
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_builders_are_filled_from_disk_when_created(self):
+        i = WEB.index("from .ofistore import")
+        blk = WEB[i:i + 400]
+        assert "load_into_builders()" in blk
+        assert "seed()" in blk and "start()" in blk
+
+    def test_restoring_happens_only_on_fresh_builders(self):
+        """Merging a disk history into a live one needs the two to
+        agree about where they overlap."""
+        i = WEB.index("from .ofistore import")
+        blk = WEB[i - 1800:i]
+        assert "if not svc.tape.ofibars:" in blk
+
+    def test_the_route_reports_what_is_stored(self):
+        r = self._route()
+        assert '"saved": _saved' in r
+        assert "_rc.status(t)" in r
+
+    def test_a_database_failure_does_not_stop_the_candles(self):
+        """Losing history is bad. Losing the live chart because
+        yesterday's could not be read is worse."""
+        i = WEB.index("from .ofistore import")
+        blk = WEB[i - 300:i + 600]
+        assert "except Exception" in blk
+        assert "self._ofirec = None" in blk
+
+    def test_their_labels_sit_on_the_left(self):
+        """The right margin already carries the price axis and four
+        level labels; a fifth there reads as another level of THIS
+        chart rather than a borrowed one."""
+        c = WEB[WEB.index("function ofiChart"):WEB.index("let _ofiTimer")]
+        blk = c[c.index("d.higher_levels"):][:1200]
+        assert "padL + 3" in blk and "xEdge + 4" not in blk

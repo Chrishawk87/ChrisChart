@@ -438,3 +438,161 @@ class TestTheHistoryIsBounded:
     def test_a_tiny_cap_is_refused(self):
         with pytest.raises(ValueError):
             OfiBarBuilder(max_bars=5)
+
+
+class TestTheDeltaColumn:
+    """Paid-for flow, alongside the book and the price path.
+
+    In order of how badly each would mislead:
+
+      delta carried across a close. It would be a running total wearing
+      a per-bar label -- the same latching failure the accumulator
+      reset exists to prevent, and it looks perfectly normal on screen
+
+      a print closing a bar. The boundary is order-flow imbalance and
+      nothing else; if trades could end one too, the threshold would
+      mean two things at once and no bar would say which closed it
+
+      an empty bar reported as a conflict. At the larger targets plenty
+      of bars contain no prints at all, and calling those disagreements
+      puts a reading on the chart that nothing supports
+
+      a print arriving before the first book touch being dropped. It
+      belongs to the bar that touch opens
+    """
+
+    def _b(self, threshold=50):
+        return OfiBarBuilder(tick_size=0.25, threshold=threshold,
+                             max_s=900.0, min_updates=2)
+
+    def _walk(self, b, n=12, size=20, side="buy", bid=20_000):
+        b.on_book(0.0, bid, 100, bid + 1, 100)
+        for i in range(1, n):
+            b.on_trade(i * 0.01, size, side)
+            b.on_book(i * 0.01, bid, 100 + i * 20, bid + 1, 100)
+        return b
+
+    def test_delta_is_buy_minus_sell(self):
+        b = self._b()
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        b.on_trade(0.1, 7, "buy")
+        b.on_trade(0.2, 3, "sell")
+        assert b.live_delta == 4
+        assert b.live_trades == 2
+
+    def test_delta_does_not_carry_across_a_close(self):
+        """The latching failure, in a second place."""
+        b = self._walk(self._b(), n=20)
+        assert len(b.bars) >= 2
+        per = [x.buy_vol + x.sell_vol for x in b.bars]
+        assert max(per) < sum(per), "a bar is holding the running total"
+        for x in b.bars:
+            assert x.trade_count <= 20
+
+    def test_each_bar_counts_only_its_own_prints(self):
+        b = self._b()
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        b.on_trade(0.01, 11, "buy")
+        # Push it over the line so the bar closes.
+        for i in range(1, 8):
+            b.on_book(i * 0.01, 20_000, 100 + i * 40, 20_001, 100)
+        first = b.bars[0]
+        assert first.trade_count == 1 and first.buy_vol == 11
+        b.on_trade(0.2, 4, "sell")
+        assert b.live_delta == -4, "the new bar starts from nothing"
+
+    def test_a_trade_never_closes_a_bar(self):
+        b = self._b()
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        for i in range(200):
+            b.on_trade(i * 0.001, 10_000, "buy")
+        assert b.bars == [], "only order-flow imbalance ends a bar"
+
+    def test_a_print_before_the_first_touch_is_kept(self):
+        b = self._b()
+        b.on_trade(0.0, 9, "buy")
+        b.on_book(0.01, 20_000, 100, 20_001, 100)
+        assert b.live_delta == 9
+
+    def test_an_unknown_side_is_refused_not_counted_as_balanced(self):
+        b = self._b()
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        b.on_trade(0.1, 50, "none")
+        b.on_trade(0.1, 50, "")
+        assert b.live_trades == 0 and b.live_delta == 0
+
+    def test_a_zero_or_negative_size_is_refused(self):
+        b = self._b()
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        b.on_trade(0.1, 0, "buy")
+        b.on_trade(0.1, -5, "sell")
+        assert b.live_trades == 0
+
+    def test_a_bar_with_no_prints_agrees_by_default(self):
+        """Nothing there to disagree with."""
+        b = self._walk(self._b(), n=20, size=0)
+        assert b.bars
+        for x in b.bars:
+            assert x.trade_count == 0
+            assert x.delta_agrees, "an empty bar is not a conflict"
+            assert x.delta == 0 and x.delta_ratio == 0.5
+
+    def test_a_green_bar_sold_into_does_not_agree(self):
+        """The case the column exists for: the bid filling up while
+        prints hit it."""
+        b = self._walk(self._b(), n=20, side="sell")
+        greens = [x for x in b.bars if x.direction == GREEN]
+        assert greens, "the feed should produce green bars"
+        for x in greens:
+            assert x.delta < 0 and not x.delta_agrees
+
+    def test_a_green_bar_bought_into_agrees(self):
+        b = self._walk(self._b(), n=20, side="buy")
+        greens = [x for x in b.bars if x.direction == GREEN]
+        assert greens
+        for x in greens:
+            assert x.delta > 0 and x.delta_agrees
+
+    def test_delta_and_the_price_path_are_separate_readings(self):
+        """`agrees` asks whether PRICE followed the book. `delta_agrees`
+        asks whether anyone PAID. They answer different questions and
+        must not be wired to the same source."""
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        i = src.index("def delta_agrees")
+        body = src[i:src.index("def _label")]
+        assert "self.buy_agg" not in body
+        assert "self.pai" not in body and "aggression" not in body
+
+    def test_the_ratio_is_a_share_of_traded_size(self):
+        b = self._b()
+        b.on_book(0.0, 20_000, 100, 20_001, 100)
+        b.on_trade(0.1, 30, "buy")
+        b.on_trade(0.2, 10, "sell")
+        for i in range(1, 8):
+            b.on_book(0.2 + i * 0.01, 20_000, 100 + i * 40, 20_001, 100)
+        x = b.bars[0]
+        assert x.volume == 40
+        assert x.delta_ratio == pytest.approx(0.75)
+
+    def test_reset_clears_the_delta_too(self):
+        b = self._walk(self._b(), n=20)
+        b.reset()
+        assert b.live_delta == 0 and b.live_trades == 0
+
+    def test_it_serialises(self):
+        import json
+        b = self._walk(self._b(), n=20)
+        for x in b.bars:
+            d = json.loads(json.dumps(x.as_dict()))
+            for k in ("delta", "buy_vol", "sell_vol", "trade_count",
+                      "delta_ratio", "delta_agrees"):
+                assert k in d, k
+
+    def test_the_aggressor_is_never_inferred_here(self):
+        """CME states the side. A tick rule is wrong on a meaningful
+        share of trades, worst when the market is fast."""
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        i = src.index("def on_trade")
+        body = src[i:i + 1600]
+        for w in ("last_px", "> last", "uptick", "tick rule"):
+            assert w not in body, w

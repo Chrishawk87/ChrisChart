@@ -1024,6 +1024,30 @@ class Runtime:
                     t: OfiBarBuilder(tick_size=0.25, threshold=t,
                                      max_s=900.0, min_updates=2)
                     for t in _OFI_LADDER}
+                # AND THE HISTORY THEY HAD BEFORE THE LAST RESTART.
+                # Held only in memory, these bars die on every deploy,
+                # and at target 2,000 that is days of structure -- the
+                # swing levels with it, since a level is only as old as
+                # the bars it was found in. Restoring happens HERE,
+                # once, on the builders that were just created and are
+                # therefore known to be empty: merging a disk history
+                # into a live one would need the two to agree about
+                # where they overlap.
+                #
+                # A failure to reach the database loses history, which
+                # is bad, and stops the chart, which is worse. So the
+                # whole of it is best-effort and the candles come up
+                # either way.
+                try:
+                    from .ofistore import OfiBarRecorder, OfiBarStore
+                    _store = OfiBarStore(self.db_path)
+                    _rec = OfiBarRecorder(_store, svc.tape.ofibars)
+                    _rec.load_into_builders()
+                    _rec.seed()
+                    _rec.start()
+                    self._ofirec = _rec
+                except Exception:                       # noqa: BLE001
+                    self._ofirec = None
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -6083,7 +6107,7 @@ def create_app() -> FastAPI:
     def api_ofibars(coin: str = "ES", target: int = 250,
                     bars: int = 140, offset: int = 0,
                     pivot: int = 5, confirm: int = 1,
-                    keep: int = 4) -> dict[str, Any]:
+                    keep: int = 4, higher: int = 1) -> dict[str, Any]:
         """OFI-closed candles for one target, newest last.
 
         Every target in the ladder is accumulating all the time, so
@@ -6179,12 +6203,16 @@ def create_app() -> FastAPI:
         # session levels use, so the chart and the ledger cannot drift
         # apart about what happened at a price.
         keep_n = max(1, min(int(keep), 8))
+        want_higher = bool(int(higher))
         lvls: list[dict[str, Any]] = []
         look = max(0, end - max(n, 300) - pv)
         hist = b.bars[look:end]
+        # Imported out here rather than inside the branch: the
+        # higher-target block below uses them too, and it runs whether
+        # or not this target had enough bars to find a swing in.
+        from . import levels as _lv
+        from . import pivots as _pvm
         if len(hist) > pv + cf:
-            from . import levels as _lv
-            from . import pivots as _pvm
             hh = [x.high * sc for x in hist]
             ll = [x.low * sc for x in hist]
             tt = [x.ts_close for x in hist]
@@ -6210,6 +6238,55 @@ def create_app() -> FastAPI:
                     "breaks": sw.level.breaks,
                     "observed": sw.observed,
                     "say": _lv.describe(sw)})
+
+        # LEVELS FROM THE TARGETS ABOVE THIS ONE.
+        #
+        # A swing on the 2,000 chart is structurally larger than one on
+        # 250 -- it took eight times the imbalance to build -- and from
+        # inside the 250 chart it is invisible. Switching targets to
+        # look for it means leaving the resolution being traded, so the
+        # bigger structure is drawn here instead, fainter, with its
+        # target on the label.
+        #
+        # A PRICE IS COMPARABLE ACROSS TARGETS; AN INDEX IS NOT. Each
+        # builder has its own bar count, so a higher-target level has
+        # no column on this chart and is drawn edge to edge.
+        #
+        # The cut is by TIME, not by bar count, for the same reason the
+        # levels above stop at `end`: scrolled back, a higher-target
+        # level that had not formed yet must not be on the screen.
+        # Only the top two targets above, two levels each. Every
+        # target at once turns the chart into the grid this is all
+        # trying to avoid.
+        hi: list[dict[str, Any]] = []
+        if want_higher and window:
+            import bisect as _bis
+            edge_ts = window[-1].ts_close
+            for ht in [x for x in sorted(builders) if x > t][:2]:
+                hb = builders[ht]
+                hbars = hb.bars
+                if len(hbars) <= pv + cf:
+                    continue
+                cut = _bis.bisect_right(hbars, edge_ts,
+                                        key=lambda x: x.ts_close)
+                lo2 = max(0, cut - 400)
+                seg = hbars[lo2:cut]
+                if len(seg) <= pv + cf:
+                    continue
+                hh2 = [x.high * sc for x in seg]
+                ll2 = [x.low * sc for x in seg]
+                tt2 = [x.ts_close for x in seg]
+                rows2 = [_lv.Bar(ts=x.ts_close, open=x.open * sc,
+                                 high=x.high * sc, low=x.low * sc,
+                                 close=x.close * sc) for x in seg]
+                found2 = _pvm.find(hh2, ll2, left=pv, right=cf, ts=tt2)
+                for sw in _lv.swing_levels(found2, rows2, keep=2):
+                    hi.append({"target": ht,
+                               "kind": "high" if sw.high_side else "low",
+                               "price": sw.price,
+                               "state": _lv.swing_status(sw),
+                               "touches": sw.level.touches,
+                               "say": _lv.describe(sw)})
         out = []
         for x in recent:
             out.append({"ts_open": x.ts_open, "ts_close": x.ts_close,
@@ -6221,7 +6298,20 @@ def create_app() -> FastAPI:
                         "price_aggression": x.aggression,
                         "price_agg_burst": round(x.pai_burst, 4),
                         "agrees": x.agrees,
+                        "delta": x.delta, "trade_count": x.trade_count,
+                        "volume": x.volume,
+                        "delta_agrees": x.delta_agrees,
                         "seconds": round(x.seconds, 3)})
+        # How much of this is on disk, so the panel can say whether a
+        # restart would cost anything.
+        _rc = getattr(rt, "_ofirec", None)
+        _saved = None
+        if _rc is not None:
+            try:
+                _saved = _rc.status(t)
+            except Exception:                           # noqa: BLE001
+                _saved = None
+
         cur = b.current
         forming = None
         if cur is not None and cur.updates > 0:
@@ -6229,6 +6319,8 @@ def create_app() -> FastAPI:
             forming = {"open": cur.open * sc, "high": cur.high * sc,
                        "low": cur.low * sc, "close": cur.close * sc,
                        "ofi": b.accumulated, "updates": cur.updates,
+                       "delta": b.live_delta,
+                       "trade_count": b.live_trades,
                        "price_agg_ratio": round(_lp, 4),
                        "price_aggression": (
                            "BUY_PRICE_AGGRESSIVE" if _lp >= 0.70
@@ -6248,6 +6340,8 @@ def create_app() -> FastAPI:
                 "oldest": off >= max(0, total - n),
                 "pivot_n": pv, "confirm_n": cf,
                 "keep_n": keep_n, "levels": lvls,
+                "higher": want_higher, "higher_levels": hi,
+                "saved": _saved,
                 "pivots": marks, "provisional": prov,
                 "unsettled": _pivot_pending(len(window), cf) if off == 0 else 0,
                 "bars": out, "forming": forming,
@@ -9878,6 +9972,68 @@ function ofiChart(d, w, h) {
             fill="${c}" opacity="${forming ? 0.4 : 0.92}"/>`;
   });
 
+  /* THE DELTA PANE, directly above the candles and on the SAME grid.
+
+     Same padL, same step, same bar width, so column i sits exactly
+     over candle i. That alignment is the whole point: the pane is not
+     a second chart, it is a second reading of the same bars, and any
+     drift between the two x-axes would make it worse than useless.
+
+     DELTA IS NOT THE BOOK. The candle is closed by order-flow
+     imbalance -- limit orders, intent that can still be withdrawn --
+     and coloured by the price path. This is traded size by the side
+     CME stated on each print: intent already paid for. Three columns,
+     and they come apart constantly.
+
+     An AMBER TICK on the zero line marks a bar where paid-for flow
+     went against the book pressure that closed it. A green bar with
+     negative delta is a bid that filled up while prints hit it. That
+     disagreement is the reason the pane is here, so it gets a mark
+     rather than being left for the eye to find. */
+  const dh = 64, dpadT = 10, dpadB = 6;
+  const dih = dh - dpadT - dpadB;
+  const dy0 = dpadT + dih / 2;
+  let dMax = 0;
+  let anyPrints = false;
+  for (const b of all) {
+    const v = Math.abs(b.delta || 0);
+    if (v > dMax) dMax = v;
+    if ((b.trade_count || 0) > 0) anyPrints = true;
+  }
+  const dScale = dMax > 0 ? (dih / 2) / dMax : 0;
+  let dg = `<line x1="${padL}" y1="${dy0.toFixed(1)}"
+      x2="${(w - padR).toFixed(1)}" y2="${dy0.toFixed(1)}"
+      stroke="var(--line)" stroke-width="0.6" opacity="0.7"/>`;
+  all.forEach((b, i) => {
+    const v = b.delta || 0;
+    const cx = padL + step * (i + 0.5);
+    const forming = b.direction === 'forming';
+    if (v) {
+      const hgt = Math.max(1, Math.abs(v) * dScale);
+      const top = v > 0 ? dy0 - hgt : dy0;
+      dg += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}"
+          width="${bw.toFixed(1)}" height="${hgt.toFixed(1)}"
+          fill="${v > 0 ? '#35c27a' : '#e2574c'}"
+          opacity="${forming ? 0.45 : 0.85}"/>`;
+    }
+    /* Marked on the zero line rather than on the column, because a
+       column can be one pixel wide and an outline on it is invisible
+       exactly when the bar is quiet enough to be worth noticing. */
+    if (b.delta_agrees === false) {
+      dg += `<line x1="${cx.toFixed(1)}" y1="${(dy0 - 3).toFixed(1)}"
+          x2="${cx.toFixed(1)}" y2="${(dy0 + 3).toFixed(1)}"
+          stroke="#e8c46a" stroke-width="1.4" opacity="0.95"/>`;
+    }
+  });
+  dg += `<text x="${(w - padR + 4).toFixed(1)}" y="${(dpadT + 4).toFixed(1)}"
+      font-size="9" fill="var(--muted)">${dMax ? '+' +
+      Math.round(dMax).toLocaleString() : 'no prints'}</text>`;
+  dg += `<text x="${(w - padR + 4).toFixed(1)}" y="${(dh - 2).toFixed(1)}"
+      font-size="9" fill="var(--muted)">${dMax ? '-' +
+      Math.round(dMax).toLocaleString() : ''}</text>`;
+  const dPane = `<svg width="${w}" height="${dh}"
+      style="display:block">${dg}</svg>`;
+
   /* Pivot marks: a caret above each swing high, below each swing low.
      Only SETTLED ones arrive here -- the server withholds anything in
      the last few bars, because the next bar can take a high out and
@@ -9981,6 +10137,31 @@ function ofiChart(d, w, h) {
              font-size="9" fill="${col}">${tag}</text>`;
   }
 
+  /* LEVELS FROM THE TARGETS ABOVE THIS ONE, drawn fainter and labelled
+     with the target they came from.
+
+     A swing on the 2,000 chart took eight times the imbalance to build
+     as one on 250, and from inside the 250 chart it cannot be seen at
+     all. These have no column here -- a price is comparable across
+     targets, a bar index is not -- so they run edge to edge. Two
+     targets up, two levels each, because every target at once is the
+     grid this is all trying to avoid. */
+  for (const L of (d && d.higher_levels) || []) {
+    const yy = y(L.price);
+    if (yy < padT || yy > padT + ih) continue;
+    const col = L.kind === 'high' ? '#e8c46a' : '#6fb6d6';
+    pv += rail(padL, xEdge, yy, col, 0.9, 0.3,
+               L.state === 'untested' ? '2,5' : '');
+    /* Labelled on the LEFT, where this target's own levels are not.
+       The right margin is already carrying the price axis and four
+       level labels, and a fifth one in the same column would be read
+       as another level of this chart rather than a borrowed one. */
+    pv += `<text x="${(padL + 3).toFixed(1)}" y="${(yy - 3).toFixed(1)}"
+             font-size="8" fill="${col}" opacity="0.7"
+             >${L.price.toFixed(2)} @${L.target >= 1000
+               ? (L.target / 1000) + 'k' : L.target}</text>`;
+  }
+
   /* Price axis on the right, in dollars. Five levels, snapped to the
      tick grid so the labels are prices that can actually print. */
   let ax = '';
@@ -10018,7 +10199,22 @@ function ofiChart(d, w, h) {
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   const nb = bars.length - ba - sa;
-  return `<svg width="${w}" height="${h}" style="display:block">${ax}${g}${pv}</svg>
+  const dLast = all[all.length - 1] || {};
+  const dSum = all.reduce((a, b) => a + (b.delta || 0), 0);
+  const dFlag = all.filter(b => b.delta_agrees === false).length;
+  const deltaLine = `<span class="stamp" style="width:100%">delta &mdash;
+      traded size by the side CME stated, one column per candle${
+      anyPrints ? '' : '; no prints in this window'}
+      &middot; this bar ${dLast.delta > 0 ? '+' : ''}${
+      Math.round(dLast.delta || 0).toLocaleString()} on ${
+      (dLast.trade_count || 0).toLocaleString()} trades
+      &middot; window ${dSum > 0 ? '+' : ''}${Math.round(dSum).toLocaleString()}
+      &middot; <b>${dFlag}</b> ${dFlag === 1 ? 'bar' : 'bars'} where the
+      paid-for flow went against the book that closed it (amber)</span>`;
+
+  return `${dPane}
+    <svg width="${w}" height="${h}" style="display:block">${ax}${g}${pv}</svg>
+    ${deltaLine}
     ${readout}
     <span class="stamp">${d.total.toLocaleString()} bars at target
       ${d.target.toLocaleString()}
@@ -10050,7 +10246,7 @@ function _ofiSave() {
   try {
     localStorage.setItem('liqmap_ofi', JSON.stringify({
       t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm,
-      k: _ofiKeep }));
+      k: _ofiKeep, h: _ofiHigher }));
   } catch (e) { /* private mode, quota, blocked -- not worth a failure */ }
 }
 let _ofiTarget = 250;
@@ -10058,6 +10254,7 @@ let _ofiWindow = 140;      // bars visible -- the zoom
 let _ofiPivot = 5;         // bars to the LEFT a swing must clear
 let _ofiConfirm = 1;       // bars to the RIGHT before it is settled
 let _ofiKeep = 4;          // how many swing levels are carried forward
+let _ofiHigher = 1;        // show levels from the targets above this one
 try {
   const _s = JSON.parse(localStorage.getItem('liqmap_ofi') || '{}');
   if (_s.t) _ofiTarget = _s.t;
@@ -10065,6 +10262,7 @@ try {
   if (_s.p) _ofiPivot = _s.p;
   if (_s.c) _ofiConfirm = _s.c;
   if (_s.k) _ofiKeep = _s.k;
+  if (_s.h !== undefined) _ofiHigher = _s.h;
 } catch (e) { /* nothing saved, or unreadable -- the defaults stand */ }
 
 function ofiSetTarget(v) {
@@ -10096,6 +10294,7 @@ function ofiPan(bars) {
 function ofiSetPivot(v) { _ofiPivot = parseInt(v, 10) || 5; _ofiSave(); ofiTick(); }
 function ofiSetConfirm(v) { _ofiConfirm = parseInt(v, 10) || 1; _ofiSave(); ofiTick(); }
 function ofiSetKeep(v) { _ofiKeep = parseInt(v, 10) || 4; _ofiSave(); ofiTick(); }
+function ofiSetHigher(v) { _ofiHigher = (v === '1' ? 1 : 0); _ofiSave(); ofiTick(); }
 function ofiLive() { _ofiOffset = 0; ofiTick(); }
 function ofiOldest() { _ofiOffset = Math.max(0, _ofiTotal - _ofiWindow); ofiTick(); }
 
@@ -10112,7 +10311,7 @@ async function ofiTick(fromTimer) {
     const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget
       + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
       + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm
-      + '&keep=' + _ofiKeep);
+      + '&keep=' + _ofiKeep + '&higher=' + _ofiHigher);
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; }
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
@@ -10152,7 +10351,12 @@ async function ofiTick(fromTimer) {
         levels forward &middot; a wick through is a touch, only a
         CLOSE through is a break &middot; dashed = not reached yet,
         solid = reached and held, &#10005; = where it was closed
-        through, &#8634; = a break that closed back</span>
+        through, &#8634; = a break that closed back &middot; levels from
+        the bigger targets
+        <select onchange="ofiSetHigher(this.value)"
+          style="margin:0 6px">${[['1', 'shown'], ['0', 'hidden']].map(o =>
+            `<option value="${o[0]}"${(o[0] === '1') === !!d.higher
+              ? ' selected' : ''}>${o[1]}</option>`).join('')}</select></span>
       <span class="stamp" style="width:100%">
         <button class="btn" onclick="ofiOldest()"
           ${d.oldest ? 'disabled' : ''}>&laquo; oldest</button>

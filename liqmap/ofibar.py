@@ -29,9 +29,30 @@ copied. It is the Cont-Kukanov-Stoikov definition and it is already
 exercised by that module's tests; a second copy here would be a
 second thing to keep correct.
 
+THREE COLUMNS, NOT ONE SCORE.
+
+    BOOK    what is RESTING -- limit orders, intent that can still be
+            withdrawn. This is OFI, and it is what closes the bar.
+    PRICE   whether it WORKED -- the path the mid actually took. This
+            is `pai`, and it is what colours the bar.
+    DELTA   who is AGGRESSING -- market orders, intent already paid
+            for. This is `delta`, and it is neither of the other two.
+
+They come apart constantly, and each gap is information: the book can
+be stacked on the bid while every print hits it. Folding them into one
+number destroys exactly what makes them worth having, so they stay
+separate all the way to the chart.
+
+THE AGGRESSOR IS STATED, NOT INFERRED. CME marks the side on every
+print. Most platforms guess it with a tick rule and are wrong on a
+meaningful share of trades, worst precisely when the market is fast.
+Nothing here guesses.
+
 NOTHING HERE PREDICTS. A green bar says buying pressure crossed a line
 you chose. Whether that precedes price is a separate question this
-module does not answer and does not assume.
+module does not answer and does not assume. Delta does not change
+that: it describes the bar more completely, which is not the same as
+saying what the next one does.
 """
 
 from __future__ import annotations
@@ -89,6 +110,11 @@ class OfiBar:
     sell_agg: float = 0.0    # sum of |downward| bid+ask steps
     buy_burst: float = 0.0   # the same over the last BURST_S only
     sell_burst: float = 0.0
+    # Traded size by STATED aggressor, over the whole bar. Volume, not
+    # book size -- these are prints that happened, not orders resting.
+    buy_vol: float = 0.0
+    sell_vol: float = 0.0
+    trade_count: int = 0
 
     @property
     def seconds(self) -> float:
@@ -129,6 +155,50 @@ class OfiBar:
         """The same, over the last BURST_S of the bar only."""
         total = self.buy_burst + self.sell_burst
         return (self.buy_burst / total) if total > 0 else 0.5
+
+    @property
+    def volume(self) -> float:
+        """Traded size in the bar, both sides."""
+        return self.buy_vol + self.sell_vol
+
+    @property
+    def delta(self) -> float:
+        """Buy-aggressed minus sell-aggressed size. The paid-for column.
+
+        Zero means either a balanced bar or an EMPTY one -- a bar built
+        from book updates with no prints in it at all, which happens on
+        quiet stretches and at every target above the smallest. Read it
+        with `trade_count`, never alone.
+        """
+        return self.buy_vol - self.sell_vol
+
+    @property
+    def delta_ratio(self) -> float:
+        """Share of traded size that lifted the offer. 0..1, 0.5 even."""
+        total = self.volume
+        return (self.buy_vol / total) if total > 0 else 0.5
+
+    @property
+    def delta_agrees(self) -> bool:
+        """Did paid-for flow go the same way as the book pressure?
+
+        THE INTERESTING CASE IS WHEN IT DOES NOT, and it is a different
+        disagreement from `agrees`. That one asks whether PRICE followed
+        the book. This asks whether anyone actually PAID to make it
+        happen. A green bar with negative delta is a bid that filled up
+        while prints were hitting it -- size arriving to be sold into.
+
+        A bar with no trades in it agrees by default. There is nothing
+        there to disagree with, and reporting an empty bar as a conflict
+        would put a reading on the chart that no print supports.
+        """
+        if self.trade_count == 0:
+            return True
+        if self.direction == GREEN:
+            return self.delta >= 0
+        if self.direction == RED:
+            return self.delta <= 0
+        return True
 
     @staticmethod
     def _label(ratio: float) -> str:
@@ -187,6 +257,11 @@ class OfiBar:
                 "price_agg_burst": round(self.pai_burst, 4),
                 "aggression_burst": self.aggression_burst,
                 "agrees": self.agrees,
+                "buy_vol": self.buy_vol, "sell_vol": self.sell_vol,
+                "trade_count": self.trade_count,
+                "delta": self.delta,
+                "delta_ratio": round(self.delta_ratio, 4),
+                "delta_agrees": self.delta_agrees,
                 "seconds": round(self.seconds, 6)}
 
 
@@ -206,7 +281,8 @@ class OfiBarBuilder:
 
     __slots__ = ("tick", "threshold", "max_s", "min_updates", "max_bars",
                  "_prev", "_acc", "_bar", "bars", "dropped",
-                 "_buy_agg", "_sell_agg", "_steps")
+                 "_buy_agg", "_sell_agg", "_steps",
+                 "_buy_vol", "_sell_vol", "_trades")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
@@ -249,6 +325,14 @@ class OfiBarBuilder:
         self._buy_agg = 0.0
         self._sell_agg = 0.0
         self._steps: deque = deque()
+        # Traded size for the bar in progress. Trades and book updates
+        # arrive on the same record stream and interleave, so these are
+        # builder state rather than bar state -- a print can land before
+        # the first book touch has opened a bar, and it still belongs to
+        # the bar that touch opens.
+        self._buy_vol = 0.0
+        self._sell_vol = 0.0
+        self._trades = 0
 
     def reset(self) -> None:
         self._prev = None
@@ -259,6 +343,9 @@ class OfiBarBuilder:
         self._buy_agg = 0.0
         self._sell_agg = 0.0
         self._steps.clear()
+        self._buy_vol = 0.0
+        self._sell_vol = 0.0
+        self._trades = 0
 
     @property
     def current(self) -> OfiBar | None:
@@ -275,6 +362,42 @@ class OfiBarBuilder:
         be drawn in the colour it currently is."""
         total = self._buy_agg + self._sell_agg
         return (self._buy_agg / total) if total > 0 else 0.5
+
+    @property
+    def live_delta(self) -> float:
+        """Paid-for flow in the bar in progress, so the delta pane can
+        show the forming column live instead of waiting for the close."""
+        return self._buy_vol - self._sell_vol
+
+    @property
+    def live_trades(self) -> int:
+        return self._trades
+
+    def on_trade(self, ts: float, size: float, aggressor: str) -> None:
+        """One print, with the side CME stated. Never closes a bar.
+
+        A TRADE DOES NOT MOVE THE BAR BOUNDARY, and that is deliberate.
+        The boundary is order-flow imbalance and nothing else; letting
+        prints end a bar would make the threshold mean two things at
+        once, and there would be no way to read which of them closed
+        it. Delta rides along inside whatever bar the book has opened.
+
+        A print arriving before the first book touch still belongs to
+        the bar that touch opens, which is why these accumulate on the
+        builder rather than on the bar.
+
+        A size of zero, or a side that is neither, is refused rather
+        than counted as balanced -- a zero would sum like a measurement.
+        """
+        if size <= 0:
+            return
+        if aggressor == "buy":
+            self._buy_vol += float(size)
+        elif aggressor == "sell":
+            self._sell_vol += float(size)
+        else:
+            return
+        self._trades += 1
 
     # ------------------------------------------------------------------
     def on_touch(self, ts: float, touch: Touch) -> OfiBar | None:
@@ -377,6 +500,9 @@ class OfiBarBuilder:
         bar.sell_agg = self._sell_agg
         bar.buy_burst = sum(x[1] for x in self._steps)
         bar.sell_burst = sum(x[2] for x in self._steps)
+        bar.buy_vol = self._buy_vol
+        bar.sell_vol = self._sell_vol
+        bar.trade_count = self._trades
         self.bars.append(bar)
         if len(self.bars) > self.max_bars:
             # Trim in blocks. Popping one per close is O(n) each time
@@ -393,5 +519,12 @@ class OfiBarBuilder:
         self._acc = 0
         self._buy_agg = 0.0
         self._sell_agg = 0.0
+        # Delta resets with everything else. It describes ONE bar's
+        # paid-for flow; carried forward it would be a running total
+        # wearing a per-bar label, which is the same latching failure
+        # the accumulator reset exists to prevent.
+        self._buy_vol = 0.0
+        self._sell_vol = 0.0
+        self._trades = 0
         self._open_bar(ts, mid)
         return bar

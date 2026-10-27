@@ -316,6 +316,18 @@ class Tape:
             # value that round-tripped through a division is a branch
             # that silently takes itself.
             try:
+                # TRADE FIRST, THEN THE BOOK FROM THE SAME RECORD, for
+                # the reason `obstacles` does it below: an MBP-10 trade
+                # record carries the book as it stands AFTER the fill.
+                # Feeding the book first can close the bar on the very
+                # update the print caused, and the print would then be
+                # counted against the next bar -- delta credited to a
+                # bar that had not started when it happened.
+                if t is not None:
+                    _ag = t.aggressor
+                    _sz = float(t.sz)
+                    for _b in self.ofibars.values():
+                        _b.on_trade(float(t.ts), _sz, _ag)
                 lv = dbn._get(rec, "levels")
                 if lv:
                     l0 = lv[0]
