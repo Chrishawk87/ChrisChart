@@ -123,19 +123,22 @@ class TestTheCallIsMadeInsideTheBar:
         assert rows[0]["bar_close"] == 10.0
         assert rows[0]["call_ts"] == 1234.5
 
-    def test_the_builder_latches_it_at_the_first_agreement(self):
+    def test_the_builder_records_it_when_the_imbalance_crosses(self):
         from liqmap.ofibar import OfiBarBuilder
         base = 7_700 * 10 ** 9
-        b = OfiBarBuilder(tick_size=0.25, threshold=250, max_s=900.0,
-                          min_updates=2)
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=900.0,
+                          min_updates=2, call_level=500)
         b.on_book(0.0, base, 100, base + RAW, 100)
         assert b.live_call[0] == ""
-        for i in range(1, 30):
+        sz = 100
+        for i in range(1, 200):
+            sz += 60
             b.on_trade(i * 0.01, 8, "buy", base + RAW)
-            b.on_book(i * 0.01, base, 100 + i * 30, base + RAW, 100)
-        assert b.bars
-        assert b.bars[0].call_side == A.UP
-        assert b.bars[0].call_px > 0
+            b.on_book(i * 0.01, base, sz, base + RAW, 100)
+        assert b.bars, "the feed should close at least one bar"
+        called = [x for x in b.bars if x.call_side]
+        assert called and called[0].call_side == A.UP
+        assert called[0].call_px > 0
 
     def test_the_call_is_not_latched(self):
         """It was, and that was the bug: a bar whose imbalance, delta
@@ -144,7 +147,7 @@ class TestTheCallIsMadeInsideTheBar:
         from liqmap.ofibar import OfiBarBuilder
         base = 7_700 * 10 ** 9
         b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
-                          min_updates=2, enter_frac=1e-5, hold_frac=2.5e-6)
+                          min_updates=2, call_level=500)
         b.on_book(0.0, base, 100, base + RAW, 100)
         ts, sz = 0.0, 100
         for _ in range(60):                     # sellers first

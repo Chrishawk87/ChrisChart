@@ -601,134 +601,146 @@ class TestTheDeltaColumn:
 RAW = 250_000_000          # one ES tick in raw feed units
 
 
-class TestTheRunningCall:
-    """Re-read on every update, never latched.
+class TestTheImbalanceIsTheTrigger:
+    """The imbalance alone, past a level, in contracts.
 
     In order of how badly each would mislead:
 
       a latched call. A bar at target 2,000 runs for minutes, and a
-      call that fires once reports DOWN on a bar whose imbalance,
-      delta and body all went up. That is not a stale reading, it is a
-      false one, and it is what the chart was doing
+      call that fires once reports DOWN on a bar whose imbalance went
+      on to go up. Not a stale reading, a false one
 
-      a call that survives the two disagreeing. Hysteresis on the gate
-      is what stops chatter; hysteresis on the AGREEMENT would keep
-      saying up while delta sells, which is the state the whole rule
-      exists to refuse
+      delta still gating it. It is measured, drawn and carried -- and
+      it is not part of the trigger. A call withheld because the
+      prints disagreed would be a different rule wearing this one's
+      name
 
-      an observation that outlives its bar. The bar is the horizon
+      a call that survives the imbalance coming back through the
+      level. That return IS the reversal
+
+      the level treated as a share of the target. It is contracts, and
+      it means the same number on every rung
     """
 
-    def _b(self, threshold=2000, **kw):
-        return OfiBarBuilder(tick_size=0.25, threshold=threshold,
-                             max_s=1e9, min_updates=2, max_bars=10 ** 7,
-                             **kw)
-
-    def _one_bar(self):
-        """A bar large enough to hold a whole reversal, with the gates
-        scaled down to match. Otherwise the bar closes in between and
-        a latched call would be cleared by the close rather than by
-        the code under test."""
+    def _one_bar(self, level=500):
+        """A bar large enough to hold a whole reversal."""
         return OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
                              min_updates=2, max_bars=10 ** 7,
-                             enter_frac=1e-5, hold_frac=2.5e-6,
-                             delta_frac=0.10)
+                             call_level=level)
 
-    def _drive(self, b, n, side, bid, start_ts=0.0, step=0):
-        """Push the book one way and trade that way."""
-        ts = start_ts
-        sz = 100
-        for i in range(n):
+    def _push(self, b, n, side, bid, ts=0.0, sz=100):
+        """Drive the book one way, and the prints with it."""
+        for _ in range(n):
             ts += 0.01
             sz += 60
-            if step and i % step == 0:
-                bid += RAW if side == "buy" else -RAW
             b.on_trade(ts, 40, side, bid if side == "sell" else bid + RAW)
             if side == "buy":
                 b.on_book(ts, bid, sz, bid + RAW, 100)
             else:
                 b.on_book(ts, bid, 100, bid + RAW, sz)
-        return ts, bid
+        return ts, sz
 
-    def test_it_reverses_inside_one_bar(self):
-        """The bug exactly: it said DOWN, the bar went on to do the
-        opposite, and it never took the call back. One bar throughout,
-        so nothing but the code under test can clear it."""
+    def test_nothing_is_called_below_the_level(self):
         b = self._one_bar()
         base = 7_700 * 10 ** 9
         b.on_book(0.0, base, 100, base + RAW, 100)
-        ts, bid = self._drive(b, 60, "sell", base)
-        assert b.live_call[0] == "down"
-        assert len(b.bars) == 0, "it must all be one bar"
-        ts, bid = self._drive(b, 400, "buy", bid, ts)
-        assert len(b.bars) == 0, "still one bar"
-        assert b.live_call[0] == "up", "it never took the down call back"
-        assert len(b.live_episodes) >= 2
-
-    def test_a_latched_call_is_what_this_replaced(self):
-        """Stated so nobody puts the latch back: the first and last
-        observations of that bar point opposite ways."""
-        b = self._one_bar()
-        base = 7_700 * 10 ** 9
-        b.on_book(0.0, base, 100, base + RAW, 100)
-        ts, bid = self._drive(b, 60, "sell", base)
-        ts, bid = self._drive(b, 400, "buy", bid, ts)
-        eps = b.live_episodes
-        assert eps[0].side == "down" and eps[-1].side == "up"
-
-    def test_an_up_call_ends_when_the_prints_turn(self):
-        """Hysteresis holds the GATE, never the agreement. Delta
-        turning against an up call ends it at once."""
-        b = self._one_bar()
-        base = 7_700 * 10 ** 9
-        b.on_book(0.0, base, 100, base + RAW, 100)
-        ts, bid = self._drive(b, 60, "buy", base)
-        assert b.live_call[0] == "up"
-        # Book keeps leaning bid; the prints turn around hard.
-        sz = 4000
-        for i in range(300):
-            ts += 0.01
-            sz += 60
-            b.on_trade(ts, 400, "sell", bid)
-            b.on_book(ts, bid, sz, bid + RAW, 100)
-        assert b.live_call[0] == "", "delta turned and the up call stood"
-
-    def test_a_down_call_ends_when_the_prints_turn(self):
-        """The mirror, and it needs its own test: the two sides are
-        two branches, and a change to one does not touch the other."""
-        b = self._one_bar()
-        base = 7_700 * 10 ** 9
-        b.on_book(0.0, base, 100, base + RAW, 100)
-        ts, bid = self._drive(b, 60, "sell", base)
-        assert b.live_call[0] == "down"
-        # Book keeps leaning offer; the prints turn around hard.
-        sz = 4000
-        for i in range(300):
-            ts += 0.01
-            sz += 60
-            b.on_trade(ts, 400, "buy", bid + RAW)
-            b.on_book(ts, bid, 100, bid + RAW, sz)
-        assert len(b.bars) == 0, "it must all be one bar"
-        assert b.live_call[0] == "", "delta turned and the down call stood"
-
-    def test_hysteresis_is_on_the_gate_not_the_agreement(self):
-        src = (ROOT / "liqmap" / "ofibar.py").read_text()
-        assert "CALL_ENTER_FRAC" in src and "CALL_HOLD_FRAC" in src
-        i = src.index("CALL_ENTER_FRAC = ")
-        assert "never on the agreement" in src[max(0, i - 900):i]
-
-    def test_a_tiny_imbalance_is_not_a_direction(self):
-        b = self._b(threshold=2000)
-        base = 7_700 * 10 ** 9
-        b.on_book(0.0, base, 100, base + RAW, 100)
-        b.on_trade(0.01, 400, "buy", base + RAW)
-        b.on_book(0.01, base, 110, base + RAW, 100)      # +10 of 2,000
+        b.on_book(0.01, base, 400, base + RAW, 100)      # +300 of 500
+        assert b.accumulated < 500
         assert b.live_call[0] == ""
 
-    def test_the_gates_are_arguments(self):
-        """They were set against a book noisier than a real one."""
-        b = self._b(enter_frac=0.5, hold_frac=0.4, delta_frac=0.3)
-        assert b._min_acc == 1000 and b._hold_acc == 800
+    def test_the_level_is_contracts_not_a_share_of_the_target(self):
+        for target in (1000, 2000, 10 ** 7):
+            b = OfiBarBuilder(tick_size=0.25, threshold=target,
+                              call_level=500)
+            assert b.call_level == 500
+
+    def test_a_buy_is_called_at_the_level(self):
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 700, base + RAW, 100)      # +600
+        assert b.accumulated >= 500
+        assert b.live_call[0] == "up"
+
+    def test_a_sell_is_called_at_the_mirror(self):
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 100, base + RAW, 700)      # -600
+        assert b.live_call[0] == "down"
+
+    def test_coming_back_through_the_level_is_the_reversal(self):
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 700, base + RAW, 100)
+        assert b.live_call[0] == "up"
+        b.on_book(0.02, base, 500, base + RAW, 100)      # back under +500
+        assert b.accumulated < 500
+        assert b.live_call[0] == "", "it held a call it had come back from"
+        assert b.live_episodes[-1].end == "reversal"
+
+    def test_it_cannot_reverse_before_it_has_been_reached(self):
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        for px in (300, 200, 400, 100):
+            b.on_book(0.01, base, px, base + RAW, 100)
+        assert b.live_episodes == [], "nothing was ever called"
+
+    def test_it_reverses_inside_one_bar(self):
+        """The bug it replaced: it said one thing and never took it
+        back. One bar throughout, so nothing but the rule can clear
+        it."""
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        ts, sz = self._push(b, 60, "sell", base)
+        assert b.live_call[0] == "down"
+        assert len(b.bars) == 0, "it must all be one bar"
+        ts, sz = self._push(b, 400, "buy", base, ts)
+        assert len(b.bars) == 0, "still one bar"
+        assert b.live_call[0] == "up", "it never took the down call back"
+        eps = b.live_episodes
+        assert len(eps) >= 2
+        assert eps[0].side == "down" and eps[-1].side == "up"
+
+    def test_delta_does_not_gate_it(self):
+        """It is measured, drawn and carried. It is not the trigger.
+
+        Prints hammering the other way while the book holds its lean
+        used to end the call. Under this rule it does not, and that is
+        the change."""
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        ts, sz = self._push(b, 60, "buy", base)
+        assert b.live_call[0] == "up"
+        for _ in range(300):
+            ts += 0.01
+            sz += 60
+            b.on_trade(ts, 400, "sell", base)            # prints turn hard
+            b.on_book(ts, base, sz, base + RAW, 100)     # book does not
+        assert b.live_call[0] == "up", "delta ended a call it does not gate"
+        assert b.live_delta < 0, "the prints really did turn"
+
+    def test_the_level_is_an_argument(self):
+        b = self._one_bar(level=1200)
+        assert b.call_level == 1200
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 700, base + RAW, 100)      # +600, under 1200
+        assert b.live_call[0] == ""
+
+    def test_a_level_past_the_target_can_never_fire(self):
+        """The bar ends when the imbalance crosses the target, so the
+        accumulator cannot travel past it. An empty table there is
+        arithmetic, not the market."""
+        for target, want in ((125, False), (250, False), (500, False),
+                             (1000, True), (2000, True)):
+            b = OfiBarBuilder(tick_size=0.25, threshold=target,
+                              call_level=500)
+            assert b.reachable() is want, target
 
 
 class TestObservationsInsideTheBar:
@@ -757,7 +769,7 @@ class TestObservationsInsideTheBar:
             for e in bar.episodes:
                 assert e.ts0 >= bar.ts_open - 1e-9
                 assert e.ts_end <= bar.ts_close + 1e-9
-                assert e.end in ("flip", "lost", "bar")
+                assert e.end in ("flip", "reversal", "bar")
 
     def test_an_open_observation_is_closed_at_the_bar(self):
         b = self._run()

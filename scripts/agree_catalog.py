@@ -53,7 +53,7 @@ TICK = 0.25
 
 
 def build(paths: list[str], targets: list[int], limit: int = 0,
-          gates: tuple = (0.20, 0.05, 0.10)):
+          level: int = 500):
     """One pass over the files, feeding every target at once."""
     import databento as db
 
@@ -61,8 +61,7 @@ def build(paths: list[str], targets: list[int], limit: int = 0,
 
     builders = {t: OfiBarBuilder(tick_size=TICK, threshold=t, max_s=900.0,
                                  min_updates=2, max_bars=10_000_000,
-                                 enter_frac=gates[0], hold_frac=gates[1],
-                                 delta_frac=gates[2])
+                                 call_level=level)
                 for t in targets}
     n = 0
     for path in paths:
@@ -117,8 +116,7 @@ def show_observations(target: int, bars) -> None:
           + ", ".join(f"{v:,} {k}" for k, v in t["ends"].items()) + ".")
     if med < 20:
         print("  THAT IS TOO SHORT TO TRAVEL TWO POINTS. The table above is")
-        print("  measuring the entry gate, not the rule. Raise"
-              " --enter-frac and")
+        print("  measuring the call level, not the rule. Raise --level and")
         print("  run it again before reading anything into those"
               " percentages.")
     print("  BAR ENDED FIRST is not a draw and not a loss -- it is price"
@@ -165,13 +163,9 @@ def main() -> int:
     ap.add_argument("--forward", type=int, nargs="+",
                     default=list(A.HORIZONS))
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--enter-frac", type=float, default=0.20,
-                    help="share of the target the imbalance must reach"
-                         " before it counts as a direction")
-    ap.add_argument("--hold-frac", type=float, default=0.05,
-                    help="and how far it may fall back before it stops")
-    ap.add_argument("--delta-frac", type=float, default=0.10,
-                    help="share of traded volume delta must be to start")
+    ap.add_argument("--level", type=int, default=500,
+                    help="imbalance, in contracts, at which a call is"
+                         " made; it reverses coming back through it")
     ap.add_argument("--out", default="",
                     help="CSV path; defaults to agree_calls_<target>.csv"
                          " beside the first input file")
@@ -182,8 +176,16 @@ def main() -> int:
     print(f"\nAGREEMENT CATALOGUE   targets {targets}   "
           f"horizons {list(horizons)}")
     print("  building bars...", flush=True)
-    builders = build(a.files, targets, a.limit,
-                     (a.enter_frac, a.hold_frac, a.delta_frac))
+    unreachable = [t for t in targets if t <= a.level]
+    if unreachable:
+        print(f"\n  NOTE: a bar ends when the imbalance crosses its"
+              f" target, so the")
+        print(f"  accumulator never travels past it. At target(s)"
+              f" {unreachable} a")
+        print(f"  {a.level}-contract call can never fire, and an empty"
+              f" table there is")
+        print(f"  the arithmetic rather than the market.")
+    builders = build(a.files, targets, a.limit, a.level)
 
     base = Path(a.files[0]).resolve().parent
     for t in targets:

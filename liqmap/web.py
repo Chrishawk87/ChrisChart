@@ -6419,6 +6419,8 @@ def create_app() -> FastAPI:
                 "dropped": getattr(b, "dropped", 0),
                 "at_live": off == 0,
                 "oldest": off >= max(0, total - n),
+                "call_level": b.call_level,
+                "reachable": b.reachable(),
                 "pivot_n": pv, "confirm_n": cf,
                 "traded_bars": sum(1 for x in window if x.traded),
                 "keep_n": keep_n, "levels": lvls,
@@ -10317,18 +10319,21 @@ function ofiChart(d, w, h) {
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   const nb = bars.length - ba - sa;
-  /* THE RUNNING CALL, re-read on every update rather than latched.
+  /* THE CALL: THE IMBALANCE, PAST A LEVEL, AND NOTHING ELSE.
 
-     A bar at target 2,000 runs for minutes, and what it is doing at
-     the start is routinely not what it is doing at the end. A call
-     that fires once and sticks reports DOWN on a bar whose imbalance,
-     delta and body all went up -- which is simply false, and was.
+     Past +level it is up, past -level it is down, and between them
+     there is no call. Coming back through the level is the reversal,
+     and it cannot happen before the level was reached because there
+     was nothing to reverse.
 
-     SAYING NOTHING IS A READING. When imbalance and delta disagree
-     there is no call, and the line says which way each of them is
-     pointing so the disagreement is visible rather than hidden behind
-     a blank. */
+     Delta is still measured, still drawn in the pane above and still
+     in the data. It does not gate this.
+
+     Re-read on every update, never latched: a bar at target 2,000
+     runs for minutes, and a call that fires once reports one thing
+     while the imbalance goes on to do the other. */
   const fm = d && d.forming;
+  const lvl = (d && d.call_level) || 500;
   const obsNow = fm && fm.obs;
   const pointsLine = o => {
     if (!o) return '';
@@ -10342,24 +10347,34 @@ function ofiChart(d, w, h) {
       + ' &middot; ' + s2 + ' &middot; ' + s4;
   };
   let liveCall;
-  if (fm && (fm.call_side === 'up' || fm.call_side === 'down')) {
+  if (d && d.reachable === false) {
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
+      + '<b class="short">NO CALL IS POSSIBLE AT THIS TARGET.</b> A bar '
+      + 'ends when the imbalance crosses ' + d.target.toLocaleString()
+      + ', so it can never reach ' + lvl.toLocaleString()
+      + '. Nothing below is the market; it is the arithmetic. Use a '
+      + 'target above ' + lvl.toLocaleString() + '.</span>';
+  } else if (fm && (fm.call_side === 'up' || fm.call_side === 'down')) {
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; <b class="'
       + (fm.call_side === 'up' ? 'long">UP' : 'short">DOWN')
       + '</b> right now &middot; imbalance ' + (fm.ofi > 0 ? '+' : '')
-      + (fm.ofi || 0).toLocaleString() + ' and delta '
-      + (fm.delta > 0 ? '+' : '') + Math.round(fm.delta || 0).toLocaleString()
-      + ' agree' + pointsLine(obsNow)
+      + (fm.ofi || 0).toLocaleString() + ', past '
+      + (fm.call_side === 'up' ? '+' : '-') + lvl.toLocaleString()
+      + ' &middot; it reverses if it comes back through '
+      + (fm.call_side === 'up' ? '+' : '-') + lvl.toLocaleString()
+      + pointsLine(obsNow)
       + ' &middot; ' + (fm.obs_so_far || 0) + ' so far this bar</span>';
   } else if (fm) {
-    const oi = fm.ofi || 0, dl = fm.delta || 0;
-    const dis = (oi > 0 && dl < 0) || (oi < 0 && dl > 0);
+    const oi = fm.ofi || 0;
+    const away = (oi >= 0 ? lvl - oi : lvl + oi);
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
       + '<b>NO CALL</b> &middot; imbalance ' + (oi > 0 ? '+' : '')
-      + oi.toLocaleString() + ' points ' + (oi > 0 ? 'up' : oi < 0 ? 'down' : 'nowhere')
-      + ', delta ' + (dl > 0 ? '+' : '') + Math.round(dl).toLocaleString()
-      + ' points ' + (dl > 0 ? 'up' : dl < 0 ? 'down' : 'nowhere')
-      + ' &middot; ' + (dis ? 'they disagree, so there is nothing to call'
-                            : 'neither has committed far enough yet')
+      + oi.toLocaleString() + ', inside &plusmn;' + lvl.toLocaleString()
+      + ' &middot; ' + Math.round(away).toLocaleString() + ' from a '
+      + (oi >= 0 ? 'buy' : 'sell')
+      + ' &middot; delta ' + (fm.delta > 0 ? '+' : '')
+      + Math.round(fm.delta || 0).toLocaleString()
+      + ', which does not gate this'
       + ' &middot; ' + (fm.obs_so_far || 0) + ' observation'
       + ((fm.obs_so_far === 1) ? '' : 's') + ' so far this bar</span>';
   } else {
@@ -10454,21 +10469,23 @@ function ofiObs(d) {
     + '<th style="text-align:right">ever resolved</th></tr>'
     + body + '</table>'
     + '<span class="stamp" style="width:100%">An observation runs from '
-    + 'the moment imbalance and delta agree until they stop, reverse, '
-    + 'or the bar ends. Nothing outlives its bar. BAR ENDED FIRST is '
+    + 'the moment the imbalance passes the level until it comes back '
+    + 'through it, crosses to the other side, or the bar ends. Nothing '
+    + 'outlives its bar. BAR ENDED FIRST is '
     + 'not a draw and not a loss &mdash; it is price never getting '
     + 'that far either way, and at four points it is usually most of '
     + 'the sample.</span>'
     + '<span class="stamp" style="width:100%"'
     + (thin ? ' ><b class="short">Median observation is ' + med
         + ' updates long.</b> That is too short to travel two points, '
-        + 'so the table above is measuring the gate and not the rule. '
-        + 'The entry gate wants raising.'
+        + 'so the table above is measuring the level and not the rule. '
+        + 'The call level wants raising.'
       : '>Median observation is ' + med + ' updates long.')
     + ' They ended: ' + Object.keys(o.ends).map(k =>
-        o.ends[k].toLocaleString() + ' ' + (k === 'lost'
-          ? 'when the two stopped agreeing' : k === 'flip'
-          ? 'by reversing' : k === 'bar' ? 'at the bar close' : k)
+        o.ends[k].toLocaleString() + ' ' + (k === 'reversal'
+          ? 'by coming back through the level' : k === 'flip'
+          ? 'by crossing straight to the other side'
+          : k === 'bar' ? 'at the bar close' : k)
       ).join(', ') + '.</span>';
 }
 

@@ -1207,8 +1207,9 @@ class TestTheRunningCallOnScreen:
 
     def test_the_builder_re_reads_rather_than_latching(self):
         src = (ROOT / "liqmap" / "ofibar.py").read_text()
-        assert "A RUNNING DETERMINATION, NOT A LATCH" in src
+        assert "THE IMBALANCE IS THE SIGNAL, ON ITS OWN." in src
         assert "if _side != self._c_side:" in src
+        assert "stateless" in src
 
     def test_the_route_sends_the_observation_in_progress(self):
         r = self._route()
@@ -1217,10 +1218,12 @@ class TestTheRunningCallOnScreen:
         assert '"obs_so_far": len(b.live_episodes)' in r
 
     def test_the_live_line_can_say_nothing(self):
-        """Saying nothing is a reading, not a gap."""
+        """Saying nothing is a reading, not a gap: inside the band
+        there is no call, and the line says how far outside it would
+        have to go."""
         c = self._chart()
-        assert "NO CALL" in c
-        assert "they disagree, so there is nothing to call" in c
+        assert "<b>NO CALL</b>" in c
+        assert "inside &plusmn;" in c
 
     def test_the_live_line_shows_both_numbers_either_way(self):
         c = self._chart()
@@ -1253,7 +1256,71 @@ class TestTheRunningCallOnScreen:
         i = WEB.index("function ofiObs")
         blk = WEB[i:i + 4000]
         assert "const thin = med < 20" in blk
-        assert "measuring the gate and not the rule" in blk
+        assert "measuring the level and not the rule" in blk
 
     def test_nothing_outlives_its_bar_is_stated_on_screen(self):
         assert "Nothing outlives its bar" in WEB
+
+
+class TestTheCallLevelOnScreen:
+    """The imbalance past a level, and the cases where it cannot be.
+
+    In order of how badly each would mislead:
+
+      an empty table at a target where the level is unreachable. A bar
+      ends when the imbalance crosses its target, so on a 250-contract
+      bar a 500-contract call never fires -- and a blank table there
+      reads as "the market did nothing" rather than "this cannot
+      happen"
+
+      the panel still saying delta gates the call. It does not any
+      more, and a line that says it does describes a different rule
+
+      the level reported as a share of the target rather than in
+      contracts
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTimer")]
+
+    def test_the_route_sends_the_level_and_whether_it_can_be_reached(self):
+        r = self._route()
+        assert '"call_level": b.call_level' in r
+        assert '"reachable": b.reachable()' in r
+
+    def test_an_unreachable_level_is_said_out_loud(self):
+        c = self._chart()
+        assert "NO CALL IS POSSIBLE AT THIS TARGET" in c
+        assert "it is the arithmetic" in c
+
+    def test_the_live_line_names_the_level_both_ways(self):
+        c = self._chart()
+        assert "past '" in c or "', past '" in c
+        assert "it reverses if it comes back through" in c
+
+    def test_the_no_call_line_says_how_far_away_it_is(self):
+        c = self._chart()
+        blk = c[c.index("<b>NO CALL</b>"):][:700]
+        assert "from a " in blk and "away" in c
+
+    def test_the_panel_says_delta_does_not_gate_it(self):
+        c = self._chart()
+        assert "which does not gate this" in c
+
+    def test_the_observation_wording_matches_the_rule(self):
+        i = WEB.index("function ofiObs")
+        blk = WEB[i:i + 4500]
+        assert "passes the level until it comes back" in blk
+        assert "by coming back through the level" in blk
+        assert "stopped agreeing" not in blk
+
+    def test_the_catalogue_takes_the_level_and_warns(self):
+        src = (ROOT / "scripts" / "agree_catalog.py").read_text()
+        assert '"--level"' in src
+        assert "can never fire" in src
+        assert "enter_frac" not in src

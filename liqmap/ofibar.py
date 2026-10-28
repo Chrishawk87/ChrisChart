@@ -98,34 +98,21 @@ BALANCED_FLOW = "BALANCED_PRICE_FLOW"
 PAI_BUY = 0.70
 PAI_SELL = 0.30
 
-# A bar must have traded at least this much before its delta is
-# allowed to speak. Below it one contract flips the sign.
-CALL_MIN_VOL = 10.0
-
-# How far the running imbalance must travel toward closing the bar
-# before it counts as a direction, and how far back it must fall
-# before it stops counting. Two numbers, not one, and that gap is the
-# whole of the design:
+# THE CALL LEVEL, in contracts of running imbalance.
 #
-# A single gate sits at one level and the accumulator crosses it back
-# and forth on consecutive updates. Measured on a book at target
-# 2,000, a single 5% gate produced 64,505 observations across 9,799
-# bars -- six and a half per bar, most of them three updates long,
-# describing nothing at all. The call has to commit before it speaks
-# and give up ground before it stops.
+# The imbalance is the signal, on its own. At +500 the call is up, at
+# -500 it is down, and between the two there is no call at all. A call
+# ends when the imbalance comes back through the level it was made at,
+# which is the reversal; it cannot reverse before it has been reached,
+# because there was nothing to reverse.
 #
-# This is hysteresis on the GATE, never on the agreement. Imbalance
-# and delta opposing each other ends the call at once, at any level:
-# a call in that state is false and no amount of inertia excuses it.
-CALL_ENTER_FRAC = 0.20
-CALL_HOLD_FRAC = 0.05
-
-# Delta gets the same two numbers, as a share of what the bar has
-# traded. A net of one lot on four hundred is not a direction, it is
-# the sign of the last print, and it changes on the next one. To start
-# speaking delta must be this share of volume; to keep speaking it
-# need only still be on the same side.
-CALL_DELTA_FRAC = 0.10
+# ABSOLUTE CONTRACTS, NOT A SHARE OF THE TARGET. The number means the
+# same thing on every rung of the ladder, which is the point of it --
+# but a bar CLOSES when the imbalance crosses its target, so the
+# accumulator cannot travel past that. On a 250-contract bar a
+# 500-contract call can never fire, and the reading has to say so
+# rather than show an empty table. `reachable()` is that test.
+CALL_LEVEL = 500
 
 # One ES point in raw feed units. A point is four ticks.
 POINT = 1_000_000_000
@@ -164,7 +151,10 @@ class Episode:
     updates: int = 0
     mfe: float = 0.0            # furthest it went the call's way
     mae: float = 0.0            # furthest it went against, as a positive
-    end: str = ""               # "flip" | "lost" | "bar"
+    # "reversal" -- came back through the level
+    # "flip"     -- went straight through to the other side
+    # "bar"      -- the bar closed under it
+    end: str = ""
     first: dict = field(default_factory=dict)   # points -> "win" | "loss"
 
     @property
@@ -424,14 +414,12 @@ class OfiBarBuilder:
                  "_buy_vol", "_sell_vol", "_trades",
                  "_t_hi", "_t_lo", "_t_last",
                  "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
-                 "_delta_frac", "_ep", "_eps")
+                 "_level", "_ep", "_eps")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
                  max_bars: int = 20_000,
-                 enter_frac: float = CALL_ENTER_FRAC,
-                 hold_frac: float = CALL_HOLD_FRAC,
-                 delta_frac: float = CALL_DELTA_FRAC) -> None:
+                 call_level: int = CALL_LEVEL) -> None:
         if tick_size <= 0:
             raise ValueError("tick_size must be positive")
         if threshold < 1:
@@ -494,13 +482,7 @@ class OfiBarBuilder:
         # How far off zero the running imbalance must be before it
         # counts as a direction at all. Scaled to the target, so the
         # same rule means the same thing on every rung of the ladder.
-        # The defaults are a starting point, not a measurement: they
-        # were set against a book far noisier than a real one. Whether
-        # they chatter on the actual tape is a question the actual tape
-        # answers, so they are arguments.
-        self._min_acc = max(1, int(self.threshold * float(enter_frac)))
-        self._hold_acc = max(1, int(self.threshold * float(hold_frac)))
-        self._delta_frac = float(delta_frac)
+        self._level = max(1, int(call_level))
         self._ep: Episode | None = None
         self._eps: list = []
 
@@ -550,6 +532,20 @@ class OfiBarBuilder:
     @property
     def live_trades(self) -> int:
         return self._trades
+
+    @property
+    def call_level(self) -> int:
+        return self._level
+
+    def reachable(self) -> bool:
+        """Can the imbalance reach the call level inside a bar?
+
+        It cannot travel past the target, because crossing the target
+        is what ends the bar. So on a 250-contract bar a 500-contract
+        call never fires, and an empty table there is the arithmetic
+        rather than the market.
+        """
+        return self._level < self.threshold
 
     @property
     def live_call(self) -> tuple[str, float, float]:
@@ -679,43 +675,27 @@ class OfiBarBuilder:
             bar.low = mid
         bar.close = mid
         bar.ts_close = ts
-        # THE CALL IS A RUNNING DETERMINATION, NOT A LATCH.
+        # THE IMBALANCE IS THE SIGNAL, ON ITS OWN.
         #
-        # Re-read on every book update, because a bar at the larger
-        # targets runs for minutes and the thing it is doing at the
-        # start is routinely not the thing it is doing at the end. A
-        # call that fires once and sticks reports DOWN on a bar whose
-        # imbalance, delta and body all went up, which is simply false.
+        # Past +level the call is up, past -level it is down, and
+        # between them there is no call. That is the whole of it --
+        # stateless, so the call is always exactly what the imbalance
+        # says right now and never a memory of what it said earlier.
         #
-        # AND IT HAS TO BE ABLE TO SAY NOTHING. When imbalance and
-        # delta disagree there is no call -- not the previous one, not
-        # a weaker version of it, nothing. Half the updates in a bar
-        # are in that state and reporting a direction through them is
-        # the whole of the error.
-        _v = self._buy_vol + self._sell_vol
-        _d = self._buy_vol - self._sell_vol
+        # Which also gives the reversal for free: coming back through
+        # the level ends the call, and it cannot happen before the
+        # level was reached because there was no call to end.
+        #
+        # DELTA DOES NOT GATE THIS. It is still measured, still drawn
+        # and still carried in the data -- it is simply not part of
+        # the trigger.
         _side = ""
-        if _v >= CALL_MIN_VOL:
-            # Already speaking: it keeps speaking while the imbalance
-            # holds the ground it gave AND delta still agrees. Delta
-            # turning against it ends the call immediately, whatever
-            # the imbalance is doing -- that is the state he means by
-            # false, and hysteresis must never reach it.
-            if self._c_side == "up" and self._acc >= self._hold_acc and _d > 0:
-                _side = "up"
-            elif (self._c_side == "down" and self._acc <= -self._hold_acc
-                  and _d < 0):
-                _side = "down"
-            else:
-                # Silent, or just lost it: it has to commit again, and
-                # both inputs have to mean something to do that.
-                _dgate = _v * self._delta_frac
-                if self._acc >= self._min_acc and _d >= _dgate:
-                    _side = "up"
-                elif self._acc <= -self._min_acc and _d <= -_dgate:
-                    _side = "down"
+        if self._acc >= self._level:
+            _side = "up"
+        elif self._acc <= -self._level:
+            _side = "down"
         if _side != self._c_side:
-            self._end_episode("flip" if _side else "lost", ts, mid)
+            self._end_episode("flip" if _side else "reversal", ts, mid)
             self._c_side = _side
             self._c_px = mid if _side else 0.0
             self._c_ts = ts if _side else 0.0
