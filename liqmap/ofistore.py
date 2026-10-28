@@ -159,7 +159,9 @@ def _eps_in(raw) -> list:
         try:
             first = {int(k): v for k, v in (d.get("first") or {}).items()}
             out.append(Episode(
-                side=str(d.get("side", "")), px0=float(d.get("px0", 0.0)),
+                side=str(d.get("side", "")),
+                level=int(d.get("level", 0) or 0),
+                px0=float(d.get("px0", 0.0)),
                 ts0=float(d.get("ts0", 0.0)),
                 px_end=float(d.get("px_end", 0.0)),
                 ts_end=float(d.get("ts_end", 0.0)),

@@ -1237,7 +1237,9 @@ class TestTheRunningCallOnScreen:
 
     def test_the_route_returns_the_observation_table(self):
         r = self._route()
-        assert "_ag.observation_table(s_bars, points=(1, 2, 3, 4))" in r
+        assert "_ag.observation_table(s_bars, points=(1, 2, 3, 4)," in r
+        assert "level=b.call_level)" in r, \
+            "the table must be for one level, not a mixture"
         assert '"obs": obs' in r
 
     def test_the_panel_draws_it_above_the_rest(self):
@@ -1324,3 +1326,80 @@ class TestTheCallLevelOnScreen:
         assert '"--level"' in src
         assert "can never fire" in src
         assert "enter_frac" not in src
+
+
+class TestTheLevelIsSelectable:
+    """100 to 500, changeable while it runs.
+
+    The failure that matters: observations made at one level pooled
+    with observations made at another. The table would be a
+    measurement of neither rule, and nothing on screen would say so.
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_takes_a_level(self):
+        r = self._route()
+        assert "level: int = 0" in r
+        assert "want_level = max(100, min(int(level), 500))" in r
+
+    def test_it_is_applied_to_every_builder(self):
+        """Or the ladder stops being comparable."""
+        r = self._route()
+        assert "for _b in builders.values():" in r
+        assert "_b.set_call_level(want_level)" in r
+
+    def test_an_observation_records_the_level_it_was_made_at(self):
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        i = src.index("class Episode:")
+        assert "level: int = 0" in src[i:i + 1400]
+        assert "level=self._level" in src
+
+    def test_changing_it_abandons_the_observation_in_progress(self):
+        """It was started under a rule that no longer applies."""
+        from liqmap.ofibar import OfiBarBuilder
+        base = 7_700 * 10 ** 9
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                          min_updates=2, call_level=200)
+        b.on_book(0.0, base, 100, base + 250_000_000, 100)
+        b.on_book(0.01, base, 500, base + 250_000_000, 100)
+        assert b.live_call[0] == "up"
+        assert b.set_call_level(400) is True
+        assert b.live_call[0] == ""
+        assert b.live_episodes[-1].end == "level"
+
+    def test_setting_the_same_level_changes_nothing(self):
+        from liqmap.ofibar import OfiBarBuilder
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, call_level=300)
+        assert b.set_call_level(300) is False
+
+    def test_the_table_is_for_one_level_only(self):
+        from liqmap import agree as A
+        from liqmap.ofibar import Episode, OfiBar
+        bar = OfiBar()
+        bar.episodes = [Episode(side="up", level=200, updates=5),
+                        Episode(side="up", level=500, updates=5)]
+        assert A.observation_table([bar], level=200)["observations"] == 1
+        assert A.observation_table([bar], level=500)["observations"] == 1
+        assert A.observation_table([bar])["observations"] == 2
+
+    def test_the_panel_has_the_selector_and_says_why(self):
+        assert "ofiSetLevel" in WEB
+        assert "call the imbalance at" in WEB
+        assert "rather than mixing two" in WEB
+
+    def test_the_choice_is_remembered(self):
+        i = WEB.index("function _ofiSave")
+        blk = WEB[i:WEB.index("async function ofiTick")]
+        assert "lv: _ofiLevel" in blk
+        k = blk.index("function ofiSetLevel")
+        assert "_ofiSave()" in blk[k:k + 200]
+
+    def test_the_sweep_script_exists_and_carries_a_control(self):
+        src = (ROOT / "scripts" / "imbalance_sweep.py").read_text()
+        assert "flipped" in src and "EDGE" in src
+        assert "bar_shape" in src, "it has to explain an empty table"
+        for w in ("def submit(", "def execute(", "def place("):
+            assert w not in src, w

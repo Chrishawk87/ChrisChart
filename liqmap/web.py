@@ -6107,7 +6107,8 @@ def create_app() -> FastAPI:
     def api_ofibars(coin: str = "ES", target: int = 250,
                     bars: int = 140, offset: int = 0,
                     pivot: int = 5, confirm: int = 1,
-                    keep: int = 4, higher: int = 1) -> dict[str, Any]:
+                    keep: int = 4, higher: int = 1,
+                    level: int = 0) -> dict[str, Any]:
         """OFI-closed candles for one target, newest last.
 
         Every target in the ladder is accumulating all the time, so
@@ -6129,6 +6130,15 @@ def create_app() -> FastAPI:
         if not builders:
             return {"ok": False, "why": "the CME engine is not configured",
                     "targets": list(_OFI_LADDER)}
+
+        # THE CALL LEVEL, CHANGEABLE WHILE IT RUNS. Applied to every
+        # builder so the ladder stays comparable, and recorded on each
+        # observation so a change does not turn the table into a
+        # mixture of two rules.
+        if level:
+            want_level = max(100, min(int(level), 500))
+            for _b in builders.values():
+                _b.set_call_level(want_level)
 
         t = int(target)
         if t not in builders:
@@ -6354,7 +6364,8 @@ def create_app() -> FastAPI:
         obs = None
         if len(s_bars) > 20:
             try:
-                obs = _ag.observation_table(s_bars, points=(1, 2, 3, 4))
+                obs = _ag.observation_table(s_bars, points=(1, 2, 3, 4),
+                                            level=b.call_level)
             except Exception:                           # noqa: BLE001
                 obs = None
 
@@ -6420,6 +6431,7 @@ def create_app() -> FastAPI:
                 "at_live": off == 0,
                 "oldest": off >= max(0, total - n),
                 "call_level": b.call_level,
+                "levels": [100, 150, 200, 250, 300, 400, 500],
                 "reachable": b.reachable(),
                 "pivot_n": pv, "confirm_n": cf,
                 "traded_bars": sum(1 for x in window if x.traded),
@@ -10685,7 +10697,7 @@ function _ofiSave() {
   try {
     localStorage.setItem('liqmap_ofi', JSON.stringify({
       t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm,
-      k: _ofiKeep, h: _ofiHigher }));
+      k: _ofiKeep, h: _ofiHigher, lv: _ofiLevel }));
   } catch (e) { /* private mode, quota, blocked -- not worth a failure */ }
 }
 let _ofiTarget = 250;
@@ -10694,6 +10706,7 @@ let _ofiPivot = 5;         // bars to the LEFT a swing must clear
 let _ofiConfirm = 1;       // bars to the RIGHT before it is settled
 let _ofiKeep = 4;          // how many swing levels are carried forward
 let _ofiHigher = 1;        // show levels from the targets above this one
+let _ofiLevel = 500;       // imbalance at which a call is made
 try {
   const _s = JSON.parse(localStorage.getItem('liqmap_ofi') || '{}');
   if (_s.t) _ofiTarget = _s.t;
@@ -10702,6 +10715,7 @@ try {
   if (_s.c) _ofiConfirm = _s.c;
   if (_s.k) _ofiKeep = _s.k;
   if (_s.h !== undefined) _ofiHigher = _s.h;
+  if (_s.lv) _ofiLevel = _s.lv;
 } catch (e) { /* nothing saved, or unreadable -- the defaults stand */ }
 
 function ofiSetTarget(v) {
@@ -10734,6 +10748,7 @@ function ofiSetPivot(v) { _ofiPivot = parseInt(v, 10) || 5; _ofiSave(); ofiTick(
 function ofiSetConfirm(v) { _ofiConfirm = parseInt(v, 10) || 1; _ofiSave(); ofiTick(); }
 function ofiSetKeep(v) { _ofiKeep = parseInt(v, 10) || 4; _ofiSave(); ofiTick(); }
 function ofiSetHigher(v) { _ofiHigher = (v === '1' ? 1 : 0); _ofiSave(); ofiTick(); }
+function ofiSetLevel(v) { _ofiLevel = parseInt(v, 10) || 500; _ofiSave(); ofiTick(); }
 function ofiLive() { _ofiOffset = 0; ofiTick(); }
 function ofiOldest() { _ofiOffset = Math.max(0, _ofiTotal - _ofiWindow); ofiTick(); }
 
@@ -10750,7 +10765,8 @@ async function ofiTick(fromTimer) {
     const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget
       + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
       + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm
-      + '&keep=' + _ofiKeep + '&higher=' + _ofiHigher);
+      + '&keep=' + _ofiKeep + '&higher=' + _ofiHigher
+      + '&level=' + _ofiLevel);
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; }
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
@@ -10782,6 +10798,15 @@ async function ofiTick(fromTimer) {
             `<option value="${k}"${k === d.confirm_n ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
         &middot; dotted carets are not confirmed yet and can vanish</span>
+      <span class="stamp" style="width:100%">call the imbalance at
+        &plusmn;<select onchange="ofiSetLevel(this.value)"
+          style="margin:0 6px">${(d.levels || []).map(k =>
+            `<option value="${k}"${k === d.call_level ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        contracts &middot; a trade closes at 3 points, the opposite
+        level, or the bar &middot; observations are kept per level, so
+        changing this starts a fresh table rather than mixing two
+        rules</span>
       <span class="stamp" style="width:100%">Swings and levels are found
         on the prices that actually TRADED, not on the candle. The
         candle is the midpoint of the quote, and on a one-tick spread a

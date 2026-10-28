@@ -251,7 +251,7 @@ def summary(bars, horizons=HORIZONS, tick: float = 1.0,
 
 # ------------------------------------------- observations inside the bar
 
-def observations(bars) -> list:
+def observations(bars, level: int | None = None) -> list:
     """Every observation across these bars, oldest first.
 
     An observation is one stretch during which the running imbalance
@@ -263,11 +263,14 @@ def observations(bars) -> list:
     """
     out = []
     for b in bars:
-        out.extend(getattr(b, "episodes", ()) or ())
+        for e in (getattr(b, "episodes", ()) or ()):
+            if level is None or getattr(e, "level", 0) == level:
+                out.append(e)
     return out
 
 
-def observation_table(bars, points=(1, 2, 3, 4)) -> dict:
+def observation_table(bars, points=(1, 2, 3, 4),
+                      level: int | None = None) -> dict:
     """Win, loss and unresolved at each distance, plus how it behaved.
 
     UNRESOLVED IS NOT A DRAW AND IT IS NOT A LOSS. It means the bar
@@ -281,7 +284,7 @@ def observation_table(bars, points=(1, 2, 3, 4)) -> dict:
     median is three the table below it is not measuring the rule -- it
     is measuring a gate that is set too low.
     """
-    eps = observations(bars)
+    eps = observations(bars, level)
     n_bars = len(bars)
     rows = []
     for pts in points:
@@ -302,8 +305,11 @@ def observation_table(bars, points=(1, 2, 3, 4)) -> dict:
     return {
         "bars": n_bars, "observations": len(eps),
         "per_bar": round(len(eps) / n_bars, 2) if n_bars else 0.0,
-        "silent_bars": sum(1 for b in bars
-                           if not (getattr(b, "episodes", ()) or ())),
+        "level": level,
+        "silent_bars": sum(
+            1 for b in bars
+            if not [e for e in (getattr(b, "episodes", ()) or ())
+                    if level is None or getattr(e, "level", 0) == level]),
         "median_updates": ups[len(ups) // 2] if ups else 0,
         "ends": ends,
         "up": sum(1 for e in eps if e.side == UP),

@@ -144,6 +144,11 @@ class Episode:
     """
 
     side: str = ""              # "up" or "down"
+    # The level this observation was made at. Recorded because the
+    # level can be changed while the service runs, and a table that
+    # mixed observations from two levels would be a measurement of
+    # neither.
+    level: int = 0
     px0: float = 0.0            # mid when the call started
     ts0: float = 0.0
     px_end: float = 0.0
@@ -172,7 +177,8 @@ class Episode:
         return self.first.get(points, "unresolved")
 
     def as_dict(self) -> dict:
-        return {"side": self.side, "px0": self.px0, "ts0": self.ts0,
+        return {"side": self.side, "level": self.level,
+                "px0": self.px0, "ts0": self.ts0,
                 "px_end": self.px_end, "ts_end": self.ts_end,
                 "updates": self.updates, "mfe": self.mfe, "mae": self.mae,
                 "end": self.end,
@@ -537,6 +543,26 @@ class OfiBarBuilder:
     def call_level(self) -> int:
         return self._level
 
+    def set_call_level(self, level: int) -> bool:
+        """Change the level. Returns True if it actually changed.
+
+        Any observation in progress is abandoned rather than carried
+        over: it was started under a rule that no longer applies, and
+        finishing it under the new one would make it an observation of
+        neither. Closed observations keep the level they were made at,
+        so the table can be read per level instead of being a mixture.
+        """
+        level = max(1, int(level))
+        if level == self._level:
+            return False
+        self._end_episode("level", self._bar.ts_close if self._bar else 0.0,
+                          self._bar.close if self._bar else 0.0)
+        self._level = level
+        self._c_side = ""
+        self._c_px = 0.0
+        self._c_ts = 0.0
+        return True
+
     def reachable(self) -> bool:
         """Can the imbalance reach the call level inside a bar?
 
@@ -743,7 +769,8 @@ class OfiBarBuilder:
         if len(self._eps) >= MAX_EPISODES:
             self._ep = None
             return
-        ep = Episode(side=side, px0=mid, ts0=ts, px_end=mid, ts_end=ts)
+        ep = Episode(side=side, level=self._level, px0=mid, ts0=ts,
+                     px_end=mid, ts_end=ts)
         self._eps.append(ep)
         self._ep = ep
 
