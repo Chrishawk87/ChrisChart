@@ -254,3 +254,181 @@ class TestItDecidesNothing:
     def test_a_null_result_is_reported_as_a_result(self):
         src = (ROOT / "scripts" / "bar_state_study.py").read_text()
         assert "That is a result, not a failure" in src
+
+
+class TestTheThreeConditionRule:
+    """Caret level + candle + delta, and what it scores on nothing.
+
+    In order of how badly each would mislead:
+
+      the level's state read AFTER the bar is applied to it, so the
+      trigger includes the very touch being used as the trigger
+
+      a pivot admitted before its confirmation window closed. On the
+      chart that pivot can still vanish; in a study it is a look-ahead
+      leak wearing a level's name
+
+      calling the rule a finding when a random walk scores the same. A
+      swing low is lower than its neighbours BY DEFINITION, so the bar
+      after one is usually higher -- the rule collects that whether or
+      not the market has anything in it
+    """
+
+    def test_the_walk_lives_in_one_place(self):
+        """The study grades the engine the panel draws, so it imports
+        the walk rather than carrying a copy that can drift."""
+        src = (ROOT / "scripts" / "bar_state_study.py").read_text()
+        i = src.index("def level_walk")
+        body = src[i:src.index("def synthetic_bars")]
+        assert "from liqmap.levels import walk_levels" in body
+        assert "return walk_levels(bars, left, right, keep)" in body
+
+    def test_a_pivot_is_not_used_before_it_is_settled(self):
+        src = (ROOT / "liqmap" / "levels.py").read_text()
+        body = src[src.index("def walk_levels"):]
+        assert "due.setdefault(q.index + right, []).append(q)" in body
+
+    def test_the_level_state_is_read_before_the_bar_is_applied(self):
+        src = (ROOT / "liqmap" / "levels.py").read_text()
+        body = src[src.index("def walk_levels"):]
+        read_at = body.index("status = swing_status")
+        apply_at = body.index("for _, _, lv in live:")
+        assert read_at < apply_at, "the trigger includes its own touch"
+
+    def test_the_walk_is_causal(self):
+        """Truncating the series must not change what earlier bars saw."""
+        bars = S.synthetic_bars(900, 250, seed=11)
+        i1, c1, x1 = S.level_walk(bars, 5, 1, 4)
+        cut = len(bars) - 120
+        i2, c2, x2 = S.level_walk(bars[:cut], 5, 1, 4)
+        n = len(i2)
+        assert n > 50
+        assert i1[:n] == i2[:n]
+        assert x1[:n] == x2[:n], "a later bar changed an earlier reading"
+
+    def test_the_rule_is_the_predicate_it_says_it_is(self):
+        class B:
+            aggression = "BUY_PRICE_AGGRESSIVE"
+            delta = 5.0
+
+        at_low = {"side": "low", "status": "held"}
+        assert S.rule_states(B(), at_low)["rule_triple"] == "long"
+
+        B.delta = -5.0
+        assert S.rule_states(B(), at_low)["rule_triple"] == "none"
+
+        B.delta = 5.0
+        assert S.rule_states(B(), {"side": "", "status": ""}
+                             )["rule_triple"] == "none"
+
+        B.aggression = "BALANCED_PRICE_FLOW"
+        assert S.rule_states(B(), at_low)["rule_triple"] == "none"
+
+    def test_absorption_is_delta_paying_without_the_candle(self):
+        class B:
+            aggression = "BALANCED_PRICE_FLOW"
+            delta = 5.0
+
+        ctx = {"side": "low", "status": "held"}
+        st = S.rule_states(B(), ctx)
+        assert st["rule_absorption"] == "long"
+        assert st["rule_triple"] == "none", "the two must not overlap"
+
+    def test_the_legs_are_measured_alone_as_well(self):
+        class B:
+            aggression = "BALANCED_PRICE_FLOW"
+            delta = 5.0
+
+        st = S.rule_states(B(), {"side": "low", "status": "held"})
+        assert st["leg_at_level"] == "low"
+        assert st["leg_level_delta"] == "long"
+        assert st["leg_level_candle"] == "none"
+
+    def test_the_noise_control_runs_the_real_builder(self):
+        """A baseline built by another route excuses whatever it fails
+        to reproduce."""
+        src = (ROOT / "scripts" / "bar_state_study.py").read_text()
+        i = src.index("def synthetic_bars")
+        body = src[i:src.index("def rule_noise")]
+        assert "from liqmap.ofibar import OfiBarBuilder" in body
+        assert "b.on_trade(" in body and "b.on_book(" in body
+
+    def test_synthetic_bars_carry_traded_prices(self):
+        bars = S.synthetic_bars(400, 250, seed=5)
+        assert len(bars) >= 400
+        assert any(b.traded for b in bars)
+
+    def test_the_rule_is_not_a_finding_on_a_random_walk(self, capsys):
+        """The whole reason the second control exists. Without it this
+        returns half a tick at |z| = 27 on data with nothing in it."""
+        rng = random.Random(12)
+        bars = S.synthetic_bars(30_000, 250, seed=31)
+        idx, closes, ctx = S.level_walk(bars, 5, 1, 4)
+        mv = [(closes[i + 1] - closes[i]) / RAW
+              for i in range(len(closes) - 1)]
+        usable = [bars[idx[i]] for i in range(len(mv))]
+        noise = S.rule_noise(len(bars), 250, 5, 1, 4, 1,
+                             ("rule_triple",), seed=77)
+        labels = [S.rule_states(usable[i], ctx[i])["rule_triple"]
+                  for i in range(len(mv))]
+        res = S.table(labels, mv, rng, 120)
+        S.report("rule_triple", res, 1, 0.4, noise.get("rule_triple", {}))
+        out = capsys.readouterr().out
+        assert "WORTH A LOOK" not in out, out
+        assert "MATCHED BY NOISE" in out, out
+
+    def test_without_the_noise_control_it_would_have_been_a_finding(self):
+        """Stated as a test so nobody quietly removes the control."""
+        rng = random.Random(12)
+        bars = S.synthetic_bars(30_000, 250, seed=31)
+        idx, closes, ctx = S.level_walk(bars, 5, 1, 4)
+        mv = [(closes[i + 1] - closes[i]) / RAW
+              for i in range(len(closes) - 1)]
+        usable = [bars[idx[i]] for i in range(len(mv))]
+        labels = [S.rule_states(usable[i], ctx[i])["rule_triple"]
+                  for i in range(len(mv))]
+        res = S.table(labels, mv, rng, 120)
+        hits = [r for r in res["rows"]
+                if r["enough"] and abs(r["z"]) >= 3.0
+                and abs(r["mean"] - res["base"]) >= 0.4]
+        assert hits, "the shuffle control alone passes this rule"
+
+    def test_the_report_names_the_extremum_bias(self):
+        src = (ROOT / "scripts" / "bar_state_study.py").read_text()
+        assert "lower than its neighbours BY" in src
+        assert "MATCHED BY NOISE" in src
+
+
+class TestTheLoaderCarriesThePrice:
+    """Without it every bar reads as 'no prints', the rule section
+    skips in one line, and the study measures nothing while looking
+    like it ran."""
+
+    def test_the_trade_event_carries_a_raw_price(self):
+        src = (ROOT / "scripts" / "bar_state_study.py").read_text()
+        i = src.index("def iter_records")
+        body = src[i:src.index("def build")]
+        assert 'float(dbn._get(rec, "price", 0) or 0)' in body
+        code = [ln for ln in body.splitlines()
+                if not ln.strip().startswith("#")]
+        assert not any("t.px" in ln for ln in code), \
+            "t.px is dollars; the bar's prices are raw units"
+
+    def test_the_builder_is_given_it(self):
+        src = (ROOT / "scripts" / "bar_state_study.py").read_text()
+        assert "b.on_trade(ev[1], ev[2], ev[3], ev[4])" in src
+
+    def test_a_feed_without_prices_produces_no_traded_bars(self):
+        """The failure this guards against, stated directly."""
+        from liqmap.ofibar import OfiBarBuilder
+        b = OfiBarBuilder(tick_size=0.25, threshold=50, max_s=900.0,
+                          min_updates=2)
+        bid = 7_700 * 10 ** 9
+        b.on_book(0.0, bid, 100, bid + RAW, 100)
+        for i in range(1, 20):
+            b.on_trade(i * 0.01, 5, "buy")          # no px
+            b.on_book(i * 0.01, bid, 100 + i * 40, bid + RAW, 100)
+        assert b.bars
+        assert not any(x.traded for x in b.bars)
+        assert all(x.trade_count > 0 for x in b.bars), \
+            "delta still works; only the traded prices are missing"

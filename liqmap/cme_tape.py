@@ -326,8 +326,14 @@ class Tape:
                 if t is not None:
                     _ag = t.aggressor
                     _sz = float(t.sz)
+                    # THE RAW PRICE OFF THE RECORD, not `t.px`. `t.px`
+                    # has been through dbn.price() into dollars, and the
+                    # bar's own prices are raw feed units -- mixing the
+                    # two would put a level three zeros away from the
+                    # candle it belongs to.
+                    _px = float(dbn._get(rec, "price", 0) or 0)
                     for _b in self.ofibars.values():
-                        _b.on_trade(float(t.ts), _sz, _ag)
+                        _b.on_trade(float(t.ts), _sz, _ag, _px)
                 lv = dbn._get(rec, "levels")
                 if lv:
                     l0 = lv[0]

@@ -705,3 +705,115 @@ def describe(sw: Swing) -> str:
         return (f"{lv.price:.2f} {side} -- touched on {bars}, "
                 f"nothing closed through")
     return f"{lv.price:.2f} {side} -- not reached in {sw.observed} bars"
+
+
+def traded_series(bars, scale: float = 1.0):
+    """The bars that actually printed, as a series to find swings in.
+
+    WHY NOT THE CANDLE'S OWN HIGH AND LOW. An OFI candle is drawn from
+    the midpoint of the quote, because that is what the imbalance
+    formula is defined against. On a one-tick ES spread the midpoint
+    sits exactly half a tick off the grid -- bid 7704.00 and ask
+    7704.25 give 7704.125 -- so a level found on it is a price that
+    cannot print. Fine for a candle. Useless for a level somebody
+    intends to work an order at.
+
+    So the swings are found on the highest and lowest price that
+    actually TRADED inside each bar. Those are on the tick grid by
+    construction, and a touch of one of them means a print happened
+    there rather than that the midpoint wandered across it.
+
+    BARS WITH NO PRINTS ARE LEFT OUT ENTIRELY, not filled in from the
+    neighbours. A borrowed price would make a level that no trade ever
+    supported, and it would look exactly like a real one. Leaving the
+    bar out also gives the level test the right behaviour for free: a
+    bar in which nothing traded cannot touch a level, because nothing
+    traded there.
+
+    Returns (indices, highs, lows, closes, ts). `indices` maps each
+    position in those lists back to its bar in `bars`, which is how a
+    caret ends up over the candle it came from.
+    """
+    idx: list[int] = []
+    highs: list[float] = []
+    lows: list[float] = []
+    closes: list[float] = []
+    stamps: list[float] = []
+    for i, b in enumerate(bars):
+        if not getattr(b, "traded", False):
+            continue
+        idx.append(i)
+        highs.append(b.trade_high * scale)
+        lows.append(b.trade_low * scale)
+        closes.append(b.trade_last * scale)
+        stamps.append(b.ts_close)
+    return idx, highs, lows, closes, stamps
+
+
+def traded_bars(highs, lows, closes, stamps) -> list[Bar]:
+    """The same series as `Bar`s, for `swing_levels`.
+
+    `open` is set to the close because nothing reads it: a swing level
+    is told which side it is read from by the pivot that made it, so
+    `resolve` never has to infer the side from a bar's open.
+    """
+    return [Bar(ts=stamps[i], open=closes[i], high=highs[i],
+                low=lows[i], close=closes[i])
+            for i in range(len(closes))]
+
+
+def walk_levels(bars, left: int = 5, right: int = 1,
+                keep: int = SWING_KEEP):
+    """Walk the traded series, carrying levels as they become settled.
+
+    Returns, for each position in the TRADED series, a dict saying what
+    that bar did against the levels that were known before it:
+
+        side    "low" / "high" / "" -- which kind of level it traded at
+        status  that level's state BEFORE this bar was applied to it
+
+    CAUSAL BY CONSTRUCTION. A pivot is only admitted once its
+    confirmation window has passed, the level's state is read before
+    the bar is resolved against it, and nothing after position j is
+    ever consulted. One bar of leak turns the whole table into a
+    measurement of itself.
+    """
+    from .pivots import find as _find
+
+    idx, hi, lo, cl, ts = traded_series(bars)
+    rows = traded_bars(hi, lo, cl, ts)
+    pivots = _find(hi, lo, left=left, right=right, ts=ts)
+    # When each pivot becomes usable: not when it printed, but when its
+    # confirmation window closed.
+    due: dict[int, list] = {}
+    for q in pivots:
+        due.setdefault(q.index + right, []).append(q)
+
+    live: list = []                 # [(price, kind, Level)]
+    out = []
+    for j in range(len(rows)):
+        for q in due.get(j, ()):    # admit anything settled by now
+            up = q.kind == "high"
+            lv = Level(kind=Kind.SWING_HIGH if up else Kind.SWING_LOW,
+                         price=float(q.price), session=trade_date(q.ts),
+                         set_ts=q.ts, last_ts=q.ts, above_at_set=not up)
+            # Catch the level up on the bars between its pivot and now,
+            # which have already happened and which it must account for.
+            for m in range(q.index + 1, j + 1):
+                resolve(lv, rows[m])
+            if any(p == q.price and k == q.kind for p, k, _ in live):
+                continue
+            live.append((float(q.price), q.kind, lv))
+            del live[:-keep]
+
+        bar = rows[j]
+        side, status = "", ""
+        for price, kind, lv in live:
+            if bar.low <= price <= bar.high:
+                side = "high" if kind == "high" else "low"
+                status = swing_status(Swing(level=lv, index=0))
+                break
+        for _, _, lv in live:
+            resolve(lv, bar)
+        out.append({"side": side, "status": status})
+    return idx, cl, out

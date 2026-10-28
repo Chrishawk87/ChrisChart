@@ -236,17 +236,31 @@ class TestTheAggressionLayer:
         line = body[body.index("g += `<line"):body.index("g += `<rect")]
         assert 'stroke="${c}"' in line
 
-    def test_weak_intent_is_grey(self):
+    def test_the_candle_is_the_order_flow_direction(self):
+        """Green or red, never grey. The colour is what closed the bar,
+        which is the half of the call the candle is responsible for."""
         i = WEB.index("function ofiChart")
         j = WEB.index("let _ofiTarget")
         body = WEB[i:j]
-        assert "BUY_PRICE_AGGRESSIVE" in body and "SELL_PRICE_AGGRESSIVE" in body
-        # The fall-through case, with no label test, is the grey one.
-        assert "return '#8a929b'" in body
+        assert "if (b.direction === 'green')" in body
+        assert "if (b.direction === 'red')" in body
+        assert "#8a929b" not in body, "a grey candle is a third state"
 
-    def test_the_panel_explains_the_three_colours(self):
-        assert "GREEN" in WEB and "RED" in WEB and "GREY" in WEB
-        assert "two-sided" in WEB
+    def test_a_time_capped_bar_still_gets_a_colour(self):
+        """It closed without reaching either line, and a third colour
+        for it is the grey this removed."""
+        i = WEB.index("function ofiChart")
+        body = WEB[i:WEB.index("let _ofiTarget")]
+        assert "(b.ofi || 0) < 0" in body
+
+    def test_the_panel_explains_the_two_colours(self):
+        assert "ORDER-FLOW" in WEB
+        assert "there is no third colour" in WEB
+
+    def test_the_price_path_is_still_measured(self):
+        """It just no longer colours the bar."""
+        assert "price_agg_ratio" in WEB
+        assert "no longer what colours the bar" in WEB
 
     def test_the_panel_says_the_boundaries_are_still_flow(self):
         """Only the colour changed. A reader needs to know the bars
@@ -269,7 +283,7 @@ class TestTheAggressionLayer:
         i = WEB.index("function ofiChart")
         j = WEB.index("function mgChart")
         panel = WEB[i:j]
-        readout = panel[panel.index("return `${dPane}"):]
+        readout = panel[panel.index("return `${liveCall}"):]
         for w in ("seconds", "toFixed(1)}s", "minute", "timeframe"):
             assert w not in readout, f"{w!r} in the on-screen readout"
         assert "book updates" in readout
@@ -525,15 +539,15 @@ class TestTheLevelLayer:
         and then vanishes is worse than no level."""
         r = self._route()
         blk = r[r.index("lvls: list[dict[str, Any]] = []"):]
-        assert "_pvm.find(hh, ll, left=pv, right=cf" in blk
+        assert "_pv.find(hh, ll, left=pv, right=cf" in blk
         assert "find_provisional" not in blk
 
     def test_pivots_are_found_on_the_numbers_they_are_judged_against(self):
         """Raw units on one side and dollars on the other would make a
         level that no bar can ever equal."""
         r = self._route()
-        assert "hh = [x.high * sc for x in hist]" in r
-        assert "high=x.high * sc" in r
+        assert "_lv.traded_series(hist, sc)" in r
+        assert "rows = _lv.traded_bars(hh, ll, cc, tt)" in r
 
     def test_the_count_is_clamped(self):
         assert "keep_n = max(1, min(int(keep), 8))" in self._route()
@@ -693,7 +707,7 @@ class TestTheDeltaPane:
 
     def test_the_pane_is_drawn_above_the_candles(self):
         c = self._chart()
-        i = c.index("return `${dPane}")
+        i = c.index("return `${liveCall}")
         assert i > 0
         assert c.index("${dPane}", i) < c.index("<svg width=", i + 10)
 
@@ -849,3 +863,330 @@ class TestTheHistorySurvivesARestart:
         c = WEB[WEB.index("function ofiChart"):WEB.index("let _ofiTimer")]
         blk = c[c.index("d.higher_levels"):][:1200]
         assert "padL + 3" in blk and "xEdge + 4" not in blk
+
+
+class TestSwingsAreOnTradedPrices:
+    """A level has to be a price an order can work at.
+
+    In order of how badly each would mislead:
+
+      a level on the midpoint. On a one-tick ES spread the mid is
+      exactly half a tick off the grid -- bid 7704.00 and ask 7704.25
+      give 7704.125 -- so the level is a price that cannot print, and
+      on a two-tick scalp that is a quarter of the target
+
+      the caret and the level it establishes coming from different
+      series, so the mark sits at one height and the line at another
+      for the same swing
+
+      a bar with no prints borrowing a neighbour's price, making a
+      level nothing traded at that looks exactly like one that did
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_carets_come_from_traded_prices(self):
+        r = self._route()
+        assert "_lv.traded_series(wide, 1e-9)" in r
+        assert "_pv.find(w_hi, w_lo, left=pv, right=cf" in r
+
+    def test_the_levels_come_from_the_same_place(self):
+        """Different series would put the mark and the line at
+        different heights for one swing."""
+        r = self._route()
+        assert "_lv.traded_series(hist, sc)" in r
+
+    def test_the_higher_targets_do_too(self):
+        r = self._route()
+        assert "_lv.traded_series(seg, sc)" in r
+
+    def test_nothing_finds_a_swing_on_the_candle_any_more(self):
+        r = self._route()
+        for w in ("x.high for x in wide", "x.high * sc for x in hist",
+                  "x.high * sc for x in seg"):
+            assert w not in r, w
+
+    def test_the_indices_are_mapped_back_to_the_candles(self):
+        """A traded series skips bars, so position k is not bar k."""
+        r = self._route()
+        assert "wide_lo + w_idx[q.index]" in r
+        assert "look + h_idx[sw.index]" in r
+        assert "h_idx[sw.broke_at]" in r and "h_idx[sw.back_at]" in r
+
+    def test_the_route_says_how_many_bars_actually_traded(self):
+        r = self._route()
+        assert '"traded_bars": sum(1 for x in window if x.traded)' in r
+
+    def test_the_panel_says_so_and_warns_when_the_window_is_thin(self):
+        assert "actually TRADED" in WEB
+        assert "most of this window did not trade" in WEB
+
+    def test_the_bar_carries_the_traded_prices(self):
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        for w in ("trade_high", "trade_low", "trade_last", "def traded"):
+            assert w in src, w
+
+    def test_the_tape_sends_the_raw_price_not_the_decoded_one(self):
+        """`t.px` has been through dbn.price() into dollars; the bar's
+        prices are raw feed units. Mixing them puts a level three zeros
+        away from its candle."""
+        src = (ROOT / "liqmap" / "cme_tape.py").read_text()
+        i = src.index("_b.on_trade(")
+        blk = src[max(0, i - 600):i + 120]
+        assert '_px = float(dbn._get(rec, "price", 0) or 0)' in blk
+        assert "_b.on_trade(float(t.ts), _sz, _ag, _px)" in src
+
+    def test_the_candle_itself_is_unchanged(self):
+        """Only the levels moved. The chart he has been reading stays
+        exactly as it was."""
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        assert "bar.high = mid" in src and "bar.low = mid" in src
+        assert "bar.close = mid" in src
+
+
+class TestTheReader:
+    """A call on every candle, and its record printed beside it.
+
+    In order of how badly each would mislead:
+
+      the call shown without its hit rate. A 50% reading feels like an
+      edge for exactly as long as nobody prints the number next to it
+
+      a hit rate without the rate it has to beat. 51% looks like money
+      until the figure beside it says 60%
+
+      the reader recomputing the columns it reads. A second opinion
+      about a bar's delta is a second thing to keep correct, and the
+      two would eventually disagree with nothing to say which is right
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_calls_every_bar(self):
+        r = self._route()
+        assert "from . import barcall as _bc" in r
+        assert "_bc.call_bar(" in r
+        assert '"calls": [calls_by_i[k] for k in sorted(calls_by_i)]' in r
+
+    def test_the_calls_carry_the_level_context(self):
+        r = self._route()
+        assert "_lv.walk_levels(s_bars, pv, cf, keep_n)" in r
+        assert 'where=ctx_at.get(i, {}).get("side", "")' in r
+
+    def test_the_scoreboard_is_returned_with_them(self):
+        r = self._route()
+        assert "_bc.scoreboard(" in r and '"scoreboard": board' in r
+
+    def test_the_scoreboard_is_bounded(self):
+        """The walk is linear in bars and this route is polled once a
+        second."""
+        r = self._route()
+        assert "SCORE_BARS = 4000" in r
+        assert "s_lo = max(0, end - SCORE_BARS)" in r
+
+    def test_a_reader_failure_does_not_take_the_chart_down(self):
+        r = self._route()
+        i = r.index("from . import barcall as _bc")
+        blk = r[i:i + 2200]
+        assert "except Exception" in blk and "board = None" in blk
+
+    def test_the_panel_prints_the_record_next_to_the_call(self):
+        assert "function ofiCalls" in WEB
+        i = WEB.index("function ofiCalls")
+        blk = WEB[i:i + 3000]
+        assert "this reading has gone that way" in blk
+        assert "and needs" in blk
+
+    def test_the_panel_prints_the_break_even_rate(self):
+        assert "Break-even is" in WEB
+
+    def test_the_panel_explains_what_decided_leaves_out(self):
+        """Flat outcomes are not misses."""
+        assert "those are not misses" in WEB
+
+    def test_the_panel_warns_about_the_extremum_bias(self):
+        """The reader fires at levels, so it collects a bias that is
+        arithmetic rather than market."""
+        assert "lower than its neighbours BY DEFINITION" in WEB
+        assert "bar_state_study.py" in WEB
+
+    def test_the_reader_is_wired_into_the_dashboard(self):
+        assert "${ofiCalls(d)}" in WEB
+
+    def test_the_reader_does_not_recompute_the_columns(self):
+        import re
+        src = (ROOT / "liqmap" / "barcall.py").read_text()
+        read = set(re.findall(r'getattr\(bar,\s*"([a-z_]+)"', src))
+        assert read == {"direction", "aggression", "delta", "volume",
+                        "close", "ts_close"}, read
+
+    def test_the_reader_places_no_orders(self):
+        src = (ROOT / "liqmap" / "barcall.py").read_text()
+        for w in ("def submit(", "def execute(", "def place(", "def order("):
+            assert w not in src, w
+
+
+class TestTheAgreementTest:
+    """OFI and delta pointing the same way, and whether price followed.
+
+    In order of how badly each would mislead:
+
+      a flat outcome put in the right or the wrong column. At one bar
+      most outcomes are exactly zero, so which way you fold them moves
+      the headline by fifty points
+
+      one percentage quoted without the other. Of all calls counts
+      flats against; of decided sets them aside, and they are far apart
+
+      the number printed without the line it has to be read against. A
+      market with nothing in it returns 50% of decided, not zero
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_runs_it(self):
+        r = self._route()
+        assert "from . import agree as _ag" in r
+        assert "_ag.summary(s_bars, horizons=(1, 3, 10)" in r
+        assert '"agree": agree' in r
+
+    def test_a_failure_there_does_not_take_the_chart_down(self):
+        r = self._route()
+        i = r.index("agree = _ag.summary")
+        assert "except Exception" in r[i:i + 300]
+        assert "agree = None" in r[i:i + 300]
+
+    def test_the_rule_consults_nothing_else(self):
+        """No level, no price path, no target, no stop."""
+        import re
+        src = (ROOT / "liqmap" / "agree.py").read_text()
+        i = src.index("def call_of")
+        body = src[i:src.index("def entry_of")]
+        read = set(re.findall(r'getattr\(bar,\s*"([a-z_]+)"', body))
+        assert read == {"volume", "delta", "direction", "call_side"}, read
+
+    def test_the_panel_leads_with_it(self):
+        """It is the question, so it goes above the longer breakdown."""
+        assert "function ofiAgree" in WEB
+        assert "${ofiAgree(d)}" in WEB
+        assert WEB.index("${ofiAgree(d)}") < WEB.index("${ofiCalls(d)}")
+
+    def test_the_panel_shows_the_flat_share(self):
+        i = WEB.index("function ofiAgree")
+        blk = WEB[i:i + 3400]
+        assert "flat" in blk
+        assert "neither right nor wrong" in blk
+
+    def test_the_panel_names_the_line_to_read_it_against(self):
+        i = WEB.index("function ofiAgree")
+        blk = WEB[i:i + 3400]
+        assert "returns 50%" in blk and "not zero" in blk
+
+    def test_the_panel_says_it_is_not_a_trade(self):
+        i = WEB.index("function ofiAgree")
+        blk = WEB[i:i + 3400]
+        assert "No target, no stop, no cost" in blk
+
+    def test_the_readout_leads_with_the_colour_it_draws(self):
+        """The stamp used to count price-path bands, which are no
+        longer what the candles show."""
+        i = WEB.index("function ofiChart")
+        blk = WEB[i:WEB.index("let _ofiTimer")]
+        assert "green</b>" in blk and "red</b>" in blk
+        assert "no longer sets the" in blk
+
+    def test_the_catalogue_script_exists_and_writes_a_csv(self):
+        src = (ROOT / "scripts" / "agree_catalog.py").read_text()
+        assert "csv.DictWriter" in src
+        assert "agree_calls_" in src
+        for w in ("def submit(", "def execute(", "def place("):
+            assert w not in src, w
+
+
+class TestTheCallIsOnTheChart:
+    """It is an intrabar reading, so it is drawn where it fired.
+
+    In order of how badly each would mislead:
+
+      the mark drawn at the close. The close is a long way after the
+      moment the reading existed -- minutes, at the larger targets --
+      and putting the mark there credits it with a move that had
+      already happened before it could be taken
+
+      the mark moving once the bar develops. The reading existed at
+      that price, whatever the rest of the bar does
+
+      direction carried by colour alone
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTimer")]
+
+    def test_the_bar_carries_the_call_and_the_price_it_fired_at(self):
+        r = self._route()
+        assert '"call_side": x.call_side' in r
+        assert '"call_px": x.call_px * sc' in r
+
+    def test_the_forming_bar_carries_its_live_call(self):
+        """The whole point: it has to be there before the bar closes."""
+        r = self._route()
+        assert "_cs, _cpx, _cts = b.live_call" in r
+        assert '"call_side": _cs' in r
+
+    def test_the_builder_latches_it_on_a_book_update(self):
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        assert "if not self._c_side:" in src
+        i = src.index("if not self._c_side:")
+        # Inside on_touch, not in _close.
+        assert src.index("def _close") > i > src.index("def on_touch")
+
+    def test_the_mark_is_drawn_at_the_call_price(self):
+        c = self._chart()
+        blk = c[c.index("THE CALL, ON THE BAR"):][:1600]
+        assert "const px = b.call_px" in blk
+        assert "const yy = y(px)" in blk
+        assert "b.close" not in blk, "the close is not where it fired"
+
+    def test_direction_is_the_shape_not_only_the_colour(self):
+        c = self._chart()
+        blk = c[c.index("THE CALL, ON THE BAR"):][:1600]
+        assert "const up = side === 'up'" in blk
+        assert "up ? yy + 5 : yy - 5" in blk
+
+    def test_the_forming_bar_gets_the_same_mark(self):
+        c = self._chart()
+        blk = c[c.index("THE CALL, ON THE BAR"):][:1600]
+        assert "b.direction === 'forming'" in blk
+
+    def test_the_marks_are_drawn_over_the_candles(self):
+        c = self._chart()
+        assert "${ax}${g}${pv}${cg}</svg>" in c
+
+    def test_the_panel_says_the_call_on_the_open_bar(self):
+        assert "while the bar is still open" in WEB
+        flat = " ".join(WEB.replace("'", " ").replace("+", " ").split())
+        assert "no call yet" in flat
+
+    def test_the_live_line_is_above_the_chart(self):
+        c = self._chart()
+        assert "return `${liveCall}" in c
+
+    def test_the_measurement_runs_from_the_call_price(self):
+        """Measuring from the close is the most flattering mistake
+        available and the easiest one to make."""
+        src = (ROOT / "liqmap" / "agree.py").read_text()
+        assert "def entry_of" in src
+        i = src.index("def measure")
+        body = src[i:src.index("def catalogue")]
+        assert "close = entry_of(bars[i])" in body

@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS ofi_bars (
     buy_vol     REAL    NOT NULL DEFAULT 0,
     sell_vol    REAL    NOT NULL DEFAULT 0,
     trade_count INTEGER NOT NULL DEFAULT 0,
+    trade_high  REAL    NOT NULL DEFAULT 0,
+    trade_low   REAL    NOT NULL DEFAULT 0,
+    trade_last  REAL    NOT NULL DEFAULT 0,
+    call_side   TEXT    NOT NULL DEFAULT '',
+    call_px     REAL    NOT NULL DEFAULT 0,
+    call_ts     REAL    NOT NULL DEFAULT 0,
     written_at  REAL    NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ofi_bars_one
@@ -89,7 +95,21 @@ KEEP_PER_TARGET = 20_000
 _COLUMNS = ("target", "ts_open", "ts_close", "open", "high", "low",
             "close", "direction", "ofi", "updates", "ofi_high", "ofi_low",
             "buy_agg", "sell_agg", "buy_burst", "sell_burst",
-            "buy_vol", "sell_vol", "trade_count", "written_at")
+            "buy_vol", "sell_vol", "trade_count",
+            "trade_high", "trade_low", "trade_last",
+            "call_side", "call_px", "call_ts", "written_at")
+
+# Columns added after the table first shipped. A CREATE TABLE IF NOT
+# EXISTS does nothing to a table that already exists, so a database
+# written by an earlier build needs these put on by hand -- otherwise
+# every insert fails with "no such column" and the chart quietly stops
+# being saved, which looks exactly like it working.
+_ADDED = (("trade_high", "REAL NOT NULL DEFAULT 0"),
+          ("trade_low", "REAL NOT NULL DEFAULT 0"),
+          ("trade_last", "REAL NOT NULL DEFAULT 0"),
+          ("call_side", "TEXT NOT NULL DEFAULT ''"),
+          ("call_px", "REAL NOT NULL DEFAULT 0"),
+          ("call_ts", "REAL NOT NULL DEFAULT 0"))
 
 
 def _row_of(target: int, b: OfiBar, now: float) -> tuple:
@@ -100,19 +120,55 @@ def _row_of(target: int, b: OfiBar, now: float) -> tuple:
             float(b.buy_agg), float(b.sell_agg),
             float(b.buy_burst), float(b.sell_burst),
             float(b.buy_vol), float(b.sell_vol), int(b.trade_count),
+            float(b.trade_high), float(b.trade_low), float(b.trade_last),
+            str(b.call_side or ""), float(b.call_px), float(b.call_ts),
             float(now))
 
 
 def _bar_of(r: sqlite3.Row) -> OfiBar:
+    """A row back into a bar.
+
+    Only the columns a bar cannot exist without are read directly.
+    Everything the table grew later goes through `_opt`, so a row
+    written by any earlier build loads with zeros in the fields it
+    never had rather than raising -- and a zero there says exactly
+    what it should: that bar recorded none.
+    """
     return OfiBar(ts_open=r["ts_open"], ts_close=r["ts_close"],
                   open=r["open"], high=r["high"], low=r["low"],
                   close=r["close"], direction=r["direction"],
                   ofi=r["ofi"], updates=r["updates"],
-                  ofi_high=r["ofi_high"], ofi_low=r["ofi_low"],
-                  buy_agg=r["buy_agg"], sell_agg=r["sell_agg"],
-                  buy_burst=r["buy_burst"], sell_burst=r["sell_burst"],
-                  buy_vol=r["buy_vol"], sell_vol=r["sell_vol"],
-                  trade_count=r["trade_count"])
+                  ofi_high=int(_opt(r, "ofi_high")),
+                  ofi_low=int(_opt(r, "ofi_low")),
+                  buy_agg=_opt(r, "buy_agg"), sell_agg=_opt(r, "sell_agg"),
+                  buy_burst=_opt(r, "buy_burst"),
+                  sell_burst=_opt(r, "sell_burst"),
+                  buy_vol=_opt(r, "buy_vol"), sell_vol=_opt(r, "sell_vol"),
+                  trade_count=int(_opt(r, "trade_count")),
+                  trade_high=_opt(r, "trade_high"),
+                  trade_low=_opt(r, "trade_low"),
+                  trade_last=_opt(r, "trade_last"),
+                  call_side=_txt(r, "call_side"),
+                  call_px=_opt(r, "call_px"),
+                  call_ts=_opt(r, "call_ts"))
+
+
+def _txt(r: sqlite3.Row, name: str) -> str:
+    """A text column an older row may not carry."""
+    try:
+        v = r[name]
+    except (IndexError, KeyError):
+        return ""
+    return str(v) if v is not None else ""
+
+
+def _opt(r: sqlite3.Row, name: str) -> float:
+    """A column an older row may not carry. Zero means no print."""
+    try:
+        v = r[name]
+    except (IndexError, KeyError):
+        return 0.0
+    return float(v) if v is not None else 0.0
 
 
 class OfiBarStore(ThreadedDB):
@@ -120,6 +176,24 @@ class OfiBarStore(ThreadedDB):
 
     def __init__(self, path: str | Path = "liqmap.db"):
         super().__init__(path, SCHEMA)
+
+    def _bootstrap(self, conn: sqlite3.Connection) -> None:
+        """Create the table, then add any column a later build grew.
+
+        Bars written before the traded-price columns existed keep their
+        rows and read back with zeros in them, which is the same thing
+        a bar with no prints says. Nothing is rewritten: a closed bar
+        is a fact, and inventing traded prices for one that never
+        recorded any would be worse than having none.
+        """
+        super()._bootstrap(conn)
+        have = {r[1] for r in
+                conn.execute("PRAGMA table_info(ofi_bars)").fetchall()}
+        for name, decl in _ADDED:
+            if name not in have:
+                conn.execute(
+                    f"ALTER TABLE ofi_bars ADD COLUMN {name} {decl}")
+        conn.commit()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:

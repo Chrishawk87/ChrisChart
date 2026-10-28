@@ -583,3 +583,111 @@ def test_swing_levels_place_no_orders():
     text = open(L.__file__).read()
     for w in ("def submit(", "def execute(", "def place(", "def order("):
         assert w not in text, w
+
+
+# ------------------------------------------------- swings on traded prices
+#
+# In order of how badly each would mislead:
+#
+#   a level on a price that cannot print. The candle is the midpoint of
+#   the quote, and on a one-tick spread the midpoint is exactly half a
+#   tick off the grid -- a level there is a price no order can work at,
+#   and for a two-tick scalp that is a quarter of the target
+#
+#   a bar with no prints borrowing a price from its neighbours. The
+#   level it makes is supported by nothing and looks exactly like one
+#   that is
+#
+#   the index mapping dropped, so the caret lands over the wrong candle
+
+class _FakeBar:
+    def __init__(self, ts, th=0.0, tl=0.0, tc=0.0, n=0):
+        self.ts_close = ts
+        self.trade_high = th
+        self.trade_low = tl
+        self.trade_last = tc
+        self.trade_count = n
+
+    @property
+    def traded(self):
+        return self.trade_count > 0 and self.trade_high > 0
+
+
+def test_only_bars_that_printed_are_in_the_series():
+    bars = [_FakeBar(0.0, 10, 9, 9.5, 3),
+            _FakeBar(1.0),                      # nothing traded
+            _FakeBar(2.0, 12, 11, 11.5, 2)]
+    idx, hi, lo, cl, ts = L.traded_series(bars)
+    assert idx == [0, 2]
+    assert hi == [10, 12] and lo == [9, 11] and cl == [9.5, 11.5]
+    assert ts == [0.0, 2.0]
+
+
+def test_a_bar_with_no_prints_does_not_borrow_a_price():
+    """A borrowed price makes a level nothing supported, and it looks
+    exactly like one that is."""
+    bars = [_FakeBar(0.0, 10, 9, 9.5, 3), _FakeBar(1.0)]
+    idx, hi, _, _, _ = L.traded_series(bars)
+    assert len(hi) == 1 and idx == [0]
+
+
+def test_the_index_maps_back_to_the_bar_it_came_from():
+    """Without it the caret lands over the wrong candle."""
+    bars = [_FakeBar(float(i)) for i in range(10)]
+    for i in (3, 7, 8):
+        bars[i] = _FakeBar(float(i), 10 + i, 9 + i, 9.5 + i, 1)
+    idx, _, _, _, _ = L.traded_series(bars)
+    assert idx == [3, 7, 8]
+
+
+def test_the_scale_is_applied_to_prices_and_not_to_time():
+    bars = [_FakeBar(1700.0, 10 ** 9, 10 ** 9, 10 ** 9, 1)]
+    idx, hi, lo, cl, ts = L.traded_series(bars, 1e-9)
+    assert hi == [1.0] and lo == [1.0] and cl == [1.0]
+    assert ts == [1700.0], "a timestamp is not a price"
+
+
+def test_an_empty_series_is_fine():
+    assert L.traded_series([]) == ([], [], [], [], [])
+    assert L.traded_series([_FakeBar(0.0)])[0] == []
+
+
+def test_traded_bars_carries_the_series_through():
+    bars = [_FakeBar(0.0, 10, 9, 9.5, 3), _FakeBar(2.0, 12, 11, 11.5, 2)]
+    idx, hi, lo, cl, ts = L.traded_series(bars)
+    rows = L.traded_bars(hi, lo, cl, ts)
+    assert [r.high for r in rows] == [10, 12]
+    assert [r.low for r in rows] == [9, 11]
+    assert [r.close for r in rows] == [9.5, 11.5]
+    assert [r.ts for r in rows] == [0.0, 2.0]
+
+
+def test_levels_found_this_way_sit_on_prices_that_can_print():
+    """The whole point. A midpoint level cannot be worked at."""
+    from liqmap import pivots as P
+    tick = 0.25
+    seq = [100, 101, 102, 103, 102, 101, 100, 99, 100, 101] * 3
+    bars = [_FakeBar(float(i), v + tick, v - tick, v, 5)
+            for i, v in enumerate(seq)]
+    idx, hi, lo, cl, ts = L.traded_series(bars)
+    got = L.swing_levels(P.find(hi, lo, 3, 1), L.traded_bars(hi, lo, cl, ts))
+    assert got
+    for sw in got:
+        on_grid = abs(round(sw.price / tick) * tick - sw.price) < 1e-9
+        assert on_grid, f"{sw.price} is not on the tick grid"
+
+
+def test_a_bar_that_did_not_trade_cannot_touch_a_level():
+    """It is not a near miss, it is an absence of evidence -- nothing
+    traded there, so nothing tested the level."""
+    from liqmap import pivots as P
+    seq = [100, 101, 105, 101, 100, 101, 105, 101, 100]
+    bars = [_FakeBar(float(i), v, v, v, 2) for i, v in enumerate(seq)]
+    # Blank out the bar that would otherwise re-touch the 105.
+    bars[6] = _FakeBar(6.0)
+    idx, hi, lo, cl, ts = L.traded_series(bars)
+    got = L.swing_levels(P.find(hi, lo, 2, 1), L.traded_bars(hi, lo, cl, ts),
+                         keep=4)
+    tops = [s for s in got if s.price == 105]
+    assert tops, "the 105 should still be a level"
+    assert tops[0].level.touches == 0

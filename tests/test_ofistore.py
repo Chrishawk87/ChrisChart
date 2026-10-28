@@ -349,3 +349,49 @@ class TestTheClockGoingBackwards:
         feed(lad, n=4000, seed=5, t0=1_000.0)
         assert lad[250].dropped > 0, "the front should have been trimmed"
         assert rec.flush() > 0
+
+
+class TestTheIntrabarCallSurvivesToo:
+    """It is the reading, so losing it on a restart loses the record."""
+
+    def test_the_call_round_trips(self, tmp_path):
+        lad = builders((250,))
+        feed(lad)
+        rec = OfiBarRecorder(OfiBarStore(tmp_path / "t.db"), lad)
+        rec.seed()
+        rec.flush()
+        fresh = builders((250,))
+        OfiBarRecorder(OfiBarStore(tmp_path / "t.db"),
+                       fresh).load_into_builders()
+        got = fresh[250].bars
+        assert any(b.call_side for b in got), "no call was ever latched"
+        for a, b in zip(lad[250].bars, got):
+            assert a.call_side == b.call_side
+            assert a.call_px == b.call_px
+
+    def test_an_older_row_reads_back_with_no_call(self, tmp_path):
+        """Bars written before the column existed never recorded one,
+        and inventing a price for them would be worse than having none."""
+        import sqlite3
+        path = tmp_path / "old.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            "CREATE TABLE ofi_bars (id INTEGER PRIMARY KEY,"
+            " target INTEGER NOT NULL, ts_open REAL NOT NULL,"
+            " ts_close REAL NOT NULL, open REAL NOT NULL,"
+            " high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,"
+            " direction TEXT NOT NULL, ofi INTEGER NOT NULL,"
+            " updates INTEGER NOT NULL, written_at REAL NOT NULL);"
+            "CREATE UNIQUE INDEX ofi_bars_one"
+            " ON ofi_bars(target, ts_open, ts_close);")
+        conn.execute(
+            "INSERT INTO ofi_bars (target,ts_open,ts_close,open,high,low,"
+            "close,direction,ofi,updates,written_at)"
+            " VALUES (250,1,2,10,11,9,10,'green',250,5,0)")
+        conn.commit()
+        conn.close()
+
+        st = OfiBarStore(path)
+        b = st.recent(250)[0]
+        assert b.call_side == "" and b.call_px == 0.0
+        assert st.count(250) == 1, "the old row survived the migration"

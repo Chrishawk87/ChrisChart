@@ -6159,26 +6159,37 @@ def create_app() -> FastAPI:
         wide = b.bars[wide_lo:wide_hi]
         marks = []
         prov = []
-        if len(wide) > pv + cf:
-            from . import pivots as _pv
-            hs = [x.high for x in wide]
-            ls = [x.low for x in wide]
-            tss = [x.ts_close for x in wide]
-            for q in _pv.find(hs, ls, left=pv, right=cf, ts=tss):
-                abs_i = wide_lo + q.index
+        # SWINGS ARE FOUND ON TRADED PRICES, NOT ON THE CANDLE.
+        #
+        # The candle is the midpoint of the quote, because that is what
+        # the imbalance formula is defined against. On a one-tick ES
+        # spread the midpoint is exactly half a tick off the grid --
+        # bid 7704.00 and ask 7704.25 give 7704.125 -- so a swing found
+        # on it is a price that cannot print. The caret and the level
+        # it establishes are both found on the highest and lowest price
+        # that actually TRADED, which is on the grid by construction.
+        #
+        # Bars with no prints drop out of the series, so `w_idx` maps
+        # each position back to the candle it belongs to.
+        from . import levels as _lv
+        from . import pivots as _pv
+        w_idx, w_hi, w_lo, w_cl, w_ts = _lv.traded_series(wide, 1e-9)
+        if len(w_idx) > pv + cf:
+            for q in _pv.find(w_hi, w_lo, left=pv, right=cf, ts=w_ts):
+                abs_i = wide_lo + w_idx[q.index]
                 if start <= abs_i < end:
                     marks.append({"i": abs_i - start, "kind": q.kind,
-                                  "price": q.price * 1e-9, "ts": q.ts})
+                                  "price": q.price, "ts": q.ts})
             # Provisional marks only mean anything at the live edge --
             # scrolled back, every bar has bars after it and the
             # settled pass has already judged them all.
             if off == 0:
-                for q in _pv.find_provisional(hs, ls, left=pv, right=cf,
-                                              ts=tss):
-                    abs_i = wide_lo + q.index
+                for q in _pv.find_provisional(w_hi, w_lo, left=pv,
+                                              right=cf, ts=w_ts):
+                    abs_i = wide_lo + w_idx[q.index]
                     if start <= abs_i < end:
                         prov.append({"i": abs_i - start, "kind": q.kind,
-                                     "price": q.price * 1e-9, "ts": q.ts})
+                                     "price": q.price, "ts": q.ts})
 
         recent = window
 
@@ -6207,25 +6218,16 @@ def create_app() -> FastAPI:
         lvls: list[dict[str, Any]] = []
         look = max(0, end - max(n, 300) - pv)
         hist = b.bars[look:end]
-        # Imported out here rather than inside the branch: the
-        # higher-target block below uses them too, and it runs whether
-        # or not this target had enough bars to find a swing in.
-        from . import levels as _lv
-        from . import pivots as _pvm
-        if len(hist) > pv + cf:
-            hh = [x.high * sc for x in hist]
-            ll = [x.low * sc for x in hist]
-            tt = [x.ts_close for x in hist]
+        h_idx, hh, ll, cc, tt = _lv.traded_series(hist, sc)
+        if len(h_idx) > pv + cf:
             # Found on the SAME numbers the levels are judged against,
             # so a pivot price and the bar that made it stay equal.
-            found = _pvm.find(hh, ll, left=pv, right=cf, ts=tt)
-            rows = [_lv.Bar(ts=x.ts_close, open=x.open * sc,
-                            high=x.high * sc, low=x.low * sc,
-                            close=x.close * sc) for x in hist]
+            found = _pv.find(hh, ll, left=pv, right=cf, ts=tt)
+            rows = _lv.traded_bars(hh, ll, cc, tt)
             for sw in _lv.swing_levels(found, rows, keep=keep_n):
-                abs_i = look + sw.index
-                brk_i = (look + sw.broke_at) if sw.broke_at >= 0 else -1
-                bak_i = (look + sw.back_at) if sw.back_at >= 0 else -1
+                abs_i = look + h_idx[sw.index]
+                brk_i = (look + h_idx[sw.broke_at]) if sw.broke_at >= 0 else -1
+                bak_i = (look + h_idx[sw.back_at]) if sw.back_at >= 0 else -1
                 lvls.append({
                     "i": abs_i - start,
                     "break_i": (brk_i - start) if brk_i >= 0 else -1,
@@ -6273,13 +6275,11 @@ def create_app() -> FastAPI:
                 seg = hbars[lo2:cut]
                 if len(seg) <= pv + cf:
                     continue
-                hh2 = [x.high * sc for x in seg]
-                ll2 = [x.low * sc for x in seg]
-                tt2 = [x.ts_close for x in seg]
-                rows2 = [_lv.Bar(ts=x.ts_close, open=x.open * sc,
-                                 high=x.high * sc, low=x.low * sc,
-                                 close=x.close * sc) for x in seg]
-                found2 = _pvm.find(hh2, ll2, left=pv, right=cf, ts=tt2)
+                i2, hh2, ll2, cc2, tt2 = _lv.traded_series(seg, sc)
+                if len(i2) <= pv + cf:
+                    continue
+                rows2 = _lv.traded_bars(hh2, ll2, cc2, tt2)
+                found2 = _pv.find(hh2, ll2, left=pv, right=cf, ts=tt2)
                 for sw in _lv.swing_levels(found2, rows2, keep=2):
                     hi.append({"target": ht,
                                "kind": "high" if sw.high_side else "low",
@@ -6298,10 +6298,64 @@ def create_app() -> FastAPI:
                         "price_aggression": x.aggression,
                         "price_agg_burst": round(x.pai_burst, 4),
                         "agrees": x.agrees,
+                        "call_side": x.call_side,
+                        "call_px": x.call_px * sc,
                         "delta": x.delta, "trade_count": x.trade_count,
                         "volume": x.volume,
                         "delta_agrees": x.delta_agrees,
                         "seconds": round(x.seconds, 3)})
+        # THE CALL ON EVERY BAR, AND HOW THE CALLS HAVE DONE.
+        #
+        # Read from the three columns the bar already carries plus
+        # where it sat against the levels. Nothing here recomputes any
+        # of those: a second opinion about a bar's delta is a second
+        # thing to keep correct.
+        #
+        # The scoreboard runs over the last SCORE_BARS rather than the
+        # whole history, because the walk is linear in bars and this
+        # route is polled once a second. It is a sample, and the panel
+        # says how big.
+        from . import agree as _ag
+        from . import barcall as _bc
+        SCORE_BARS = 4000
+        s_lo = max(0, end - SCORE_BARS)
+        s_bars = b.bars[s_lo:end]
+        calls_by_i: dict[int, dict] = {}
+        board = None
+        if len(s_bars) > pv + cf:
+            try:
+                s_idx, _s_cl, s_ctx = _lv.walk_levels(s_bars, pv, cf, keep_n)
+                ctx_at = {s_idx[k]: s_ctx[k] for k in range(len(s_idx))}
+                s_calls = [
+                    _bc.call_bar(x, index=i,
+                                 where=ctx_at.get(i, {}).get("side", ""),
+                                 level_state=ctx_at.get(i, {}).get(
+                                     "status", ""))
+                    for i, x in enumerate(s_bars)]
+                board = _bc.scoreboard(
+                    s_calls, [x.close for x in s_bars], horizon=3,
+                    tick=250_000_000.0, target=2.0, stop=2.0, cost=0.4)
+                for c in s_calls:
+                    abs_i = s_lo + c.index
+                    if start <= abs_i < end:
+                        d = c.as_dict()
+                        d["i"] = abs_i - start
+                        d["price"] = c.price * sc
+                        calls_by_i[abs_i - start] = d
+            except Exception:                           # noqa: BLE001
+                board = None
+
+        # THE AGREEMENT TEST, which is the whole question in one table:
+        # OFI closed the bar one way and delta went the same way, so
+        # did price. No level, no price path, no target, no stop.
+        agree = None
+        if len(s_bars) > 20:
+            try:
+                agree = _ag.summary(s_bars, horizons=(1, 3, 10),
+                                    tick=250_000_000.0)
+            except Exception:                           # noqa: BLE001
+                agree = None
+
         # How much of this is on disk, so the panel can say whether a
         # restart would cost anything.
         _rc = getattr(rt, "_ofirec", None)
@@ -6316,7 +6370,9 @@ def create_app() -> FastAPI:
         forming = None
         if cur is not None and cur.updates > 0:
             _lp = b.live_pai
-            forming = {"open": cur.open * sc, "high": cur.high * sc,
+            _cs, _cpx, _cts = b.live_call
+            forming = {"call_side": _cs, "call_px": _cpx * sc,
+                       "open": cur.open * sc, "high": cur.high * sc,
                        "low": cur.low * sc, "close": cur.close * sc,
                        "ofi": b.accumulated, "updates": cur.updates,
                        "delta": b.live_delta,
@@ -6339,7 +6395,11 @@ def create_app() -> FastAPI:
                 "at_live": off == 0,
                 "oldest": off >= max(0, total - n),
                 "pivot_n": pv, "confirm_n": cf,
+                "traded_bars": sum(1 for x in window if x.traded),
                 "keep_n": keep_n, "levels": lvls,
+                "agree": agree,
+                "calls": [calls_by_i[k] for k in sorted(calls_by_i)],
+                "scoreboard": board,
                 "higher": want_higher, "higher_levels": hi,
                 "saved": _saved,
                 "pivots": marks, "provisional": prov,
@@ -9934,24 +9994,24 @@ function ofiChart(d, w, h) {
   const step = iw / n;
   const bw = Math.max(1.2, Math.min(9, step * 0.68));
 
-  /* ONE COLOUR PER CANDLE: the strength of intent in the direction the
-     bar is travelling.
+  /* THE CANDLE IS THE OFI DIRECTION. GREEN OR RED, NEVER GREY.
 
-     The share of price movement that went up is a single number that
-     carries both facts at once. Above 0.5 the bar is travelling up,
-     below it down, and the distance from 0.5 is how one-sided the path
-     was getting there. So the colour is simply that number banded:
-     decisively up is green, decisively down is red, and a two-sided
-     path -- price went both ways and committed to neither -- is grey.
+     Green means order-flow imbalance crossed +target and closed the
+     bar; red means it crossed -target. That is what "OFI says price is
+     moving up" means, so it is what the candle shows, and pairing it
+     with the delta column above is the whole reading.
 
-     Grey is a reading, not a gap. It says the bar moved without intent,
-     which is a different statement from a small bar: a candle can span
-     six ticks and still be grey if it spent them going back and forth. */
+     A bar that closed on the time cap without either line being
+     reached takes the sign of the imbalance it did accumulate, so
+     there is no third colour. Those are rare -- the cap is fifteen
+     minutes -- and the exact figure is in the readout either way.
+
+     The price path is still measured and still carried in the data as
+     `price_agg_ratio`; it is simply no longer what colours the bar. */
   const bodyColour = b => {
-    const a = b.price_aggression;
-    if (a === 'BUY_PRICE_AGGRESSIVE') return '#35c27a';
-    if (a === 'SELL_PRICE_AGGRESSIVE') return '#e2574c';
-    return '#8a929b';
+    if (b.direction === 'green') return '#35c27a';
+    if (b.direction === 'red') return '#e2574c';
+    return (b.ofi || 0) < 0 ? '#e2574c' : '#35c27a';
   };
 
   let g = '';
@@ -9970,6 +10030,39 @@ function ofiChart(d, w, h) {
     g += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}"
             width="${bw.toFixed(1)}" height="${bodyH.toFixed(1)}"
             fill="${c}" opacity="${forming ? 0.4 : 0.92}"/>`;
+  });
+
+  /* THE CALL, ON THE BAR, AT THE PRICE IT FIRED.
+
+     This is an intrabar reading. The mark goes at `call_px` -- the mid
+     at the instant the running imbalance and the running delta first
+     agreed inside that bar -- and not at the close, which is a long
+     way after the moment it could have been acted on.
+
+     A filled triangle under the bar for an up call, over it for a
+     down call, so the direction is the shape and not only the colour.
+     The bar still forming gets the same mark the moment it fires, and
+     that mark does not move afterwards: the reading existed at that
+     price whatever the rest of the bar does. */
+  let cg = '';
+  all.forEach((b, i) => {
+    const side = b.call_side;
+    if (side !== 'up' && side !== 'down') return;
+    const px = b.call_px;
+    if (!px) return;
+    const cx = padL + step * (i + 0.5);
+    const yy = y(px);
+    if (yy < padT || yy > padT + ih) return;
+    const up = side === 'up';
+    const col = up ? '#35c27a' : '#e2574c';
+    const base = up ? yy + 5 : yy - 5;
+    const tip = up ? yy + 1 : yy - 1;
+    const forming = b.direction === 'forming';
+    cg += `<path d="M ${(cx - 3.4).toFixed(1)} ${base.toFixed(1)}
+             L ${(cx + 3.4).toFixed(1)} ${base.toFixed(1)}
+             L ${cx.toFixed(1)} ${tip.toFixed(1)} Z"
+             fill="${col}" opacity="${forming ? 0.75 : 1}"
+             ${forming ? 'stroke="' + col + '" stroke-width="0.8"' : ''}/>`;
   });
 
   /* THE DELTA PANE, directly above the candles and on the SAME grid.
@@ -10199,6 +10292,23 @@ function ofiChart(d, w, h) {
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   const nb = bars.length - ba - sa;
+  const fm = d && d.forming;
+  const liveCall = (fm && (fm.call_side === 'up' || fm.call_side === 'down'))
+    ? '<span class="stamp" style="width:100%">THIS BAR &mdash; <b class="'
+      + (fm.call_side === 'up' ? 'long">UP' : 'short">DOWN')
+      + '</b> called at ' + (fm.call_px || 0).toFixed(2)
+      + ', while the bar is still open &middot; imbalance '
+      + (fm.ofi > 0 ? '+' : '') + (fm.ofi || 0).toLocaleString()
+      + ' and delta ' + (fm.delta > 0 ? '+' : '')
+      + Math.round(fm.delta || 0).toLocaleString()
+      + ' pointing the same way</span>'
+    : '<span class="stamp" style="width:100%">THIS BAR &mdash; no call '
+      + 'yet: imbalance and delta have not agreed inside it'
+      + (fm ? ' (imbalance ' + (fm.ofi > 0 ? '+' : '')
+          + (fm.ofi || 0).toLocaleString() + ', delta '
+          + (fm.delta > 0 ? '+' : '') + Math.round(fm.delta || 0)
+            .toLocaleString() + ')' : '') + '</span>';
+
   const dLast = all[all.length - 1] || {};
   const dSum = all.reduce((a, b) => a + (b.delta || 0), 0);
   const dFlag = all.filter(b => b.delta_agrees === false).length;
@@ -10212,24 +10322,207 @@ function ofiChart(d, w, h) {
       &middot; <b>${dFlag}</b> ${dFlag === 1 ? 'bar' : 'bars'} where the
       paid-for flow went against the book that closed it (amber)</span>`;
 
-  return `${dPane}
-    <svg width="${w}" height="${h}" style="display:block">${ax}${g}${pv}</svg>
+  return `${liveCall}
+    ${dPane}
+    <svg width="${w}" height="${h}" style="display:block">${ax}${g}${pv}${cg}</svg>
     ${deltaLine}
     ${readout}
     <span class="stamp">${d.total.toLocaleString()} bars at target
       ${d.target.toLocaleString()}
       &middot; showing ${bars.length}
-      &middot; <b class="long">${ba} up</b>
-      / <b class="short">${sa} down</b>
-      / ${nb} no intent
-      &middot; flow that closed them: ${bars.filter(b =>
-          b.direction === 'green').length}g / ${bars.filter(b =>
-          b.direction === 'red').length}r</span>
+      &middot; <b class="long">${bars.filter(b =>
+          b.direction === 'green').length} green</b>
+      / <b class="short">${bars.filter(b =>
+          b.direction === 'red').length} red</b>
+      &middot; the price path inside them, which no longer sets the
+      colour: ${ba} up / ${sa} down / ${nb} two-sided</span>
     <span class="stamp">last ${last.close.toFixed(2)}
       &middot; ${(last.price_agg_ratio * 100).toFixed(0)}% of its movement went up
       &middot; closed by ${last.direction === 'green' ? 'buying' : 'selling'} flow
       (OFI ${last.ofi > 0 ? '+' : ''}${last.ofi})
       &middot; built from ${last.updates} book updates</span>`
+}
+
+/* THE AGREEMENT TEST, at the top, because it is the question.
+
+   OFI closed the bar green and delta was positive, so it is an up
+   call; red and negative is a down call; everything else is not a
+   call at all. Then: did price go that way, and by how much.
+
+   UP, FLAT AND DOWN ARE THREE OUTCOMES. At one bar on a one-tick
+   market most moves are exactly zero, so which column the flats land
+   in moves the headline by fifty points. They get their own, and both
+   percentages are printed. Fifty percent OF DECIDED is what a market
+   with nothing in it returns -- that is the line to read these
+   against, not zero. */
+function ofiAgree(d) {
+  const a = d && d.agree;
+  if (!a || !a.rows || !a.rows.length) {
+    return '<span class="stamp" style="width:100%">agreement &mdash; '
+      + 'not enough closed bars yet</span>';
+  }
+  const by = {};
+  for (const r of a.rows) by[r.call + r.horizon] = r;
+  const hs = a.horizons;
+  const cell = r => {
+    if (!r) return '<td style="text-align:right">&mdash;</td>';
+    const cls = r.pct_of_decided >= 0.5 ? 'long' : 'short';
+    return '<td style="text-align:right"><b class="' + cls + '">'
+      + (r.pct_of_decided * 100).toFixed(1) + '%</b>'
+      + '<span style="color:var(--muted)"> of '
+      + r.decided.toLocaleString() + '</span></td>';
+  };
+  const flat = r => r
+    ? '<td style="text-align:right;color:var(--muted)">'
+      + (r.n ? (100 * r.flat / r.n).toFixed(0) : '0') + '%</td>'
+    : '<td></td>';
+  const mean = r => r
+    ? '<td style="text-align:right">' + (r.mean_ticks > 0 ? '+' : '')
+      + r.mean_ticks.toFixed(3) + '</td>'
+    : '<td></td>';
+
+  let head = '<tr style="color:var(--muted)"><th style="text-align:left">'
+    + 'call</th>';
+  for (const h of hs) {
+    head += '<th style="text-align:right">' + h + ' bar'
+      + (h === 1 ? '' : 's') + ' on</th>'
+      + '<th style="text-align:right">flat</th>'
+      + '<th style="text-align:right">mean tk</th>';
+  }
+  head += '</tr>';
+
+  let body = '';
+  for (const c of ['up', 'down']) {
+    const first = by[c + hs[0]];
+    body += '<tr><td><b class="' + (c === 'up' ? 'long' : 'short') + '">'
+      + c.toUpperCase() + '</b><span style="color:var(--muted)"> '
+      + (first ? first.n.toLocaleString() : '0') + ' called</span></td>';
+    for (const h of hs) {
+      const r = by[c + h];
+      body += cell(r) + flat(r) + mean(r);
+    }
+    body += '</tr>';
+  }
+
+  return '<span class="stamp" style="width:100%"><b>agreement</b> '
+    + '&mdash; OFI and delta pointing the same way, and whether price '
+    + 'followed. ' + a.called.toLocaleString() + ' calls out of '
+    + a.bars.toLocaleString() + ' bars ('
+    + (a.share_called * 100).toFixed(0) + '%).</span>'
+    + '<table style="width:100%;font-size:11px">' + head + body + '</table>'
+    + '<span class="stamp" style="width:100%">The percentage is of '
+    + 'DECIDED calls &mdash; price in the same place that many bars '
+    + 'later is neither right nor wrong, and the flat column says how '
+    + 'often that happens. A market with nothing in it returns 50%. '
+    + 'That is the line, not zero. No target, no stop, no cost: this '
+    + 'is not a trade, it is whether price went the way the bar '
+    + 'said.</span>';
+}
+
+/* THE CALLS: what the reader made of each candle, and how those
+   readings have actually done.
+
+   The record is printed NEXT TO the call, never under a tab. A
+   reading and its hit rate are one piece of information, and showing
+   the call alone is how a 50% reading comes to feel like an edge.
+
+   Every row carries the hit rate it has to beat to cover costs. A row
+   below that line is losing money however good the percentage looks,
+   and a row above it on sixty calls is sixty coin flips -- which is
+   why the sample size is in the row too. */
+const CALL_WORDS = {
+  CONFIRMED_UP: 'all three up', CONFIRMED_DOWN: 'all three down',
+  SOLD_INTO: 'sold into', BOUGHT_INTO: 'bought into',
+  PAID_NO_MOVE: 'paid, no move', UNPAID_PUSH: 'unpaid push',
+  NO_INTENT: 'no intent', NO_PRINTS: 'no prints'
+};
+
+function ofiCalls(d) {
+  const calls = (d && d.calls) || [];
+  const sb = d && d.scoreboard;
+  if (!calls.length) {
+    return '<span class="stamp" style="width:100%">reader &mdash; '
+      + 'no closed bars to call yet</span>';
+  }
+  const last = calls[calls.length - 1];
+  const rows = (sb && sb.rows) || [];
+  const mine = rows.filter(r => r.verdict === last.verdict
+    && r.lean === last.lean)[0];
+  const need = sb ? sb.needs : 0.6;
+
+  const leanTag = L => L === 'long' ? '<b class="long">LONG</b>'
+    : L === 'short' ? '<b class="short">SHORT</b>' : '<b>no lean</b>';
+
+  let head = '<span class="stamp" style="width:100%">reader &mdash; '
+    + '<b>' + (CALL_WORDS[last.verdict] || last.verdict) + '</b> &middot; '
+    + leanTag(last.lean) + ' &middot; ' + last.says;
+  if (mine && mine.decided) {
+    const ok = mine.hit_rate >= need;
+    head += ' &middot; this reading has gone that way <b class="'
+      + (ok ? 'long' : 'short') + '">'
+      + (mine.hit_rate * 100).toFixed(0) + '%</b> of '
+      + mine.decided.toLocaleString() + ' decided calls, and needs '
+      + (need * 100).toFixed(0) + '%';
+  } else if (mine) {
+    head += ' &middot; no decided calls for this reading yet';
+  }
+  head += '</span>';
+
+  const recent = calls.slice(-8).reverse().map(c =>
+    '<div style="font-size:11px;color:var(--muted)">'
+    + (c.price ? c.price.toFixed(2) : '') + ' &middot; '
+    + (CALL_WORDS[c.verdict] || c.verdict)
+    + (c.lean === 'none' ? '' : ' (' + c.lean + ')')
+    + ' &middot; delta ' + (c.paid > 0 ? '+' : '')
+    + Math.round(c.paid).toLocaleString()
+    + (c.where ? ' &middot; at a swing ' + c.where
+        + (c.level_state ? ' that has ' + c.level_state : '') : '')
+    + '</div>').join('');
+
+  let table = '';
+  if (sb) {
+    const body = rows.filter(r => r.n >= 20).map(r => {
+      const dec = r.decided;
+      const rate = dec ? (r.hit_rate * 100).toFixed(1) + '%' : '--';
+      const mark = !dec ? '' : r.clears ? ' CLEARS'
+        : (!r.enough ? ' too few' : ' below');
+      const cls = r.clears ? 'long' : (dec && r.enough ? 'short' : '');
+      return '<tr><td>' + (CALL_WORDS[r.verdict] || r.verdict) + '</td>'
+        + '<td>' + (r.lean === 'none' ? '&mdash;' : r.lean) + '</td>'
+        + '<td style="text-align:right">' + r.n.toLocaleString() + '</td>'
+        + '<td style="text-align:right">' + dec.toLocaleString() + '</td>'
+        + '<td style="text-align:right">' + rate + '</td>'
+        + '<td style="text-align:right">'
+        + (r.mean_ticks > 0 ? '+' : '') + r.mean_ticks.toFixed(3) + '</td>'
+        + '<td class="' + cls + '">' + mark + '</td></tr>';
+    }).join('');
+    table = '<table style="width:100%;font-size:11px;margin-top:4px">'
+      + '<tr style="color:var(--muted)"><th style="text-align:left">reading'
+      + '</th><th style="text-align:left">lean</th>'
+      + '<th style="text-align:right">calls</th>'
+      + '<th style="text-align:right">decided</th>'
+      + '<th style="text-align:right">went that way</th>'
+      + '<th style="text-align:right">mean ticks</th><th></th></tr>'
+      + body + '</table>'
+      + '<span class="stamp" style="width:100%">Over the last '
+      + sb.scored.toLocaleString() + ' calls held, measured '
+      + sb.horizon + ' bars forward. DECIDED leaves out the calls where '
+      + 'price was in the same place ' + sb.horizon + ' bars later &mdash; '
+      + 'those are not misses, and burying them in the denominator drags '
+      + 'every rate toward a number that is not about direction. '
+      + 'Break-even is ' + (need * 100).toFixed(0) + '% at a '
+      + sb.target + '-tick target, a ' + sb.stop + '-tick stop and '
+      + sb.cost + ' ticks of cost.</span>'
+      + '<span class="stamp" style="width:100%">A reading that fires at '
+      + 'a level collects a bias that is arithmetic rather than market: '
+      + 'a swing low is lower than its neighbours BY DEFINITION, so the '
+      + 'bar after one is usually higher. scripts/bar_state_study.py '
+      + 'measures that against a random walk; this table does not.</span>';
+  }
+
+  return head
+    + '<span class="stamp" style="width:100%">last eight calls</span>'
+    + recent + table;
 }
 
 let _ofiTimer = null;
@@ -10343,6 +10636,16 @@ async function ofiTick(fromTimer) {
             `<option value="${k}"${k === d.confirm_n ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
         &middot; dotted carets are not confirmed yet and can vanish</span>
+      <span class="stamp" style="width:100%">Swings and levels are found
+        on the prices that actually TRADED, not on the candle. The
+        candle is the midpoint of the quote, and on a one-tick spread a
+        midpoint sits half a tick off the grid &mdash; a level there is
+        a price no order can work at. ${d.traded_bars || 0} of the
+        ${(d.bars || []).length} bars on screen contain a print${
+        (d.traded_bars || 0) * 2 < (d.bars || []).length
+          ? '; most of this window did not trade, so there is little'
+            + ' here for a level to be built from'
+          : ''}.</span>
       <span class="stamp" style="width:100%">carry
         <select onchange="ofiSetKeep(this.value)"
           style="margin:0 6px">${[2, 4, 6, 8].map(k =>
@@ -10376,14 +10679,18 @@ async function ofiTick(fromTimer) {
         &middot; ${d.total.toLocaleString()} held${d.dropped
           ? ' (' + d.dropped.toLocaleString() + ' older ones aged out)' : ''}</span>
       ${ofiChart(d, w, 240)}
-      <span class="stamp" style="width:100%">Colour is the strength of
-        intent in the direction the bar travelled. GREEN: 70%+ of the
-        price movement went up. RED: 70%+ went down. GREY: the path was
-        two-sided and committed to neither &mdash; a bar can span six
-        ticks and still be grey if it spent them going back and forth.</span>
-      <span class="stamp" style="width:100%">Measured across the whole
-        bar &mdash; every book update it contains, start to finish. The
-        dashed bar on the right is still forming.</span>
+      ${ofiAgree(d)}
+      ${ofiCalls(d)}
+      <span class="stamp" style="width:100%">Colour is the ORDER-FLOW
+        DIRECTION that closed the bar. GREEN: imbalance crossed
+        +${d.target}. RED: it crossed &minus;${d.target}. A bar that ran
+        out the time cap without reaching either takes the sign of what
+        it did accumulate, so there is no third colour. The dashed bar
+        on the right is still forming.</span>
+      <span class="stamp" style="width:100%">The price path is still
+        measured and still in the data as price_agg_ratio &mdash; it is
+        no longer what colours the bar. Read the candle against the
+        delta column above it: agreeing is the call.</span>
       <span class="stamp" style="width:100%">The bar BOUNDARIES still come
         from order-flow imbalance &mdash; a bar ends when flow crosses
         your target, never on a clock. Only the colour is price. Where

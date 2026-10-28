@@ -43,6 +43,21 @@ be stacked on the bid while every print hits it. Folding them into one
 number destroys exactly what makes them worth having, so they stay
 separate all the way to the chart.
 
+THE CANDLE IS THE MID. THE LEVELS ARE NOT.
+
+Open, high, low and close are the midpoint of the quote, because that
+is what the OFI formula is defined against and what the price path is
+measured on. On a one-tick ES spread a midpoint sits exactly half a
+tick off the grid -- bid 7704.00 and ask 7704.25 give 7704.125, which
+is not a price that can print. That is fine for a candle and useless
+for a level, so every bar also carries the highest, lowest and last
+price that ACTUALLY TRADED inside it. Those are on the tick grid by
+construction, and they are what the swing levels are found on.
+
+A bar with no prints in it has no traded prices at all, and says so
+with zeros rather than borrowing the mid. A level built from a
+borrowed mid would look exactly like a real one.
+
 THE AGGRESSOR IS STATED, NOT INFERRED. CME marks the side on every
 print. Most platforms guess it with a tick rule and are wrong on a
 meaningful share of trades, worst precisely when the market is fast.
@@ -83,6 +98,10 @@ BALANCED_FLOW = "BALANCED_PRICE_FLOW"
 PAI_BUY = 0.70
 PAI_SELL = 0.30
 
+# A bar must have traded at least this much before its delta is
+# allowed to speak. Below it one contract flips the sign.
+CALL_MIN_VOL = 10.0
+
 # The closing-burst window. Reported alongside the bar-wide figure,
 # never used to colour the bar -- see `pai` for why.
 BURST_S = 0.005
@@ -115,6 +134,25 @@ class OfiBar:
     buy_vol: float = 0.0
     sell_vol: float = 0.0
     trade_count: int = 0
+    # Prices that ACTUALLY TRADED inside the bar, in the same raw feed
+    # units as open/high/low/close. Zero means no print landed here --
+    # not a price of zero, and never filled in from the mid.
+    trade_high: float = 0.0
+    trade_low: float = 0.0
+    trade_last: float = 0.0
+    # THE CALL, MADE INSIDE THE BAR AND NOT AFTER IT.
+    #
+    # The first moment during this bar at which the running imbalance
+    # and the running delta pointed the same way. That is when the
+    # reading existed and when it could have been acted on; the close
+    # is minutes of information later. `call_px` is the mid at that
+    # instant, which is why it is the price any measurement of the
+    # call has to run from.
+    #
+    # Empty means the two never agreed inside this bar.
+    call_side: str = ""
+    call_px: float = 0.0
+    call_ts: float = 0.0
 
     @property
     def seconds(self) -> float:
@@ -155,6 +193,15 @@ class OfiBar:
         """The same, over the last BURST_S of the bar only."""
         total = self.buy_burst + self.sell_burst
         return (self.buy_burst / total) if total > 0 else 0.5
+
+    @property
+    def traded(self) -> bool:
+        """Did anything print inside this bar?
+
+        The test for whether the traded prices mean anything. Reading
+        `trade_high` without it gets a zero that looks like a price.
+        """
+        return self.trade_count > 0 and self.trade_high > 0
 
     @property
     def volume(self) -> float:
@@ -262,6 +309,13 @@ class OfiBar:
                 "delta": self.delta,
                 "delta_ratio": round(self.delta_ratio, 4),
                 "delta_agrees": self.delta_agrees,
+                "trade_high": self.trade_high,
+                "trade_low": self.trade_low,
+                "trade_last": self.trade_last,
+                "traded": self.traded,
+                "call_side": self.call_side,
+                "call_px": self.call_px,
+                "call_ts": self.call_ts,
                 "seconds": round(self.seconds, 6)}
 
 
@@ -282,7 +336,9 @@ class OfiBarBuilder:
     __slots__ = ("tick", "threshold", "max_s", "min_updates", "max_bars",
                  "_prev", "_acc", "_bar", "bars", "dropped",
                  "_buy_agg", "_sell_agg", "_steps",
-                 "_buy_vol", "_sell_vol", "_trades")
+                 "_buy_vol", "_sell_vol", "_trades",
+                 "_t_hi", "_t_lo", "_t_last",
+                 "_c_side", "_c_px", "_c_ts")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
@@ -333,6 +389,19 @@ class OfiBarBuilder:
         self._buy_vol = 0.0
         self._sell_vol = 0.0
         self._trades = 0
+        # Traded extremes for the bar in progress. None, not zero: a
+        # bar with no prints must be distinguishable from one that
+        # traded at zero, and min() against a zero would win forever.
+        self._t_hi: float | None = None
+        self._t_lo: float | None = None
+        self._t_last: float = 0.0
+        # The first instant inside the bar at which imbalance and delta
+        # agreed. Latched: once the reading existed it existed, and
+        # moving it later would be rewriting when it could have been
+        # acted on.
+        self._c_side: str = ""
+        self._c_px: float = 0.0
+        self._c_ts: float = 0.0
 
     def reset(self) -> None:
         self._prev = None
@@ -346,6 +415,12 @@ class OfiBarBuilder:
         self._buy_vol = 0.0
         self._sell_vol = 0.0
         self._trades = 0
+        self._t_hi = None
+        self._t_lo = None
+        self._t_last = 0.0
+        self._c_side = ""
+        self._c_px = 0.0
+        self._c_ts = 0.0
 
     @property
     def current(self) -> OfiBar | None:
@@ -373,7 +448,28 @@ class OfiBarBuilder:
     def live_trades(self) -> int:
         return self._trades
 
-    def on_trade(self, ts: float, size: float, aggressor: str) -> None:
+    @property
+    def live_call(self) -> tuple[str, float, float]:
+        """(side, price, ts) of the call inside the bar in progress.
+
+        Empty side means imbalance and delta have not agreed yet in
+        this bar. This is what the chart marks while the bar is still
+        forming, because the reading is intrabar and waiting for the
+        close throws away the whole of it.
+        """
+        return (self._c_side, self._c_px, self._c_ts)
+
+    @property
+    def live_traded(self) -> tuple[float, float, float]:
+        """Traded high, low and last of the bar in progress.
+
+        Zeros when nothing has printed yet, which is the same thing a
+        closed bar says and for the same reason.
+        """
+        return (self._t_hi or 0.0, self._t_lo or 0.0, self._t_last)
+
+    def on_trade(self, ts: float, size: float, aggressor: str,
+                 px: float = 0.0) -> None:
         """One print, with the side CME stated. Never closes a bar.
 
         A TRADE DOES NOT MOVE THE BAR BOUNDARY, and that is deliberate.
@@ -385,6 +481,12 @@ class OfiBarBuilder:
         A print arriving before the first book touch still belongs to
         the bar that touch opens, which is why these accumulate on the
         builder rather than on the bar.
+
+        `px` is the print price in the SAME RAW FEED UNITS as the book
+        prices, and it is what the swing levels are found on. A caller
+        that does not have it passes nothing: delta still works and the
+        traded extremes stay empty, which is honest. Passing a price in
+        dollars here would put two unit systems in one bar.
 
         A size of zero, or a side that is neither, is refused rather
         than counted as balanced -- a zero would sum like a measurement.
@@ -398,6 +500,12 @@ class OfiBarBuilder:
         else:
             return
         self._trades += 1
+        if px > 0:
+            if self._t_hi is None or px > self._t_hi:
+                self._t_hi = float(px)
+            if self._t_lo is None or px < self._t_lo:
+                self._t_lo = float(px)
+            self._t_last = float(px)
 
     # ------------------------------------------------------------------
     def on_touch(self, ts: float, touch: Touch) -> OfiBar | None:
@@ -459,6 +567,22 @@ class OfiBarBuilder:
             bar.low = mid
         bar.close = mid
         bar.ts_close = ts
+        # THE CALL IS MADE HERE, INSIDE THE BAR.
+        #
+        # Checked on every book update rather than at the close,
+        # because the reading is intrabar: the moment the running
+        # imbalance and the running delta first point the same way is
+        # the moment it could have been acted on, and the close is a
+        # long time after that. Latched once set -- the reading existed
+        # at that price, whatever the rest of the bar goes on to do.
+        if not self._c_side:
+            _v = self._buy_vol + self._sell_vol
+            if _v >= CALL_MIN_VOL:
+                _d = self._buy_vol - self._sell_vol
+                if self._acc > 0 and _d > 0:
+                    self._c_side, self._c_px, self._c_ts = "up", mid, ts
+                elif self._acc < 0 and _d < 0:
+                    self._c_side, self._c_px, self._c_ts = "down", mid, ts
         if self._acc > bar.ofi_high:
             bar.ofi_high = self._acc
         if self._acc < bar.ofi_low:
@@ -503,6 +627,12 @@ class OfiBarBuilder:
         bar.buy_vol = self._buy_vol
         bar.sell_vol = self._sell_vol
         bar.trade_count = self._trades
+        bar.trade_high = self._t_hi or 0.0
+        bar.trade_low = self._t_lo or 0.0
+        bar.trade_last = self._t_last
+        bar.call_side = self._c_side
+        bar.call_px = self._c_px
+        bar.call_ts = self._c_ts
         self.bars.append(bar)
         if len(self.bars) > self.max_bars:
             # Trim in blocks. Popping one per close is O(n) each time
@@ -526,5 +656,11 @@ class OfiBarBuilder:
         self._buy_vol = 0.0
         self._sell_vol = 0.0
         self._trades = 0
+        self._t_hi = None
+        self._t_lo = None
+        self._t_last = 0.0
+        self._c_side = ""
+        self._c_px = 0.0
+        self._c_ts = 0.0
         self._open_bar(ts, mid)
         return bar
