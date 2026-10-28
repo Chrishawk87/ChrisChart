@@ -6345,6 +6345,19 @@ def create_app() -> FastAPI:
             except Exception:                           # noqa: BLE001
                 board = None
 
+        # THE OBSERVATIONS: every stretch where imbalance and delta
+        # agreed, and whether price got the distance before the bar
+        # ended. The chatter figures sit in the same table on purpose
+        # -- an observation three updates long cannot travel two
+        # points, so a low median says the gate is wrong rather than
+        # that the rule is.
+        obs = None
+        if len(s_bars) > 20:
+            try:
+                obs = _ag.observation_table(s_bars, points=(1, 2, 3, 4))
+            except Exception:                           # noqa: BLE001
+                obs = None
+
         # THE AGREEMENT TEST, which is the whole question in one table:
         # OFI closed the bar one way and delta went the same way, so
         # did price. No level, no price path, no target, no stop.
@@ -6371,7 +6384,19 @@ def create_app() -> FastAPI:
         if cur is not None and cur.updates > 0:
             _lp = b.live_pai
             _cs, _cpx, _cts = b.live_call
+            _ep = b.live_episode
+            _liveobs = None
+            if _ep is not None:
+                _liveobs = {
+                    "side": _ep.side, "px0": _ep.px0 * sc,
+                    "updates": _ep.updates,
+                    "now_pts": round(_ep.move / 1e9, 2),
+                    "mfe_pts": round(_ep.mfe / 1e9, 2),
+                    "mae_pts": round(_ep.mae / 1e9, 2),
+                    "at2": _ep.outcome(2), "at4": _ep.outcome(4)}
             forming = {"call_side": _cs, "call_px": _cpx * sc,
+                       "obs": _liveobs,
+                       "obs_so_far": len(b.live_episodes),
                        "open": cur.open * sc, "high": cur.high * sc,
                        "low": cur.low * sc, "close": cur.close * sc,
                        "ofi": b.accumulated, "updates": cur.updates,
@@ -6397,7 +6422,7 @@ def create_app() -> FastAPI:
                 "pivot_n": pv, "confirm_n": cf,
                 "traded_bars": sum(1 for x in window if x.traded),
                 "keep_n": keep_n, "levels": lvls,
-                "agree": agree,
+                "agree": agree, "obs": obs,
                 "calls": [calls_by_i[k] for k in sorted(calls_by_i)],
                 "scoreboard": board,
                 "higher": want_higher, "higher_levels": hi,
@@ -10292,22 +10317,55 @@ function ofiChart(d, w, h) {
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   const nb = bars.length - ba - sa;
+  /* THE RUNNING CALL, re-read on every update rather than latched.
+
+     A bar at target 2,000 runs for minutes, and what it is doing at
+     the start is routinely not what it is doing at the end. A call
+     that fires once and sticks reports DOWN on a bar whose imbalance,
+     delta and body all went up -- which is simply false, and was.
+
+     SAYING NOTHING IS A READING. When imbalance and delta disagree
+     there is no call, and the line says which way each of them is
+     pointing so the disagreement is visible rather than hidden behind
+     a blank. */
   const fm = d && d.forming;
-  const liveCall = (fm && (fm.call_side === 'up' || fm.call_side === 'down'))
-    ? '<span class="stamp" style="width:100%">THIS BAR &mdash; <b class="'
+  const obsNow = fm && fm.obs;
+  const pointsLine = o => {
+    if (!o) return '';
+    const s2 = o.at2 === 'win' ? '<b class="long">+2 hit</b>'
+      : o.at2 === 'loss' ? '<b class="short">-2 hit</b>' : '2pt open';
+    const s4 = o.at4 === 'win' ? '<b class="long">+4 hit</b>'
+      : o.at4 === 'loss' ? '<b class="short">-4 hit</b>' : '4pt open';
+    return ' &middot; from ' + o.px0.toFixed(2) + ': '
+      + (o.now_pts > 0 ? '+' : '') + o.now_pts.toFixed(2) + ' pt now, best '
+      + o.mfe_pts.toFixed(2) + ' / worst -' + o.mae_pts.toFixed(2)
+      + ' &middot; ' + s2 + ' &middot; ' + s4;
+  };
+  let liveCall;
+  if (fm && (fm.call_side === 'up' || fm.call_side === 'down')) {
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; <b class="'
       + (fm.call_side === 'up' ? 'long">UP' : 'short">DOWN')
-      + '</b> called at ' + (fm.call_px || 0).toFixed(2)
-      + ', while the bar is still open &middot; imbalance '
-      + (fm.ofi > 0 ? '+' : '') + (fm.ofi || 0).toLocaleString()
-      + ' and delta ' + (fm.delta > 0 ? '+' : '')
-      + Math.round(fm.delta || 0).toLocaleString()
-      + ' pointing the same way</span>'
-    : '<span class="stamp" style="width:100%">THIS BAR &mdash; no call '
-      + 'yet: imbalance and delta have not agreed inside it'
-      + (fm ? ' (imbalance ' + (fm.ofi > 0 ? '+' : '')
-          + (fm.ofi || 0).toLocaleString() + ', delta '
-          + (fm.delta > 0 ? '+' : '') + Math.round(fm.delta || 0)
-            .toLocaleString() + ')' : '') + '</span>';
+      + '</b> right now &middot; imbalance ' + (fm.ofi > 0 ? '+' : '')
+      + (fm.ofi || 0).toLocaleString() + ' and delta '
+      + (fm.delta > 0 ? '+' : '') + Math.round(fm.delta || 0).toLocaleString()
+      + ' agree' + pointsLine(obsNow)
+      + ' &middot; ' + (fm.obs_so_far || 0) + ' so far this bar</span>';
+  } else if (fm) {
+    const oi = fm.ofi || 0, dl = fm.delta || 0;
+    const dis = (oi > 0 && dl < 0) || (oi < 0 && dl > 0);
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
+      + '<b>NO CALL</b> &middot; imbalance ' + (oi > 0 ? '+' : '')
+      + oi.toLocaleString() + ' points ' + (oi > 0 ? 'up' : oi < 0 ? 'down' : 'nowhere')
+      + ', delta ' + (dl > 0 ? '+' : '') + Math.round(dl).toLocaleString()
+      + ' points ' + (dl > 0 ? 'up' : dl < 0 ? 'down' : 'nowhere')
+      + ' &middot; ' + (dis ? 'they disagree, so there is nothing to call'
+                            : 'neither has committed far enough yet')
+      + ' &middot; ' + (fm.obs_so_far || 0) + ' observation'
+      + ((fm.obs_so_far === 1) ? '' : 's') + ' so far this bar</span>';
+  } else {
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
+      + 'no bar is forming</span>';
+  }
 
   const dLast = all[all.length - 1] || {};
   const dSum = all.reduce((a, b) => a + (b.delta || 0), 0);
@@ -10341,6 +10399,77 @@ function ofiChart(d, w, h) {
       &middot; closed by ${last.direction === 'green' ? 'buying' : 'selling'} flow
       (OFI ${last.ofi > 0 ? '+' : ''}${last.ofi})
       &middot; built from ${last.updates} book updates</span>`
+}
+
+/* THE OBSERVATIONS, which is the strategy stated as a measurement.
+
+   Each one runs from the moment imbalance and delta agree to the
+   moment they stop, they reverse, or the bar ends -- whichever comes
+   first. Nothing outlives its bar.
+
+   UNRESOLVED IS NOT A DRAW AND IT IS NOT A LOSS. It means the bar
+   ended before price got that far either way, and at four points it
+   will often be most of the sample. Calling it anything else is how a
+   rule that rarely reaches its distance comes to look like one that
+   reaches it and wins.
+
+   The chatter figures are in the same block deliberately. An
+   observation three updates long cannot travel two points, so a low
+   median says the gate is set wrong, not that the rule failed. */
+function ofiObs(d) {
+  const o = d && d.obs;
+  if (!o || !o.rows) {
+    return '<span class="stamp" style="width:100%">observations &mdash; '
+      + 'not enough bars yet</span>';
+  }
+  const body = o.rows.map(r => {
+    const rate = r.decided
+      ? '<b class="' + (r.pct_of_decided >= 0.5 ? 'long' : 'short') + '">'
+        + (r.pct_of_decided * 100).toFixed(1) + '%</b>'
+      : '&mdash;';
+    return '<tr><td>' + r.points + ' point'
+      + (r.points === 1 ? '' : 's') + '</td>'
+      + '<td style="text-align:right">' + r.win.toLocaleString() + '</td>'
+      + '<td style="text-align:right">' + r.loss.toLocaleString() + '</td>'
+      + '<td style="text-align:right;color:var(--muted)">'
+      + r.unresolved.toLocaleString() + '</td>'
+      + '<td style="text-align:right">' + rate + '</td>'
+      + '<td style="text-align:right;color:var(--muted)">'
+      + (r.pct_resolved * 100).toFixed(0) + '%</td></tr>';
+  }).join('');
+  const med = o.median_updates;
+  const thin = med < 20;
+  return '<span class="stamp" style="width:100%"><b>observations</b> '
+    + '&mdash; ' + o.observations.toLocaleString() + ' across '
+    + o.bars.toLocaleString() + ' bars (' + o.per_bar + ' a bar, '
+    + o.silent_bars.toLocaleString() + ' bars never called), '
+    + o.up.toLocaleString() + ' up / ' + o.down.toLocaleString()
+    + ' down</span>'
+    + '<table style="width:100%;font-size:11px"><tr style="color:var(--muted)">'
+    + '<th style="text-align:left">distance</th>'
+    + '<th style="text-align:right">hit it</th>'
+    + '<th style="text-align:right">hit the other way</th>'
+    + '<th style="text-align:right">bar ended first</th>'
+    + '<th style="text-align:right">of decided</th>'
+    + '<th style="text-align:right">ever resolved</th></tr>'
+    + body + '</table>'
+    + '<span class="stamp" style="width:100%">An observation runs from '
+    + 'the moment imbalance and delta agree until they stop, reverse, '
+    + 'or the bar ends. Nothing outlives its bar. BAR ENDED FIRST is '
+    + 'not a draw and not a loss &mdash; it is price never getting '
+    + 'that far either way, and at four points it is usually most of '
+    + 'the sample.</span>'
+    + '<span class="stamp" style="width:100%"'
+    + (thin ? ' ><b class="short">Median observation is ' + med
+        + ' updates long.</b> That is too short to travel two points, '
+        + 'so the table above is measuring the gate and not the rule. '
+        + 'The entry gate wants raising.'
+      : '>Median observation is ' + med + ' updates long.')
+    + ' They ended: ' + Object.keys(o.ends).map(k =>
+        o.ends[k].toLocaleString() + ' ' + (k === 'lost'
+          ? 'when the two stopped agreeing' : k === 'flip'
+          ? 'by reversing' : k === 'bar' ? 'at the bar close' : k)
+      ).join(', ') + '.</span>';
 }
 
 /* THE AGREEMENT TEST, at the top, because it is the question.
@@ -10679,6 +10808,7 @@ async function ofiTick(fromTimer) {
         &middot; ${d.total.toLocaleString()} held${d.dropped
           ? ' (' + d.dropped.toLocaleString() + ' older ones aged out)' : ''}</span>
       ${ofiChart(d, w, 240)}
+      ${ofiObs(d)}
       ${ofiAgree(d)}
       ${ofiCalls(d)}
       <span class="stamp" style="width:100%">Colour is the ORDER-FLOW

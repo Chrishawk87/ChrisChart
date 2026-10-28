@@ -52,14 +52,17 @@ RAW_TICK = 250_000_000.0
 TICK = 0.25
 
 
-def build(paths: list[str], targets: list[int], limit: int = 0):
+def build(paths: list[str], targets: list[int], limit: int = 0,
+          gates: tuple = (0.20, 0.05, 0.10)):
     """One pass over the files, feeding every target at once."""
     import databento as db
 
     from liqmap import dbn
 
     builders = {t: OfiBarBuilder(tick_size=TICK, threshold=t, max_s=900.0,
-                                 min_updates=2, max_bars=10_000_000)
+                                 min_updates=2, max_bars=10_000_000,
+                                 enter_frac=gates[0], hold_frac=gates[1],
+                                 delta_frac=gates[2])
                 for t in targets}
     n = 0
     for path in paths:
@@ -91,6 +94,38 @@ def build(paths: list[str], targets: list[int], limit: int = 0):
             break
     print(f"  {n:,} records read")
     return builders
+
+
+def show_observations(target: int, bars) -> None:
+    """The strategy as he states it: every stretch where imbalance and
+    delta agreed, scored at the distance it was shooting for, inside
+    the bar it happened in."""
+    t = A.observation_table(bars, points=(1, 2, 3, 4))
+    print(f"\n  OBSERVATIONS  {t['observations']:,} across "
+          f"{t['bars']:,} bars ({t['per_bar']} a bar, "
+          f"{t['silent_bars']:,} bars never called) "
+          f"{t['up']:,} up / {t['down']:,} down")
+    print(f"  {'distance':<12}{'hit it':>9}{'hit other':>11}"
+          f"{'bar ended':>11}{'of decided':>12}{'resolved':>10}")
+    for r in t["rows"]:
+        rate = f"{r['pct_of_decided']:.1%}" if r["decided"] else "--"
+        print(f"  {str(r['points']) + ' point':<12}{r['win']:>9,}"
+              f"{r['loss']:>11,}{r['unresolved']:>11,}{rate:>12}"
+              f"{r['pct_resolved']:>10.1%}")
+    med = t["median_updates"]
+    print(f"\n  Median observation is {med:,} updates long. Ended: "
+          + ", ".join(f"{v:,} {k}" for k, v in t["ends"].items()) + ".")
+    if med < 20:
+        print("  THAT IS TOO SHORT TO TRAVEL TWO POINTS. The table above is")
+        print("  measuring the entry gate, not the rule. Raise"
+              " --enter-frac and")
+        print("  run it again before reading anything into those"
+              " percentages.")
+    print("  BAR ENDED FIRST is not a draw and not a loss -- it is price"
+          " never")
+    print("  getting that far either way. At four points it is usually"
+          " most of")
+    print("  the sample.")
 
 
 def show(target: int, bars, horizons) -> list[dict]:
@@ -130,6 +165,13 @@ def main() -> int:
     ap.add_argument("--forward", type=int, nargs="+",
                     default=list(A.HORIZONS))
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--enter-frac", type=float, default=0.20,
+                    help="share of the target the imbalance must reach"
+                         " before it counts as a direction")
+    ap.add_argument("--hold-frac", type=float, default=0.05,
+                    help="and how far it may fall back before it stops")
+    ap.add_argument("--delta-frac", type=float, default=0.10,
+                    help="share of traded volume delta must be to start")
     ap.add_argument("--out", default="",
                     help="CSV path; defaults to agree_calls_<target>.csv"
                          " beside the first input file")
@@ -140,12 +182,14 @@ def main() -> int:
     print(f"\nAGREEMENT CATALOGUE   targets {targets}   "
           f"horizons {list(horizons)}")
     print("  building bars...", flush=True)
-    builders = build(a.files, targets, a.limit)
+    builders = build(a.files, targets, a.limit,
+                     (a.enter_frac, a.hold_frac, a.delta_frac))
 
     base = Path(a.files[0]).resolve().parent
     for t in targets:
         bars = builders[t].bars
         rows = show(t, bars, horizons)
+        show_observations(t, bars)
         if not rows:
             continue
         out = (Path(a.out) if a.out and len(targets) == 1

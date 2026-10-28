@@ -247,3 +247,66 @@ def summary(bars, horizons=HORIZONS, tick: float = 1.0,
             "share_called": round(called / len(bars), 4) if bars else 0.0,
             "horizons": list(horizons),
             "rows": [r.as_dict() for r in rows]}
+
+
+# ------------------------------------------- observations inside the bar
+
+def observations(bars) -> list:
+    """Every observation across these bars, oldest first.
+
+    An observation is one stretch during which the running imbalance
+    and the running delta agreed on a direction. It starts when they
+    agree, and ends when they stop agreeing, when they agree the other
+    way, or when the bar closes. NOTHING OUTLIVES ITS BAR -- at the
+    larger targets a bar is minutes, and an observation that ran past
+    it would be answering a question about a bar that no longer exists.
+    """
+    out = []
+    for b in bars:
+        out.extend(getattr(b, "episodes", ()) or ())
+    return out
+
+
+def observation_table(bars, points=(1, 2, 3, 4)) -> dict:
+    """Win, loss and unresolved at each distance, plus how it behaved.
+
+    UNRESOLVED IS NOT A DRAW AND IT IS NOT A LOSS. It means the bar
+    ended before price got that far either way, and at four points it
+    will often be most of the sample. Reporting it as anything else
+    is how a rule that rarely reaches its distance comes to look like
+    a rule that reaches it and wins.
+
+    The chatter figures are in here for the same reason. An
+    observation three updates long cannot travel two points, so if the
+    median is three the table below it is not measuring the rule -- it
+    is measuring a gate that is set too low.
+    """
+    eps = observations(bars)
+    n_bars = len(bars)
+    rows = []
+    for pts in points:
+        win = sum(1 for e in eps if e.outcome(pts) == "win")
+        loss = sum(1 for e in eps if e.outcome(pts) == "loss")
+        unres = len(eps) - win - loss
+        dec = win + loss
+        rows.append({
+            "points": pts, "n": len(eps), "win": win, "loss": loss,
+            "unresolved": unres, "decided": dec,
+            "pct_of_decided": round(win / dec, 4) if dec else 0.0,
+            "pct_resolved": round(dec / len(eps), 4) if eps else 0.0,
+        })
+    ups = sorted(e.updates for e in eps)
+    ends: dict = {}
+    for e in eps:
+        ends[e.end or "open"] = ends.get(e.end or "open", 0) + 1
+    return {
+        "bars": n_bars, "observations": len(eps),
+        "per_bar": round(len(eps) / n_bars, 2) if n_bars else 0.0,
+        "silent_bars": sum(1 for b in bars
+                           if not (getattr(b, "episodes", ()) or ())),
+        "median_updates": ups[len(ups) // 2] if ups else 0,
+        "ends": ends,
+        "up": sum(1 for e in eps if e.side == UP),
+        "down": sum(1 for e in eps if e.side == DOWN),
+        "rows": rows,
+    }

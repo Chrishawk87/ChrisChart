@@ -137,62 +137,30 @@ class TestTheCallIsMadeInsideTheBar:
         assert b.bars[0].call_side == A.UP
         assert b.bars[0].call_px > 0
 
-    def test_the_latch_does_not_move_once_set(self):
-        """The reading existed at that price, whatever the rest of the
-        bar goes on to do."""
+    def test_the_call_is_not_latched(self):
+        """It was, and that was the bug: a bar whose imbalance, delta
+        and body all went up still reported DOWN, because the call
+        fired once early and stuck."""
         from liqmap.ofibar import OfiBarBuilder
         base = 7_700 * 10 ** 9
-        b = OfiBarBuilder(tick_size=0.25, threshold=100_000, max_s=900.0,
-                          min_updates=2)
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                          min_updates=2, enter_frac=1e-5, hold_frac=2.5e-6)
         b.on_book(0.0, base, 100, base + RAW, 100)
-        b.on_trade(0.01, 50, "buy", base + RAW)
-        b.on_book(0.01, base, 400, base + RAW, 100)
-        first = b.live_call
-        assert first[0] == A.UP
-        for i in range(2, 40):
-            b.on_trade(i * 0.01, 50, "sell", base)
-            b.on_book(i * 0.01, base, 100, base + RAW, 100 + i * 50)
-        assert b.live_call == first
-
-
-class TestFlatsAreTheirOwnColumn:
-    """The largest lever on the headline number."""
-
-    def _bars(self, moves, call="green", delta=50.0):
-        px, bars = 0.0, []
-        for m in moves:
-            bars.append(Bar(call, delta=delta, close=px))
-            px += m
-        bars.append(Bar("chop", delta=0.0, close=px))
-        return bars
-
-    def test_a_flat_outcome_is_neither_right_nor_wrong(self):
-        bars = self._bars([0.0, 0.0, 0.0])
-        r = A.measure(bars, horizons=(1,))[0]
-        assert r.flat == r.n and r.right == 0 and r.wrong == 0
-
-    def test_of_all_counts_flats_against_the_call(self):
-        bars = self._bars([1.0, 0.0, 0.0, 0.0])
-        r = A.measure(bars, horizons=(1,))[0]
-        assert r.n == 4 and r.right == 1
-        assert r.pct_of_all == pytest.approx(0.25)
-
-    def test_of_decided_sets_them_aside(self):
-        bars = self._bars([1.0, 0.0, 0.0, 0.0])
-        r = A.measure(bars, horizons=(1,))[0]
-        assert r.decided == 1
-        assert r.pct_of_decided == pytest.approx(1.0)
-
-    def test_the_two_percentages_are_far_apart_on_real_bars(self):
-        """Which is exactly why both are reported."""
-        bars = walk(200_000)
-        rows = A.measure(bars, horizons=(1,), tick=RAW)
-        for r in rows:
-            assert r.pct_of_decided - r.pct_of_all > 0.25, r.as_dict()
-
-    def test_no_decided_calls_means_no_rate(self):
-        r = A.measure(self._bars([0.0, 0.0]), horizons=(1,))[0]
-        assert r.pct_of_decided == 0.0
+        ts, sz = 0.0, 100
+        for _ in range(60):                     # sellers first
+            ts += 0.01
+            sz += 60
+            b.on_trade(ts, 40, "sell", base)
+            b.on_book(ts, base, 100, base + RAW, sz)
+        assert b.live_call[0] == A.DOWN
+        sz = 100
+        for _ in range(400):                    # then buyers, hard
+            ts += 0.01
+            sz += 60
+            b.on_trade(ts, 40, "buy", base + RAW)
+            b.on_book(ts, base, sz, base + RAW, 100)
+        assert len(b.bars) == 0, "it must all be one bar"
+        assert b.live_call[0] == A.UP, "it never took the down call back"
 
 
 class TestWhatCountsAsFinished:

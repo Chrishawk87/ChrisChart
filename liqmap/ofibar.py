@@ -102,9 +102,91 @@ PAI_SELL = 0.30
 # allowed to speak. Below it one contract flips the sign.
 CALL_MIN_VOL = 10.0
 
+# How far the running imbalance must travel toward closing the bar
+# before it counts as a direction, and how far back it must fall
+# before it stops counting. Two numbers, not one, and that gap is the
+# whole of the design:
+#
+# A single gate sits at one level and the accumulator crosses it back
+# and forth on consecutive updates. Measured on a book at target
+# 2,000, a single 5% gate produced 64,505 observations across 9,799
+# bars -- six and a half per bar, most of them three updates long,
+# describing nothing at all. The call has to commit before it speaks
+# and give up ground before it stops.
+#
+# This is hysteresis on the GATE, never on the agreement. Imbalance
+# and delta opposing each other ends the call at once, at any level:
+# a call in that state is false and no amount of inertia excuses it.
+CALL_ENTER_FRAC = 0.20
+CALL_HOLD_FRAC = 0.05
+
+# Delta gets the same two numbers, as a share of what the bar has
+# traded. A net of one lot on four hundred is not a direction, it is
+# the sign of the last print, and it changes on the next one. To start
+# speaking delta must be this share of volume; to keep speaking it
+# need only still be on the same side.
+CALL_DELTA_FRAC = 0.10
+
+# One ES point in raw feed units. A point is four ticks.
+POINT = 1_000_000_000
+
+# The win/lose distances an observation is scored at, in points.
+OUTCOME_POINTS: tuple[int, ...] = (1, 2, 3, 4)
+
+# Most observations a single bar may hold.
+MAX_EPISODES = 64
+
 # The closing-burst window. Reported alongside the bar-wide figure,
 # never used to colour the bar -- see `pai` for why.
 BURST_S = 0.005
+
+
+@dataclass(slots=True)
+class Episode:
+    """One stretch of the bar during which the call held one direction.
+
+    Starts the moment imbalance and delta agree, ends when they stop
+    agreeing, when they agree the OTHER way, or when the bar closes --
+    whichever comes first. Nothing outlives its bar.
+
+    `first` records, for each distance in OUTCOME_POINTS, whether price
+    got that far the call's way BEFORE it got that far against it.
+    Recorded as it happens rather than worked out afterwards from the
+    high and the low, because a high and a low cannot say which came
+    first and that is the entire question.
+    """
+
+    side: str = ""              # "up" or "down"
+    px0: float = 0.0            # mid when the call started
+    ts0: float = 0.0
+    px_end: float = 0.0
+    ts_end: float = 0.0
+    updates: int = 0
+    mfe: float = 0.0            # furthest it went the call's way
+    mae: float = 0.0            # furthest it went against, as a positive
+    end: str = ""               # "flip" | "lost" | "bar"
+    first: dict = field(default_factory=dict)   # points -> "win" | "loss"
+
+    @property
+    def seconds(self) -> float:
+        return self.ts_end - self.ts0
+
+    @property
+    def move(self) -> float:
+        """Where it finished, the call's way, in raw units."""
+        d = self.px_end - self.px0
+        return d if self.side == "up" else -d
+
+    def outcome(self, points: int) -> str:
+        """win / loss / unresolved at a given distance."""
+        return self.first.get(points, "unresolved")
+
+    def as_dict(self) -> dict:
+        return {"side": self.side, "px0": self.px0, "ts0": self.ts0,
+                "px_end": self.px_end, "ts_end": self.ts_end,
+                "updates": self.updates, "mfe": self.mfe, "mae": self.mae,
+                "end": self.end,
+                "first": {str(k): v for k, v in self.first.items()}}
 
 
 @dataclass(slots=True)
@@ -153,6 +235,9 @@ class OfiBar:
     call_side: str = ""
     call_px: float = 0.0
     call_ts: float = 0.0
+    # Every observation inside this bar, oldest first. A bar where the
+    # call reversed has two; one where it never fired has none.
+    episodes: list = field(default_factory=list)
 
     @property
     def seconds(self) -> float:
@@ -338,11 +423,15 @@ class OfiBarBuilder:
                  "_buy_agg", "_sell_agg", "_steps",
                  "_buy_vol", "_sell_vol", "_trades",
                  "_t_hi", "_t_lo", "_t_last",
-                 "_c_side", "_c_px", "_c_ts")
+                 "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
+                 "_delta_frac", "_ep", "_eps")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
-                 max_bars: int = 20_000) -> None:
+                 max_bars: int = 20_000,
+                 enter_frac: float = CALL_ENTER_FRAC,
+                 hold_frac: float = CALL_HOLD_FRAC,
+                 delta_frac: float = CALL_DELTA_FRAC) -> None:
         if tick_size <= 0:
             raise ValueError("tick_size must be positive")
         if threshold < 1:
@@ -402,6 +491,18 @@ class OfiBarBuilder:
         self._c_side: str = ""
         self._c_px: float = 0.0
         self._c_ts: float = 0.0
+        # How far off zero the running imbalance must be before it
+        # counts as a direction at all. Scaled to the target, so the
+        # same rule means the same thing on every rung of the ladder.
+        # The defaults are a starting point, not a measurement: they
+        # were set against a book far noisier than a real one. Whether
+        # they chatter on the actual tape is a question the actual tape
+        # answers, so they are arguments.
+        self._min_acc = max(1, int(self.threshold * float(enter_frac)))
+        self._hold_acc = max(1, int(self.threshold * float(hold_frac)))
+        self._delta_frac = float(delta_frac)
+        self._ep: Episode | None = None
+        self._eps: list = []
 
     def reset(self) -> None:
         self._prev = None
@@ -421,6 +522,8 @@ class OfiBarBuilder:
         self._c_side = ""
         self._c_px = 0.0
         self._c_ts = 0.0
+        self._ep = None
+        self._eps = []
 
     @property
     def current(self) -> OfiBar | None:
@@ -450,14 +553,23 @@ class OfiBarBuilder:
 
     @property
     def live_call(self) -> tuple[str, float, float]:
-        """(side, price, ts) of the call inside the bar in progress.
+        """(side, price, ts) of the call RIGHT NOW in the open bar.
 
-        Empty side means imbalance and delta have not agreed yet in
-        this bar. This is what the chart marks while the bar is still
-        forming, because the reading is intrabar and waiting for the
-        close throws away the whole of it.
+        Empty side means imbalance and delta do not agree at this
+        instant -- which is a reading in itself and not a gap. It is
+        re-read on every update, so it reverses when they reverse.
         """
         return (self._c_side, self._c_px, self._c_ts)
+
+    @property
+    def live_episode(self) -> Episode | None:
+        """The observation in progress, or None if there is no call."""
+        return self._ep
+
+    @property
+    def live_episodes(self) -> list:
+        """Every observation in the bar so far, oldest first."""
+        return list(self._eps)
 
     @property
     def live_traded(self) -> tuple[float, float, float]:
@@ -567,22 +679,50 @@ class OfiBarBuilder:
             bar.low = mid
         bar.close = mid
         bar.ts_close = ts
-        # THE CALL IS MADE HERE, INSIDE THE BAR.
+        # THE CALL IS A RUNNING DETERMINATION, NOT A LATCH.
         #
-        # Checked on every book update rather than at the close,
-        # because the reading is intrabar: the moment the running
-        # imbalance and the running delta first point the same way is
-        # the moment it could have been acted on, and the close is a
-        # long time after that. Latched once set -- the reading existed
-        # at that price, whatever the rest of the bar goes on to do.
-        if not self._c_side:
-            _v = self._buy_vol + self._sell_vol
-            if _v >= CALL_MIN_VOL:
-                _d = self._buy_vol - self._sell_vol
-                if self._acc > 0 and _d > 0:
-                    self._c_side, self._c_px, self._c_ts = "up", mid, ts
-                elif self._acc < 0 and _d < 0:
-                    self._c_side, self._c_px, self._c_ts = "down", mid, ts
+        # Re-read on every book update, because a bar at the larger
+        # targets runs for minutes and the thing it is doing at the
+        # start is routinely not the thing it is doing at the end. A
+        # call that fires once and sticks reports DOWN on a bar whose
+        # imbalance, delta and body all went up, which is simply false.
+        #
+        # AND IT HAS TO BE ABLE TO SAY NOTHING. When imbalance and
+        # delta disagree there is no call -- not the previous one, not
+        # a weaker version of it, nothing. Half the updates in a bar
+        # are in that state and reporting a direction through them is
+        # the whole of the error.
+        _v = self._buy_vol + self._sell_vol
+        _d = self._buy_vol - self._sell_vol
+        _side = ""
+        if _v >= CALL_MIN_VOL:
+            # Already speaking: it keeps speaking while the imbalance
+            # holds the ground it gave AND delta still agrees. Delta
+            # turning against it ends the call immediately, whatever
+            # the imbalance is doing -- that is the state he means by
+            # false, and hysteresis must never reach it.
+            if self._c_side == "up" and self._acc >= self._hold_acc and _d > 0:
+                _side = "up"
+            elif (self._c_side == "down" and self._acc <= -self._hold_acc
+                  and _d < 0):
+                _side = "down"
+            else:
+                # Silent, or just lost it: it has to commit again, and
+                # both inputs have to mean something to do that.
+                _dgate = _v * self._delta_frac
+                if self._acc >= self._min_acc and _d >= _dgate:
+                    _side = "up"
+                elif self._acc <= -self._min_acc and _d <= -_dgate:
+                    _side = "down"
+        if _side != self._c_side:
+            self._end_episode("flip" if _side else "lost", ts, mid)
+            self._c_side = _side
+            self._c_px = mid if _side else 0.0
+            self._c_ts = ts if _side else 0.0
+            if _side:
+                self._start_episode(_side, ts, mid)
+        if self._ep is not None:
+            self._track(ts, mid)
         if self._acc > bar.ofi_high:
             bar.ofi_high = self._acc
         if self._acc < bar.ofi_low:
@@ -613,6 +753,54 @@ class OfiBarBuilder:
         self._bar = OfiBar(ts_open=ts, ts_close=ts, open=mid, high=mid,
                            low=mid, close=mid, direction=CHOP)
 
+    # -- observations inside the bar -----------------------------------
+
+    def _start_episode(self, side: str, ts: float, mid: float) -> None:
+        # A hard ceiling on how many a single bar may hold. Without it a
+        # chopping bar can spend a minute flickering across the gate and
+        # produce thousands of one-update observations, which is a
+        # memory leak wearing a measurement's clothes.
+        if len(self._eps) >= MAX_EPISODES:
+            self._ep = None
+            return
+        ep = Episode(side=side, px0=mid, ts0=ts, px_end=mid, ts_end=ts)
+        self._eps.append(ep)
+        self._ep = ep
+
+    def _end_episode(self, why: str, ts: float, mid: float) -> None:
+        ep = self._ep
+        if ep is None:
+            return
+        ep.end = why
+        ep.px_end = mid
+        ep.ts_end = ts
+        self._ep = None
+
+    def _track(self, ts: float, mid: float) -> None:
+        ep = self._ep
+        assert ep is not None
+        ep.updates += 1
+        ep.px_end = mid
+        ep.ts_end = ts
+        d = mid - ep.px0
+        fav = d if ep.side == "up" else -d
+        adv = -fav
+        if fav > ep.mfe:
+            ep.mfe = fav
+        if adv > ep.mae:
+            ep.mae = adv
+        # WHICH CAME FIRST, recorded as it happens. A high and a low
+        # cannot say which of them was reached first, and that is the
+        # entire question being asked.
+        for pts in OUTCOME_POINTS:
+            if pts in ep.first:
+                continue
+            need = pts * POINT
+            if fav >= need:
+                ep.first[pts] = "win"
+            elif adv >= need:
+                ep.first[pts] = "loss"
+
     def _close(self, direction: str, ts: float, mid: float) -> OfiBar:
         bar = self._bar
         assert bar is not None
@@ -630,9 +818,14 @@ class OfiBarBuilder:
         bar.trade_high = self._t_hi or 0.0
         bar.trade_low = self._t_lo or 0.0
         bar.trade_last = self._t_last
-        bar.call_side = self._c_side
-        bar.call_px = self._c_px
-        bar.call_ts = self._c_ts
+        # NOTHING OUTLIVES ITS BAR. Whatever is still open is closed
+        # here and the record goes with the bar it happened in.
+        self._end_episode("bar", ts, mid)
+        bar.episodes = list(self._eps)
+        first = self._eps[0] if self._eps else None
+        bar.call_side = first.side if first else ""
+        bar.call_px = first.px0 if first else 0.0
+        bar.call_ts = first.ts0 if first else 0.0
         self.bars.append(bar)
         if len(self.bars) > self.max_bars:
             # Trim in blocks. Popping one per close is O(n) each time
@@ -662,5 +855,7 @@ class OfiBarBuilder:
         self._c_side = ""
         self._c_px = 0.0
         self._c_ts = 0.0
+        self._ep = None
+        self._eps = []
         self._open_bar(ts, mid)
         return bar

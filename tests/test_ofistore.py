@@ -395,3 +395,53 @@ class TestTheIntrabarCallSurvivesToo:
         b = st.recent(250)[0]
         assert b.call_side == "" and b.call_px == 0.0
         assert st.count(250) == 1, "the old row survived the migration"
+
+
+class TestTheObservationsSurvive:
+    """At target 2,000 a bar is minutes, so four thousand bars is days.
+    A restart that lost the observations would empty the table that
+    measures the strategy and take days to refill it."""
+
+    def test_they_round_trip(self, tmp_path):
+        lad = builders((250,))
+        feed(lad)
+        assert any(b.episodes for b in lad[250].bars)
+        rec = OfiBarRecorder(OfiBarStore(tmp_path / "t.db"), lad)
+        rec.seed()
+        rec.flush()
+        fresh = builders((250,))
+        OfiBarRecorder(OfiBarStore(tmp_path / "t.db"),
+                       fresh).load_into_builders()
+        for a, b in zip(lad[250].bars, fresh[250].bars):
+            assert len(a.episodes) == len(b.episodes)
+            for x, y in zip(a.episodes, b.episodes):
+                assert x.as_dict() == y.as_dict()
+
+    def test_the_win_loss_record_comes_back_with_them(self, tmp_path):
+        lad = builders((250,))
+        feed(lad)
+        rec = OfiBarRecorder(OfiBarStore(tmp_path / "t.db"), lad)
+        rec.seed()
+        rec.flush()
+        fresh = builders((250,))
+        OfiBarRecorder(OfiBarStore(tmp_path / "t.db"),
+                       fresh).load_into_builders()
+        from liqmap import agree as A
+        a = A.observation_table(lad[250].bars, points=(1, 2))
+        b = A.observation_table(fresh[250].bars, points=(1, 2))
+        assert a["observations"] == b["observations"]
+        assert a["rows"] == b["rows"]
+
+    def test_a_bar_with_no_observations_stores_nothing(self, store):
+        assert store.record(250, OfiBar(ts_open=1.0, ts_close=2.0, open=1,
+                                        high=2, low=0, close=1,
+                                        direction="green", ofi=250,
+                                        updates=9)) == 1
+        assert store.recent(250)[0].episodes == []
+
+    def test_an_unreadable_record_yields_none_not_a_guess(self, tmp_path):
+        """Inventing an observation is worse than having none."""
+        from liqmap.ofistore import _eps_in
+        assert _eps_in("not json at all") == []
+        assert _eps_in("") == []
+        assert _eps_in("[{}]")[0].side == ""

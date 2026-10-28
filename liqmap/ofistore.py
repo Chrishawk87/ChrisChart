@@ -37,6 +37,7 @@ cupboard.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -45,7 +46,7 @@ from pathlib import Path
 from typing import Iterator
 
 from .db import ThreadedDB
-from .ofibar import OfiBar
+from .ofibar import Episode, OfiBar
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ofi_bars (
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS ofi_bars (
     call_side   TEXT    NOT NULL DEFAULT '',
     call_px     REAL    NOT NULL DEFAULT 0,
     call_ts     REAL    NOT NULL DEFAULT 0,
+    episodes    TEXT    NOT NULL DEFAULT '',
     written_at  REAL    NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ofi_bars_one
@@ -97,7 +99,7 @@ _COLUMNS = ("target", "ts_open", "ts_close", "open", "high", "low",
             "buy_agg", "sell_agg", "buy_burst", "sell_burst",
             "buy_vol", "sell_vol", "trade_count",
             "trade_high", "trade_low", "trade_last",
-            "call_side", "call_px", "call_ts", "written_at")
+            "call_side", "call_px", "call_ts", "episodes", "written_at")
 
 # Columns added after the table first shipped. A CREATE TABLE IF NOT
 # EXISTS does nothing to a table that already exists, so a database
@@ -109,7 +111,8 @@ _ADDED = (("trade_high", "REAL NOT NULL DEFAULT 0"),
           ("trade_last", "REAL NOT NULL DEFAULT 0"),
           ("call_side", "TEXT NOT NULL DEFAULT ''"),
           ("call_px", "REAL NOT NULL DEFAULT 0"),
-          ("call_ts", "REAL NOT NULL DEFAULT 0"))
+          ("call_ts", "REAL NOT NULL DEFAULT 0"),
+          ("episodes", "TEXT NOT NULL DEFAULT ''"))
 
 
 def _row_of(target: int, b: OfiBar, now: float) -> tuple:
@@ -122,7 +125,50 @@ def _row_of(target: int, b: OfiBar, now: float) -> tuple:
             float(b.buy_vol), float(b.sell_vol), int(b.trade_count),
             float(b.trade_high), float(b.trade_low), float(b.trade_last),
             str(b.call_side or ""), float(b.call_px), float(b.call_ts),
-            float(now))
+            _eps_out(b), float(now))
+
+
+def _eps_out(b: OfiBar) -> str:
+    """The bar's observations as JSON, or empty for a bar that made none.
+
+    JSON in a column rather than a table of its own: they are only
+    ever read back with the bar they belong to, and nothing queries
+    across them. A second table would buy a join and cost a migration.
+    """
+    eps = getattr(b, "episodes", None)
+    if not eps:
+        return ""
+    try:
+        return json.dumps([e.as_dict() for e in eps], separators=(",", ":"))
+    except Exception:                                   # noqa: BLE001
+        return ""
+
+
+def _eps_in(raw) -> list:
+    """Back into Episodes. A row that cannot be parsed yields none --
+    an unreadable record is no record, and inventing one would be
+    worse than a bar that made no observations."""
+    if not raw:
+        return []
+    try:
+        rows = json.loads(raw)
+    except Exception:                                   # noqa: BLE001
+        return []
+    out = []
+    for d in rows:
+        try:
+            first = {int(k): v for k, v in (d.get("first") or {}).items()}
+            out.append(Episode(
+                side=str(d.get("side", "")), px0=float(d.get("px0", 0.0)),
+                ts0=float(d.get("ts0", 0.0)),
+                px_end=float(d.get("px_end", 0.0)),
+                ts_end=float(d.get("ts_end", 0.0)),
+                updates=int(d.get("updates", 0)),
+                mfe=float(d.get("mfe", 0.0)), mae=float(d.get("mae", 0.0)),
+                end=str(d.get("end", "")), first=first))
+        except Exception:                               # noqa: BLE001
+            continue
+    return out
 
 
 def _bar_of(r: sqlite3.Row) -> OfiBar:
@@ -150,7 +196,8 @@ def _bar_of(r: sqlite3.Row) -> OfiBar:
                   trade_last=_opt(r, "trade_last"),
                   call_side=_txt(r, "call_side"),
                   call_px=_opt(r, "call_px"),
-                  call_ts=_opt(r, "call_ts"))
+                  call_ts=_opt(r, "call_ts"),
+                  episodes=_eps_in(_txt(r, "episodes")))
 
 
 def _txt(r: sqlite3.Row, name: str) -> str:

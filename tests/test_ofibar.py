@@ -596,3 +596,215 @@ class TestTheDeltaColumn:
         body = src[i:i + 1600]
         for w in ("last_px", "> last", "uptick", "tick rule"):
             assert w not in body, w
+
+
+RAW = 250_000_000          # one ES tick in raw feed units
+
+
+class TestTheRunningCall:
+    """Re-read on every update, never latched.
+
+    In order of how badly each would mislead:
+
+      a latched call. A bar at target 2,000 runs for minutes, and a
+      call that fires once reports DOWN on a bar whose imbalance,
+      delta and body all went up. That is not a stale reading, it is a
+      false one, and it is what the chart was doing
+
+      a call that survives the two disagreeing. Hysteresis on the gate
+      is what stops chatter; hysteresis on the AGREEMENT would keep
+      saying up while delta sells, which is the state the whole rule
+      exists to refuse
+
+      an observation that outlives its bar. The bar is the horizon
+    """
+
+    def _b(self, threshold=2000, **kw):
+        return OfiBarBuilder(tick_size=0.25, threshold=threshold,
+                             max_s=1e9, min_updates=2, max_bars=10 ** 7,
+                             **kw)
+
+    def _one_bar(self):
+        """A bar large enough to hold a whole reversal, with the gates
+        scaled down to match. Otherwise the bar closes in between and
+        a latched call would be cleared by the close rather than by
+        the code under test."""
+        return OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                             min_updates=2, max_bars=10 ** 7,
+                             enter_frac=1e-5, hold_frac=2.5e-6,
+                             delta_frac=0.10)
+
+    def _drive(self, b, n, side, bid, start_ts=0.0, step=0):
+        """Push the book one way and trade that way."""
+        ts = start_ts
+        sz = 100
+        for i in range(n):
+            ts += 0.01
+            sz += 60
+            if step and i % step == 0:
+                bid += RAW if side == "buy" else -RAW
+            b.on_trade(ts, 40, side, bid if side == "sell" else bid + RAW)
+            if side == "buy":
+                b.on_book(ts, bid, sz, bid + RAW, 100)
+            else:
+                b.on_book(ts, bid, 100, bid + RAW, sz)
+        return ts, bid
+
+    def test_it_reverses_inside_one_bar(self):
+        """The bug exactly: it said DOWN, the bar went on to do the
+        opposite, and it never took the call back. One bar throughout,
+        so nothing but the code under test can clear it."""
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        ts, bid = self._drive(b, 60, "sell", base)
+        assert b.live_call[0] == "down"
+        assert len(b.bars) == 0, "it must all be one bar"
+        ts, bid = self._drive(b, 400, "buy", bid, ts)
+        assert len(b.bars) == 0, "still one bar"
+        assert b.live_call[0] == "up", "it never took the down call back"
+        assert len(b.live_episodes) >= 2
+
+    def test_a_latched_call_is_what_this_replaced(self):
+        """Stated so nobody puts the latch back: the first and last
+        observations of that bar point opposite ways."""
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        ts, bid = self._drive(b, 60, "sell", base)
+        ts, bid = self._drive(b, 400, "buy", bid, ts)
+        eps = b.live_episodes
+        assert eps[0].side == "down" and eps[-1].side == "up"
+
+    def test_an_up_call_ends_when_the_prints_turn(self):
+        """Hysteresis holds the GATE, never the agreement. Delta
+        turning against an up call ends it at once."""
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        ts, bid = self._drive(b, 60, "buy", base)
+        assert b.live_call[0] == "up"
+        # Book keeps leaning bid; the prints turn around hard.
+        sz = 4000
+        for i in range(300):
+            ts += 0.01
+            sz += 60
+            b.on_trade(ts, 400, "sell", bid)
+            b.on_book(ts, bid, sz, bid + RAW, 100)
+        assert b.live_call[0] == "", "delta turned and the up call stood"
+
+    def test_a_down_call_ends_when_the_prints_turn(self):
+        """The mirror, and it needs its own test: the two sides are
+        two branches, and a change to one does not touch the other."""
+        b = self._one_bar()
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        ts, bid = self._drive(b, 60, "sell", base)
+        assert b.live_call[0] == "down"
+        # Book keeps leaning offer; the prints turn around hard.
+        sz = 4000
+        for i in range(300):
+            ts += 0.01
+            sz += 60
+            b.on_trade(ts, 400, "buy", bid + RAW)
+            b.on_book(ts, bid, 100, bid + RAW, sz)
+        assert len(b.bars) == 0, "it must all be one bar"
+        assert b.live_call[0] == "", "delta turned and the down call stood"
+
+    def test_hysteresis_is_on_the_gate_not_the_agreement(self):
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        assert "CALL_ENTER_FRAC" in src and "CALL_HOLD_FRAC" in src
+        i = src.index("CALL_ENTER_FRAC = ")
+        assert "never on the agreement" in src[max(0, i - 900):i]
+
+    def test_a_tiny_imbalance_is_not_a_direction(self):
+        b = self._b(threshold=2000)
+        base = 7_700 * 10 ** 9
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_trade(0.01, 400, "buy", base + RAW)
+        b.on_book(0.01, base, 110, base + RAW, 100)      # +10 of 2,000
+        assert b.live_call[0] == ""
+
+    def test_the_gates_are_arguments(self):
+        """They were set against a book noisier than a real one."""
+        b = self._b(enter_frac=0.5, hold_frac=0.4, delta_frac=0.3)
+        assert b._min_acc == 1000 and b._hold_acc == 800
+
+
+class TestObservationsInsideTheBar:
+
+    def _run(self, n=300_000, seed=11, threshold=2000):
+        import random
+        rng = random.Random(seed)
+        b = OfiBarBuilder(tick_size=0.25, threshold=threshold, max_s=900.0,
+                          min_updates=2, max_bars=10 ** 7)
+        bid, ts = 7_700 * 10 ** 9, 0.0
+        for _ in range(n):
+            if rng.random() < 0.06:
+                bid += RAW if rng.random() < 0.5 else -RAW
+            ts += 0.01
+            if rng.random() < 0.4:
+                px = bid if rng.random() < 0.5 else bid + RAW
+                b.on_trade(ts, rng.randint(1, 40),
+                           "buy" if rng.random() < 0.5 else "sell", px)
+            b.on_book(ts, bid, rng.randint(50, 900), bid + RAW,
+                      rng.randint(50, 900))
+        return b
+
+    def test_nothing_outlives_its_bar(self):
+        b = self._run()
+        for bar in b.bars:
+            for e in bar.episodes:
+                assert e.ts0 >= bar.ts_open - 1e-9
+                assert e.ts_end <= bar.ts_close + 1e-9
+                assert e.end in ("flip", "lost", "bar")
+
+    def test_an_open_observation_is_closed_at_the_bar(self):
+        b = self._run()
+        closed = [e for bar in b.bars for e in bar.episodes]
+        assert closed and all(e.end for e in closed)
+        assert any(e.end == "bar" for e in closed)
+
+    def test_a_bar_can_hold_several(self):
+        b = self._run()
+        assert any(len(bar.episodes) > 1 for bar in b.bars)
+
+    def test_the_count_is_capped(self):
+        from liqmap.ofibar import MAX_EPISODES
+        b = self._run()
+        assert all(len(bar.episodes) <= MAX_EPISODES for bar in b.bars)
+
+    def test_which_came_first_is_recorded_as_it_happens(self):
+        """A high and a low cannot say which was reached first, and
+        that is the entire question."""
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        i = src.index("def _track")
+        body = src[i:src.index("def _close")]
+        assert "if pts in ep.first:" in body
+        assert "continue" in body
+
+    def test_a_win_is_only_recorded_before_the_other_side(self):
+        from liqmap.ofibar import Episode, POINT
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=1e9,
+                          min_updates=2)
+        ep = Episode(side="up", px0=0.0, px_end=0.0)
+        b._ep = ep
+        b._track(0.0, -2 * POINT)        # 2 points against, first
+        b._track(1.0, +3 * POINT)        # then 3 the right way
+        assert ep.outcome(1) == "loss"
+        assert ep.outcome(2) == "loss"
+        assert ep.outcome(3) == "win", "it got there before -3"
+        assert ep.mfe == 3 * POINT and ep.mae == 2 * POINT
+
+    def test_an_unreached_distance_is_unresolved(self):
+        from liqmap.ofibar import Episode
+        assert Episode(side="up").outcome(4) == "unresolved"
+
+    def test_the_first_observation_is_the_bar_s_call(self):
+        b = self._run()
+        for bar in b.bars:
+            if bar.episodes:
+                assert bar.call_side == bar.episodes[0].side
+                assert bar.call_px == bar.episodes[0].px0
+            else:
+                assert bar.call_side == ""

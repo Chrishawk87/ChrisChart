@@ -1144,10 +1144,10 @@ class TestTheCallIsOnTheChart:
         assert "_cs, _cpx, _cts = b.live_call" in r
         assert '"call_side": _cs' in r
 
-    def test_the_builder_latches_it_on_a_book_update(self):
+    def test_the_call_is_read_on_every_book_update(self):
+        """Not at the close, and not once per bar."""
         src = (ROOT / "liqmap" / "ofibar.py").read_text()
-        assert "if not self._c_side:" in src
-        i = src.index("if not self._c_side:")
+        i = src.index("if _side != self._c_side:")
         # Inside on_touch, not in _close.
         assert src.index("def _close") > i > src.index("def on_touch")
 
@@ -1173,10 +1173,11 @@ class TestTheCallIsOnTheChart:
         c = self._chart()
         assert "${ax}${g}${pv}${cg}</svg>" in c
 
-    def test_the_panel_says_the_call_on_the_open_bar(self):
-        assert "while the bar is still open" in WEB
-        flat = " ".join(WEB.replace("'", " ").replace("+", " ").split())
-        assert "no call yet" in flat
+    def test_the_panel_states_the_call_on_the_open_bar(self):
+        """And states it as of now, not as of whenever it first
+        fired -- which is what it used to do."""
+        assert "right now &middot; imbalance" in WEB
+        assert "NO CALL" in WEB
 
     def test_the_live_line_is_above_the_chart(self):
         c = self._chart()
@@ -1190,3 +1191,69 @@ class TestTheCallIsOnTheChart:
         i = src.index("def measure")
         body = src[i:src.index("def catalogue")]
         assert "close = entry_of(bars[i])" in body
+
+
+class TestTheRunningCallOnScreen:
+    """The bug he hit: THIS BAR said DOWN while the bar was open, with
+    positive imbalance, positive delta and a green body."""
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTimer")]
+
+    def test_the_builder_re_reads_rather_than_latching(self):
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        assert "A RUNNING DETERMINATION, NOT A LATCH" in src
+        assert "if _side != self._c_side:" in src
+
+    def test_the_route_sends_the_observation_in_progress(self):
+        r = self._route()
+        assert "_ep = b.live_episode" in r
+        assert '"obs": _liveobs' in r
+        assert '"obs_so_far": len(b.live_episodes)' in r
+
+    def test_the_live_line_can_say_nothing(self):
+        """Saying nothing is a reading, not a gap."""
+        c = self._chart()
+        assert "NO CALL" in c
+        assert "they disagree, so there is nothing to call" in c
+
+    def test_the_live_line_shows_both_numbers_either_way(self):
+        c = self._chart()
+        blk = c[c.index("const fm = d && d.forming;"):][:3000]
+        assert "fm.ofi" in blk and "fm.delta" in blk
+
+    def test_the_live_line_shows_the_distance_so_far(self):
+        c = self._chart()
+        assert "pt now, best" in c
+        assert "+2 hit" in c and "-2 hit" in c
+
+    def test_the_route_returns_the_observation_table(self):
+        r = self._route()
+        assert "_ag.observation_table(s_bars, points=(1, 2, 3, 4))" in r
+        assert '"obs": obs' in r
+
+    def test_the_panel_draws_it_above_the_rest(self):
+        assert "function ofiObs" in WEB
+        assert WEB.index("${ofiObs(d)}") < WEB.index("${ofiAgree(d)}")
+
+    def test_the_table_says_unresolved_is_not_a_loss(self):
+        i = WEB.index("function ofiObs")
+        blk = WEB[i:i + 4000]
+        assert "not a draw and not a loss" in blk
+        assert "bar ended first" in blk
+
+    def test_the_table_warns_when_the_observations_are_too_short(self):
+        """Three updates cannot travel two points, so the table would
+        be measuring the gate rather than the rule."""
+        i = WEB.index("function ofiObs")
+        blk = WEB[i:i + 4000]
+        assert "const thin = med < 20" in blk
+        assert "measuring the gate and not the rule" in blk
+
+    def test_nothing_outlives_its_bar_is_stated_on_screen(self):
+        assert "Nothing outlives its bar" in WEB
