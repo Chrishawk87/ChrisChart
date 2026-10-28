@@ -6431,7 +6431,7 @@ def create_app() -> FastAPI:
                 "at_live": off == 0,
                 "oldest": off >= max(0, total - n),
                 "call_level": b.call_level,
-                "levels": [100, 150, 200, 250, 300, 400, 500],
+                "call_levels": [100, 150, 200, 250, 300, 400, 500],
                 "reachable": b.reachable(),
                 "pivot_n": pv, "confirm_n": cf,
                 "traded_bars": sum(1 for x in window if x.traded),
@@ -10800,7 +10800,7 @@ async function ofiTick(fromTimer) {
         &middot; dotted carets are not confirmed yet and can vanish</span>
       <span class="stamp" style="width:100%">call the imbalance at
         &plusmn;<select onchange="ofiSetLevel(this.value)"
-          style="margin:0 6px">${(d.levels || []).map(k =>
+          style="margin:0 6px">${(d.call_levels || []).map(k =>
             `<option value="${k}"${k === d.call_level ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
         contracts &middot; a trade closes at 3 points, the opposite

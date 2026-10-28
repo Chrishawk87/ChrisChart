@@ -361,6 +361,26 @@ def _live_feed(coin="BTC", interval="15m", rising=True):
     return f
 
 
+@pytest.fixture
+def plenty_of_candle(monkeypatch):
+    """Stop the wall clock deciding whether these tests pass.
+
+    The route refuses a suggestion when too little of the live candle
+    is left, which is correct and has its own test in
+    tests/test_suggest.py. But the live candle sits on the real
+    fifteen-minute grid, so every test below that only wants to
+    exercise the SUGGESTION fails whenever the suite happens to be
+    running in the last twenty seconds of a quarter hour.
+
+    That is a test failing on the time of day, which is worse than no
+    test: it trains you to re-run until green, and the next real
+    failure gets re-run too.
+    """
+    from liqmap import suggest as _sg
+
+    monkeypatch.setattr(_sg, "MIN_SECONDS_LEFT", 0.0)
+
+
 def _settle(rt, coin="BTC", interval="15m", direction="up", seconds=60.0):
     """Pre-age the agreement tracker, as if the feed had been up a while.
 
@@ -380,7 +400,7 @@ def _settle(rt, coin="BTC", interval="15m", direction="up", seconds=60.0):
 
 
 def test_a_running_feed_produces_a_real_suggestion_that_can_be_decided(client,
-                                                                      monkeypatch):
+                                                                      monkeypatch, plenty_of_candle):
     rt = web.runtime()
     feed = _live_feed()
     monkeypatch.setattr(rt, "feed", feed, raising=False)
@@ -413,7 +433,7 @@ def test_a_running_feed_produces_a_real_suggestion_that_can_be_decided(client,
 
 
 def test_polling_the_same_candle_does_not_write_a_second_suggestion(client,
-                                                                   monkeypatch):
+                                                                   monkeypatch, plenty_of_candle):
     """Ninety rows for one trade would let a single lucky fifteen minutes
     dominate the measured hit rate."""
     rt = web.runtime()
@@ -428,7 +448,7 @@ def test_polling_the_same_candle_does_not_write_a_second_suggestion(client,
     assert len(rt.history.recent_suggestions()) == 1
 
 
-def test_record_false_asks_without_writing_anything(client, monkeypatch):
+def test_record_false_asks_without_writing_anything(client, monkeypatch, plenty_of_candle):
     """The page polls every few seconds; a dry run must not fill the table."""
     rt = web.runtime()
     feed = _live_feed()
@@ -442,7 +462,7 @@ def test_record_false_asks_without_writing_anything(client, monkeypatch):
     assert rt.history.recent_suggestions() == []
 
 
-def test_a_short_book_produces_a_short_suggestion(client, monkeypatch):
+def test_a_short_book_produces_a_short_suggestion(client, monkeypatch, plenty_of_candle):
     """The sign error that would invert every trade the tool ever makes."""
     rt = web.runtime()
     feed = _live_feed(rising=False)      # book AND tape both bearish

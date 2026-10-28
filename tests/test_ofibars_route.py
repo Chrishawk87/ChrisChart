@@ -1403,3 +1403,43 @@ class TestTheLevelIsSelectable:
         assert "bar_shape" in src, "it has to explain an empty table"
         for w in ("def submit(", "def execute(", "def place("):
             assert w not in src, w
+
+
+class TestNoDictLiteralHasADuplicateKey:
+    """A silent failure, and this file is full of large dict literals.
+
+    `"levels"` was returned twice from one route -- once for the swing
+    rails, once for the call-level dropdown. Python keeps the last and
+    says nothing, so the dropdown silently received an array of swing
+    objects and rendered them as [object Object]. Nothing raised,
+    nothing logged, and the only symptom was a box full of nonsense.
+
+    The scan is over the WHOLE module rather than the one route,
+    because the next one will be somewhere else.
+    """
+
+    def test_every_dict_literal_in_web_has_unique_string_keys(self):
+        import ast
+        tree = ast.parse(WEB)
+        bad = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            seen = set()
+            for k in node.keys:
+                if not (isinstance(k, ast.Constant)
+                        and isinstance(k.value, str)):
+                    continue
+                if k.value in seen:
+                    bad.append(f"line {node.lineno}: {k.value!r}")
+                seen.add(k.value)
+        assert not bad, bad
+
+    def test_the_dropdown_reads_its_own_key(self):
+        assert '"call_levels": [100, 150, 200, 250, 300, 400, 500],' in WEB
+        assert "(d.call_levels || []).map" in WEB
+
+    def test_the_swing_rails_still_read_theirs(self):
+        assert '"keep_n": keep_n, "levels": lvls,' in WEB
+        c = WEB[WEB.index("function ofiChart"):WEB.index("let _ofiTimer")]
+        assert "const lvls = (d && d.levels) || [];" in c
