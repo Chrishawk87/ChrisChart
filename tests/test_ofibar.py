@@ -801,6 +801,7 @@ class TestObservationsInsideTheBar:
                           min_updates=2)
         ep = Episode(side="up", px0=0.0, px_end=0.0)
         b._ep = ep
+        b._meas = [ep]
         b._track(0.0, -2 * POINT)        # 2 points against, first
         b._track(1.0, +3 * POINT)        # then 3 the right way
         assert ep.outcome(1) == "loss"
@@ -917,3 +918,65 @@ class TestBothSidesOfTheImbalance:
         d = json.loads(json.dumps(b.bars[0].as_dict()))
         for k in ("push_up", "push_dn", "gross", "share", "dominance"):
             assert k in d, k
+
+
+class TestTheTradeIsMeasuredPastTheCall:
+    """A call can lapse long before price has gone anywhere.
+
+    The question being asked is what happened to the TRADE, so the
+    objective keeps being tracked until the bar closes. Stopping when
+    the call stops would leave most trades unresolved and make the
+    tally a measurement of how long calls last rather than of whether
+    they worked.
+    """
+
+    def _b(self, level=200):
+        return OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                             min_updates=2, max_bars=10 ** 7,
+                             call_level=level, objective_points=1.0)
+
+    def test_it_resolves_after_the_call_has_lapsed(self):
+        base = 7_700 * 10 ** 9
+        b = self._b()
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 500, base + RAW, 100)      # call fires
+        ep = b.live_episodes[-1]
+        assert b.live_call[0] == "up"
+        b.on_book(0.02, base, 150, base + RAW, 100)      # call lapses
+        assert b.live_call[0] == ""
+        assert ep.end == "reversal"
+        up = base + 4 * RAW
+        b.on_book(0.03, up, 150, up + RAW, 100)          # price arrives
+        assert ep.hit == "win", "it stopped measuring when the call did"
+
+    def test_the_call_length_still_measures_the_call(self):
+        """`updates` is the chatter diagnostic, so it must not keep
+        climbing after the call is over."""
+        base = 7_700 * 10 ** 9
+        b = self._b()
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 500, base + RAW, 100)
+        ep = b.live_episodes[-1]
+        b.on_book(0.02, base, 150, base + RAW, 100)      # lapses
+        n = ep.updates
+        for k in range(10):
+            b.on_book(0.03 + k * 0.01, base, 150, base + RAW, 100)
+        assert ep.updates == n, "it kept counting after the call ended"
+
+    def test_nothing_is_measured_past_the_bar(self):
+        import random
+        rng = random.Random(3)
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=900.0,
+                          min_updates=2, max_bars=10 ** 7, call_level=300)
+        bid, ts = 7_700 * 10 ** 9, 0.0
+        for _ in range(60_000):
+            if rng.random() < 0.1:
+                bid += RAW if rng.random() < 0.5 else -RAW
+            ts += 0.01
+            b.on_book(ts, bid, rng.randint(50, 900), bid + RAW,
+                      rng.randint(50, 900))
+        assert len(b.bars) > 5
+        for bar in b.bars:
+            for e in bar.episodes:
+                if e.hit:
+                    assert e.hit_ts <= bar.ts_close + 1e-9

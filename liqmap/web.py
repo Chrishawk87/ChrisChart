@@ -6382,6 +6382,31 @@ def create_app() -> FastAPI:
             except Exception:                           # noqa: BLE001
                 agree = None
 
+        # EVERY CALL IN THE WINDOW, AND WHERE IT RESOLVED.
+        #
+        # One arrow per call rather than one per bar: a bar at this
+        # size routinely holds several, and showing only the first
+        # would hide the ones that came after a reversal.
+        #
+        # A mark is drawn only where the objective was actually
+        # reached, at the price it was reached at. A call the bar
+        # closed on gets no mark, because nothing happened to it --
+        # and drawing one would make "it ran out of bar" look like a
+        # result.
+        trade_arrows: list[dict[str, Any]] = []
+        trade_marks: list[dict[str, Any]] = []
+        _lvl_now = b.call_level
+        for _w, _bar in enumerate(window):
+            for _e in (_bar.episodes or ()):
+                if _e.level and _e.level != _lvl_now:
+                    continue
+                trade_arrows.append({"i": _w, "side": _e.side,
+                                     "px": _e.px0 * sc})
+                if _e.hit:
+                    trade_marks.append({"i": _w, "kind": _e.hit,
+                                        "px": _e.hit_px * sc,
+                                        "from": _e.px0 * sc})
+
         # How much of this is on disk, so the panel can say whether a
         # restart would cost anything.
         _rc = getattr(rt, "_ofirec", None)
@@ -6408,6 +6433,15 @@ def create_app() -> FastAPI:
                     "mfe_pts": round(_ep.mfe / 1e9, 2),
                     "mae_pts": round(_ep.mae / 1e9, 2),
                     "at2": _ep.outcome(2), "at4": _ep.outcome(4)}
+            # The forming bar's own calls sit one column past the
+            # closed ones, which is where the chart draws it.
+            for _e in b.live_episodes:
+                trade_arrows.append({"i": len(out), "side": _e.side,
+                                     "px": _e.px0 * sc})
+                if _e.hit:
+                    trade_marks.append({"i": len(out), "kind": _e.hit,
+                                        "px": _e.hit_px * sc,
+                                        "from": _e.px0 * sc})
             forming = {"call_side": _cs, "call_px": _cpx * sc,
                        "push_up": _pu, "push_dn": _pd,
                        "share": round(b.live_share, 4),
@@ -6442,6 +6476,8 @@ def create_app() -> FastAPI:
                 "traded_bars": sum(1 for x in window if x.traded),
                 "keep_n": keep_n, "levels": lvls,
                 "agree": agree, "obs": obs,
+                "trade_arrows": trade_arrows, "trade_marks": trade_marks,
+                "objective_pts": round(b.objective / 1e9, 2),
                 "calls": [calls_by_i[k] for k in sorted(calls_by_i)],
                 "scoreboard": board,
                 "higher": want_higher, "higher_levels": hi,
@@ -10076,38 +10112,62 @@ function ofiChart(d, w, h) {
             fill="${c}" opacity="${forming ? 0.4 : 0.92}"/>`;
   });
 
-  /* THE CALL, ON THE BAR, AT THE PRICE IT FIRED.
+  /* EVERY CALL, AND WHERE IT RESOLVED.
 
-     This is an intrabar reading. The mark goes at `call_px` -- the mid
-     at the instant the running imbalance and the running delta first
-     agreed inside that bar -- and not at the close, which is a long
-     way after the moment it could have been acted on.
+     An arrow at the price the call fired -- one per CALL, not one
+     per bar, because a bar at this size routinely holds several and
+     showing only the first hides the ones that came after a
+     reversal.
 
-     A filled triangle under the bar for an up call, over it for a
-     down call, so the direction is the shape and not only the colour.
-     The bar still forming gets the same mark the moment it fires, and
-     that mark does not move afterwards: the reading existed at that
-     price whatever the rest of the bar does. */
+     Then the objective, four ticks either way:
+
+       blue X    it made the point. The X sits at the price it got
+                 there, not at the target, so a move that gapped past
+                 shows where it actually was
+       black X   it lost four ticks first
+
+     A call the bar closed on gets NO MARK. Nothing happened to it,
+     and a mark there would make "it ran out of bar" look like a
+     result -- which is the single easiest way to make a rule that
+     drifts look like a rule that works. */
+  const arrows = (d && d.trade_arrows) || [];
+  const tmarks = (d && d.trade_marks) || [];
   let cg = '';
-  all.forEach((b, i) => {
-    const side = b.call_side;
-    if (side !== 'up' && side !== 'down') return;
-    const px = b.call_px;
-    if (!px) return;
-    const cx = padL + step * (i + 0.5);
-    const yy = y(px);
-    if (yy < padT || yy > padT + ih) return;
-    const up = side === 'up';
+  for (const a of arrows) {
+    if (a.i < 0 || a.i >= all.length || !a.px) continue;
+    const cx = padL + step * (a.i + 0.5);
+    const yy = y(a.px);
+    if (yy < padT || yy > padT + ih) continue;
+    const up = a.side === 'up';
     const col = up ? '#35c27a' : '#e2574c';
     const base = up ? yy + 5 : yy - 5;
     const tip = up ? yy + 1 : yy - 1;
-    const forming = b.direction === 'forming';
     cg += `<path d="M ${(cx - 3.4).toFixed(1)} ${base.toFixed(1)}
              L ${(cx + 3.4).toFixed(1)} ${base.toFixed(1)}
-             L ${cx.toFixed(1)} ${tip.toFixed(1)} Z"
-             fill="${col}" opacity="${forming ? 0.75 : 1}"
-             ${forming ? 'stroke="' + col + '" stroke-width="0.8"' : ''}/>`;
-  });
+             L ${cx.toFixed(1)} ${tip.toFixed(1)} Z" fill="${col}"/>`;
+  }
+  for (const m of tmarks) {
+    if (m.i < 0 || m.i >= all.length || !m.px) continue;
+    const cx = padL + step * (m.i + 0.5);
+    const yy = y(m.px);
+    if (yy < padT || yy > padT + ih) continue;
+    const win = m.kind === 'win';
+    /* The failure mark is drawn near-black with a pale ring, because
+       a true black X vanishes on the dark theme and this has to read
+       on both. */
+    const col = win ? '#3f8fd8' : '#0d1014';
+    const r = 3.8;
+    const cross = `M ${(cx - r).toFixed(1)} ${(yy - r).toFixed(1)}
+         L ${(cx + r).toFixed(1)} ${(yy + r).toFixed(1)}
+         M ${(cx - r).toFixed(1)} ${(yy + r).toFixed(1)}
+         L ${(cx + r).toFixed(1)} ${(yy - r).toFixed(1)}`;
+    if (!win) {
+      cg += `<path d="${cross}" stroke="var(--muted)" stroke-width="3.4"
+               fill="none" opacity="0.9"/>`;
+    }
+    cg += `<path d="${cross}" stroke="${col}" stroke-width="1.8"
+             fill="none"/>`;
+  }
 
   /* THE DELTA PANE, directly above the candles and on the SAME grid.
 
@@ -10493,7 +10553,39 @@ function ofiObs(d) {
   }).join('');
   const med = o.median_updates;
   const thin = med < 20;
-  return '<span class="stamp" style="width:100%"><b>observations</b> '
+  /* THE TALLY, at the objective. Three outcomes, and the third is
+     not a loss: a call the bar closed on never reached either side,
+     and counting it as a failure would make a rule that drifts look
+     worse than it is -- just as counting it as a win would make it
+     look better. */
+  const obj = (d && d.objective_pts) || 1;
+  const tally = '<span class="stamp" style="width:100%"><b>tally at '
+    + obj + ' point</b> &mdash; <b class="long">'
+    + (o.won || 0).toLocaleString() + ' won</b> / <b class="short">'
+    + (o.failed || 0).toLocaleString() + ' failed</b>'
+    + (o.settled ? ' &middot; <b>' + (o.win_rate * 100).toFixed(1)
+        + '%</b> of the ' + o.settled.toLocaleString() + ' that settled'
+        : '')
+    + ' &middot; ' + (o.open_at_close || 0).toLocaleString()
+    + ' still open when the bar closed, which is neither'
+    + '</span>'
+    /* The raw rate carries a bias that is arithmetic, not market. A
+       call fires AFTER the move it is reading -- measured on a random
+       walk, up calls fire at 0.55 of the bar's range and down calls
+       at 0.44 -- so there is less room left the way it was called and
+       more room against it, and a symmetric bracket inherits that.
+       The same walk returns 18%, not 50%. Only the flipped control in
+       the sweep can say whether a rate here means anything. */
+    + '<span class="stamp" style="width:100%">A call fires after the '
+    + 'move it is reading, so a symmetric bracket is biased against it '
+    + 'before the market does anything: on a random walk this tally '
+    + 'returns 18%, not 50%. Read it against '
+    + 'scripts/imbalance_sweep.py, which runs the same rule backwards '
+    + 'on the same bars &mdash; the gap between them is the only part '
+    + 'a market that does nothing cannot produce.</span>';
+
+  return tally
+    + '<span class="stamp" style="width:100%"><b>observations</b> '
     + '&mdash; ' + o.observations.toLocaleString() + ' across '
     + o.bars.toLocaleString() + ' bars (' + o.per_bar + ' a bar, '
     + o.silent_bars.toLocaleString() + ' bars never called), '

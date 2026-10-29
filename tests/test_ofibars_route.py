@@ -1109,20 +1109,22 @@ class TestTheAgreementTest:
             assert w not in src, w
 
 
-class TestTheCallIsOnTheChart:
-    """It is an intrabar reading, so it is drawn where it fired.
+class TestEveryCallIsMarkedAndResolved:
+    """An arrow per call, and a mark only where it actually resolved.
 
     In order of how badly each would mislead:
 
-      the mark drawn at the close. The close is a long way after the
-      moment the reading existed -- minutes, at the larger targets --
-      and putting the mark there credits it with a move that had
-      already happened before it could be taken
+      a mark on a call the bar simply closed on. Nothing happened to
+      it, and drawing one makes "it ran out of bar" look like a
+      result -- the single easiest way to make a rule that drifts
+      look like a rule that works
 
-      the mark moving once the bar develops. The reading existed at
-      that price, whatever the rest of the bar does
+      one arrow per BAR rather than per call. A bar at this size holds
+      several, and showing the first hides every one that came after
+      a reversal
 
-      direction carried by colour alone
+      the mark drawn at the target price rather than the price it
+      actually reached, which hides a move that gapped past it
     """
 
     def _route(self):
@@ -1133,64 +1135,193 @@ class TestTheCallIsOnTheChart:
         i = WEB.index("function ofiChart")
         return WEB[i:WEB.index("let _ofiTimer")]
 
-    def test_the_bar_carries_the_call_and_the_price_it_fired_at(self):
+    def test_one_arrow_per_call_not_per_bar(self):
         r = self._route()
-        assert '"call_side": x.call_side' in r
-        assert '"call_px": x.call_px * sc' in r
+        assert "for _e in (_bar.episodes or ()):" in r
+        assert "trade_arrows.append(" in r
 
-    def test_the_forming_bar_carries_its_live_call(self):
-        """The whole point: it has to be there before the bar closes."""
+    def test_arrows_are_for_the_level_being_shown(self):
+        """Observations made at another level belong to another rule."""
         r = self._route()
-        assert "_cs, _cpx, _cts = b.live_call" in r
-        assert '"call_side": _cs' in r
+        assert "if _e.level and _e.level != _lvl_now:" in r
 
-    def test_the_call_is_read_on_every_book_update(self):
-        """Not at the close, and not once per bar."""
-        src = (ROOT / "liqmap" / "ofibar.py").read_text()
-        i = src.index("if _side != self._c_side:")
-        # Inside on_touch, not in _close.
-        assert src.index("def _close") > i > src.index("def on_touch")
+    def test_a_mark_is_only_drawn_where_it_resolved(self):
+        r = self._route()
+        i = r.index("trade_marks.append(")
+        assert "if _e.hit:" in r[max(0, i - 200):i]
 
-    def test_the_mark_is_drawn_at_the_call_price(self):
+    def test_the_mark_is_at_the_price_it_reached(self):
+        r = self._route()
+        assert '"px": _e.hit_px * sc' in r
+
+    def test_the_forming_bar_contributes_its_own(self):
+        r = self._route()
+        assert "for _e in b.live_episodes:" in r
+        assert '"i": len(out)' in r
+
+    def test_the_chart_draws_both_kinds(self):
         c = self._chart()
-        blk = c[c.index("THE CALL, ON THE BAR"):][:1600]
-        assert "const px = b.call_px" in blk
-        assert "const yy = y(px)" in blk
-        assert "b.close" not in blk, "the close is not where it fired"
+        assert "const win = m.kind === 'win';" in c
+        assert "#3f8fd8" in c, "the win mark is blue"
+        assert "#0d1014" in c, "the failure mark is near-black"
+
+    def test_the_failure_mark_survives_the_dark_theme(self):
+        """A true black X vanishes on it."""
+        c = self._chart()
+        blk = c[c.index("const win = m.kind"):][:900]
+        assert 'stroke="var(--muted)"' in blk
 
     def test_direction_is_the_shape_not_only_the_colour(self):
         c = self._chart()
-        blk = c[c.index("THE CALL, ON THE BAR"):][:1600]
-        assert "const up = side === 'up'" in blk
+        blk = c[c.index("const arrows ="):][:900]
+        assert "const up = a.side === 'up';" in blk
         assert "up ? yy + 5 : yy - 5" in blk
 
-    def test_the_forming_bar_gets_the_same_mark(self):
-        c = self._chart()
-        blk = c[c.index("THE CALL, ON THE BAR"):][:1600]
-        assert "b.direction === 'forming'" in blk
-
     def test_the_marks_are_drawn_over_the_candles(self):
-        c = self._chart()
-        assert "${ax}${g}${pv}${cg}</svg>" in c
+        assert "${ax}${g}${pv}${cg}</svg>" in self._chart()
 
-    def test_the_panel_states_the_call_on_the_open_bar(self):
-        """And states it as of now, not as of whenever it first
-        fired -- which is what it used to do."""
-        assert "right now &middot; imbalance" in WEB
-        assert "NO CALL" in WEB
+    def test_the_builder_records_where_it_resolved(self):
+        from liqmap.ofibar import OfiBarBuilder, POINT
+        base = 7_700 * 10 ** 9
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                          min_updates=2, call_level=200,
+                          objective_points=1.0)
+        b.on_book(0.0, base, 100, base + 250_000_000, 100)
+        b.on_book(0.01, base, 500, base + 250_000_000, 100)
+        assert b.live_call[0] == "up"
+        ep = b.live_episode
+        assert ep is not None and ep.resolved == "unresolved"
+        up = base + 4 * 250_000_000
+        b.on_book(0.02, up, 500, up + 250_000_000, 100)
+        assert ep.hit == "win"
+        assert ep.hit_px > ep.px0
 
-    def test_the_live_line_is_above_the_chart(self):
-        c = self._chart()
-        assert "return `${liveCall}" in c
+    def test_four_ticks_against_is_a_failure_not_a_drift(self):
+        from liqmap.ofibar import OfiBarBuilder
+        base = 7_700 * 10 ** 9
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                          min_updates=2, call_level=200,
+                          objective_points=1.0)
+        b.on_book(0.0, base, 100, base + 250_000_000, 100)
+        b.on_book(0.01, base, 500, base + 250_000_000, 100)
+        ep = b.live_episode
+        dn = base - 4 * 250_000_000
+        b.on_book(0.02, dn, 500, dn + 250_000_000, 100)
+        assert ep.hit == "loss"
 
-    def test_the_measurement_runs_from_the_call_price(self):
-        """Measuring from the close is the most flattering mistake
-        available and the easiest one to make."""
+    def test_the_first_one_reached_is_the_one_recorded(self):
+        from liqmap.ofibar import OfiBarBuilder
+        base = 7_700 * 10 ** 9
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                          min_updates=2, call_level=200,
+                          objective_points=1.0)
+        b.on_book(0.0, base, 100, base + 250_000_000, 100)
+        b.on_book(0.01, base, 500, base + 250_000_000, 100)
+        ep = b.live_episode
+        dn = base - 4 * 250_000_000
+        b.on_book(0.02, dn, 500, dn + 250_000_000, 100)
+        up = base + 8 * 250_000_000
+        b.on_book(0.03, up, 500, up + 250_000_000, 100)
+        assert ep.hit == "loss", "it got there second"
+
+    def test_the_tally_counts_three_outcomes(self):
+        i = WEB.index("const tally =")
+        blk = WEB[i:i + 900]
+        assert "won</b>" in blk and "failed</b>" in blk
+        assert "still open when the bar closed, which is neither" in blk
+
+    def test_the_tally_rate_is_over_what_settled(self):
+        """Counting the unresolved as losses would make a rule that
+        drifts look worse than it is."""
+        from liqmap import agree as A
+        from liqmap.ofibar import Episode, OfiBar
+        bar = OfiBar()
+        bar.episodes = [Episode(side="up", level=200, hit="win"),
+                        Episode(side="up", level=200, hit="loss"),
+                        Episode(side="up", level=200)]
+        t = A.observation_table([bar], level=200)
+        assert t["won"] == 1 and t["failed"] == 1
+        assert t["settled"] == 2 and t["open_at_close"] == 1
+        assert t["win_rate"] == 0.5
+
+
+class TestTheAgreementTest:
+    """OFI and delta pointing the same way, and whether price followed.
+
+    In order of how badly each would mislead:
+
+      a flat outcome put in the right or the wrong column. At one bar
+      most outcomes are exactly zero, so which way you fold them moves
+      the headline by fifty points
+
+      one percentage quoted without the other. Of all calls counts
+      flats against; of decided sets them aside, and they are far apart
+
+      the number printed without the line it has to be read against. A
+      market with nothing in it returns 50% of decided, not zero
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_runs_it(self):
+        r = self._route()
+        assert "from . import agree as _ag" in r
+        assert "_ag.summary(s_bars, horizons=(1, 3, 10)" in r
+        assert '"agree": agree' in r
+
+    def test_a_failure_there_does_not_take_the_chart_down(self):
+        r = self._route()
+        i = r.index("agree = _ag.summary")
+        assert "except Exception" in r[i:i + 300]
+        assert "agree = None" in r[i:i + 300]
+
+    def test_the_rule_consults_nothing_else(self):
+        """No level, no price path, no target, no stop."""
+        import re
         src = (ROOT / "liqmap" / "agree.py").read_text()
-        assert "def entry_of" in src
-        i = src.index("def measure")
-        body = src[i:src.index("def catalogue")]
-        assert "close = entry_of(bars[i])" in body
+        i = src.index("def call_of")
+        body = src[i:src.index("def entry_of")]
+        read = set(re.findall(r'getattr\(bar,\s*"([a-z_]+)"', body))
+        assert read == {"volume", "delta", "direction", "call_side"}, read
+
+    def test_the_panel_leads_with_it(self):
+        """It is the question, so it goes above the longer breakdown."""
+        assert "function ofiAgree" in WEB
+        assert "${ofiAgree(d)}" in WEB
+        assert WEB.index("${ofiAgree(d)}") < WEB.index("${ofiCalls(d)}")
+
+    def test_the_panel_shows_the_flat_share(self):
+        i = WEB.index("function ofiAgree")
+        blk = WEB[i:i + 3400]
+        assert "flat" in blk
+        assert "neither right nor wrong" in blk
+
+    def test_the_panel_names_the_line_to_read_it_against(self):
+        i = WEB.index("function ofiAgree")
+        blk = WEB[i:i + 3400]
+        assert "returns 50%" in blk and "not zero" in blk
+
+    def test_the_panel_says_it_is_not_a_trade(self):
+        i = WEB.index("function ofiAgree")
+        blk = WEB[i:i + 3400]
+        assert "No target, no stop, no cost" in blk
+
+    def test_the_readout_leads_with_the_colour_it_draws(self):
+        """The stamp used to count price-path bands, which are no
+        longer what the candles show."""
+        i = WEB.index("function ofiChart")
+        blk = WEB[i:WEB.index("let _ofiTimer")]
+        assert "green</b>" in blk and "red</b>" in blk
+        assert "no longer sets the" in blk
+
+    def test_the_catalogue_script_exists_and_writes_a_csv(self):
+        src = (ROOT / "scripts" / "agree_catalog.py").read_text()
+        assert "csv.DictWriter" in src
+        assert "agree_calls_" in src
+        for w in ("def submit(", "def execute(", "def place("):
+            assert w not in src, w
 
 
 class TestTheRunningCallOnScreen:
@@ -1256,7 +1387,7 @@ class TestTheRunningCallOnScreen:
         """Three updates cannot travel two points, so the table would
         be measuring the gate rather than the rule."""
         i = WEB.index("function ofiObs")
-        blk = WEB[i:i + 4000]
+        blk = WEB[i:WEB.index("function ofiCalls")]
         assert "const thin = med < 20" in blk
         assert "measuring the level and not the rule" in blk
 
@@ -1316,7 +1447,7 @@ class TestTheCallLevelOnScreen:
 
     def test_the_observation_wording_matches_the_rule(self):
         i = WEB.index("function ofiObs")
-        blk = WEB[i:i + 4500]
+        blk = WEB[i:WEB.index("function ofiCalls")]
         assert "passes the level until it comes back" in blk
         assert "by coming back through the level" in blk
         assert "stopped agreeing" not in blk
@@ -1503,3 +1634,52 @@ class TestBothSidesOnScreen:
         assert TARGET_POINTS == 1.0
         src = (ROOT / "scripts" / "imbalance_sweep.py").read_text()
         assert '"--points", type=float, default=1.0' in src
+
+
+class TestTheTallyStatesItsOwnBias:
+    """18% on a random walk, and the panel has to say so.
+
+    A call fires after the move it is reading, so a symmetric bracket
+    is biased against it before the market does anything. A rate shown
+    without that is read as a verdict on the rule when it is mostly a
+    property of when the rule fires.
+    """
+
+    def test_the_panel_names_the_bias_and_the_number(self):
+        i = WEB.index("const tally =")
+        blk = WEB[i:i + 2200]
+        assert "fires after the " in blk
+        assert "18%, not 50%" in blk
+
+    def test_it_points_at_the_control_that_can_settle_it(self):
+        i = WEB.index("const tally =")
+        blk = WEB[i:i + 2200]
+        assert "imbalance_sweep.py" in blk
+        assert "backwards" in blk
+
+    def test_both_sides_are_biased_the_same_way(self):
+        """If one side won and the other lost, it would be a sign
+        error rather than a bias, and that inverts every trade."""
+        import random
+        from liqmap.ofibar import OfiBarBuilder
+        rng = random.Random(7)
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=900.0,
+                          min_updates=2, max_bars=10 ** 7,
+                          call_level=300, objective_points=1.0)
+        bid, ts = 7_700 * 10 ** 9, 0.0
+        for _ in range(200_000):
+            if rng.random() < 0.12:
+                bid += 250_000_000 if rng.random() < 0.5 else -250_000_000
+            ts += 0.01
+            b.on_book(ts, bid, rng.randint(50, 900), bid + 250_000_000,
+                      rng.randint(50, 900))
+        eps = [e for x in b.bars for e in x.episodes]
+        rates = {}
+        for side in ("up", "down"):
+            sub = [e for e in eps if e.side == side]
+            w = sum(1 for e in sub if e.hit == "win")
+            l = sum(1 for e in sub if e.hit == "loss")
+            assert w + l > 100, side
+            rates[side] = w / (w + l)
+        assert abs(rates["up"] - rates["down"]) < 0.25, rates
+        assert max(rates.values()) < 0.5, rates

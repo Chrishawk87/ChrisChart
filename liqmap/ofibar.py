@@ -142,6 +142,12 @@ POINT = 1_000_000_000
 # The win/lose distances an observation is scored at, in points.
 OUTCOME_POINTS: tuple[int, ...] = (1, 2, 3, 4)
 
+# THE OBJECTIVE. One point is four ticks on ES, and the same distance
+# the other way is a failure -- so every call resolves one of three
+# ways and none of them is "it drifted". The price it resolved at is
+# recorded, because that is where the mark goes on the chart.
+OBJECTIVE_POINTS = 1.0
+
 # Most observations a single bar may hold.
 MAX_EPISODES = 64
 
@@ -183,6 +189,14 @@ class Episode:
     # "bar"      -- the bar closed under it
     end: str = ""
     first: dict = field(default_factory=dict)   # points -> "win" | "loss"
+    # Where it resolved against the objective: "win" at the objective
+    # distance, "loss" at the same distance the other way, empty if
+    # the bar ended before either. `hit_px` is the mid at that moment
+    # -- the truth, not the target price, so a move that gapped past
+    # the objective shows where it actually was.
+    hit: str = ""
+    hit_px: float = 0.0
+    hit_ts: float = 0.0
 
     @property
     def seconds(self) -> float:
@@ -198,12 +212,18 @@ class Episode:
         """win / loss / unresolved at a given distance."""
         return self.first.get(points, "unresolved")
 
+    @property
+    def resolved(self) -> str:
+        """win / loss / unresolved at the objective."""
+        return self.hit or "unresolved"
+
     def as_dict(self) -> dict:
         return {"side": self.side, "level": self.level,
                 "px0": self.px0, "ts0": self.ts0,
                 "px_end": self.px_end, "ts_end": self.ts_end,
                 "updates": self.updates, "mfe": self.mfe, "mae": self.mae,
-                "end": self.end,
+                "end": self.end, "hit": self.hit,
+                "hit_px": self.hit_px, "hit_ts": self.hit_ts,
                 "first": {str(k): v for k, v in self.first.items()}}
 
 
@@ -471,12 +491,13 @@ class OfiBarBuilder:
                  "_buy_vol", "_sell_vol", "_trades",
                  "_t_hi", "_t_lo", "_t_last",
                  "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
-                 "_level", "_ep", "_eps", "_pu", "_pd")
+                 "_level", "_obj", "_ep", "_eps", "_meas", "_pu", "_pd")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
                  max_bars: int = 20_000,
-                 call_level: int = CALL_LEVEL) -> None:
+                 call_level: int = CALL_LEVEL,
+                 objective_points: float = OBJECTIVE_POINTS) -> None:
         if tick_size <= 0:
             raise ValueError("tick_size must be positive")
         if threshold < 1:
@@ -540,11 +561,19 @@ class OfiBarBuilder:
         # counts as a direction at all. Scaled to the target, so the
         # same rule means the same thing on every rung of the ladder.
         self._level = max(1, int(call_level))
+        self._obj = max(1.0, float(objective_points) * POINT)
         # Both sides of the imbalance for the bar in progress.
         self._pu = 0
         self._pd = 0
         self._ep: Episode | None = None
         self._eps: list = []
+        # Observations still being MEASURED. A call can lapse -- the
+        # imbalance comes back inside the band -- long before price has
+        # gone anywhere, and the question being asked is what happened
+        # to the TRADE, not to the call. So the objective keeps being
+        # tracked until the bar closes, while `end` still records when
+        # the call itself stopped.
+        self._meas: list = []
 
     def reset(self) -> None:
         self._prev = None
@@ -566,6 +595,7 @@ class OfiBarBuilder:
         self._c_ts = 0.0
         self._ep = None
         self._eps = []
+        self._meas = []
         self._pu = 0
         self._pd = 0
 
@@ -598,6 +628,11 @@ class OfiBarBuilder:
     @property
     def call_level(self) -> int:
         return self._level
+
+    @property
+    def objective(self) -> float:
+        """The objective in raw feed units."""
+        return self._obj
 
     def set_call_level(self, level: int) -> bool:
         """Change the level. Returns True if it actually changed.
@@ -797,7 +832,10 @@ class OfiBarBuilder:
             self._c_ts = ts if _side else 0.0
             if _side:
                 self._start_episode(_side, ts, mid)
-        if self._ep is not None:
+        # Measured whether or not the call is still live: the
+        # objective is a fact about the trade, and a call that lapsed
+        # with price unmoved has not resolved either way.
+        if self._meas:
             self._track(ts, mid)
         if self._acc > bar.ofi_high:
             bar.ofi_high = self._acc
@@ -842,6 +880,7 @@ class OfiBarBuilder:
         ep = Episode(side=side, level=self._level, px0=mid, ts0=ts,
                      px_end=mid, ts_end=ts)
         self._eps.append(ep)
+        self._meas.append(ep)
         self._ep = ep
 
     def _end_episode(self, why: str, ts: float, mid: float) -> None:
@@ -854,29 +893,40 @@ class OfiBarBuilder:
         self._ep = None
 
     def _track(self, ts: float, mid: float) -> None:
-        ep = self._ep
-        assert ep is not None
-        ep.updates += 1
-        ep.px_end = mid
-        ep.ts_end = ts
-        d = mid - ep.px0
-        fav = d if ep.side == "up" else -d
-        adv = -fav
-        if fav > ep.mfe:
-            ep.mfe = fav
-        if adv > ep.mae:
-            ep.mae = adv
-        # WHICH CAME FIRST, recorded as it happens. A high and a low
-        # cannot say which of them was reached first, and that is the
-        # entire question being asked.
-        for pts in OUTCOME_POINTS:
-            if pts in ep.first:
-                continue
-            need = pts * POINT
-            if fav >= need:
-                ep.first[pts] = "win"
-            elif adv >= need:
-                ep.first[pts] = "loss"
+        live = self._ep
+        for ep in self._meas:
+            if ep is live:
+                # `updates` measures the CALL, not the trade, because
+                # it is what says whether the level is set too low.
+                ep.updates += 1
+                ep.px_end = mid
+                ep.ts_end = ts
+            d = mid - ep.px0
+            fav = d if ep.side == "up" else -d
+            adv = -fav
+            if fav > ep.mfe:
+                ep.mfe = fav
+            if adv > ep.mae:
+                ep.mae = adv
+            # THE OBJECTIVE, AND WHERE IT RESOLVED. Four ticks either
+            # way from the call price, first one wins, and the mid at
+            # that instant is kept because that is where the mark goes.
+            if not ep.hit:
+                if fav >= self._obj:
+                    ep.hit, ep.hit_px, ep.hit_ts = "win", mid, ts
+                elif adv >= self._obj:
+                    ep.hit, ep.hit_px, ep.hit_ts = "loss", mid, ts
+            # WHICH CAME FIRST, recorded as it happens. A high and a
+            # low cannot say which of them was reached first, and that
+            # is the entire question being asked.
+            for pts in OUTCOME_POINTS:
+                if pts in ep.first:
+                    continue
+                need = pts * POINT
+                if fav >= need:
+                    ep.first[pts] = "win"
+                elif adv >= need:
+                    ep.first[pts] = "loss"
 
     def _close(self, direction: str, ts: float, mid: float) -> OfiBar:
         bar = self._bar
@@ -938,6 +988,7 @@ class OfiBarBuilder:
         self._c_ts = 0.0
         self._ep = None
         self._eps = []
+        self._meas = []
         self._pu = 0
         self._pd = 0
         self._open_bar(ts, mid)

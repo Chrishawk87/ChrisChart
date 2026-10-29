@@ -172,7 +172,11 @@ def _eps_in(raw) -> list:
                 ts_end=float(d.get("ts_end", 0.0)),
                 updates=int(d.get("updates", 0)),
                 mfe=float(d.get("mfe", 0.0)), mae=float(d.get("mae", 0.0)),
-                end=str(d.get("end", "")), first=first))
+                end=str(d.get("end", "")),
+                hit=str(d.get("hit", "")),
+                hit_px=float(d.get("hit_px", 0.0) or 0.0),
+                hit_ts=float(d.get("hit_ts", 0.0) or 0.0),
+                first=first))
         except Exception:                               # noqa: BLE001
             continue
     return out

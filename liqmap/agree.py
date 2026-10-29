@@ -298,6 +298,14 @@ def observation_table(bars, points=(1, 2, 3, 4),
             "pct_of_decided": round(win / dec, 4) if dec else 0.0,
             "pct_resolved": round(dec / len(eps), 4) if eps else 0.0,
         })
+    # THE TALLY, at the objective. Three outcomes and none of them is
+    # "it drifted": it made the point, it lost the same distance
+    # first, or the bar ended before either. The third is not a loss
+    # and is never counted as one.
+    won = sum(1 for e in eps if getattr(e, "hit", "") == "win")
+    failed = sum(1 for e in eps if getattr(e, "hit", "") == "loss")
+    settled = won + failed
+
     ups = sorted(e.updates for e in eps)
     ends: dict = {}
     for e in eps:
@@ -310,6 +318,10 @@ def observation_table(bars, points=(1, 2, 3, 4),
             1 for b in bars
             if not [e for e in (getattr(b, "episodes", ()) or ())
                     if level is None or getattr(e, "level", 0) == level]),
+        "won": won, "failed": failed,
+        "open_at_close": len(eps) - settled,
+        "settled": settled,
+        "win_rate": round(won / settled, 4) if settled else 0.0,
         "median_updates": ups[len(ups) // 2] if ups else 0,
         "ends": ends,
         "up": sum(1 for e in eps if e.side == UP),
