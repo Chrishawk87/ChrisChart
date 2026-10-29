@@ -41,8 +41,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from liqmap.flowread import (DOWN, FlowRead, GROW_S,          # noqa: E402
-                             HOLD_S, UP, WINDOW_S)
+from liqmap.flowread import (DOWN, FlowRead, HOLD_S,          # noqa: E402
+                             PERIOD_S, UP, WARMUP_S)
 from liqmap.ofi import Touch, level_ofi                       # noqa: E402
 
 RAW_TICK = 250_000_000.0
@@ -94,9 +94,18 @@ def from_files(paths, limit: int = 0):
     return out
 
 
-def readings(events, window_s, grow_s, hold_s):
-    """One row each time the published read CHANGES to a direction."""
-    f = FlowRead(window_s=window_s, grow_s=grow_s, hold_s=hold_s)
+def readings(events, period_s, warmup_s, hold_s):
+    """One row each time the published read CHANGES to a direction.
+
+    Not one per update: scoring every update would count a single
+    three-minute UP read a thousand times and report its sample size
+    as a thousand.
+
+    Each row carries the close of ITS OWN CANDLE, because that is the
+    trade. A five-minute position opened on this reading is closed by
+    that candle ending, whatever the clock horizons below say.
+    """
+    f = FlowRead(period_s=period_s, warmup_s=warmup_s, hold_s=hold_s)
     out, cur = [], ""
     for ts, e, px in events:
         f.on_event(ts, e)
@@ -106,8 +115,36 @@ def readings(events, window_s, grow_s, hold_s):
                 s = f.snapshot
                 out.append({"ts": ts, "side": r, "px": px,
                             "lead": s.lead, "gross": s.gross,
-                            "share": s.share, "flips": s.flips_1m})
+                            "share": s.share, "flips": s.flips,
+                            "into_s": s.into_s,
+                            "candle_end": s.candle_ts + period_s})
             cur = r
+    return out
+
+
+def to_candle_close(rows, events, flip: bool = False):
+    """Ticks moved the reading's way BY THE CLOSE OF ITS OWN CANDLE.
+
+    The clock horizons measure a fixed distance ahead. This measures
+    the actual trade: in at the reading, out when the candle ends.
+    A reading that settles twenty seconds in holds for nearly five
+    minutes; one that settles at four minutes holds for one. Both are
+    scored on what they were, not on a horizon they never had.
+    """
+    import bisect
+    times = [e[0] for e in events]
+    pxs = [e[2] for e in events]
+    out = []
+    for r in rows:
+        side = r["side"]
+        if flip:
+            side = DOWN if side == UP else UP
+        j = bisect.bisect_left(times, r["candle_end"])
+        if j >= len(times):
+            continue
+        d = (pxs[j] - r["px"]) / RAW_TICK
+        out.append({"move": d if side == UP else -d,
+                    "held_s": r["candle_end"] - r["ts"]})
     return out
 
 
@@ -154,8 +191,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="*",
                     help=".dbn / .dbn.zst MBP files; omit for a walk")
-    ap.add_argument("--window", type=float, default=WINDOW_S)
-    ap.add_argument("--short", type=float, default=GROW_S)
+    ap.add_argument("--period", type=float, default=PERIOD_S,
+                    help="candle length in seconds")
+    ap.add_argument("--warmup", type=float, default=WARMUP_S)
     ap.add_argument("--hold", type=float, default=HOLD_S)
     ap.add_argument("--minutes", type=float, nargs="+",
                     default=list(MINUTES))
@@ -176,11 +214,12 @@ def main() -> int:
         return 2
 
     span = (ev[-1][0] - ev[0][0]) / 60.0
-    rows = readings(ev, a.window, a.short, a.hold)
+    rows = readings(ev, a.period, a.warmup, a.hold)
     print(f"\n{'=' * 86}")
     print(f"READ ACCURACY AGAINST THE CLOCK   {src}")
     print(f"{len(ev):,} book updates   {span:.0f} minutes   "
-          f"long {a.window:g}s / short {a.short:g}s / hold {a.hold:g}s")
+          f"{a.period:g}s candles / warmup {a.warmup:g}s / "
+          f"hold {a.hold:g}s")
     print("=" * 86)
     if not rows:
         print("  The read never settled on a direction. Nothing to"
@@ -205,6 +244,36 @@ def main() -> int:
               f"{100 * r['pct_all']:>8.1f}%{100 * r['pct_dec']:>11.1f}%"
               f"{r['mean']:>+10.2f}{100 * c['pct_dec']:>8.1f}%"
               f"{100 * (r['pct_dec'] - c['pct_dec']):>+7.1f}%")
+
+    # THE TRADE ITSELF, which is not a fixed horizon. In at the
+    # reading, out when that candle closes.
+    cc = to_candle_close(rows, ev)
+    cc_ctl = to_candle_close(rows, ev, flip=True)
+    if cc:
+        w = sum(1 for x in cc if x["move"] > 0)
+        l = sum(1 for x in cc if x["move"] < 0)
+        f0 = len(cc) - w - l
+        cw = sum(1 for x in cc_ctl if x["move"] > 0)
+        cl = sum(1 for x in cc_ctl if x["move"] < 0)
+        dec = w + l
+        cdec = cw + cl
+        held = statistics.median(x["held_s"] for x in cc)
+        print(f"\n  HELD TO THE CANDLE CLOSE -- the actual trade, in"
+              f" at the reading")
+        print(f"  and out when that candle ends, {held / 60:.1f}"
+              f" minutes at the median:")
+        print(f"    {len(cc):,} readings &middot; {w:,} right,"
+              f" {f0:,} flat, {l:,} wrong"
+              .replace("&middot;", "\u00b7"))
+        if dec:
+            print(f"    {100 * w / dec:.1f}% of decided &middot;"
+                  f" flipped {100 * cw / cdec if cdec else 0:.1f}%"
+                  f" &middot; EDGE"
+                  f" {100 * (w / dec - (cw / cdec if cdec else 0)):+.1f}%"
+                  .replace("&middot;", "\u00b7"))
+            print(f"    {statistics.mean(x['move'] for x in cc):+.2f}"
+                  f" ticks a reading, median"
+                  f" {statistics.median(x['move'] for x in cc):+.2f}")
 
     best = max((r for r in real if r.get("n")),
                key=lambda r: r["pct_dec"], default=None)

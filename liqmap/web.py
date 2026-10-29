@@ -10591,48 +10591,83 @@ function ofiChart(d, w, h) {
      turned. */
   const readLine = r => {
     if (!r) return '';
-    const mins = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
-                               : s.toFixed(0) + 's');
+    const clock = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
+                                : Math.round(s) + 's');
+    /* THE CANDLE IS THE WINDOW. Everything on this line is counted
+       from the five-minute candle's open and thrown away at its
+       close, which is the whole reason it answers "what is this
+       candle doing" rather than "what happened in the last thirty
+       seconds" -- two questions that are often opposites. */
+    const left = ' &middot; ' + clock(r.left_s) + ' left in this candle';
+    if (!r.warm) {
+      /* The first seconds are a handful of book updates. A direction
+         built from those is a coin toss with a label on it, so the
+         clock goes up instead. */
+      return '<span class="stamp" style="width:100%">READ &mdash; '
+        + '<b>NEW CANDLE</b>, ' + Math.round(r.into_s) + 's in '
+        + '&mdash; too early to say which way it is being taken'
+        + left + '</span>';
+    }
     const dir = r.read === 'up'
       ? '<b class="long">UP</b>'
       : r.read === 'down' ? '<b class="short">DOWN</b>'
       : '<b>NO READ</b>';
     let why;
     if (!r.read) {
-      /* Saying nothing is a result, and the reason for it is the
-         most useful sentence on the panel: it separates "the sides
-         are even" from "the side that was winning has stopped". */
       why = (Math.abs(r.lead) < 1)
-        ? ' &mdash; the two sides are level'
-        : (r.lead > 0) === (r.recent > 0)
-          ? ' &mdash; waiting for it to hold'
-          : ' &mdash; ' + (r.lead > 0 ? 'buying' : 'selling')
-            + ' is still ahead over the window but has stopped '
-            + 'winning right now, which is where a push ends';
+        ? ' &mdash; buying and selling are level on this candle'
+        : ' &mdash; waiting for it to hold';
     } else {
-      why = ' for ' + mins(r.held_s)
-        + ' &middot; ' + (r.read === 'up' ? 'buying' : 'selling')
+      /* THE WORD FOLLOWS THE LEAD, NOT THE READ. During a turn the
+         published read is still UP while the candle's lead has
+         already gone negative, and taking the word from the read
+         would print "buying ahead" over a number that is selling's.
+         The two disagreeing IS the information; writing over it is
+         not a tidier line, it is a wrong one. */
+      why = ' for ' + clock(r.held_s) + ' &middot; '
+        + (r.lead >= 0 ? 'buying' : 'selling')
         + ' ahead by ' + Math.abs(Math.round(r.lead)).toLocaleString()
         + ' of ' + Math.round(r.gross).toLocaleString() + ' ('
-        + (100 * r.share).toFixed(0) + '% buy)'
+        + (100 * r.share).toFixed(0) + '% buy) since this candle opened'
         + (r.strength === 'strong'
             ? ' &middot; <b>past your level</b>'
             : ' &middot; short of your level');
     }
+    /* THE RAW SIGN IS SHOWN BESIDE THE STEADY ONE. Hiding it would
+       make the smoothing unfalsifiable: if the steady read is wrong,
+       the first thing worth knowing is whether the raw one had
+       already turned. */
     const turning = (r.raw !== r.read)
-      ? ' &middot; <b>turning</b> &mdash; it has read '
-        + (r.raw ? r.raw.toUpperCase() : 'nothing') + ' for '
-        + mins(r.pending_s) + ' and publishes if that holds'
+      ? ' &middot; <b>turning</b> &mdash; the candle has led '
+        + (r.raw ? r.raw.toUpperCase() : 'neither way') + ' for '
+        + clock(r.pending_s) + ' and this publishes if it holds'
       : '';
-    const shaky = (r.flips_1m > 6)
-      ? ' &middot; <b class="short">' + r.flips_1m + ' changes of mind '
-        + 'in the last minute</b> &mdash; too unsettled to take'
+    /* A HIGH FLIP COUNT DOES NOT MAKE THE READ UNSTABLE -- it makes
+       it FROZEN, which looks the same and is worse. When the lead
+       crosses zero every couple of seconds it never survives the
+       hold, so the published read stops changing and sits on
+       whichever side happened to be ahead when it first settled. */
+    const shaky = (r.flips > 20)
+      ? ' &middot; <b class="short">the lead has crossed ' + r.flips
+        + ' times this candle</b> &mdash; the two sides are level and '
+        + 'the reading above is stuck on whichever was ahead first, '
+        + 'not tracking anything'
+      : (r.flips > 4)
+        ? ' &middot; <b class="short">' + r.flips + ' changes of mind '
+          + 'this candle</b> &mdash; unsettled'
+        : '';
+    /* Carried, not used. The read describes the candle; this says
+       whether the candle is still being taken that way right now,
+       which is a different question and sometimes the opposite
+       answer. */
+    const stall = (r.read && r.stalling)
+      ? ' &middot; though the last few seconds went the other way'
       : '';
     return '<span class="stamp" style="width:100%">READ &mdash; ' + dir
-      + why + turning + shaky
+      + why + turning + stall + shaky + left
       + ' &middot; this is the five-minute direction, not a trade on '
-      + 'these bars; it ignores the level dropdown and does not reset '
-      + 'when a candle closes</span>';
+      + 'these bars; it ignores the level dropdown and resets only '
+      + 'when your candle does</span>';
   };
 
   let liveCall;

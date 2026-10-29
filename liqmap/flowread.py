@@ -10,51 +10,52 @@ enough to act on".
 
 Two consequences follow immediately and neither is optional.
 
-IT CANNOT RESET AT AN OFI BAR CLOSE. The accumulator inside
-`ofibar` resets at every close, and it must: without that the
-threshold latches and every bar after the first is green. But a
-reading that blanks every time a bar happens to end is useless to
-someone holding a five-minute position -- at target 2,000 that is
-several blanks per trade, each one looking like the signal died.
+IT RESETS ON THE FIVE-MINUTE BOUNDARY, AND ON NOTHING ELSE.
 
-So this keeps its own flow, over a TRAILING WINDOW, independent of
-where the bars fall.
+The position is a five-minute candle, so the question is what THAT
+candle is doing -- which means the flow is counted from the moment
+the candle opened and thrown away when it closes. A reading made
+from the last thirty seconds answers a different question, one that
+is often the opposite of this one: a candle bought hard for four
+minutes and quiet for the last thirty seconds is a bought candle,
+and a trailing window calls it neutral.
 
-IT IS A WINDOW, NOT A RUNNING TOTAL. A cumulative sum of buying
+So the window is the candle. `period_s` is the only thing that
+resets it.
+
+IT DOES NOT RESET WHEN AN OFI BAR CLOSES. The accumulator inside
+`ofibar` does, and must: without that the threshold latches and
+every bar after the first is green. But those bars are a quantity of
+flow, not a quantity of clock, and they fall wherever they fall. A
+reading that blanked every time one of them ended would blank
+several times inside one five-minute position, each blank looking
+like the signal dying.
+
+THE RESET IS WHAT KEEPS IT FROM LATCHING. A cumulative sum of buying
 minus selling walks away from zero on any session with a direction
 and never comes back -- measured on a book drifting up at 52% of
-ticks, that construction reads one way for the entire day. A window
-forgets, so it can say "the buy side was winning and now it is not",
-which is the only thing worth saying.
+ticks, that construction reads one way for the entire day. Counting
+from the candle open and starting again at the next one is the same
+discipline `ofibar` applies to its own accumulator, with the clock
+in place of the flow.
 
 THE READ
 
-    UP      buying is ahead over the window AND winning right now
-    DOWN    selling is ahead over the window AND winning right now
-    none    neither -- including a side that is ahead on a push that
-            has already finished
+    UP      buying has led this candle since it opened
+    DOWN    selling has led this candle since it opened
+    none    too early in the candle to say, or the two are level
 
-The third case is the point of this and not a technicality. A lead
-that is being given back is a side whose push is over, and the
-cumulative gap is LARGEST at exactly that moment -- which is why a
-threshold on the running total is most confident just as the move
-ends.
+WHAT THE READ DESCRIBES IS THE CANDLE, NOT THE LAST FEW SECONDS. A
+candle that was bought hard and has since gone quiet still reads UP,
+because that is what the candle has done. The cost of that is stated
+rather than hidden: it will sometimes hold UP through a stall that
+turns out to be the top. `recent` is carried in the data for anyone
+measuring that, but it does not gate the reading.
 
-TWO WINDOWS, BOTH REQUIRED. The long one says who is AHEAD; a short
-one says who is winning RIGHT NOW, and nothing is published unless
-they agree.
-
-The short window is not a refinement. Without it, buying that stopped
-ten seconds ago is still sitting inside a thirty-second window, so
-the lead is still positive, still not shrinking, and the read says UP
-on a push that is already over -- which is the exact failure a
-threshold on the running total has, arriving by a different route.
-
-THE LEAD IS THE IMBALANCE. `push_up - push_dn` is the net imbalance
-identically, so "buying minus selling" and "the imbalance" are two
-names for one number and asking for both adds nothing. What this
-adds over a threshold on that number is the DERIVATIVE -- whether
-the gap is still opening -- and the window it is measured over.
+THE FIRST SECONDS OF A CANDLE SAY NOTHING, and the panel says so
+rather than printing a direction built from four book updates. Until
+`warmup_s` of the candle has passed there is no read at all, and the
+line shows how far into the candle it is instead.
 
 IT HAS TO HOLD BEFORE IT COUNTS
 
@@ -88,60 +89,62 @@ UP = "up"
 DOWN = "down"
 NONE = ""
 
-# THE THREE NUMBERS THIS RESTS ON, taken from a measured grid rather
-# than chosen. scripts/read_tuning.py prints it; run it again on real
-# files before trusting these, because the grid below was made on a
-# random walk.
+# THE CANDLE. Everything is counted from its open and thrown away at
+# its close, so this is the only thing that resets the reading.
 #
-#   long  short  hold   reads/min   median     p90   silent
-#     30     10     5        1.06      29.8s    68s      34%
-#     30     10    10        0.64      40.3s   110s      30%
-#     30     10    15        0.22     190.5s   363s       0%   <- these
-#     30     20    15        0.62      59.9s   186s       0%
-#     60     10    15        0.22     164.2s   368s      10%
-#    120     10    20        0.04     720.1s  1063s       5%
-#
-# Chosen because the position is a FIVE-MINUTE CANDLE. A read whose
-# median life is thirty seconds expires a tenth of the way into the
-# trade, which is worse than no read: it puts you in a position the
-# chart has already stopped holding. At 30/10/15 the median read runs
-# a little over three minutes, nine in ten end inside six, and one
-# arrives about every four and a half -- roughly one a candle.
-#
-# The walk's flow has no memory, so it flips harder than a real book
-# and every figure above is a WORST CASE.
+# Boundaries are clock-aligned on the epoch -- floor(ts / period) --
+# which puts them at :00, :05, :10 and so on, the same places a
+# five-minute chart puts them. Not aligned to when the service
+# started, which would be five-minute candles nobody else can see.
+PERIOD_S = 300.0
 
-# How much recent flow the reading is made from.
-WINDOW_S = 30.0
-
-# How far back "still pulling away" looks. The lead now against the
-# lead this long ago; if it has not grown, the side is no longer
-# extending and the read goes to none.
+# How far into a candle before the reading is allowed to speak.
 #
-# BELOW ABOUT FIVE SECONDS THIS STOPS WORKING ENTIRELY -- at a one-
-# or two-second lookback the gap is never reliably growing and the
-# grid above returns no reads at all, at any hold. That is a cliff,
-# not a gradient, and it is the reason this is not simply "as recent
-# as possible".
-GROW_S = 10.0
+# The first seconds of a candle are a handful of book updates, and a
+# direction built from those is a coin toss with a label on it. Until
+# this much of the candle has passed the panel shows how far in it
+# is, and no direction at all.
+WARMUP_S = 10.0
 
 # How long a new direction must survive before the published read
-# changes to it. This is the whole of the smoothing.
+# changes to it.
 #
-# There is a cliff on this one too, in the other direction: at a
-# twenty-second hold with a five-second grow, nothing is ever
-# published, because the raw read does not survive twenty seconds on
-# a walk. A hold longer than the raw read's own life is a reading
-# that never speaks.
-HOLD_S = 15.0
+# Measured, from scripts/read_tuning.py on a random walk:
+#
+#   warmup  hold   % of candle spoken   settles at   raw flips
+#       10     0                 96.7%         10s         146
+#       10     5                 93.4%         19s         146
+#       10    10                 90.1%         25s         146   <- this
+#       10    15                 87.2%         35s         146
+#       10    30                 77.4%         50s         146
+#
+# Settling EARLY is what this is traded on -- a direction that
+# arrives four minutes into five is a direction you cannot take -- so
+# the hold is kept to the point where the read is up at about a
+# twelfth of the way in and still covers nine tenths of the candle.
+#
+# AND THE RAW FLIP COUNT IS THE NUMBER THAT MATTERS MORE THAN EITHER.
+# At 146 changes of mind a candle -- which is what a driftless walk
+# produces, the cumulative lead sitting on zero and crossing it
+# constantly -- the raw reading never survives any hold, so the
+# published read never changes at all. It is then FROZEN on whichever
+# side was ahead when it first settled, and the 90% above is
+# measuring that rather than stability. On a walk this is the correct
+# outcome: there is nothing to hold. On real tape a flip count still
+# in the dozens means the same thing, and the reading should be
+# ignored on those candles rather than tuned into looking better.
+# That is why `flips` is on the panel.
+HOLD_S = 10.0
 
-# Resolution of the trailing window. Flow is accumulated into buckets
-# of this width rather than kept per update, because ES can print
-# thousands of book updates a second and a sixty-second deque of them
-# is a quarter of a million objects that all have to be walked. At
-# half a second the error is bounded by one bucket at each end of the
-# window and the memory is a fixed 120 slots.
+# A short trailing window, carried for measurement and NOT used to
+# decide anything. It answers "is this candle still being bought",
+# which is a different question from "has this candle been bought"
+# and sometimes the opposite answer. The reading is the second one;
+# this is here so the first can be measured against outcomes later.
+RECENT_S = 10.0
+
 BUCKET_S = 0.5
+
 
 
 @dataclass
@@ -153,18 +156,25 @@ class Snapshot:
     #                             can be checked rather than trusted
     held_s: float = 0.0         # how long `read` has stood
     pending_s: float = 0.0      # how long `raw` has disagreed with it
-    up: float = 0.0             # buying flow over the window
-    dn: float = 0.0             # selling flow over the window
-    lead: float = 0.0           # up - dn; the net imbalance
+    up: float = 0.0             # buying since this candle opened
+    dn: float = 0.0             # selling since this candle opened
+    lead: float = 0.0           # up - dn; what the candle has done
     gross: float = 0.0          # up + dn; the size of the fight
     share: float = 0.5          # buying as a share of gross, 0.5 even
-    growth: float = 0.0         # lead now minus lead GROW_S ago
-    recent: float = 0.0         # buy minus sell over the last GROW_S
-    #                             alone -- who is winning RIGHT NOW
-    extending: bool = False     # whether the leader is still pulling away
-    flips_1m: int = 0           # raw direction changes in the last minute
+    recent: float = 0.0         # buy minus sell over the last RECENT_S
+    #                             alone. CARRIED, NOT USED -- "is it
+    #                             still being bought" is a different
+    #                             question from "has it been bought",
+    #                             and this reading is the second one.
+    stalling: bool = False      # the candle leads one way and the
+    #                             last few seconds went the other
+    into_s: float = 0.0         # how far into the candle
+    left_s: float = 0.0         # how much of it is left
+    candle_ts: float = 0.0      # the candle's open, clock-aligned
+    warm: bool = False          # past the warmup, allowed to speak
+    flips: int = 0              # raw direction changes THIS CANDLE
     strength: str = ""          # "" | "weak" | "strong", vs the level
-    seconds: float = 0.0        # clock covered so far, capped at window
+    period_s: float = PERIOD_S
 
     @property
     def dominance(self) -> float:
@@ -189,120 +199,118 @@ class Snapshot:
                 "gross": round(self.gross, 1),
                 "share": round(self.share, 4),
                 "dominance": round(self.dominance, 4),
-                "growth": round(self.growth, 1),
                 "recent": round(self.recent, 1),
-                "extending": self.extending,
-                "flips_1m": self.flips_1m,
+                "stalling": self.stalling,
+                "into_s": round(self.into_s, 1),
+                "left_s": round(self.left_s, 1),
+                "candle_ts": self.candle_ts,
+                "warm": self.warm,
+                "flips": self.flips,
                 "strength": self.strength,
                 "settled": self.settled,
-                "seconds": round(self.seconds, 2)}
+                "period_s": self.period_s}
 
 
 class FlowRead:
-    """The rolling buy-versus-sell read. One instance, fed every update.
+    """Buying against selling, counted from the candle open.
 
-    Not per target. The bars are five different slicings of one tape;
-    the flow underneath them is one thing, and reading it five times
-    would produce five answers to a question with one.
+    One instance, fed every book update. Not per target: the five OFI
+    builders are five slicings of one tape, and the flow underneath
+    them is one thing. Reading it five times would produce five
+    answers to a question that has one.
     """
 
-    __slots__ = ("window_s", "grow_s", "hold_s", "bucket_s", "level",
-                 "_prev",
-                 "_n", "_up", "_dn", "_i0", "_t0", "_lead_hist",
-                 "_sum_up", "_sum_dn", "_raw", "_raw_since",
-                 "_read", "_read_since", "_flips", "_started", "_last")
+    __slots__ = ("period_s", "warmup_s", "hold_s", "recent_s",
+                 "bucket_s", "level", "_prev",
+                 "_up", "_dn", "_open_ts", "_last", "_started",
+                 "_r_up", "_r_dn", "_r_i", "_r_t0", "_r_n",
+                 "_raw", "_raw_since", "_read", "_read_since", "_flips",
+                 "_last_dir")
 
-    def __init__(self, window_s: float = WINDOW_S,
-                 grow_s: float = GROW_S, hold_s: float = HOLD_S,
-                 bucket_s: float = BUCKET_S, level: int = 500) -> None:
-        if window_s <= 0:
-            raise ValueError("window_s must be positive")
-        if bucket_s <= 0 or bucket_s > window_s:
-            raise ValueError("bucket_s must be positive and inside the "
-                             "window")
-        if grow_s < 0:
-            raise ValueError("grow_s cannot be negative")
+    def __init__(self, period_s: float = PERIOD_S,
+                 warmup_s: float = WARMUP_S, hold_s: float = HOLD_S,
+                 recent_s: float = RECENT_S, bucket_s: float = BUCKET_S,
+                 level: int = 500) -> None:
+        if period_s <= 0:
+            raise ValueError("period_s must be positive")
+        if warmup_s < 0 or warmup_s >= period_s:
+            raise ValueError("warmup_s must be inside the candle")
         if hold_s < 0:
             raise ValueError("hold_s cannot be negative")
-        self.window_s = float(window_s)
-        self.grow_s = float(grow_s)
+        if bucket_s <= 0 or bucket_s > max(recent_s, bucket_s):
+            raise ValueError("bucket_s must be positive")
+        self.period_s = float(period_s)
+        self.warmup_s = float(warmup_s)
         self.hold_s = float(hold_s)
+        self.recent_s = max(0.0, float(recent_s))
         self.bucket_s = float(bucket_s)
         # Only ever a label on the reading. The direction does not
         # depend on it and there is a test that it does not.
         self.level = max(1, int(level))
-
-        self._n = max(1, int(round(window_s / bucket_s)))
-        self._up = [0.0] * self._n
-        self._dn = [0.0] * self._n
-        self._sum_up = 0.0
-        self._sum_dn = 0.0
-        self._i0 = 0            # bucket index of the newest bucket
-        self._t0 = 0.0          # start time of that bucket
-        self._started = False
-        self._last = 0.0        # latest timestamp seen
         self._prev: Touch | None = None
 
-        # Lead sampled once per bucket, for the growth comparison.
-        self._lead_hist: list = [0.0] * self._n
+        # The candle's own flow. Plain running sums -- the window is
+        # the candle, so nothing has to expire out of it.
+        self._up = 0.0
+        self._dn = 0.0
+        self._open_ts = 0.0
+        self._started = False
+        self._last = 0.0
+
+        # The short trailing window, for the stall diagnostic only.
+        self._r_n = max(1, int(round(self.recent_s / self.bucket_s)))
+        self._r_up = [0.0] * self._r_n
+        self._r_dn = [0.0] * self._r_n
+        self._r_i = 0
+        self._r_t0 = 0.0
 
         self._raw = NONE
         self._raw_since = 0.0
         self._read = NONE
         self._read_since = 0.0
-        # (timestamp, new direction) for each raw change, trimmed to a
-        # minute. The flip rate is the honest way to say "this is too
-        # unstable to take right now".
-        self._flips: list = []
+        self._flips = 0
+        self._last_dir = NONE
 
     # ------------------------------------------------------------------
     def reset(self) -> None:
         self._prev = None
-        self._up = [0.0] * self._n
-        self._dn = [0.0] * self._n
-        self._sum_up = self._sum_dn = 0.0
-        self._lead_hist = [0.0] * self._n
-        self._i0 = 0
-        self._t0 = 0.0
         self._started = False
+        self._new_candle(0.0)
         self._last = 0.0
-        self._raw = self._read = NONE
-        self._raw_since = self._read_since = 0.0
-        self._flips = []
 
     def set_level(self, level: int) -> None:
         """The strength label only. Direction is untouched by it."""
         self.level = max(1, int(level))
 
-    # ------------------------------------------------------------------
-    def on_event(self, ts: float, e: float) -> None:
-        """One signed order-flow imbalance event.
+    def _candle_of(self, ts: float) -> float:
+        """The open of the candle `ts` falls in, aligned to the clock.
 
-        Positive is buying pressure, negative selling -- the same `e`
-        the bar builder accumulates, so the two cannot disagree about
-        what happened.
+        floor(ts / period) puts the boundaries at :00, :05, :10 --
+        where a five-minute chart puts them. Aligning to when the
+        service happened to start would make five-minute candles
+        nobody else can see.
         """
-        ts = float(ts)
-        if not self._started:
-            self._started = True
-            self._t0 = ts
-            self._last = ts
-        elif ts < self._last:
-            # Time went backwards: a replayed or out-of-order record.
-            # Fold it into the current bucket rather than rolling the
-            # window to a past instant, which would discard everything
-            # between here and there.
-            ts = self._last
-        self._roll(ts)
-        self._last = ts
-        if e > 0:
-            self._up[self._i0] += e
-            self._sum_up += e
-        elif e < 0:
-            self._dn[self._i0] -= e
-            self._sum_dn -= e
-        self._decide(ts)
+        return (ts // self.period_s) * self.period_s
 
+    def _new_candle(self, open_ts: float) -> None:
+        self._up = 0.0
+        self._dn = 0.0
+        self._open_ts = open_ts
+        self._r_up = [0.0] * self._r_n
+        self._r_dn = [0.0] * self._r_n
+        self._r_i = 0
+        self._r_t0 = open_ts
+        # NOTHING CARRIES OVER, the published read least of all. It
+        # described a candle that has closed, and leaving it up would
+        # be the previous candle's answer wearing this one's label.
+        self._raw = NONE
+        self._read = NONE
+        self._raw_since = open_ts
+        self._read_since = open_ts
+        self._flips = 0
+        self._last_dir = NONE
+
+    # ------------------------------------------------------------------
     def on_book(self, ts: float, bid_px: int, bid_sz: int,
                 ask_px: int, ask_sz: int) -> None:
         """One book update, in the same shape the bar builder takes.
@@ -324,102 +332,81 @@ class FlowRead:
             return
         self.on_event(ts, float(level_ofi(prev, t)))
 
-    def _roll(self, ts: float) -> None:
-        """Advance to the bucket `ts` falls in, clearing what expired."""
-        steps = int((ts - self._t0) // self.bucket_s)
+    def on_event(self, ts: float, e: float) -> None:
+        """One signed order-flow imbalance event.
+
+        Positive is buying pressure, negative selling -- the same `e`
+        the bar builder accumulates, so the two cannot disagree about
+        what happened.
+        """
+        ts = float(ts)
+        if not self._started:
+            self._started = True
+            self._new_candle(self._candle_of(ts))
+            self._last = ts
+        elif ts < self._last:
+            # Time went backwards: a replayed or out-of-order record.
+            # Treat it as now rather than reopening a closed candle.
+            ts = self._last
+        open_ts = self._candle_of(ts)
+        if open_ts != self._open_ts:
+            self._new_candle(open_ts)
+        self._last = ts
+        self._roll_recent(ts)
+        if e > 0:
+            self._up += e
+            self._r_up[self._r_i] += e
+        elif e < 0:
+            self._dn -= e
+            self._r_dn[self._r_i] -= e
+        self._decide(ts)
+
+    def _roll_recent(self, ts: float) -> None:
+        steps = int((ts - self._r_t0) // self.bucket_s)
         if steps <= 0:
             return
-        if steps >= self._n:
-            # The whole window expired. Nothing in it is about now.
-            self._up = [0.0] * self._n
-            self._dn = [0.0] * self._n
-            self._lead_hist = [0.0] * self._n
-            self._sum_up = self._sum_dn = 0.0
-            self._i0 = 0
-            self._t0 += steps * self.bucket_s
-            return
-        for _ in range(steps):
-            # The bucket just completed keeps its lead sample, then
-            # the next one is cleared of whatever it held a window ago.
-            self._lead_hist[self._i0] = self._sum_up - self._sum_dn
-            self._i0 = (self._i0 + 1) % self._n
-            self._sum_up -= self._up[self._i0]
-            self._sum_dn -= self._dn[self._i0]
-            self._up[self._i0] = 0.0
-            self._dn[self._i0] = 0.0
-        self._t0 += steps * self.bucket_s
-
-    def _lead_ago(self, seconds: float) -> float:
-        """The lead as it stood roughly this long ago."""
-        back = int(round(seconds / self.bucket_s))
-        if back <= 0:
-            return self._sum_up - self._sum_dn
-        if back >= self._n:
-            back = self._n - 1
-        return self._lead_hist[(self._i0 - back) % self._n]
+        if steps >= self._r_n:
+            self._r_up = [0.0] * self._r_n
+            self._r_dn = [0.0] * self._r_n
+            self._r_i = 0
+        else:
+            for _ in range(steps):
+                self._r_i = (self._r_i + 1) % self._r_n
+                self._r_up[self._r_i] = 0.0
+                self._r_dn[self._r_i] = 0.0
+        self._r_t0 += steps * self.bucket_s
 
     def _recent(self) -> float:
-        """Buying minus selling over the last `grow_s` ALONE.
-
-        A SECOND, SHORTER WINDOW, and the reason for it is a case the
-        long one gets wrong on its own: buying that stopped ten
-        seconds ago is still in a thirty-second window, so the lead is
-        still positive and still not shrinking, and the read says UP
-        on flow that has already finished. The long window says who is
-        ahead; this says who is winning RIGHT NOW. Both have to agree
-        before anything is published.
-        """
-        k = max(1, int(round(self.grow_s / self.bucket_s)))
-        if k >= self._n:
-            return self._sum_up - self._sum_dn
-        tot = 0.0
-        i = self._i0
-        for _ in range(k):
-            tot += self._up[i] - self._dn[i]
-            i = (i - 1) % self._n
-        return tot
+        return sum(self._r_up) - sum(self._r_dn)
 
     def _decide(self, ts: float) -> None:
-        lead = self._sum_up - self._sum_dn
-        growth = lead - self._lead_ago(self.grow_s)
-        # PULLING AWAY IS THE WINDOWED LEAD ITSELF, and getting this
-        # wrong is the first thing this module did.
-        #
-        # The gap between total buying and total selling is a
-        # cumulative quantity; the lead over a trailing window is its
-        # RATE OF CHANGE. So a positive windowed lead already means
-        # "the buy side is pulling away from the sell side right now",
-        # and a side that was ahead but has stopped buying sees its
-        # windowed lead decay to zero on its own -- the window
-        # supplies the "still", without anything else being asked for.
-        #
-        # Requiring the windowed lead to also be GROWING asks for
-        # acceleration, which is a different and much stricter claim:
-        # steady one-sided buying has a flat windowed lead, and the
-        # first version of this read that as "not pulling away" and
-        # went silent through exactly the pushes worth trading.
-        #
-        # What growth is still good for is the other sign. A lead that
-        # is SHRINKING is a side whose push is fading, and reading UP
-        # into that is the entry that lands just before the turn. So:
-        # ahead, and not fading.
-        recent = self._recent()
-        if lead > 0 and recent > 0:
-            raw = UP
-        elif lead < 0 and recent < 0:
-            raw = DOWN
-        else:
-            raw = NONE
+        into = ts - self._open_ts
+        if into < self.warmup_s:
+            # TOO EARLY. A direction built from a handful of book
+            # updates is a coin toss with a label on it, and the
+            # panel shows the clock instead.
+            if self._raw:
+                self._raw = NONE
+                self._raw_since = ts
+            self._read = NONE
+            return
+        lead = self._up - self._dn
+        # THE CANDLE'S OWN LEAD, and nothing else. A candle bought
+        # hard and since gone quiet still reads UP, because that is
+        # what the candle has done -- `recent` is carried for anyone
+        # measuring the stall, and does not gate this.
+        raw = UP if lead > 0 else (DOWN if lead < 0 else NONE)
         if raw != self._raw:
             self._raw = raw
             self._raw_since = ts
-            self._flips.append((ts, raw))
-            cut = ts - 60.0
-            while self._flips and self._flips[0][0] < cut:
-                self._flips.pop(0)
-        # THE HOLD. The published read changes only once the raw one
-        # has stood by its new answer for hold_s. Without this the
-        # reading changes while you are clicking.
+            # CHANGES OF MIND, not transitions. The first direction a
+            # candle settles on is not a change of mind, and counting
+            # it as one would put a 1 on every quiet candle and make
+            # the figure useless for spotting the noisy ones.
+            if raw and self._last_dir and raw != self._last_dir:
+                self._flips += 1
+            if raw:
+                self._last_dir = raw
         if raw != self._read and (ts - self._raw_since) >= self.hold_s:
             self._read = raw
             self._read_since = ts
@@ -428,29 +415,30 @@ class FlowRead:
     @property
     def snapshot(self) -> Snapshot:
         ts = self._last
-        up, dn = self._sum_up, self._sum_dn
+        up, dn = self._up, self._dn
         lead = up - dn
         gross = up + dn
-        growth = lead - self._lead_ago(self.grow_s)
-        recent = self._recent()
-        extending = (lead > 0 and recent > 0) or (lead < 0 and recent < 0)
+        into = max(0.0, ts - self._open_ts) if self._started else 0.0
+        recent = self._recent() if self._started else 0.0
         strength = ""
         if self._read:
             strength = "strong" if abs(lead) >= self.level else "weak"
         return Snapshot(
             read=self._read, raw=self._raw,
-            held_s=max(0.0, ts - self._read_since) if self._read_since
-            else 0.0,
+            held_s=max(0.0, ts - self._read_since) if self._read else 0.0,
             pending_s=(max(0.0, ts - self._raw_since)
                        if self._raw != self._read else 0.0),
             up=up, dn=dn, lead=lead, gross=gross,
             share=(up / gross) if gross > 0 else 0.5,
-            growth=growth, recent=recent, extending=extending,
-            flips_1m=len(self._flips),
+            recent=recent,
+            stalling=bool(lead and recent and (lead > 0) != (recent > 0)),
+            into_s=into,
+            left_s=max(0.0, self.period_s - into) if self._started else 0.0,
+            candle_ts=self._open_ts,
+            warm=into >= self.warmup_s,
+            flips=self._flips,
             strength=strength,
-            seconds=min(self.window_s, max(0.0, ts - self._t0
-                                           + self.window_s)
-                        if self._started else 0.0))
+            period_s=self.period_s)
 
     @property
     def read(self) -> str:

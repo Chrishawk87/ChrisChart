@@ -50,6 +50,17 @@ class TestAccuracyMeasuresInMinutes:
         assert "MINUTES = (1.0, 3.0, 5.0)" in ACC
         assert "m * 60.0" in ACC
 
+    def test_it_also_scores_the_trade_itself(self):
+        """A fixed horizon is not the trade. The position is opened
+        on the reading and closed when THAT candle ends, which is a
+        different length every time."""
+        assert "def to_candle_close" in ACC
+        assert "HELD TO THE CANDLE CLOSE" in ACC
+        assert "candle_end" in ACC
+
+    def test_the_candle_close_measure_has_its_own_control(self):
+        assert "to_candle_close(rows, ev, flip=True)" in ACC
+
     def test_it_scores_one_row_per_reading_not_per_update(self):
         assert "One row per" in ACC and "not one per update" in ACC
         assert "would count a" in ACC
@@ -91,11 +102,19 @@ class TestTheyRun:
 
     def test_tuning_produces_a_grid(self):
         rc, out = self._run(ROOT / "scripts" / "read_tuning.py",
-                            ["--updates", "20000", "--windows", "30",
+                            ["--updates", "40000", "--warmups", "10",
                              "--holds", "5", "15"])
         assert rc == 0
         assert "READ STABILITY" in out
+        assert "% spoken" in out
         assert out.count("\n") > 8
+
+    def test_tuning_names_the_frozen_case(self):
+        """A read that never changes because its raw sign never
+        survives the hold looks identical to a rock-steady one, and
+        is the opposite."""
+        assert "FROZEN" in TUNE or "frozen" in TUNE
+        assert "whichever side happened to be ahead" in TUNE
 
     def test_accuracy_runs_on_a_walk_and_says_it_found_nothing(self):
         rc, out = self._run(ROOT / "scripts" / "read_accuracy.py",

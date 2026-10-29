@@ -56,87 +56,129 @@ def walk_events(n: int = 400_000, seed: int = 3, p_move: float = 0.12,
     return out
 
 
-def stability(events, window_s, grow_s, hold_s) -> dict:
-    f = FlowRead(window_s=window_s, grow_s=grow_s, hold_s=hold_s)
-    runs, cur, since = [], "", None
-    silent = 0.0
+def stability(events, period_s, warmup_s, hold_s) -> dict:
+    """How the reading behaves across whole candles.
+
+    The figures that matter changed with the construction. A trailing
+    window was asked how long a read lasts; a candle-aligned one is
+    asked how much OF EACH CANDLE it spends saying something, and how
+    often it changes its mind inside one. A read that settles at
+    twenty seconds and holds to the close is what this is for.
+    """
+    f = FlowRead(period_s=period_s, warmup_s=warmup_s, hold_s=hold_s,
+                 recent_s=10.0)
+    per_candle: dict = {}
+    cur_candle = None
+    first_read_at = None
+    spoke = 0.0
     last_ts = events[0][0]
+    cur, since = "", None
     for ts, e, _px in events:
         f.on_event(ts, e)
-        r = f.read
+        s = f.snapshot
+        if s.candle_ts != cur_candle:
+            if cur_candle is not None:
+                if cur and since is not None:
+                    spoke += ts - since
+                per_candle[cur_candle] = {
+                    "spoke": spoke,
+                    "settled_at": first_read_at,
+                    "flips": flips_at_close}
+            cur_candle = s.candle_ts
+            spoke, first_read_at, cur, since = 0.0, None, "", None
+        flips_at_close = s.flips
+        r = s.read
         if r != cur:
-            if since is not None and cur:
-                runs.append(ts - since)
-            if not cur and since is not None:
-                silent += ts - since
+            if cur and since is not None:
+                spoke += ts - since
+            if r and first_read_at is None:
+                first_read_at = s.into_s
             cur, since = r, ts
         last_ts = ts
     span = last_ts - events[0][0]
-    live = [x for x in runs if x > 0]
-    return {"window": window_s, "grow": grow_s, "hold": hold_s,
-            "reads": len(live),
-            "per_min": round(60.0 * len(live) / span, 2) if span else 0.0,
-            "median_s": round(statistics.median(live), 1) if live else 0.0,
-            "p90_s": round(sorted(live)[int(len(live) * 0.9)], 1)
-            if live else 0.0,
-            "longest_s": round(max(live), 1) if live else 0.0,
-            "pct_silent": round(100.0 * silent / span, 1) if span else 0.0}
+    rows = list(per_candle.values())
+    if not rows:
+        return {"period": period_s, "warmup": warmup_s, "hold": hold_s,
+                "candles": 0, "pct_spoken": 0.0, "settled_at": 0.0,
+                "flips": 0.0, "never": 100.0, "span": span}
+    spoke_pct = [100.0 * r["spoke"] / period_s for r in rows]
+    settled = [r["settled_at"] for r in rows
+               if r["settled_at"] is not None]
+    never = 100.0 * (len(rows) - len(settled)) / len(rows)
+    return {"period": period_s, "warmup": warmup_s, "hold": hold_s,
+            "candles": len(rows),
+            "pct_spoken": statistics.mean(spoke_pct),
+            "settled_at": statistics.median(settled) if settled else 0.0,
+            "flips": statistics.mean(r["flips"] for r in rows),
+            "never": never, "span": span}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--updates", type=int, default=400_000)
     ap.add_argument("--seed", type=int, default=3)
-    ap.add_argument("--windows", type=float, nargs="+",
-                    default=[15, 30, 60, 120])
+    ap.add_argument("--period", type=float, default=300.0)
+    ap.add_argument("--warmups", type=float, nargs="+",
+                    default=[0, 5, 10, 20, 30])
     ap.add_argument("--holds", type=float, nargs="+",
-                    default=[0, 2, 5, 10, 20])
-    ap.add_argument("--grow", type=float, default=5.0)
+                    default=[0, 5, 10, 15, 30])
     a = ap.parse_args()
 
     ev = walk_events(a.updates, a.seed)
     span = (ev[-1][0] - ev[0][0]) / 60.0
     print(f"\n{'=' * 78}")
     print(f"READ STABILITY   {len(ev):,} book updates   "
-          f"{span:.0f} minutes of clock   grow {a.grow:g}s")
+          f"{span:.0f} minutes   {a.period:g}s candles")
     print("A RANDOM WALK. Its flow has no memory, so it flips harder")
     print("than a real book: every figure here is a worst case.")
     print("=" * 78)
-    print(f"  {'window':>7}{'hold':>6}{'reads/min':>11}{'median':>9}"
-          f"{'p90':>8}{'longest':>9}{'silent':>8}")
-    best = None
-    for w in a.windows:
+    print(f"  {'warmup':>7}{'hold':>6}{'candles':>9}{'% spoken':>10}"
+          f"{'settles at':>12}{'flips/candle':>14}{'never spoke':>13}")
+    for w in a.warmups:
         for h in a.holds:
-            r = stability(ev, w, a.grow, h)
-            print(f"  {w:>7.0f}{h:>6.0f}{r['per_min']:>11.2f}"
-                  f"{r['median_s']:>8.1f}s{r['p90_s']:>7.1f}s"
-                  f"{r['longest_s']:>8.1f}s{r['pct_silent']:>7.1f}%")
-            # Wanted: a read that usually survives a five-minute
-            # candle, and that is not silent most of the time.
-            if r["median_s"] >= 60 and r["pct_silent"] <= 70:
-                if best is None or r["median_s"] > best["median_s"]:
-                    best = r
-    print("\n  MEDIAN is how long a published read lasts. For a"
-          " five-minute trade it")
-    print("  wants to be in the hundreds of seconds, not the tens --"
-          " a read that")
-    print("  expires a minute in puts you in a position the chart no"
-          " longer holds.")
-    print("  SILENT is the share of the clock saying nothing, which is"
-          " the price of")
-    print("  only speaking while a side is still pulling away.")
-    if best:
-        print(f"\n  Longest-lasting pairing that is not mostly silent:"
-              f" window {best['window']:.0f}s, hold {best['hold']:.0f}s"
-              f" ({best['median_s']:.0f}s median,"
-              f" {best['pct_silent']:.0f}% silent).")
-    else:
-        print("\n  NO PAIRING HOLDS A READ FOR A MINUTE on this data."
-              " On a walk that is")
-        print("  the expected answer -- there is nothing to hold onto."
-              " Run it against")
-        print("  real files before concluding anything about the"
-              " settings.")
+            if w + h >= a.period:
+                continue
+            r = stability(ev, a.period, w, h)
+            print(f"  {w:>7.0f}{h:>6.0f}{r['candles']:>9,}"
+                  f"{r['pct_spoken']:>9.1f}%{r['settled_at']:>11.0f}s"
+                  f"{r['flips']:>14.1f}{r['never']:>12.1f}%")
+
+    print("\n  % SPOKEN is how much of a candle the reading is saying"
+          " something. A")
+    print("  reading meant to put you in that candle wants to be"
+          " saying it for most")
+    print("  of the candle, and to have settled EARLY -- a direction"
+          " that arrives at")
+    print("  four minutes into five is a direction you cannot trade.")
+    worst = max((stability(ev, a.period, w, h)["flips"]
+                 for w in a.warmups for h in a.holds
+                 if w + h < a.period), default=0.0)
+    print("\n  FLIPS/CANDLE is changes of mind in the RAW reading"
+          " inside one candle.")
+    print("  Above one or two, the cumulative lead is crossing zero"
+          " rather than")
+    print("  pointing anywhere.")
+    if worst > 20:
+        print(f"\n  AND IT IS {worst:.0f} HERE, WHICH CHANGES WHAT THE"
+              f" COLUMN BEFORE IT MEANS.")
+        print("  When the raw reading flips every couple of seconds it"
+              " never survives")
+        print("  the hold, so the published read never changes either"
+              " -- it is frozen")
+        print("  on whichever side happened to be ahead when it first"
+              " settled, and a")
+        print("  high % SPOKEN is measuring that, not stability. On a"
+              " random walk this")
+        print("  is the correct and expected outcome: there is no"
+              " direction to hold.")
+        print("  On real tape, a flip count still in the dozens means"
+              " the same thing,")
+        print("  and the reading should be ignored on those candles"
+              " rather than tuned.")
+    print("\n  NEVER SPOKE is candles that produced no direction at"
+          " all. On a walk")
+    print("  that is the honest answer for a candle whose two sides"
+          " finished level.")
     print("\n  This says nothing about whether the read is RIGHT."
           " scripts/read_accuracy.py")
     print("  is that question, and it has its own control.")

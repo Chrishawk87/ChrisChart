@@ -1847,23 +1847,42 @@ class TestTheReadIsAboutTheOtherTrade:
         assert F is not None
 
     def test_saying_nothing_says_why(self):
-        """The most useful sentence on the panel: it separates the
-        sides being level from the winning side having stopped."""
+        """Two different silences, and they mean opposite things: too
+        early in the candle to say, versus the candle's two sides
+        having finished level."""
         c = self._chart()
-        assert "the two sides are level" in c
-        assert "stopped " in c and "which is where a push ends" in c
+        assert "NEW CANDLE" in c and "too early to say" in c
+        assert "buying and selling are level on this candle" in c
 
     def test_the_raw_sign_is_shown_beside_the_steady_one(self):
         """Hiding it would make the smoothing unfalsifiable."""
         c = self._chart()
         assert "turning" in c
         assert "r.raw !== r.read" in c
-        assert "publishes if that holds" in c
+        assert "publishes if it holds" in c
 
     def test_it_says_when_it_is_too_unstable_to_take(self):
         c = self._chart()
         assert "changes of mind" in c
-        assert "too unsettled to take" in c
+        assert "unsettled" in c
+
+    def test_a_frozen_read_is_named_as_frozen_not_as_steady(self):
+        """The failure that looks like success: when the lead crosses
+        zero every couple of seconds it never survives the hold, so
+        the published read stops changing and sits on whichever side
+        was ahead first. That reads as a rock-steady signal."""
+        c = self._chart()
+        assert "stuck on whichever was ahead first" in c
+        assert "not tracking anything" in c
+        assert "r.flips > 20" in c
+
+    def test_it_shows_how_much_of_the_candle_is_left(self):
+        c = self._chart()
+        assert "left in this candle" in c
+
+    def test_it_resets_only_with_the_candle(self):
+        c = self._chart()
+        assert "resets only " in c and "when your candle does" in c
 
     def test_an_absent_read_draws_nothing_rather_than_zeros(self):
         """A reading that has not started must not render as a
