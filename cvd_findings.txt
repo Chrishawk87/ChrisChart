@@ -1,0 +1,112 @@
+reading data/ES_c_0_mbp-10_2026-09-21.dbn.zst ...
+reading data/ES_c_0_mbp-10_2026-09-25.dbn.zst ...
+reading data/ES_c_0_mbp-10_2026-10-08.dbn.zst ...
+reading data/ES_c_0_ohlcv-1s_2024-09-30.dbn.zst ...
+
+========================================================================
+ES CVD STUDY -- 300s bars
+========================================================================
+  77,886,013 records in 1,914s   54,994,186 books   2,444,850 trades   0 refused
+  1,288 completed bars   73,778 grid samples
+
+========================================================================
+1. DOES THE BOOK LEAD PRICE -- and if so by how many seconds
+========================================================================
+  73,778 samples every 5s (102.5 hours)
+
+  noise floor 0.0606, measured by rotating one series
+  200 times and re-running this same scan. A peak
+  below this is what unrelated data produces.
+
+       lag     corr(book -> price)   meaning
+     -120s                 -0.0001   book leads
+     -100s                  0.0045   book leads
+      -80s                  0.0005   book leads
+      -60s                  0.0092   book leads
+      -40s                 -0.0060   book leads
+      -20s                  0.0022   book leads
+       +0s                  0.3490   same instant
+      +20s                 -0.0098   price leads
+      +40s                 -0.0023   price leads
+      +60s                  0.0023   price leads
+      +80s                  0.0035   price leads
+     +100s                  0.0023   price leads
+     +120s                  0.0107   price leads
+
+  STRONGEST: +0.3490 at +0s   (floor 0.0606)
+  -> They move together. Nothing to act on: by the time the
+     book has moved, price already has.
+
+========================================================================
+2. WHAT SEPARATES AN UP BAR FROM A DOWN BAR
+========================================================================
+  1,218 completed 300s bars   614 up / 604 down
+  BASE RATE 50.4% up -- always calling one way scores 50.4%
+  Anything below that has found nothing.
+
+   into bar   reading    up bars  down bars      gap       n
+       20%    book_z      0.429     -0.655    1.084    1215
+       20%    tape_z      0.727     -0.448    1.176    1215
+       20%       gap     -0.122     -0.120   -0.002    1215
+
+       40%    book_z      0.675     -0.520    1.196    1215
+       40%    tape_z      0.840     -0.317    1.157    1215
+       40%       gap     -0.090     -0.076   -0.014    1215
+
+       60%    book_z      0.526     -0.768    1.293    1215
+       60%    tape_z      0.786     -0.592    1.378    1215
+       60%       gap     -0.292     -0.084   -0.207    1215
+
+       80%    book_z      0.529     -0.705    1.234    1215
+       80%    tape_z      0.735     -0.668    1.403    1215
+       80%       gap     -0.145      0.028   -0.173    1215
+
+  A reading separates up bars from down bars only if its two
+  medians differ at the EARLY checkpoints. A gap that appears
+  only at 80% is the bar telling you what it already did.
+
+========================================================================
+3. WHAT PRICE DID INSIDE EACH REGIME
+========================================================================
+  189 stretches of at least 2.0s
+
+              regime      n  median net   favour  adverse    secs
+       up_book_above     52         0.0      2.0      0.0     5.1
+       up_book_below     52        -0.5      1.0     -1.0     7.9
+     down_book_above     54        -1.0      0.5     -1.0     6.8
+     down_book_below     31         1.0      1.0      0.0     4.8
+
+     up: book above runs further  0.0t vs -0.5t  diff +0.5t  n 52/52
+   down: book BELOW runs further  -1.0t vs 1.0t  diff -2.0t  n 54/31
+
+========================================================================
+4. CALLING THE BAR BEFORE IT CLOSES
+========================================================================
+  74 bars settled   base rate 50.0% up   always-one-way scores 50.0%
+
+     caller  into bar       n     rate     edge
+     regime      20%      47   68.1%  +18.1%  THIN
+     regime      40%      46   58.7%   +8.7%  THIN
+     regime      60%      38   65.8%  +15.8%  THIN
+     regime      80%      47   72.3%  +22.3%  THIN
+      bar_z      20%      74   55.4%   +5.4%  THIN
+      bar_z      40%      74   67.6%  +17.6%  THIN
+      bar_z      60%      74   66.2%  +16.2%  THIN
+      bar_z      80%      74   75.7%  +25.7%  THIN
+
+  EDGE is the rate minus always-one-way. Zero means no better
+  than the dumbest possible rule. Only the early checkpoints
+  would be worth anything.
+
+========================================================================
+READ THIS PART
+========================================================================
+  Section 1 decides whether any of the rest matters. If the
+  strongest correlation sits at zero lag or at a positive one,
+  the book is not leading price on this data and no amount of
+  regime slicing in sections 2-4 will change that.
+
+  Every rate in sections 2 and 4 is against the base rate. A
+  number that merely matches it is a finding of nothing, which
+  is a real result and worth knowing in an afternoon rather
+  than after a month of live trading.

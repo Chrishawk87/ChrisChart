@@ -1,0 +1,135 @@
+{
+  "candles": 398,
+  "base_rate": 0.4899497487437186,
+  "by_fraction": {
+    "0.25": {
+      "table": {
+        "down": {
+          "n": 211,
+          "hits": 104,
+          "rate": 0.4929,
+          "ci_low": 0.4262,
+          "ci_high": 0.5599,
+          "enough": true,
+          "avg_ticks": -0.4,
+          "candle_rate": 0.5355,
+          "candle_avg_ticks": 2.02
+        },
+        "flat": {
+          "n": 24,
+          "went_up": 9,
+          "rate": 0.375,
+          "ci_low": 0.0,
+          "ci_high": 0.0,
+          "enough": false,
+          "avg_ticks": 1.08
+        },
+        "up": {
+          "n": 167,
+          "hits": 83,
+          "rate": 0.497,
+          "ci_low": 0.4221,
+          "ci_high": 0.572,
+          "enough": true,
+          "avg_ticks": -0.06,
+          "candle_rate": 0.5449,
+          "candle_avg_ticks": 3.44
+        }
+      },
+      "control": {
+        "runs": 400,
+        "mean": 0.5026,
+        "sd": 0.0255,
+        "p95": 0.545
+      },
+      "directional": 378,
+      "rate": 0.4947089947089947
+    },
+    "0.5": {
+      "table": {
+        "down": {
+          "n": 201,
+          "hits": 104,
+          "rate": 0.5174,
+          "ci_low": 0.4487,
+          "ci_high": 0.5855,
+          "enough": true,
+          "avg_ticks": 0.62,
+          "candle_rate": 0.5373,
+          "candle_avg_ticks": 3.27
+        },
+        "flat": {
+          "n": 36,
+          "went_up": 20,
+          "rate": 0.5556,
+          "ci_low": 0.0,
+          "ci_high": 0.0,
+          "enough": true,
+          "avg_ticks": 1.56
+        },
+        "up": {
+          "n": 165,
+          "hits": 85,
+          "rate": 0.5152,
+          "ci_low": 0.4394,
+          "ci_high": 0.5902,
+          "enough": true,
+          "avg_ticks": 1.17,
+          "candle_rate": 0.5152,
+          "candle_avg_ticks": 3.98
+        }
+      },
+      "control": {
+        "runs": 400,
+        "mean": 0.5021,
+        "sd": 0.026,
+        "p95": 0.5464
+      },
+      "directional": 366,
+      "rate": 0.5163934426229508
+    },
+    "0.75": {
+      "table": {
+        "down": {
+          "n": 206,
+          "hits": 101,
+          "rate": 0.4903,
+          "ci_low": 0.4228,
+          "ci_high": 0.5581,
+          "enough": true,
+          "avg_ticks": 0.22,
+          "candle_rate": 0.5631,
+          "candle_avg_ticks": 3.61
+        },
+        "flat": {
+          "n": 33,
+          "went_up": 15,
+          "rate": 0.4545,
+          "ci_low": 0.0,
+          "ci_high": 0.0,
+          "enough": true,
+          "avg_ticks": -1.09
+        },
+        "up": {
+          "n": 163,
+          "hits": 84,
+          "rate": 0.5153,
+          "ci_low": 0.4391,
+          "ci_high": 0.5908,
+          "enough": true,
+          "avg_ticks": 1.21,
+          "candle_rate": 0.5706,
+          "candle_avg_ticks": 4.36
+        }
+      },
+      "control": {
+        "runs": 400,
+        "mean": 0.5035,
+        "sd": 0.0245,
+        "p95": 0.5474
+      },
+      "directional": 369,
+      "rate": 0.5013550135501355
+    }
+  }
+}

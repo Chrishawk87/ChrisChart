@@ -1,0 +1,90 @@
+========================================================================
+ES LEVEL-1 QUEUE STUDY   build 2026-10-26a
+========================================================================
+  3,669,283 grid samples every 50ms
+  886,290 resolved events
+    permanent_ask       442,744
+    permanent_bid       442,962
+    failed_ask              291
+    failed_bid              293
+
+------------------------------------------------------------------------
+  250ms forward
+------------------------------------------------------------------------
+    state                   n      up%    mean t   vs ctrl       z   verdict
+    control         3,669,278    12.4%     0.001        --      --   (unconditional)
+    permanent_ask     442,734    22.1%    -0.017     +9.6%  154.59   REAL
+    permanent_bid     442,952    25.1%     0.034    +12.7%  194.88   REAL
+    failed_ask            291    26.1%    -0.058    +13.7%    5.32   REAL
+    failed_bid            293    29.4%    -0.039    +16.9%    6.36   REAL
+
+------------------------------------------------------------------------
+  500ms forward
+------------------------------------------------------------------------
+    state                   n      up%    mean t   vs ctrl       z   verdict
+    control         3,669,273    16.7%     0.001        --      --   (unconditional)
+    permanent_ask     442,702    26.1%    -0.016     +9.4%  142.02   REAL
+    permanent_bid     442,931    29.1%     0.038    +12.4%  181.83   REAL
+    failed_ask            287    32.1%     0.038    +15.3%    5.57   REAL
+    failed_bid            289    32.9%     0.057    +16.2%    5.85   REAL
+
+------------------------------------------------------------------------
+  1000ms forward
+------------------------------------------------------------------------
+    state                   n      up%    mean t   vs ctrl       z   verdict
+    control         3,669,262    22.1%     0.001        --      --   (unconditional)
+    permanent_ask     442,685    30.5%    -0.015     +8.4%  121.91   REAL
+    permanent_bid     442,911    33.5%     0.044    +11.4%  160.78   REAL
+    failed_ask            283    34.6%    -0.039    +12.5%    4.43   REAL
+    failed_bid            288    35.1%    -0.062    +13.0%    4.61   REAL
+
+------------------------------------------------------------------------
+  2500ms forward
+------------------------------------------------------------------------
+    state                   n      up%    mean t   vs ctrl       z   verdict
+    control         3,669,233    29.8%     0.003        --      --   (unconditional)
+    permanent_ask     442,629    36.1%    -0.005     +6.3%   86.74   REAL
+    permanent_bid     442,853    38.6%     0.061     +8.8%  120.35   REAL
+    failed_ask            276    41.3%    -0.011    +11.5%    3.87   REAL
+    failed_bid            282    39.7%    -0.057     +9.9%    3.39   REAL
+
+------------------------------------------------------------------------
+  5000ms forward
+------------------------------------------------------------------------
+    state                   n      up%    mean t   vs ctrl       z   verdict
+    control         3,669,183    35.3%     0.005        --      --   (unconditional)
+    permanent_ask     442,577    40.1%     0.002     +4.8%   65.32   REAL
+    permanent_bid     442,805    41.9%     0.065     +6.6%   89.68   REAL
+    failed_ask            270    42.2%    -0.226     +7.0%    2.32   marginal
+    failed_bid            280    37.9%    -0.364     +2.6%    0.89   nothing
+
+------------------------------------------------------------------------
+  15000ms forward
+------------------------------------------------------------------------
+    state                   n      up%    mean t   vs ctrl       z   verdict
+    control         3,668,983    41.5%     0.013        --      --   (unconditional)
+    permanent_ask     442,452    44.1%    -0.000     +2.6%   34.21   REAL
+    permanent_bid     442,680    45.3%     0.079     +3.8%   50.94   REAL
+    failed_ask            266    44.0%     0.055     +2.5%    0.81   nothing
+    failed_bid            276    43.8%    -0.322     +2.3%    0.77   nothing
+
+========================================================================
+HOW TO READ IT
+========================================================================
+  Compare every row to the CONTROL on the same horizon, never
+  to 50%. A state matching the control has added nothing.
+
+  THE PAIRS ARE THE TEST.
+    permanent_ask and permanent_bid are the same event on
+    opposite sides. A real effect appears in BOTH, with the
+    same sign once each is read in its own direction. One
+    alone is this sample's drift wearing the event's name.
+
+    The same for failed_ask and failed_bid -- AND the two
+    pairs must point OPPOSITE ways. If a cleared offer and a
+    defended offer both precede the same direction, the
+    reading is not about defence at all.
+
+  MEAN MATTERS MORE THAN up%. ES costs a tick to cross. A
+  state that is 55% up with a mean of 0.05 ticks is a losing
+  trade taken often. Read the mean against 1.0.

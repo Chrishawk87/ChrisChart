@@ -1,0 +1,24 @@
+============================================================================
+ES OFI-CLOSED CANDLES   build 2026-10-26a
+============================================================================
+  54,994,186 records   414.5 hours
+  chop cap 30.0s   min updates per bar 2
+
+   threshold      bars  per hour   green     red    chop  med secs  med ticks
+         250    28,972        70   35.5%   37.0%   27.6%      8.19       3.00
+         500    15,888        38   15.9%   17.4%   66.7%     30.02       4.00
+        1000    13,183        32    3.3%    3.8%   93.0%     30.05       4.00
+        2000    12,797        31    0.2%    0.3%   99.5%     30.05       4.00
+        4000    12,762        31    0.0%    0.0%  100.0%     30.05       4.00
+        8000    12,702        31    0.0%    0.0%  100.0%     30.05       4.00
+       16000    12,651        31    0.0%    0.0%  100.0%     30.05       4.00
+       32000    12,651        31    0.0%    0.0%  100.0%     30.05       4.00
+
+  PICK THE ROW THAT LOOKS LIKE A CHART YOU WOULD READ. A median
+  range of 0 ticks means the bars have no body -- the threshold
+  is below the noise floor of this book. A handful of bars per
+  hour means it is above anything that happens.
+
+  Green and red should sit near even. A long way off means the
+  accumulator is latching or the sign is inverted, and either
+  makes every bar wrong in the same direction.

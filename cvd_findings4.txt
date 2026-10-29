@@ -1,0 +1,428 @@
+reading data/ES_c_0_mbp-10_2026-09-21.dbn.zst ...
+     1,000,000 records   70k/s     14s for the last million   51,987 trades
+     2,000,000 records   68k/s     15s for the last million   106,680 trades
+     3,000,000 records   68k/s     15s for the last million   161,618 trades
+     4,000,000 records   68k/s     15s for the last million   216,933 trades
+     5,000,000 records   66k/s     15s for the last million   276,286 trades
+     6,000,000 records   66k/s     15s for the last million   321,774 trades
+     7,000,000 records   68k/s     15s for the last million   367,332 trades
+     8,000,000 records   69k/s     14s for the last million   414,785 trades
+     9,000,000 records   68k/s     15s for the last million   462,183 trades
+    10,000,000 records   69k/s     15s for the last million   504,643 trades
+    11,000,000 records   68k/s     15s for the last million   551,455 trades
+    12,000,000 records   67k/s     15s for the last million   602,918 trades
+    13,000,000 records   65k/s     15s for the last million   655,586 trades
+    14,000,000 records   65k/s     15s for the last million   696,275 trades
+    15,000,000 records   69k/s     15s for the last million   743,678 trades
+    16,000,000 records   69k/s     14s for the last million   790,410 trades
+    17,000,000 records   69k/s     14s for the last million   835,889 trades
+    18,000,000 records   69k/s     15s for the last million   877,288 trades
+    19,000,000 records   69k/s     15s for the last million   921,165 trades
+    20,000,000 records   69k/s     15s for the last million   962,722 trades
+    21,000,000 records   67k/s     15s for the last million   1,009,119 trades
+    22,000,000 records   66k/s     15s for the last million   1,062,930 trades
+    23,000,000 records   68k/s     15s for the last million   1,101,039 trades
+    24,000,000 records   67k/s     15s for the last million   1,144,608 trades
+    25,000,000 records   69k/s     14s for the last million   1,187,464 trades
+    26,000,000 records   69k/s     15s for the last million   1,227,878 trades
+    27,000,000 records   69k/s     14s for the last million   1,269,278 trades
+    28,000,000 records   69k/s     15s for the last million   1,312,057 trades
+    29,000,000 records   71k/s     14s for the last million   1,353,110 trades
+    30,000,000 records   69k/s     14s for the last million   1,398,483 trades
+    31,000,000 records   70k/s     14s for the last million   1,435,388 trades
+    32,000,000 records   70k/s     14s for the last million   1,476,143 trades
+    33,000,000 records   69k/s     15s for the last million   1,523,934 trades
+    34,000,000 records   66k/s     15s for the last million   1,561,054 trades
+    35,000,000 records   67k/s     15s for the last million   1,598,168 trades
+    36,000,000 records   68k/s     15s for the last million   1,641,783 trades
+    37,000,000 records   70k/s     14s for the last million   1,683,866 trades
+    38,000,000 records   70k/s     14s for the last million   1,717,341 trades
+    39,000,000 records   69k/s     14s for the last million   1,748,802 trades
+    40,000,000 records   69k/s     14s for the last million   1,787,532 trades
+    41,000,000 records   69k/s     14s for the last million   1,832,331 trades
+    42,000,000 records   70k/s     14s for the last million   1,876,742 trades
+    43,000,000 records   68k/s     15s for the last million   1,918,059 trades
+    44,000,000 records   69k/s     15s for the last million   1,964,272 trades
+reading data/ES_c_0_mbp-10_2026-09-25.dbn.zst ...
+    45,000,000 records   120k/s      8s for the last million   2,016,167 trades
+    46,000,000 records   70k/s     14s for the last million   2,057,811 trades
+reading data/ES_c_0_mbp-10_2026-10-08.dbn.zst ...
+    47,000,000 records   400k/s      3s for the last million   2,091,871 trades
+    48,000,000 records   75k/s     13s for the last million   2,124,622 trades
+    49,000,000 records   69k/s     15s for the last million   2,168,136 trades
+    50,000,000 records   69k/s     15s for the last million   2,213,325 trades
+    51,000,000 records   68k/s     15s for the last million   2,265,792 trades
+    52,000,000 records   71k/s     14s for the last million   2,312,348 trades
+    53,000,000 records   70k/s     14s for the last million   2,352,090 trades
+    54,000,000 records   69k/s     14s for the last million   2,394,097 trades
+
+========================================================================
+ES CVD STUDY -- 300s bars   build 2026-10-23i
+========================================================================
+  54,994,186 records in 802s   54,994,186 books   2,444,850 trades   0 refused   0 skipped
+  1,288 completed bars   73,778 grid samples
+
+========================================================================
+1. DOES THE BOOK LEAD PRICE -- and if so by how many seconds
+========================================================================
+  73,778 samples every 5s (102.5 hours)
+
+  noise floor 0.0606, measured by rotating one series
+  200 times and re-running this same scan. A peak
+  below this is what unrelated data produces.
+
+       lag     corr(book -> price)   meaning
+     -120s                 -0.0001   book leads
+     -100s                  0.0045   book leads
+      -80s                  0.0005   book leads
+      -60s                  0.0092   book leads
+      -40s                 -0.0060   book leads
+      -20s                  0.0022   book leads
+       +0s                  0.3490   same instant
+      +20s                 -0.0098   price leads
+      +40s                 -0.0023   price leads
+      +60s                  0.0023   price leads
+      +80s                  0.0035   price leads
+     +100s                  0.0023   price leads
+     +120s                  0.0107   price leads
+
+  STRONGEST: +0.3490 at +0s   (floor 0.0606)
+  -> They move together. Nothing to act on: by the time the
+     book has moved, price already has.
+
+========================================================================
+2. WHAT SEPARATES AN UP BAR FROM A DOWN BAR
+========================================================================
+  1,218 completed 300s bars   614 up / 604 down
+  BASE RATE 50.4% up -- always calling one way scores 50.4%
+  Anything below that has found nothing.
+
+   into bar   reading    up bars  down bars      gap       n
+       20%    book_z      0.429     -0.655    1.084    1215
+       20%    tape_z      0.727     -0.448    1.176    1215
+       20%       gap     -0.122     -0.120   -0.002    1215
+
+       40%    book_z      0.675     -0.520    1.196    1215
+       40%    tape_z      0.840     -0.317    1.157    1215
+       40%       gap     -0.090     -0.076   -0.014    1215
+
+       60%    book_z      0.526     -0.768    1.293    1215
+       60%    tape_z      0.786     -0.592    1.378    1215
+       60%       gap     -0.292     -0.084   -0.207    1215
+
+       80%    book_z      0.529     -0.705    1.234    1215
+       80%    tape_z      0.735     -0.668    1.403    1215
+       80%       gap     -0.145      0.028   -0.173    1215
+
+  A reading separates up bars from down bars only if its two
+  medians differ at the EARLY checkpoints. A gap that appears
+  only at 80% is the bar telling you what it already did.
+
+========================================================================
+3. WHAT PRICE DID INSIDE EACH REGIME
+========================================================================
+  189 stretches of at least 2.0s
+
+              regime      n  median net   favour  adverse    secs
+       up_book_above     52         0.0      2.0      0.0     5.1
+       up_book_below     52        -0.5      1.0     -1.0     7.9
+     down_book_above     54        -1.0      0.5     -1.0     6.8
+     down_book_below     31         1.0      1.0      0.0     4.8
+
+     up: book above runs further  0.0t vs -0.5t  diff +0.5t  n 52/52
+   down: book BELOW runs further  -1.0t vs 1.0t  diff -2.0t  n 54/31
+
+========================================================================
+4. CALLING THE BAR BEFORE IT CLOSES
+========================================================================
+  74 bars settled   base rate 50.0% up   always-one-way scores 50.0%
+
+     caller  into bar       n     rate     edge
+     regime      20%      47   68.1%  +18.1%  THIN
+     regime      40%      46   58.7%   +8.7%  THIN
+     regime      60%      38   65.8%  +15.8%  THIN
+     regime      80%      47   72.3%  +22.3%  THIN
+      bar_z      20%      74   55.4%   +5.4%  THIN
+      bar_z      40%      74   67.6%  +17.6%  THIN
+      bar_z      60%      74   66.2%  +16.2%  THIN
+      bar_z      80%      74   75.7%  +25.7%  THIN
+
+  EDGE is the rate minus always-one-way. Zero means no better
+  than the dumbest possible rule. Only the early checkpoints
+  would be worth anything.
+
+========================================================================
+5. DOES THE READING CALL WHAT IS LEFT OF THE BAR
+========================================================================
+
+  20% into the bar -- 1,213 bars, 51.8% of remainders were up
+  always calling one way scores 51.8%; beat THAT or nothing was added
+       reading     rate     edge       z     corr   verdict
+        book_z   48.7%   -3.1%   -2.12   -0.021   nothing
+        tape_z   52.0%   +0.2%    0.17    0.002   nothing
+           gap   48.3%   -3.5%   -2.41   -0.021   nothing
+      momentum   51.9%   +0.1%    0.09   -0.062   nothing
+
+  40% into the bar -- 1,206 bars, 50.1% of remainders were up
+  always calling one way scores 50.1%; beat THAT or nothing was added
+       reading     rate     edge       z     corr   verdict
+        book_z   48.0%   -2.1%   -1.44   -0.009   nothing
+        tape_z   50.4%   +0.3%    0.23   -0.032   nothing
+           gap   49.0%   -1.1%   -0.75    0.024   nothing
+      momentum   49.9%   -0.2%   -0.14   -0.078   nothing
+
+  60% into the bar -- 1,187 bars, 51.6% of remainders were up
+  always calling one way scores 51.6%; beat THAT or nothing was added
+       reading     rate     edge       z     corr   verdict
+        book_z   51.5%   -0.2%   -0.12    0.066   nothing
+        tape_z   49.6%   -2.0%   -1.39   -0.004   nothing
+           gap   51.0%   -0.7%   -0.46    0.064   nothing
+      momentum   49.9%   -1.8%   -1.19   -0.090   nothing
+
+  80% into the bar -- 1,152 bars, 51.7% of remainders were up
+  always calling one way scores 51.7%; beat THAT or nothing was added
+       reading     rate     edge       z     corr   verdict
+        book_z   53.4%   +1.6%    1.12    0.045   nothing
+        tape_z   49.3%   -2.4%   -1.65    0.025   nothing
+           gap   53.3%   +1.6%    1.06    0.016   nothing
+      momentum   49.0%   -2.8%   -1.85   -0.074   nothing
+
+  READ IT THIS WAY. If `momentum` scores and the CVD readings
+  do not, the separation in section 2 was the bar describing
+  itself. If a CVD reading beats momentum at an EARLY
+  checkpoint, that is the one genuinely useful thing in this
+  whole report, and it is worth re-running on another month
+  before trusting it.
+
+========================================================================
+6. WHAT PRICE DOES FROM EACH STATE OF THE TWO LINES
+========================================================================
+  73,778 samples every 5s   deadband +/-0.25
+
+  ---- 15s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73775  24592     0.00     0.01      1.00  40.2%      --   (the control)
+        both_up   21102   7034     0.00     0.02      1.00  40.1%   -0.23   nothing
+      both_down   20618   6873     0.00    -0.05      1.00  39.9%   -0.45   nothing
+     book_leads    9013   3004     0.00     0.05      1.00  41.4%    1.34   nothing
+     tape_leads   10082   3361     0.00     0.01      1.00  40.0%   -0.22   nothing
+           flat   12960   4320     0.00     0.05      1.00  40.2%   -0.06   nothing
+
+  ---- 30s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73772  12295     0.00     0.02      2.00  43.1%      --   (the control)
+        both_up   21102   3517     0.00     0.08      2.00  42.7%   -0.43   nothing
+      both_down   20616   3436     0.00    -0.09      2.00  42.8%   -0.38   nothing
+     book_leads    9013   1502     0.00     0.11      2.00  44.2%    0.83   nothing
+     tape_leads   10081   1680     0.00     0.01      2.00  44.0%    0.71   nothing
+           flat   12960   2160     0.00     0.02      2.00  42.8%   -0.31   nothing
+
+  ---- 60s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73766   6147     0.00     0.04      2.00  45.4%      --   (the control)
+        both_up   21101   1758     0.00     0.22      2.00  45.0%   -0.29   nothing
+      both_down   20616   1718     0.00    -0.14      2.50  45.4%    0.06   nothing
+     book_leads    9013    751     0.00     0.15      2.50  46.6%    0.69   nothing
+     tape_leads   10077    840     0.00    -0.04      2.50  45.4%    0.03   nothing
+           flat   12959   1080     0.00    -0.01      2.00  44.9%   -0.30   nothing
+
+  ---- 120s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73754   3073     0.00     0.07      3.50  46.5%      --   (the control)
+        both_up   21090    879     0.00     0.49      3.50  46.6%    0.06   nothing
+      both_down   20616    859     0.00    -0.22      3.50  46.9%    0.25   nothing
+     book_leads    9012    376     0.00     0.20      3.00  47.5%    0.40   nothing
+     tape_leads   10077    420     0.00    -0.04      4.00  45.6%   -0.35   nothing
+           flat   12959    540     0.00    -0.14      3.00  45.6%   -0.42   nothing
+
+
+  HOW TO READ IT. Compare every state row against the `all`
+  row ABOVE it on the same horizon, never against 50%. If
+  `both_up` shows 52% up and `all` shows 52% up, the state
+  added nothing -- you would have got that entering blind.
+
+  If `|travel|` is larger for a state but `up%` matches the
+  control, that state predicts a BIGGER move without
+  predicting its direction. Worth knowing for sizing, no use
+  for picking a side.
+
+========================================================================
+7. BOOK CVD AGAINST PRICE -- the divergence read
+========================================================================
+  price z-scored over 60s (12 samples), matched to
+  the book line's look-back   deadband +/-0.5
+  gap = book_z - price_z   median -0.080   corr(book_z, price_z) +0.825
+
+  ---- 15s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73775  24592     0.00     0.01      1.00  40.2%      --   (the control)
+        book_up   15855   5285     0.00     0.05      1.00  40.8%    0.96   nothing
+       price_up   20228   6743     0.00    -0.06      1.00  37.5%   -4.47   REAL
+       together   37692  12564     0.00     0.03      1.00  41.4%    2.65   marginal
+
+  ---- 30s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73772  12295     0.00     0.02      2.00  43.1%      --   (the control)
+        book_up   15853   2642     0.00     0.03      1.50  42.7%   -0.41   nothing
+       price_up   20228   3371     0.00    -0.06      1.50  41.6%   -1.79   nothing
+       together   37691   6282     0.00     0.05      2.00  44.1%    1.58   nothing
+
+  ---- 60s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73766   6147     0.00     0.04      2.00  45.4%      --   (the control)
+        book_up   15850   1321     0.00     0.01      2.00  44.2%   -0.88   nothing
+       price_up   20228   1686     0.00    -0.06      2.00  44.4%   -0.83   nothing
+       together   37688   3141     0.00     0.09      3.00  46.4%    1.18   nothing
+
+  ---- 120s forward ------------------------------------------------
+          state       n  indep   median     mean  |travel|     up%       z   verdict
+            all   73754   3073     0.00     0.07      3.50  46.5%      --   (the control)
+        book_up   15841    660     0.00     0.11      3.00  44.9%   -0.82   nothing
+       price_up   20228    843     0.00    -0.16      3.00  46.1%   -0.21   nothing
+       together   37685   1570     0.00     0.18      4.00  47.4%    0.69   nothing
+
+  book_up  = flow has built that price has not yet paid for.
+  price_up = price has run ahead of the flow behind it.
+
+  If either is REAL against the control, the sign of its
+  median says which way to read it, and that is the first
+  thing in this whole report that would be worth putting on
+  a chart. If both come back nothing, the gap between flow
+  and price is noise at these horizons and the crossover
+  would mean no more than the last one did.
+
+========================================================================
+8. WHEN THE WINNING SIDE STOPS WINNING
+========================================================================
+  1,004 stalls in 1,288 bars (78% of bars)
+  a stall is the leader giving back 35% of their own best lead, minimum 50 contracts
+
+  ---- 15s after the stall --------------------------------------
+         side       n  indep   median     mean  reverse%       z   verdict
+      control   73775  24592     0.00     0.01    39.7%      --   (no stall involved)
+       buyers     457    457     0.00     0.19    39.2%   -0.24   nothing
+      sellers     459    458    -0.00    -0.29    40.3%    0.26   nothing
+
+  ---- 30s after the stall --------------------------------------
+         side       n  indep   median     mean  reverse%       z   verdict
+      control   73772  12295     0.00     0.02    42.4%      --   (no stall involved)
+       buyers     457    457     0.00     0.30    40.5%   -0.84   nothing
+      sellers     459    458    -0.00    -0.34    42.9%    0.22   nothing
+
+  ---- 60s after the stall --------------------------------------
+         side       n  indep   median     mean  reverse%       z   verdict
+      control   73766   6147     0.00     0.04    44.7%      --   (no stall involved)
+       buyers     457    457     0.00     0.81    41.1%   -1.52   nothing
+      sellers     459    457    -0.00    -0.21    46.2%    0.65   nothing
+
+  ---- 120s after the stall --------------------------------------
+         side       n  indep   median     mean  reverse%       z   verdict
+      control   73754   3073     0.00     0.07    46.5%      --   (no stall involved)
+       buyers     457    451     0.50     1.29    43.5%   -1.24   nothing
+      sellers     459    453    -0.50    -0.84    50.5%    1.74   nothing
+
+  Travel is signed in the stalled leader's direction, so a
+  NEGATIVE median means price turned against them -- the
+  reversal -- and a positive one means they carried on
+  regardless.
+
+  A result on one side only is a warning, not a finding: the
+  same event should behave the same way whichever side it
+  happens to, and one-sided results are usually the market's
+  drift over the sample rather than the event.
+
+========================================================================
+9. HOW MUCH PUSH-BACK BEFORE THE MOVE GIVES OUT
+========================================================================
+  53,196 of 73,778 samples had a lead of at least 50 contracts (72%)
+  give-back is measured against that leader's OWN best, so a
+  quiet bar and a busy one are held to the same standard
+
+  ---- 15s forward ------------------------------------------------
+      given back       n  indep   median     mean  against%       z   verdict
+         control   73775  24592     0.00     0.01    39.7%      --   (no leader involved)
+          0%-10%   15923   5308     0.00     0.05    41.8%    3.07   REAL
+         10%-20%    9160   3053     0.00     0.02    41.4%    1.86   nothing
+         20%-35%    9494   3165    -0.00    -0.07    41.4%    1.93   nothing
+         35%-50%    6430   2143    -0.00    -0.02    41.6%    1.74   nothing
+         50%-75%    7382   2461     0.00     0.02    41.5%    1.84   nothing
+        75%-100%    4744   1581     0.00     0.06    41.3%    1.27   nothing
+
+  ---- 30s forward ------------------------------------------------
+      given back       n  indep   median     mean  against%       z   verdict
+         control   73772  12295     0.00     0.02    42.4%      --   (no leader involved)
+          0%-10%   15921   2654    -0.00     0.10    44.2%    1.82   nothing
+         10%-20%    9159   1526     0.00     0.03    43.8%    1.12   nothing
+         20%-35%    9494   1582     0.00    -0.15    44.7%    1.85   nothing
+         35%-50%    6430   1072    -0.00    -0.02    43.3%    0.56   nothing
+         50%-75%    7382   1230     0.00     0.04    43.7%    0.93   nothing
+        75%-100%    4744    791     0.00     0.12    42.2%   -0.12   nothing
+
+  ---- 60s forward ------------------------------------------------
+      given back       n  indep   median     mean  against%       z   verdict
+         control   73766   6147     0.00     0.04    44.7%      --   (no leader involved)
+          0%-10%   15920   1327    -0.00     0.19    45.7%    0.79   nothing
+         10%-20%    9159    763    -0.00    -0.09    47.6%    1.64   nothing
+         20%-35%    9494    791    -0.00    -0.21    47.0%    1.33   nothing
+         35%-50%    6427    536    -0.00     0.03    44.4%   -0.12   nothing
+         50%-75%    7382    615    -0.00     0.09    45.0%    0.16   nothing
+        75%-100%    4742    395     0.00     0.17    44.5%   -0.06   nothing
+
+  READ THE COLUMN, NOT THE ROWS. One bucket clearing the bar
+  on its own is one cell out of eighteen and will happen by
+  chance. What would be real is the median sliding steadily
+  DOWN as the give-back grows -- a move that carries on while
+  barely offset and turns once it has handed back half. A
+  flat column says the amount of push-back does not matter.
+
+========================================================================
+10. WHO IS GAINING vs WHO IS AHEAD
+========================================================================
+  the rates disagreed with the totals in 14,543 of 73,778 samples (20%)
+  rate constant 10.0s, deadband 20%
+
+  ---- 15s forward ------------------------------------------------
+              state       n  indep   median     mean  their way%       z   verdict
+            control   73775  24592     0.00     0.01      40.2%      --   (unconditional, up)
+      buyers_extend   19136   6379     0.00    -0.01      38.5%   -2.74   marginal
+     sellers_extend   16035   5345    -0.00    -0.01      38.9%   -2.01   marginal
+        buyers_take    6964   2321     0.00    -0.04      36.4%   -3.72   REAL
+       sellers_take    7579   2526    -0.00    -0.02      38.3%   -1.96   nothing
+               even   24061   8020     0.00     0.04      42.7%    4.56   REAL
+
+  ---- 30s forward ------------------------------------------------
+              state       n  indep   median     mean  their way%       z   verdict
+            control   73772  12295     0.00     0.02      43.1%      --   (unconditional, up)
+      buyers_extend   19136   3189     0.00    -0.01      41.3%   -2.05   marginal
+     sellers_extend   16032   2672    -0.00     0.02      42.1%   -1.05   nothing
+        buyers_take    6964   1161     0.00     0.02      41.8%   -0.92   nothing
+       sellers_take    7579   1263    -0.00     0.03      40.6%   -1.82   nothing
+               even   24061   4010     0.00     0.08      45.1%    2.55   marginal
+
+  ---- 60s forward ------------------------------------------------
+              state       n  indep   median     mean  their way%       z   verdict
+            control   73766   6147     0.00     0.04      45.4%      --   (unconditional, up)
+      buyers_extend   19136   1595     0.00     0.04      43.7%   -1.37   nothing
+     sellers_extend   16031   1336    -0.00     0.04      44.1%   -0.93   nothing
+        buyers_take    6964    580     0.00     0.11      44.1%   -0.63   nothing
+       sellers_take    7579    632    -0.00     0.06      43.9%   -0.72   nothing
+               even   24056   2005     0.00     0.09      47.1%    1.55   nothing
+
+  THE PAIR IS THE TEST. `buyers_take` and `sellers_take` are
+  the same event on opposite sides, so a real effect shows in
+  BOTH, with the same sign once each is read in its own
+  direction. One alone is the market's drift across this
+  sample wearing the reading's name.
+
+========================================================================
+READ THIS PART
+========================================================================
+  Section 1 decides whether any of the rest matters. If the
+  strongest correlation sits at zero lag or at a positive one,
+  the book is not leading price on this data and no amount of
+  regime slicing in sections 2-4 will change that.
+
+  Every rate in sections 2 and 4 is against the base rate. A
+  number that merely matches it is a finding of nothing, which
+  is a real result and worth knowing in an afternoon rather
+  than after a month of live trading.

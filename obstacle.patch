@@ -1,0 +1,272 @@
+diff --git a/liqmap/cme_tape.py b/liqmap/cme_tape.py
+index d129106..2b00c76 100644
+--- a/liqmap/cme_tape.py
++++ b/liqmap/cme_tape.py
+@@ -104,6 +104,9 @@ class Tape:
+     # traded, the other what is standing there, and neither
+     # substitutes for the other.
+     bookdiag: object = None
++    # Whether the flow can actually get through that standing size.
++    # Scoped to the same candle as the footprint and the book reading.
++    obstacles: object = None
+     last_px: float = 0.0
+     last_side: str = ""
+     last_ts: float = 0.0
+@@ -280,6 +283,23 @@ class Tape:
+                 except Exception:                       # noqa: BLE001
+                     pass
+         t = dbn.trade_from(rec)
++        if self.obstacles is not None:
++            # Trade FIRST, then the book from the same record. An
++            # MBP-10 trade record carries the book as it stands after
++            # the fill, so observing the book first would attribute
++            # every fill to a wall that withdrew rather than one that
++            # was eaten -- the exact confusion this module exists to
++            # resolve.
++            try:
++                if t is not None:
++                    sz = int(round(float(t.sz)))
++                    if sz > 0:
++                        self.obstacles.observe_trade(
++                            float(t.ts), t.aggressor, sz, float(t.px))
++                if dbn._get(rec, "levels"):
++                    self.obstacles.observe_book(rec)
++            except Exception:                           # noqa: BLE001
++                pass            # a display must not stop the tape
+         if t is None:
+             return False
+         self.trades += 1
+@@ -323,8 +343,11 @@ class Tape:
+             # refresh rate instead of to the bar. The footprint is
+             # not modified to do this; its return value already says
+             # when a bar ended.
+-            if closed and self.bookdiag is not None:
+-                self.bookdiag.reset()
++            if closed:
++                if self.bookdiag is not None:
++                    self.bookdiag.reset()
++                if self.obstacles is not None:
++                    self.obstacles.reset()
+         except Exception:                               # noqa: BLE001
+             # The footprint is a display. It must never be able to
+             # stop the tape that feeds the engine and the candles.
+diff --git a/liqmap/web.py b/liqmap/web.py
+index 5ccdba6..5eb3270 100644
+--- a/liqmap/web.py
++++ b/liqmap/web.py
+@@ -1008,6 +1008,13 @@ class Runtime:
+             # not modified.
+             from .bookdiag import BookDiagonal
+             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
++            # And whether the flow can get THROUGH that standing size.
++            # Sixteen ticks is four points; on a dense ES book MBP-10
++            # reaches about nine of them, and the reading says so
++            # rather than pretending the rest is empty.
++            from .obstacle import Obstacles
++            svc.tape.obstacles = Obstacles(
++                tick_size=0.25, reach_ticks=16, window_s=10.0)
+             self._footprint = stream
+             self._footprint_rule = key
+             return stream
+@@ -6010,6 +6017,14 @@ def create_app() -> FastAPI:
+         bd = getattr(tape, "bookdiag", None)
+         if bd is not None:
+             out["book"] = bd.reading().as_dict()
++
++        # Whether anyone can get through it, each way. Also a separate
++        # key: the book reading says what is standing there, this says
++        # whether the flow is enough to eat it.
++        obs = getattr(tape, "obstacles", None)
++        if obs is not None:
++            out["clearance"] = {"buy": obs.clearance("buy").as_dict(),
++                                "sell": obs.clearance("sell").as_dict()}
+         return out
+ 
+     @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
+@@ -7333,6 +7348,8 @@ DASHBOARD = """<!doctype html>
+       <div id="fpStats" class="fpstat"></div>
+       <div id="fpBook" class="fpstat" style="border-top:1px solid
+            var(--line);padding-top:8px"></div>
++      <div id="fpClear" class="fpstat" style="border-top:1px solid
++           var(--line);padding-top:8px"></div>
+       <div id="fpBody"><div class="msg">Loading&hellip;</div></div>
+       <div id="fpHist" class="fphist"></div>
+     </div>
+@@ -9228,6 +9245,57 @@ function fpBookRow(d) {
+       ${b.spread_ticks.toFixed(1)}t</span>`;
+ }
+ 
++/* ---- can the flow get THROUGH it -------------------------------
++   The row above says what is standing there. This says whether
++   anyone is paying fast enough to eat it, in SECONDS -- a unit you
++   can argue with, unlike a ratio of two numbers measured over
++   different windows.
++
++   Two honesty rules are in the display, not just the maths:
++
++   the depth actually seen is printed whenever it fell short of the
++   distance asked for, because a truncated obstacle UNDERSTATES
++   resistance and would otherwise read as an easier clear;
++
++   no visible size reports "can't tell", never "clear" -- icebergs
++   show at no depth, so an empty ladder is an unknown, not a road. */
++function fpClearRow(d) {
++  const c = d.clearance;
++  if (!c) return '';
++  const say = (side, k) => {
++    const o = k.obstacle || {};
++    let verdict, cls = '';
++    if (k.verdict === 'unknown') {
++      verdict = "CAN'T TELL &mdash; no visible size to measure";
++    } else if (k.verdict === 'clears') {
++      verdict = 'CLEARS &mdash; ' +
++        (k.seconds_to_clear === null ? 'at this rate'
++         : k.seconds_to_clear.toFixed(1) + 's to eat ' +
++           fpNum(o.size) + ' at ' + k.rate.toFixed(0) + '/s');
++      cls = side === 'buy' ? 'long' : 'short';
++    } else {
++      verdict = 'BLOCKED &mdash; ' + fpNum(o.size) + ' resting, ' +
++        (k.rate > 0 ? k.seconds_to_clear.toFixed(0) + 's at the current '
++                      + k.rate.toFixed(0) + '/s'
++                    : 'nothing is paying');
++    }
++    // Only ever a LOWER bound on resistance when the book ran out.
++    const seen = o.truncated
++      ? ` &middot; saw ${o.covered_ticks}t of ${o.asked_ticks}t asked
++          (book ran out &mdash; resistance is AT LEAST this)` : '';
++    // A wall that left is not a wall that was eaten.
++    const left = (k.pulled + k.consumed) > 0
++      ? ` &middot; ${(k.pulled_share * 100).toFixed(0)}% of the decline
++          was pulled, not traded` : '';
++    return `
++      <span class="stamp">${side} side</span>
++      <span class="${cls}" style="font-size:13px"><b>${verdict}</b></span>
++      <span class="stamp">${fpNum(k.flow)} paid vs ${fpNum(k.opposing)}
++        against over ${k.window_s.toFixed(1)}s${seen}${left}</span>`;
++  };
++  return say('buy', c.buy) + say('sell', c.sell);
++}
++
+ function fpStats(d) {
+   const p = d.pulse || {};
+   const ratio = (p.ratio == null) ? '--' : p.ratio.toFixed(2);
+@@ -9325,6 +9393,7 @@ async function fpLoad() {
+     `${(d.tape_trades || 0).toLocaleString()} prints`;
+   $('fpStats').innerHTML = fpStats(d);
+   $('fpBook').innerHTML = fpBookRow(d);
++  $('fpClear').innerHTML = fpClearRow(d);
+   $('fpBody').innerHTML = fpTable(d);
+   $('fpHist').innerHTML = fpHistory(d);
+ }
+diff --git a/tests/test_cme_tape.py b/tests/test_cme_tape.py
+index f09d608..40a6af3 100644
+--- a/tests/test_cme_tape.py
++++ b/tests/test_cme_tape.py
+@@ -620,3 +620,107 @@ class TestSeedInterval:
+     def test_seed_with_unknown_interval_name_is_silent(self):
+         t = Tape()
+         t.seed_interval("99x", [self._candle(T0)])  # should not raise
++
++
++class TestTheTapeFeedsTheObstacles:
++    """Three readings off one record stream now: what traded, what is
++    resting, and whether the one can get through the other."""
++
++    def _rec(self, *a, **k):
++        return TestTheTapeFeedsTheBookDiagonal._rec(self, *a, **k)
++
++    def _wired(self, contracts=100):
++        from liqmap.footprint import VolumeRule
++        from liqmap.footprint_live import FootprintStream
++        from liqmap.obstacle import Obstacles
++        t = cme_tape.Tape(symbol="ES")
++        t.footprint = FootprintStream(tick_size=0.25,
++                                      rule=VolumeRule(contracts))
++        t.obstacles = Obstacles(tick_size=0.25, reach_ticks=16)
++        return t
++
++    def test_book_records_reach_it(self):
++        t = self._wired()
++        for i in range(5):
++            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100))
++        assert t.obstacles.obstacle("buy").size > 0
++
++    def test_trades_reach_it(self):
++        t = self._wired()
++        for i in range(5):
++            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
++                              trade_sz=5))
++        assert t.obstacles.clearance("buy").flow == 25
++
++    def test_a_fill_is_attributed_to_the_trade_not_to_a_pulled_wall(self):
++        """An MBP-10 trade record carries the book as of AFTER the
++        fill. Observing that book before recording the trade would
++        read every fill as size that withdrew -- the exact confusion
++        the module exists to resolve, arriving through the wiring
++        rather than the maths."""
++        t = self._wired()
++        base = 1_700_000_000.0
++        t.offer(self._rec(0, base, BASE, 400, 100))
++        r = self._rec(1, base + 1, BASE, 400, 50, trade_sz=50)
++        r.price = BASE + TICK
++        t.offer(r)
++        # The fixture thins every ask level at once, so most of the
++        # decline IS withdrawal. What matters is that the 50 lots
++        # that printed were credited to the level they printed at.
++        assert t.obstacles.clearance("buy").consumed == 50
++
++        # Same book change, no print: nothing is consumed. This is the
++        # ordering check -- if the book were observed before the trade
++        # were recorded, this and the case above would be identical.
++        q = self._wired()
++        q.offer(self._rec(0, base, BASE, 400, 100))
++        q.offer(self._rec(1, base + 1, BASE, 400, 50))
++        assert q.obstacles.clearance("buy").consumed == 0
++
++    def test_attribution_is_keyed_to_the_price_that_traded(self):
++        """A print cannot take credit for size that left somewhere
++        else. Attribution is per price level, so a trade away from a
++        level that emptied leaves that level counted as pulled --
++        which is the honest reading."""
++        t = self._wired()
++        base = 1_700_000_000.0
++        t.offer(self._rec(0, base, BASE, 400, 100))
++        r = self._rec(1, base + 1, BASE, 400, 50, trade_sz=50)
++        r.price = BASE + 9 * TICK          # a print nowhere near it
++        t.offer(r)
++        assert t.obstacles.clearance("buy").pulled > 0
++
++    def test_a_closing_bar_restarts_the_counters(self):
++        t = self._wired(contracts=20)
++        base = 1_700_000_000.0
++        for i in range(4):
++            t.offer(self._rec(i, base + i, BASE, 400, 100, trade_sz=5))
++        assert len(t.footprint.history) == 1
++        c = t.obstacles.clearance("buy")
++        assert c.flow == 0, "flow is scoped to the bar"
++        assert c.obstacle.size > 0, "the standing book is not"
++
++    def test_without_it_attached_nothing_changes(self):
++        t = cme_tape.Tape(symbol="ES")
++        for i in range(5):
++            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
++                              trade_sz=5))
++        assert t.trades == 5 and t.books == 5
++
++    def test_a_broken_reader_cannot_stop_the_tape(self):
++        class Boom:
++            def observe_trade(self, *a, **k):
++                raise RuntimeError("boom")
++
++            def observe_book(self, *a, **k):
++                raise RuntimeError("boom")
++
++            def reset(self):
++                raise RuntimeError("boom")
++
++        t = cme_tape.Tape(symbol="ES")
++        t.obstacles = Boom()
++        for i in range(5):
++            t.offer(self._rec(i, 1_700_000_000.0 + i, BASE, 400, 100,
++                              trade_sz=5))
++        assert t.trades == 5
