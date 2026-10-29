@@ -473,3 +473,92 @@ class TestBothSidesSurviveTheRestart:
                                  ofi=250, updates=9))
         got = store.recent(250)[0]
         assert got.gross == 0 and got.share == 0.5
+
+
+class TestTheTradeRecordSurvivesTheRestart:
+    """The fixtures above only ever produce skips, so every field that
+    only a TAKEN trade carries -- the fill, the result, the speed it
+    fired into -- would round-trip untested on them. This builds the
+    four outcomes by hand instead of hoping a feed happens to make
+    them."""
+
+    def _bar(self):
+        from liqmap.ofibar import OfiBar, Episode
+        b = OfiBar(ts_open=1.0, ts_close=9.0, open=100.0, high=140.0,
+                   low=90.0, close=130.0, direction="green", ofi=600,
+                   updates=40, path=321.0)
+        b.episodes = [
+            Episode(side="up", rule="imb-confirm-v2", level=500,
+                    px0=100.0, ts0=1.0, px_end=130.0, ts_end=5.0,
+                    took=True, entry_px=101.0, entry_ts=1.5,
+                    atr0=12.5, tps0=3.25, updates=7,
+                    mfe=30.0, mae=4.0, end="bar",
+                    hit="win", hit_px=125.0, hit_ts=4.0,
+                    first={1: "win", 2: "win"}),
+            Episode(side="down", rule="imb-confirm-v2", level=500,
+                    px0=130.0, ts0=5.0, px_end=136.0, ts_end=6.0,
+                    took=True, entry_px=129.0, entry_ts=5.2,
+                    atr0=20.0, tps0=1.5, updates=3,
+                    mfe=1.0, mae=7.0, end="reversal",
+                    hit="loss", hit_px=136.0, hit_ts=6.0,
+                    first={1: "loss", 2: "loss"}),
+            Episode(side="up", rule="imb-confirm-v2", level=500,
+                    px0=136.0, ts0=6.0, px_end=136.0, ts_end=7.0,
+                    took=False, updates=2, end="reversal", hit="skip",
+                    hit_px=136.0, hit_ts=7.0),
+            Episode(side="up", rule="imb-confirm-v2", level=500,
+                    px0=136.0, ts0=7.0, px_end=138.0, ts_end=9.0,
+                    took=True, entry_px=137.0, entry_ts=7.5,
+                    atr0=30.0, tps0=0.5, updates=5, end="bar"),
+        ]
+        return b
+
+    def test_all_four_outcomes_come_back_exactly(self, tmp_path):
+        st = OfiBarStore(tmp_path / "t.db")
+        bar = self._bar()
+        st.record_many(250, [bar])
+        back = st.recent(250, limit=10)
+        assert len(back) == 1
+        got = back[0]
+        assert [e.hit for e in got.episodes] == ["win", "loss", "skip", ""]
+        for a, b in zip(bar.episodes, got.episodes):
+            assert a.as_dict() == b.as_dict()
+
+    def test_the_fill_and_the_result_survive(self, tmp_path):
+        st = OfiBarStore(tmp_path / "t.db")
+        st.record_many(250, [self._bar()])
+        win, loss, skip, live = st.recent(250, limit=10)[0].episodes
+        assert win.entered and win.entry_px == 101.0
+        assert win.result == 125.0 - 101.0, "the win's result moved"
+        assert loss.entered and loss.result == 129.0 - 136.0
+        assert not skip.entered and skip.result == 0.0
+        assert live.entered and live.hit == ""
+
+    def test_the_speed_it_fired_into_survives(self, tmp_path):
+        st = OfiBarStore(tmp_path / "t.db")
+        st.record_many(250, [self._bar()])
+        got = st.recent(250, limit=10)[0]
+        assert got.path == 321.0
+        assert [round(e.atr0, 2) for e in got.episodes] == [12.5, 20.0,
+                                                            0.0, 30.0]
+        assert [round(e.tps0, 2) for e in got.episodes] == [3.25, 1.5,
+                                                            0.0, 0.5]
+
+    def test_a_row_written_before_any_of_this_still_loads(self, tmp_path):
+        """The field that matters is `took`: an older row has no such
+        key, and a trade it never took must not come back as one."""
+        import json
+        import sqlite3
+        st = OfiBarStore(tmp_path / "t.db")
+        st.record_many(250, [self._bar()])
+        old = json.dumps([{"side": "up", "px0": 100.0, "px_end": 110.0,
+                           "hit": "win", "hit_px": 110.0, "level": 500,
+                           "first": {"1": "win"}}])
+        with sqlite3.connect(tmp_path / "t.db") as cx:
+            cx.execute("UPDATE ofi_bars SET episodes=?, path=0", (old,))
+        got = st.recent(250, limit=10)[0]
+        e = got.episodes[0]
+        assert not e.took and not e.entered
+        assert e.entry_px == 0.0 and e.atr0 == 0.0
+        assert e.rule == "", "an older row claimed the current rule"
+        assert got.path == 0.0 and got.efficiency == 0.0

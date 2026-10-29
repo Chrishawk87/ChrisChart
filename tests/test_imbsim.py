@@ -413,6 +413,68 @@ class TestOneSidednessAtEntry:
     def test_the_sweep_passes_both_sides_through(self):
         sw = Sweep(levels=(200,), policies=(HOLD,), target_points=3.0)
         sw.tick(1.0, 400, PX, 0.66, 9_000)
-        t = sw.sims[(200, HOLD, False)]._t
+        t = sw.sims[(200, HOLD, 0.0, False)]._t
         assert t is not None and t.entry_share == pytest.approx(0.66)
         assert t.entry_gross == 9_000
+
+
+class TestConfirmationInTheSimulation:
+    """The sweep has to test the SAME entry the chart takes, or it is
+    validating a strategy nobody is running."""
+
+    RAW = 250_000_000
+
+    def _sim(self, confirm=1.0, level=100):
+        return ImbSim(level=level, target_points=1.0, policy=BAND,
+                      confirm_ticks=confirm)
+
+    def test_the_call_alone_does_not_open_a_trade(self):
+        s = self._sim()
+        s.tick(0.0, 200, 1000 * self.RAW)
+        assert not s.trades and s._t is None, "it entered at the call"
+
+    def test_price_confirming_opens_it_at_the_price_not_the_call(self):
+        s = self._sim()
+        s.tick(0.0, 200, 1000 * self.RAW)
+        s.tick(0.1, 200, 1001 * self.RAW)
+        assert s._t is not None
+        assert s._t.entry_px == 1001 * self.RAW
+        assert s._t.call_px == 1000 * self.RAW
+        assert s._t.slip == 1.0
+
+    def test_a_call_that_dies_first_is_skipped_not_lost(self):
+        s = self._sim()
+        s.tick(0.0, 200, 1000 * self.RAW)
+        s.tick(0.1, 10, 1000 * self.RAW)          # imbalance collapses
+        assert s._t is None
+        assert s.skipped == 1
+        assert not s.trades, "a trade nobody took was recorded"
+
+    def test_confirmation_costs_the_ticks_it_waited(self):
+        """Target measured from the FILL. Four ticks from the call is
+        not a win when the fill was one tick in."""
+        s = self._sim()
+        s.tick(0.0, 200, 1000 * self.RAW)
+        s.tick(0.1, 200, 1001 * self.RAW)         # fill at +1
+        s.tick(0.2, 200, 1004 * self.RAW)         # +4 from the CALL
+        assert not s.trades, "it paid out at the call's distance"
+        s.tick(0.3, 200, 1005 * self.RAW)         # +4 from the FILL
+        assert len(s.trades) == 1 and s.trades[0].won
+
+    def test_zero_confirmation_is_the_old_entry(self):
+        s = self._sim(confirm=0.0)
+        s.tick(0.0, 200, 1000 * self.RAW)
+        assert s._t is not None
+        assert s._t.entry_px == s._t.call_px
+        assert s._t.slip == 0.0
+
+    def test_the_flipped_control_waits_the_same_way(self):
+        """Otherwise the control gets a better entry than the rule and
+        the gap between them stops meaning anything."""
+        a = ImbSim(level=100, target_points=1.0, policy=BAND,
+                   confirm_ticks=1.0)
+        b = ImbSim(level=100, target_points=1.0, policy=BAND,
+                   confirm_ticks=1.0, flip=True)
+        for s in (a, b):
+            s.tick(0.0, 200, 1000 * self.RAW)
+            assert s._t is None, "one of them entered at the call"

@@ -70,7 +70,8 @@ TICK = 0.25
 
 
 def run(paths: list[str], targets: list[int], levels, target_points: float,
-        limit: int = 0, min_share: float = 0.0):
+        limit: int = 0, min_share: float = 0.0,
+        confirms: tuple = (0.0,)):
     """One pass over the records, every target and level at once."""
     import databento as db
 
@@ -80,7 +81,7 @@ def run(paths: list[str], targets: list[int], levels, target_points: float,
                                  min_updates=2, max_bars=10_000_000)
                 for t in targets}
     sweeps = {t: Sweep(levels=tuple(levels), target_points=target_points,
-                       min_share=min_share)
+                       min_share=min_share, confirms=tuple(confirms))
               for t in targets}
     n = 0
     for path in paths:
@@ -169,14 +170,16 @@ def show(target: int, bars_list, sweep: Sweep, target_points: float) -> None:
             print("  close at the bar rather than at the objective. That is"
                   " the arithmetic")
             print("  of the bar size, not a verdict on the rule.")
-    print(f"  {'level':>6}{'rule':>6}{'trades':>9}{'/bar':>6}{'hit 3pt':>9}"
+    print(f"  {'level':>6}{'rule':>6}{'cfm':>5}{'trades':>9}{'skipped':>9}"
+          f"{'/bar':>6}{'hit':>8}"
           f"{'flipped':>9}{'EDGE':>8}{'mean pt':>9}{'flip pt':>9}"
           f"{'EDGE pt':>9}{'upd':>6}")
     rows = sweep.rows()
     for r in rows:
-        print(f"  {r['level']:>6}{r['policy']:>6}{r['trades']:>9,}"
+        print(f"  {r['level']:>6}{r['policy']:>6}{r.get('confirm', 0):>5.0f}"
+              f"{r['trades']:>9,}{r.get('skipped', 0):>9,}"
               f"{r['trades_per_bar']:>6.2f}"
-              f"{100 * r['win_rate']:>8.1f}%"
+              f"{100 * r['win_rate']:>7.1f}%"
               f"{100 * r['control_win_rate']:>8.1f}%"
               f"{100 * r['edge']:>+7.1f}%"
               f"{r['mean_points']:>+9.3f}{r['control_mean_points']:>+9.3f}"
@@ -203,7 +206,15 @@ def show(target: int, bars_list, sweep: Sweep, target_points: float) -> None:
         print("  same thing on data this sweep has not seen. An edge that"
               " does not")
         print("  survive that was a property of these particular days.")
-    print("\n  HIT 3PT counts only trades that reached the objective."
+    print("\n  CFM is ticks of confirmation waited before entry, and"
+          " SKIPPED is how")
+    print("  many calls died before price ever confirmed. Those were"
+          " never taken, so")
+    print("  they are in neither column -- but a level whose skips dwarf"
+          " its trades is")
+    print("  a level the confirmation has switched off, whatever its win"
+          " rate says.")
+    print("\n  HIT counts only trades that reached the objective."
           " Everything else")
     print("  closed at the opposite level or at the bar, wherever price"
           " happened to")
@@ -279,6 +290,10 @@ def main() -> int:
                     help="entry level to break out by one-sidedness;"
                          " defaults to the one with the largest edge")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--confirm", type=float, nargs="+", default=[0.0, 1.0,
+                                                               2.0],
+                    help="ticks of confirmation to wait before entry;"
+                         " several values fan out over the same tape")
     ap.add_argument("--min-share", type=float, default=0.0,
                     help="require this share of the bar's gross flow on"
                          " the side taken; 0 takes every signal")
@@ -302,7 +317,9 @@ def main() -> int:
     print(f"\nIMBALANCE SWEEP   targets {targets}   levels {levels}")
     print("  building...", flush=True)
     builders, sweeps = run(a.files, targets, levels, a.points, a.limit,
-                           a.min_share)
+                           a.min_share,
+                           tuple(sorted({float(x) for x in a.confirm
+                                         if x >= 0})) or (0.0,))
 
     base = Path(a.files[0]).resolve().parent
     for t in targets:

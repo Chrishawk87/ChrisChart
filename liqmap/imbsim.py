@@ -106,6 +106,11 @@ class Trade:
     entry_px: float = 0.0
     entry_ts: float = 0.0
     entry_acc: int = 0
+    # Where the CALL fired, which is not where the trade was taken
+    # once confirmation is on. `slip` is the difference, and it is a
+    # cost paid on every trade in exchange for the ones not taken.
+    call_px: float = 0.0
+    call_ts: float = 0.0
     # How one-sided the bar's flow was at the moment of entry, and how
     # much flow there had been. The net alone cannot say either.
     entry_share: float = 0.5
@@ -128,6 +133,14 @@ class Trade:
         return self.why == "target"
 
     @property
+    def slip(self) -> float:
+        """Ticks given up waiting for price to confirm the call."""
+        if not self.call_px:
+            return 0.0
+        d = self.entry_px - self.call_px
+        return (d if self.side == UP else -d) / (POINT / 4.0)
+
+    @property
     def seconds(self) -> float:
         return self.exit_ts - self.entry_ts
 
@@ -137,6 +150,8 @@ class Trade:
                 "entry_gross": self.entry_gross,
                 "dominance": round(abs(self.entry_share - 0.5) * 2.0, 4),
                 "entry_px": self.entry_px, "entry_ts": self.entry_ts,
+                "call_px": self.call_px, "call_ts": self.call_ts,
+                "slip_ticks": round(self.slip, 3),
                 "entry_acc": self.entry_acc, "exit_px": self.exit_px,
                 "exit_ts": self.exit_ts, "why": self.why,
                 "updates": self.updates,
@@ -151,12 +166,14 @@ class ImbSim:
     """One entry level, one exit rule, one direction convention."""
 
     __slots__ = ("level", "target", "policy", "flip", "min_share",
-                 "trades", "bar", "_side", "_t", "_armed_up",
-                 "_armed_down", "_per_bar", "_share", "_gross")
+                 "confirm", "skipped", "trades", "bar", "_side", "_t",
+                 "_armed_up", "_armed_down", "_per_bar", "_share",
+                 "_gross", "_call_side", "_call_px", "_call_ts")
 
     def __init__(self, level: int, target_points: float = TARGET_POINTS,
                  policy: str = HOLD, flip: bool = False,
-                 min_share: float = 0.0) -> None:
+                 min_share: float = 0.0,
+                 confirm_ticks: float = 0.0) -> None:
         if level < 1:
             raise ValueError("level must be at least 1")
         if target_points <= 0:
@@ -173,6 +190,16 @@ class ImbSim:
         # talking. Set it only once the bands say there is something
         # to filter on.
         self.min_share = float(min_share)
+        # CONFIRMATION BEFORE ENTRY. The call fires on the imbalance;
+        # the trade waits until price has gone that way by this many
+        # ticks. A call that lapses first produced NO TRADE -- it is
+        # counted in `skipped` and never lands in `trades`, because a
+        # trade nobody took cannot win or lose.
+        self.confirm = max(0.0, float(confirm_ticks)) * (POINT / 4.0)
+        self.skipped = 0
+        self._call_side = ""
+        self._call_px = 0.0
+        self._call_ts = 0.0
         self._share = 0.5
         self._gross = 0
         self.trades: list[Trade] = []
@@ -230,10 +257,30 @@ class ImbSim:
 
         if self._t is None:
             want = self._signal(acc)
-            if want == UP and self._armed_up and self._one_sided(UP):
-                self._open(UP, ts, mid, acc)
-            elif want == DOWN and self._armed_down and self._one_sided(DOWN):
-                self._open(DOWN, ts, mid, acc)
+            ok = (want == UP and self._armed_up and self._one_sided(UP)) or \
+                 (want == DOWN and self._armed_down
+                  and self._one_sided(DOWN))
+            if not ok:
+                # The call is gone. Anything waiting on it was never
+                # taken, and that is a skip, not a loss.
+                if self._call_side:
+                    self.skipped += 1
+                    self._call_side = ""
+                return
+            if self.confirm <= 0:
+                self._open(want, ts, mid, acc, mid, ts)
+                return
+            if self._call_side != want:
+                # A fresh call. Note where it fired and wait.
+                self._call_side = want
+                self._call_px = mid
+                self._call_ts = ts
+                return
+            d = mid - self._call_px
+            if (d if want == UP else -d) >= self.confirm:
+                self._open(want, ts, mid, acc, self._call_px,
+                           self._call_ts)
+                self._call_side = ""
 
     def bar_close(self, ts: float, px: float) -> None:
         """The bar ended. Nothing survives it."""
@@ -270,9 +317,11 @@ class ImbSim:
             side = DOWN if side == UP else UP
         return side
 
-    def _open(self, side: str, ts: float, mid: float, acc: int) -> None:
+    def _open(self, side: str, ts: float, mid: float, acc: int,
+              call_px: float = 0.0, call_ts: float = 0.0) -> None:
         self._t = Trade(side=side, level=self.level, entry_px=mid,
                         entry_ts=ts, entry_acc=int(acc),
+                        call_px=call_px or mid, call_ts=call_ts or ts,
                         entry_share=self._share, entry_gross=self._gross)
         self._side = side
         self.bar += 1
@@ -347,16 +396,21 @@ class Sweep:
     target_points: float = TARGET_POINTS
     policies: tuple = POLICIES
     min_share: float = 0.0
+    # Ticks of confirmation to fan out over. The chart runs one of
+    # these; the sweep runs all of them on the same tape so the choice
+    # can be checked rather than argued about.
+    confirms: tuple = (0.0,)
     sims: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.sims:
             for lv in self.levels:
                 for pol in self.policies:
-                    for flip in (False, True):
-                        self.sims[(lv, pol, flip)] = ImbSim(
-                            lv, self.target_points, pol, flip,
-                            self.min_share)
+                    for cf in self.confirms:
+                        for flip in (False, True):
+                            self.sims[(lv, pol, cf, flip)] = ImbSim(
+                                lv, self.target_points, pol, flip,
+                                self.min_share, cf)
 
     def tick(self, ts: float, acc: int, mid: float,
              share: float = 0.5, gross: int = 0) -> None:
@@ -369,10 +423,13 @@ class Sweep:
 
     def rows(self) -> list[dict]:
         out = []
-        for lv in self.levels:
-            for pol in self.policies:
-                real = self.sims[(lv, pol, False)].summary()
-                ctl = self.sims[(lv, pol, True)].summary()
+        for lv, pol, cf in [(a, b, c) for a in self.levels
+                            for b in self.policies
+                            for c in self.confirms]:
+                real = self.sims[(lv, pol, cf, False)].summary()
+                ctl = self.sims[(lv, pol, cf, True)].summary()
+                real["confirm"] = cf
+                real["skipped"] = self.sims[(lv, pol, cf, False)].skipped
                 real["control_win_rate"] = ctl["win_rate"]
                 real["control_mean_points"] = ctl["mean_points"]
                 real["control_trades"] = ctl["trades"]
@@ -384,10 +441,12 @@ class Sweep:
                 out.append(real)
         return out
 
-    def trades(self, policy: str = HOLD) -> list[Trade]:
+    def trades(self, policy: str = HOLD, confirm: float | None = None
+               ) -> list[Trade]:
+        cf = self.confirms[0] if confirm is None else confirm
         out: list[Trade] = []
         for lv in self.levels:
-            out.extend(self.sims[(lv, policy, False)].trades)
+            out.extend(self.sims[(lv, policy, cf, False)].trades)
         out.sort(key=lambda t: (t.entry_ts, t.level))
         return out
 

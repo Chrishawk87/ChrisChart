@@ -6366,8 +6366,18 @@ def create_app() -> FastAPI:
         obs = None
         if len(s_bars) > 20:
             try:
+                from .ofibar import CALL_RULE as _RULE
                 obs = _ag.observation_table(s_bars, points=(1, 2, 3, 4),
-                                            level=b.call_level)
+                                            level=b.call_level,
+                                            rule=_RULE)
+                # AND THE SAME COUNT OVER JUST WHAT IS ON SCREEN.
+                # The history runs over thousands of bars and the
+                # chart over a hundred, so a tally of one beside a
+                # picture of the other reads as a contradiction --
+                # he counts five marks and the panel says a hundred.
+                obs["on_screen"] = _ag.observation_table(
+                    list(window), points=(1,), level=b.call_level,
+                    rule=_RULE)
             except Exception:                           # noqa: BLE001
                 obs = None
 
@@ -6401,11 +6411,14 @@ def create_app() -> FastAPI:
                 if _e.level and _e.level != _lvl_now:
                     continue
                 trade_arrows.append({"i": _w, "side": _e.side,
-                                     "px": _e.px0 * sc})
+                                     "px": _e.px0 * sc,
+                                     "entry": (_e.entry_px * sc
+                                               if _e.entered else 0.0)})
                 if _e.hit:
                     trade_marks.append({"i": _w, "kind": _e.hit,
                                         "px": _e.hit_px * sc,
-                                        "from": _e.px0 * sc})
+                                        "from": _e.px0 * sc,
+                                        "ticks": round(_e.result_ticks, 2)})
 
         # How much of this is on disk, so the panel can say whether a
         # restart would cost anything.
@@ -6429,6 +6442,15 @@ def create_app() -> FastAPI:
                 _liveobs = {
                     "side": _ep.side, "px0": _ep.px0 * sc,
                     "updates": _ep.updates,
+                    # WAITING or IN. A call with no fill behind it is
+                    # not a trade, and the panel has to say which of
+                    # the two is on screen or it is describing a
+                    # position nobody holds.
+                    "took": bool(_ep.entered),
+                    "entry_px": (_ep.entry_px * sc
+                                 if _ep.entered else 0.0),
+                    "slip": round(_ep.slip, 2),
+                    "ticks": round(_ep.result_ticks, 2),
                     "now_pts": round(_ep.move / 1e9, 2),
                     "mfe_pts": round(_ep.mfe / 1e9, 2),
                     "mae_pts": round(_ep.mae / 1e9, 2),
@@ -6437,11 +6459,14 @@ def create_app() -> FastAPI:
             # closed ones, which is where the chart draws it.
             for _e in b.live_episodes:
                 trade_arrows.append({"i": len(out), "side": _e.side,
-                                     "px": _e.px0 * sc})
+                                     "px": _e.px0 * sc,
+                                     "entry": (_e.entry_px * sc
+                                               if _e.entered else 0.0)})
                 if _e.hit:
                     trade_marks.append({"i": len(out), "kind": _e.hit,
                                         "px": _e.hit_px * sc,
-                                        "from": _e.px0 * sc})
+                                        "from": _e.px0 * sc,
+                                        "ticks": round(_e.result_ticks, 2)})
             forming = {"call_side": _cs, "call_px": _cpx * sc,
                        "push_up": _pu, "push_dn": _pd,
                        "share": round(b.live_share, 4),
@@ -6457,6 +6482,13 @@ def create_app() -> FastAPI:
                            "BUY_PRICE_AGGRESSIVE" if _lp >= 0.70
                            else "SELL_PRICE_AGGRESSIVE" if _lp <= 0.30
                            else "BALANCED_PRICE_FLOW"),
+                       # EXPANSION AND SPEED, running with the bar.
+                       # Nothing is gated on these -- they are here to
+                       # be looked at next to the imbalance, because
+                       # 500 in four seconds and 500 in four minutes
+                       # are the same number and not the same event.
+                       "speed": {k: round(v, 3)
+                                 for k, v in b.live_speed.items()},
                        "seconds": round(cur.seconds, 3)}
         # The forming bar belongs only at the live edge. Scrolled back,
         # appending it would staple the present onto the end of the past.
@@ -10142,15 +10174,49 @@ function ofiChart(d, w, h) {
     const col = up ? '#35c27a' : '#e2574c';
     const base = up ? yy + 5 : yy - 5;
     const tip = up ? yy + 1 : yy - 1;
-    cg += `<path d="M ${(cx - 3.4).toFixed(1)} ${base.toFixed(1)}
+    /* THE SURFACE RING IS NOT DECORATION. The call price sits inside
+       the candle body by construction, and a green arrow drawn on a
+       green body is invisible -- which is the one thing an arrow
+       cannot be. The ring separates the glyph from whatever it lands
+       on, in either theme, without moving it off the price it
+       marks. */
+    const tri = `M ${(cx - 3.4).toFixed(1)} ${base.toFixed(1)}
              L ${(cx + 3.4).toFixed(1)} ${base.toFixed(1)}
-             L ${cx.toFixed(1)} ${tip.toFixed(1)} Z" fill="${col}"/>`;
+             L ${cx.toFixed(1)} ${tip.toFixed(1)} Z`;
+    cg += `<path d="${tri}" fill="${col}" stroke="var(--bg)"
+             stroke-width="1.6" stroke-linejoin="round"/>`;
+    /* THE ARROW IS THE CALL. THE DASH IS THE FILL. They are different
+       prices now -- the trade waits for price to confirm the call --
+       and drawing only the arrow would show every result measured
+       from a price nothing was bought at. */
+    if (a.entry) {
+      const ey = y(a.entry);
+      if (ey >= padT && ey <= padT + ih) {
+        const seg = `M ${(cx - 4.2).toFixed(1)} ${ey.toFixed(1)}
+                 L ${(cx + 4.2).toFixed(1)} ${ey.toFixed(1)}`;
+        cg += `<path d="${seg}" stroke="var(--bg)" stroke-width="3.6"
+                 fill="none" stroke-linecap="round"/>`;
+        cg += `<path d="${seg}" stroke="${col}" stroke-width="1.8"
+                 fill="none" stroke-linecap="round"/>`;
+      }
+    }
   }
   for (const m of tmarks) {
     if (m.i < 0 || m.i >= all.length || !m.px) continue;
     const cx = padL + step * (m.i + 0.5);
     const yy = y(m.px);
     if (yy < padT || yy > padT + ih) continue;
+    /* A SKIP IS NOT A LOSS AND MUST NOT LOOK LIKE ONE. The call fired
+       and price never confirmed it, so no trade was taken. It gets a
+       small hollow ring -- visible, countable, and impossible to
+       mistake for the black cross of a trade that was taken and
+       died. */
+    if (m.kind === 'skip') {
+      cg += `<circle cx="${cx.toFixed(1)}" cy="${yy.toFixed(1)}" r="2.8"
+               fill="var(--bg)" stroke="var(--dim)" stroke-width="1.3"
+               opacity="0.95"/>`;
+      continue;
+    }
     const win = m.kind === 'win';
     /* The failure mark is drawn near-black with a pale ring, because
        a true black X vanishes on the dark theme and this has to read
@@ -10434,14 +10500,49 @@ function ofiChart(d, w, h) {
   const obsNow = fm && fm.obs;
   const pointsLine = o => {
     if (!o) return '';
+    /* A CALL IS NOT A POSITION. Price has to confirm the call before
+       the trade is taken, so the panel says which of the two is on
+       screen -- otherwise it is describing a position nobody is in,
+       which is the most expensive sentence a chart can print. */
+    if (!o.took) {
+      return ' &middot; <b>WAITING</b> &mdash; called at '
+        + o.px0.toFixed(2) + ', no entry until price confirms it. If '
+        + 'the call dies first, no trade was taken and it counts as '
+        + 'neither.';
+    }
     const s2 = o.at2 === 'win' ? '<b class="long">+2 hit</b>'
       : o.at2 === 'loss' ? '<b class="short">-2 hit</b>' : '2pt open';
     const s4 = o.at4 === 'win' ? '<b class="long">+4 hit</b>'
       : o.at4 === 'loss' ? '<b class="short">-4 hit</b>' : '4pt open';
-    return ' &middot; from ' + o.px0.toFixed(2) + ': '
-      + (o.now_pts > 0 ? '+' : '') + o.now_pts.toFixed(2) + ' pt now, best '
-      + o.mfe_pts.toFixed(2) + ' / worst -' + o.mae_pts.toFixed(2)
+    return ' &middot; <b>IN</b> at ' + o.entry_px.toFixed(2)
+      + ' (called ' + o.px0.toFixed(2) + ', '
+      + (o.slip || 0).toFixed(2) + ' ticks of confirmation) &middot; '
+      + ((o.ticks || 0) >= 0 ? '+' : '') + (o.ticks || 0).toFixed(2)
+      + ' ticks now, best ' + o.mfe_pts.toFixed(2)
+      + ' / worst -' + o.mae_pts.toFixed(2) + ' pt'
       + ' &middot; ' + s2 + ' &middot; ' + s4;
+  };
+  /* EXPANSION AND SPEED, running with the bar. Nothing is gated on
+     these. They are here because 500 of imbalance in four seconds and
+     500 in four minutes are the same number and not the same event,
+     and the panel had no way to tell them apart.
+
+     `eff` is the one to watch: distance covered that went somewhere.
+     1.0 is a straight line, 0.1 is a bar that worked hard and ended
+     where it started. The same imbalance means something different at
+     each end of that. */
+  const speedLine = fm => {
+    const v = fm && fm.speed;
+    if (!v || !v.secs) return '';
+    return '<span class="stamp" style="width:100%">SPEED &mdash; range '
+      + (v.tr || 0).toFixed(1) + ' ticks over ' + (v.secs || 0).toFixed(1)
+      + 's &middot; covered ' + (v.path || 0).toFixed(1) + ' ticks at '
+      + (v.tps || 0).toFixed(2) + ' a second &middot; opening at '
+      + (v.rps || 0).toFixed(2) + ' ticks of range a second'
+      + ' &middot; <b>' + (v.eff || 0).toFixed(2) + ' efficiency</b> '
+      + ((v.eff || 0) >= 0.5 ? '(going somewhere)'
+         : (v.eff || 0) >= 0.2 ? '(grinding)' : '(round-tripping)')
+      + ' &middot; nothing is filtered on this</span>';
   };
   let liveCall;
   if (d && d.reachable === false) {
@@ -10480,6 +10581,7 @@ function ofiChart(d, w, h) {
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
       + 'no bar is forming</span>';
   }
+  liveCall += speedLine(fm);
 
   const dLast = all[all.length - 1] || {};
   const dSum = all.reduce((a, b) => a + (b.delta || 0), 0);
@@ -10559,7 +10661,22 @@ function ofiObs(d) {
      worse than it is -- just as counting it as a win would make it
      look better. */
   const obj = (d && d.objective_pts) || 1;
-  const tally = '<span class="stamp" style="width:100%"><b>tally at '
+  const sc_ = o.on_screen;
+  /* ON SCREEN FIRST, because it is the only part that can be checked
+     by counting the marks. The history covers thousands of bars and
+     the chart a hundred or so, and a tally of one printed beside a
+     picture of the other reads as a contradiction. */
+  const screenLine = sc_
+    ? '<span class="stamp" style="width:100%"><b>on screen</b> &mdash; '
+      + '<b class="long">' + (sc_.won || 0) + ' won</b> / '
+      + '<b class="short">' + (sc_.failed || 0) + ' failed</b> / '
+      + (sc_.open_at_close || 0) + ' unresolved, out of '
+      + (sc_.observations || 0) + ' calls on the '
+      + (sc_.bars || 0) + ' bars drawn. Count the blue and black '
+      + 'crosses &mdash; these are them.</span>'
+    : '';
+  const tally = screenLine
+    + '<span class="stamp" style="width:100%"><b>everything held at '
     + obj + ' point</b> &mdash; <b class="long">'
     + (o.won || 0).toLocaleString() + ' won</b> / <b class="short">'
     + (o.failed || 0).toLocaleString() + ' failed</b>'
@@ -10568,21 +10685,73 @@ function ofiObs(d) {
         : '')
     + ' &middot; ' + (o.open_at_close || 0).toLocaleString()
     + ' still open when the bar closed, which is neither'
+    + ' &middot; ' + (o.skipped || 0).toLocaleString()
+    + ' never confirmed, so no trade was taken'
+    + ' &middot; over ' + (o.bars || 0).toLocaleString() + ' bars'
+    /* Only say it is a wider span when it IS one. The sentence was
+       unconditional, so on a short history it claimed a difference
+       that was not there -- and a panel that explains a gap nobody
+       can see is how the next real gap gets ignored. */
+    + ((o.on_screen && o.bars > (o.on_screen.bars || 0))
+        ? ', which is more than the ' + (o.on_screen.bars || 0)
+          + ' on screen' : '')
+    + (o.left_out ? ' &middot; ' + o.left_out.toLocaleString()
+        + ' left out: made by an earlier rule or at another level' : '')
+    + '</span>'
+    /* THE RATE CANNOT SETTLE THIS AND THE NET CAN.
+
+       There is no stop, so a loss is however far price got while the
+       call died -- it has no fixed size. Eleven four-tick wins and one
+       nine-tick loss is a 92% rule that loses money. So the average
+       win, the average loss and the net per trade sit on the line
+       ABOVE the percentage, not in a footnote under it. */
+    + '<span class="stamp" style="width:100%"><b>what it actually '
+    + 'made</b> &mdash; <b class="long">+'
+    + (o.avg_win_ticks || 0).toFixed(2) + ' ticks</b> a winner, '
+    + '<b class="short">' + (o.avg_loss_ticks || 0).toFixed(2)
+    + ' ticks</b> a loser, <b>'
+    + ((o.net_per_trade || 0) >= 0 ? '+' : '')
+    + (o.net_per_trade || 0).toFixed(2) + ' ticks</b> a trade across '
+    + (o.settled || 0).toLocaleString() + ' &mdash; '
+    + ((o.net_ticks || 0) >= 0 ? '+' : '')
+    + (o.net_ticks || 0).toFixed(1) + ' ticks in all'
+    + ((o.avg_slip_ticks || 0)
+        ? ' &middot; ' + (o.avg_slip_ticks).toFixed(2)
+          + ' ticks of that given up waiting for confirmation'
+        : '')
+    + ' &middot; before costs, which run about 0.4 ticks a round turn'
     + '</span>'
     /* The raw rate carries a bias that is arithmetic, not market. A
        call fires AFTER the move it is reading -- measured on a random
        walk, up calls fire at 0.55 of the bar's range and down calls
        at 0.44 -- so there is less room left the way it was called and
-       more room against it, and a symmetric bracket inherits that.
-       The same walk returns 18%, not 50%. Only the flipped control in
-       the sweep can say whether a rate here means anything. */
-    + '<span class="stamp" style="width:100%">A call fires after the '
-    + 'move it is reading, so a symmetric bracket is biased against it '
-    + 'before the market does anything: on a random walk this tally '
-    + 'returns 18%, not 50%. Read it against '
+       more room against it.
+
+       The symmetric bracket inherited that directly and returned 18%
+       on the walk. This rule has no bracket, so the bias lands
+       somewhere else: the call dies before the trade can travel, and
+       the walk returns 0.0%. Both numbers are the rule's own
+       arithmetic rather than the market's, and only the flipped
+       control in the sweep can say whether a rate here means
+       anything. */
+    /* WHAT THE BASELINE ACTUALLY IS, measured on this rule rather
+       than inherited from the last one. The old symmetric bracket
+       returned 18% on a random walk; this rule returns 0.0% on the
+       same walk, across 224,081 calls, because without a stop a trade
+       has until the call dies to find its point and on noise the call
+       dies in two updates. So the bar to clear is 0%, not 50% -- and
+       the number that says whether the live figure is even
+       comparable is the median call length right below it. */
+    + '<span class="stamp" style="width:100%"><b>the bar to clear is '
+    + '0%, not 50%.</b> Run on a random walk &mdash; a market with no '
+    + 'edge in it by construction &mdash; this rule returns 0.0% over '
+    + '224,081 calls, losing 0.18 ticks a trade. Not because it is '
+    + 'wrong there: because the call dies after 2 updates and the '
+    + 'trade never gets the room. If the median call length below is '
+    + 'also around 2, this tally is measuring chatter and not the '
+    + 'rule, whatever the percentage says. Read it against '
     + 'scripts/imbalance_sweep.py, which runs the same rule backwards '
-    + 'on the same bars &mdash; the gap between them is the only part '
-    + 'a market that does nothing cannot produce.</span>';
+    + 'on the same bars.</span>';
 
   return tally
     + '<span class="stamp" style="width:100%"><b>observations</b> '

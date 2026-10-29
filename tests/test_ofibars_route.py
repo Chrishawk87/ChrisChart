@@ -1181,11 +1181,11 @@ class TestEveryCallIsMarkedAndResolved:
         assert "${ax}${g}${pv}${cg}</svg>" in self._chart()
 
     def test_the_builder_records_where_it_resolved(self):
-        from liqmap.ofibar import OfiBarBuilder, POINT
+        from liqmap.ofibar import OfiBarBuilder
         base = 7_700 * 10 ** 9
         b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
                           min_updates=2, call_level=200,
-                          objective_points=1.0)
+                          objective_points=1.0, confirm_ticks=0.0)
         b.on_book(0.0, base, 100, base + 250_000_000, 100)
         b.on_book(0.01, base, 500, base + 250_000_000, 100)
         assert b.live_call[0] == "up"
@@ -1196,33 +1196,39 @@ class TestEveryCallIsMarkedAndResolved:
         assert ep.hit == "win"
         assert ep.hit_px > ep.px0
 
-    def test_four_ticks_against_is_a_failure_not_a_drift(self):
-        from liqmap.ofibar import OfiBarBuilder
-        base = 7_700 * 10 ** 9
-        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
-                          min_updates=2, call_level=200,
-                          objective_points=1.0)
-        b.on_book(0.0, base, 100, base + 250_000_000, 100)
-        b.on_book(0.01, base, 500, base + 250_000_000, 100)
-        ep = b.live_episode
-        dn = base - 4 * 250_000_000
-        b.on_book(0.02, dn, 500, dn + 250_000_000, 100)
-        assert ep.hit == "loss"
+    def test_there_is_no_adverse_stop_left_in_the_tracker(self):
+        """THE STOP IS GONE, and this is the test that it stayed gone.
 
-    def test_the_first_one_reached_is_the_one_recorded(self):
+        A drawdown with the call still live is a position under water,
+        not a closed loser. The behavioural proof is in
+        tests/test_ofibar.py, where a live episode is driven directly;
+        here the point is that `_track` has no losing-distance branch
+        at all, because one could be reintroduced without any feed
+        test noticing until it changed a percentage.
+        """
+        src = (ROOT / "liqmap" / "ofibar.py").read_text()
+        i = src.index("def _track")
+        body = src[i:src.index("def _close")]
+        assert "adv >= self._obj" not in body, "the stop is back"
+        assert body.count('"loss"') == 0, "_track can still record a loss"
+        # And the only place a loss IS recorded is the call ending.
+        j = src.index("def _end_episode")
+        assert '"loss"' in src[j:i]
+
+    def test_coming_back_through_the_level_is_what_records_the_loss(self):
         from liqmap.ofibar import OfiBarBuilder
         base = 7_700 * 10 ** 9
         b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
                           min_updates=2, call_level=200,
-                          objective_points=1.0)
+                          objective_points=1.0, confirm_ticks=0.0)
         b.on_book(0.0, base, 100, base + 250_000_000, 100)
         b.on_book(0.01, base, 500, base + 250_000_000, 100)
         ep = b.live_episode
-        dn = base - 4 * 250_000_000
-        b.on_book(0.02, dn, 500, dn + 250_000_000, 100)
-        up = base + 8 * 250_000_000
-        b.on_book(0.03, up, 500, up + 250_000_000, 100)
-        assert ep.hit == "loss", "it got there second"
+        assert ep.hit == ""
+        b.on_book(0.02, base, 150, base + 250_000_000, 100)   # lapses
+        assert b.live_call[0] == ""
+        assert ep.hit == "loss"
+        assert ep.hit_px > 0, "a loss with no price is not a record"
 
     def test_the_tally_counts_three_outcomes(self):
         i = WEB.index("const tally =")
@@ -1358,19 +1364,22 @@ class TestTheRunningCallOnScreen:
 
     def test_the_live_line_shows_both_numbers_either_way(self):
         c = self._chart()
-        blk = c[c.index("const fm = d && d.forming;"):][:3000]
+        blk = c[c.index("const fm = d && d.forming;"):
+                c.index("const dLast = all[all.length - 1]")]
         assert "fm.ofi" in blk and "fm.delta" in blk
 
     def test_the_live_line_shows_the_distance_so_far(self):
         c = self._chart()
-        assert "pt now, best" in c
+        assert "ticks now, best" in c
         assert "+2 hit" in c and "-2 hit" in c
 
     def test_the_route_returns_the_observation_table(self):
         r = self._route()
         assert "_ag.observation_table(s_bars, points=(1, 2, 3, 4)," in r
-        assert "level=b.call_level)" in r, \
+        assert "level=b.call_level," in r, \
             "the table must be for one level, not a mixture"
+        assert "rule=_RULE)" in r, \
+            "and for one rule, not a mixture of strategies"
         assert '"obs": obs' in r
 
     def test_the_panel_draws_it_above_the_rest(self):
@@ -1379,7 +1388,7 @@ class TestTheRunningCallOnScreen:
 
     def test_the_table_says_unresolved_is_not_a_loss(self):
         i = WEB.index("function ofiObs")
-        blk = WEB[i:i + 4000]
+        blk = WEB[i:WEB.index("function ofiCalls")]
         assert "not a draw and not a loss" in blk
         assert "bar ended first" in blk
 
@@ -1485,7 +1494,7 @@ class TestTheLevelIsSelectable:
     def test_an_observation_records_the_level_it_was_made_at(self):
         src = (ROOT / "liqmap" / "ofibar.py").read_text()
         i = src.index("class Episode:")
-        assert "level: int = 0" in src[i:i + 1400]
+        assert "level: int = 0" in src[i:src.index("class OfiBar:")]
         assert "level=self._level" in src
 
     def test_changing_it_abandons_the_observation_in_progress(self):
@@ -1646,14 +1655,27 @@ class TestTheTallyStatesItsOwnBias:
     """
 
     def test_the_panel_names_the_bias_and_the_number(self):
+        """And names it for THIS rule. The 18% figure was measured on
+        the symmetric bracket, which no longer exists -- quoting it
+        here would be a number from a different strategy."""
         i = WEB.index("const tally =")
-        blk = WEB[i:i + 2200]
-        assert "fires after the " in blk
-        assert "18%, not 50%" in blk
+        blk = WEB[i:WEB.index("return tally")]
+        assert "0%, not 50%" in blk
+        assert "random walk" in blk
+        assert "18%, not 50%" not in blk, "a figure from the old rule"
+
+    def test_it_says_when_its_own_number_is_meaningless(self):
+        """A median call of two updates cannot travel a point, so the
+        percentage above it would be measuring the gate, not the
+        rule. The panel has to say so itself."""
+        i = WEB.index("const tally =")
+        blk = WEB[i:WEB.index("return tally")]
+        assert "chatter" in blk
+        assert "median call length" in blk
 
     def test_it_points_at_the_control_that_can_settle_it(self):
         i = WEB.index("const tally =")
-        blk = WEB[i:i + 2200]
+        blk = WEB[i:WEB.index("return tally")]
         assert "imbalance_sweep.py" in blk
         assert "backwards" in blk
 
@@ -1683,3 +1705,99 @@ class TestTheTallyStatesItsOwnBias:
             rates[side] = w / (w + l)
         assert abs(rates["up"] - rates["down"]) < 0.25, rates
         assert max(rates.values()) < 0.5, rates
+
+
+class TestTheTallyMatchesWhatIsOnScreen:
+    """103 won beside a chart showing five marks reads as a lie.
+
+    In order of how badly each would mislead:
+
+      a count over thousands of bars printed beside a picture of a
+      hundred, with nothing saying the spans differ. Both numbers are
+      true and the pair is not checkable
+
+      counting observations made by a rule that no longer exists.
+      They are still on disk, still carry a level, and describe a
+      strategy that was replaced
+
+      dropping those silently. A number that shrinks with no
+      explanation is worse than one that is wrong
+    """
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_every_observation_is_stamped_with_its_rule(self):
+        from liqmap.ofibar import CALL_RULE, OfiBarBuilder
+        base = 7_700 * 10 ** 9
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                          min_updates=2, call_level=200)
+        b.on_book(0.0, base, 100, base + 250_000_000, 100)
+        b.on_book(0.01, base, 500, base + 250_000_000, 100)
+        assert b.live_episodes[-1].rule == CALL_RULE
+
+    def test_an_older_rule_is_not_counted(self):
+        from liqmap import agree as A
+        from liqmap.ofibar import CALL_RULE, Episode, OfiBar
+        bar = OfiBar()
+        bar.episodes = [Episode(side="up", rule=CALL_RULE, level=300,
+                                hit="win"),
+                        Episode(side="up", rule="", level=300,
+                                hit="loss")]
+        t = A.observation_table([bar], level=300, rule=CALL_RULE)
+        assert t["won"] == 1 and t["failed"] == 0
+        assert t["observations"] == 1
+
+    def test_what_was_left_out_is_reported(self):
+        from liqmap import agree as A
+        from liqmap.ofibar import CALL_RULE, Episode, OfiBar
+        bar = OfiBar()
+        bar.episodes = [Episode(side="up", rule=CALL_RULE, level=300),
+                        Episode(side="up", rule="", level=300),
+                        Episode(side="up", rule=CALL_RULE, level=500)]
+        t = A.observation_table([bar], level=300, rule=CALL_RULE)
+        assert t["left_out"] == 2
+
+    def test_a_stamped_rule_survives_the_database(self):
+        from liqmap.ofistore import _eps_in, _eps_out
+        from liqmap.ofibar import CALL_RULE, Episode, OfiBar
+        bar = OfiBar()
+        bar.episodes = [Episode(side="up", rule=CALL_RULE, level=300)]
+        back = _eps_in(_eps_out(bar))
+        assert back[0].rule == CALL_RULE
+
+    def test_a_row_written_before_the_stamp_reads_as_an_older_rule(self):
+        from liqmap.ofistore import _eps_in
+        back = _eps_in('[{"side":"up","level":300}]')
+        assert back[0].rule == ""
+
+    def test_the_route_filters_on_the_rule(self):
+        r = self._route()
+        assert "from .ofibar import CALL_RULE as _RULE" in r
+        assert "rule=_RULE)" in r
+
+    def test_the_route_counts_the_visible_bars_separately(self):
+        r = self._route()
+        assert 'obs["on_screen"] = _ag.observation_table(' in r
+        assert "list(window)" in r
+
+    def test_the_panel_leads_with_what_can_be_counted(self):
+        i = WEB.index("const screenLine")
+        blk = WEB[i:i + 1400]
+        assert "on screen" in blk
+        assert "Count the blue and black " in blk
+        assert WEB.index("const screenLine") < WEB.index("everything held at")
+
+    def test_the_panel_says_the_history_covers_more(self):
+        """And says it only when it does. An unconditional sentence
+        claimed a gap on a short history where there was none, which
+        is how a reader learns to skip the sentence that matters."""
+        i = WEB.index("const tally =")
+        blk = WEB[i:WEB.index("return tally")]
+        assert "which is more than the" in blk
+        assert "on screen'" in blk
+        assert "o.bars > (o.on_screen.bars || 0)" in blk
+
+    def test_the_panel_says_what_it_left_out(self):
+        assert "made by an earlier rule or at another level" in WEB

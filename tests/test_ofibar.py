@@ -795,19 +795,45 @@ class TestObservationsInsideTheBar:
         assert "if pts in ep.first:" in body
         assert "continue" in body
 
-    def test_a_win_is_only_recorded_before_the_other_side(self):
-        from liqmap.ofibar import Episode, POINT
+    def test_going_against_it_is_not_a_loss_while_the_call_is_live(self):
+        """THERE IS NO STOP. The old rule failed a trade at one point
+        against even with the call still live; this one does not, and
+        a trade that goes two points against and then three the right
+        way is a win, because that is what happened to it."""
+        from liqmap.ofibar import Episode, POINT, RAW_TICK
         b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=1e9,
                           min_updates=2)
-        ep = Episode(side="up", px0=0.0, px_end=0.0)
+        ep = Episode(side="up", px0=0.0, px_end=0.0,
+                     took=True, entry_px=0.0)      # already confirmed
         b._ep = ep
         b._meas = [ep]
         b._track(0.0, -2 * POINT)        # 2 points against, first
+        assert ep.hit == "", "an adverse move must not resolve it"
+        assert ep.outcome(1) == "unresolved"
         b._track(1.0, +3 * POINT)        # then 3 the right way
-        assert ep.outcome(1) == "loss"
-        assert ep.outcome(2) == "loss"
-        assert ep.outcome(3) == "win", "it got there before -3"
-        assert ep.mfe == 3 * POINT and ep.mae == 2 * POINT
+        assert ep.hit == "win"
+        assert ep.outcome(1) == "win"
+        assert ep.outcome(3) == "win"
+        assert ep.mfe >= 3 * POINT - 1 and ep.mae >= 2 * POINT - 1
+        # And it closed AT the objective, not at the extreme it ran to
+        # afterwards -- the trade was over by then.
+        assert ep.hit_px == 3 * POINT
+        assert ep.result_ticks > 0
+
+    def test_a_distance_never_reached_before_the_lapse_is_a_loss(self):
+        from liqmap.ofibar import Episode, POINT
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=1e9,
+                          min_updates=2)
+        ep = Episode(side="up", px0=0.0, px_end=0.0,
+                     took=True, entry_px=0.0)
+        b._ep = ep
+        b._meas = [ep]
+        b._track(0.0, 2 * POINT)         # reached 2, never 3
+        b._end_episode("reversal", 1.0, 2 * POINT)
+        assert ep.outcome(1) == "win"
+        assert ep.outcome(2) == "win"
+        assert ep.outcome(3) == "loss", "it never got there"
+        assert ep.outcome(4) == "loss"
 
     def test_an_unreached_distance_is_unresolved(self):
         from liqmap.ofibar import Episode
@@ -920,22 +946,22 @@ class TestBothSidesOfTheImbalance:
             assert k in d, k
 
 
-class TestTheTradeIsMeasuredPastTheCall:
-    """A call can lapse long before price has gone anywhere.
+class TestTheTradeEndsWhenTheCallDoes:
+    """THE SIGNAL ENDS THE TRADE, because the signal is the rule.
 
-    The question being asked is what happened to the TRADE, so the
-    objective keeps being tracked until the bar closes. Stopping when
-    the call stops would leave most trades unresolved and make the
-    tally a measurement of how long calls last rather than of whether
-    they worked.
+    A trade is over when it makes its point or when the imbalance
+    goes back through the level that asked for it. There is no stop
+    distance, and price arriving at the objective AFTER the call has
+    lapsed is not a win -- nobody was in the trade to take it.
     """
 
-    def _b(self, level=200):
+    def _b(self, level=200, confirm=0.0):
         return OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
                              min_updates=2, max_bars=10 ** 7,
-                             call_level=level, objective_points=1.0)
+                             call_level=level, objective_points=1.0,
+                             confirm_ticks=confirm)
 
-    def test_it_resolves_after_the_call_has_lapsed(self):
+    def test_price_arriving_after_the_lapse_is_not_a_win(self):
         base = 7_700 * 10 ** 9
         b = self._b()
         b.on_book(0.0, base, 100, base + RAW, 100)
@@ -947,7 +973,53 @@ class TestTheTradeIsMeasuredPastTheCall:
         assert ep.end == "reversal"
         up = base + 4 * RAW
         b.on_book(0.03, up, 150, up + RAW, 100)          # price arrives
-        assert ep.hit == "win", "it stopped measuring when the call did"
+        assert ep.hit != "win", "it was measured after the call was over"
+
+    def test_the_lapse_is_the_loss_and_it_carries_its_ticks(self):
+        base = 7_700 * 10 ** 9
+        b = self._b(confirm=0.0)
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 500, base + RAW, 100)      # call fires up
+        ep = b.live_episodes[-1]
+        dn = base - 2 * RAW
+        b.on_book(0.02, dn, 500, dn + RAW, 100)          # drifts against
+        b.on_book(0.03, dn, 150, dn + RAW, 100)          # call lapses
+        assert ep.hit == "loss"
+        # Either way out of the call is a loss: back through the level
+        # or straight through to the other side.
+        assert ep.end in ("reversal", "flip")
+        # The size of the loss is whatever price had done, NOT a fixed
+        # stop. This is the figure that decides the rule.
+        assert ep.result_ticks < 0
+        assert ep.hit_px == (dn + (dn + RAW)) / 2.0
+
+    def test_a_loss_can_be_bigger_than_the_objective(self):
+        """Which is the whole hazard of having no stop, so it is
+        asserted rather than hoped for."""
+        base = 7_700 * 10 ** 9
+        b = self._b(confirm=0.0)
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 500, base + RAW, 100)
+        ep = b.live_episodes[-1]
+        dn = base - 9 * RAW
+        b.on_book(0.02, dn, 500, dn + RAW, 100)
+        b.on_book(0.03, dn, 150, dn + RAW, 100)          # lapses, -9
+        assert ep.hit == "loss"
+        assert ep.result_ticks <= -8.0
+
+    def test_the_bar_ending_is_not_a_loss(self):
+        base = 7_700 * 10 ** 9
+        b = OfiBarBuilder(tick_size=0.25, threshold=600, max_s=1e9,
+                          min_updates=2, max_bars=10 ** 7,
+                          call_level=200, objective_points=1.0,
+                          confirm_ticks=0.0)
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 400, base + RAW, 100)      # call fires
+        ep = b.live_episodes[-1]
+        b.on_book(0.02, base, 900, base + RAW, 100)      # bar closes
+        assert b.bars, "the bar should have closed"
+        assert ep.end == "bar"
+        assert ep.hit in ("", "win"), "a bar ending is not a loss"
 
     def test_the_call_length_still_measures_the_call(self):
         """`updates` is the chatter diagnostic, so it must not keep
@@ -980,3 +1052,156 @@ class TestTheTradeIsMeasuredPastTheCall:
             for e in bar.episodes:
                 if e.hit:
                     assert e.hit_ts <= bar.ts_close + 1e-9
+
+
+class TestConfirmationBeforeEntry:
+    """The call is the imbalance. The TRADE waits for price.
+
+    A call fires at +level, but nothing is bought until price has
+    actually gone that way by CONFIRM_TICKS. That costs those ticks on
+    every trade taken, and it is meant to: the thing it buys is
+    skipping the calls that fire straight into a turn.
+    """
+
+    def _b(self, confirm=1.0, level=200):
+        return OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                             min_updates=2, max_bars=10 ** 7,
+                             call_level=level, objective_points=1.0,
+                             confirm_ticks=confirm)
+
+    def _call(self, b, base):
+        b.on_book(0.0, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 500, base + RAW, 100)
+        ep = b.live_episodes[-1]
+        assert b.live_call[0] == "up"
+        return ep
+
+    def test_the_arrow_is_at_the_call_and_the_fill_is_not(self):
+        base = 7_700 * 10 ** 9
+        b = self._b()
+        ep = self._call(b, base)
+        assert ep.px0 > 0 and not ep.entered, "entered before price moved"
+        up = base + RAW
+        b.on_book(0.02, up, 500, up + RAW, 100)          # +1 tick
+        assert ep.entered
+        assert ep.entry_px > ep.px0, "it filled at the call price"
+        assert ep.slip >= 1.0
+
+    def test_a_call_that_never_confirms_is_a_skip_not_a_loss(self):
+        base = 7_700 * 10 ** 9
+        b = self._b()
+        ep = self._call(b, base)
+        b.on_book(0.02, base, 150, base + RAW, 100)      # lapses flat
+        assert ep.hit == "skip"
+        assert ep.hit != "loss", "a trade nobody took cannot lose"
+        assert ep.result_ticks == 0.0
+        assert not ep.entered
+
+    def test_the_objective_measures_from_the_fill_not_the_call(self):
+        """Otherwise confirmation would be free, which it is not."""
+        base = 7_700 * 10 ** 9
+        b = self._b()
+        ep = self._call(b, base)
+        up1 = base + RAW
+        b.on_book(0.02, up1, 500, up1 + RAW, 100)        # fill, +1 tick
+        up4 = base + 4 * RAW
+        b.on_book(0.03, up4, 500, up4 + RAW, 100)        # +4 from CALL
+        assert ep.hit != "win", "it measured from the call, not the fill"
+        up5 = base + 5 * RAW
+        b.on_book(0.04, up5, 500, up5 + RAW, 100)        # +4 from FILL
+        assert ep.hit == "win"
+
+    def test_zero_confirmation_is_the_old_behaviour(self):
+        base = 7_700 * 10 ** 9
+        b = self._b(confirm=0.0)
+        ep = self._call(b, base)
+        assert ep.entered and ep.entry_px == ep.px0
+        assert ep.slip == 0.0
+
+
+class TestExpansionAndSpeed:
+    """Recorded on every bar, stamped on every call, gating nothing.
+
+    An imbalance of 500 in four seconds and the same 500 in four
+    minutes are one number and two different events. These say which.
+    """
+
+    def _walk(self, steps=4000, seed=11):
+        import random
+        rng = random.Random(seed)
+        b = OfiBarBuilder(tick_size=0.25, threshold=800, max_s=900.0,
+                          min_updates=2, max_bars=10 ** 7, call_level=300)
+        bid, ts = 7_700 * 10 ** 9, 0.0
+        for _ in range(steps):
+            if rng.random() < 0.25:
+                bid += RAW if rng.random() < 0.5 else -RAW
+            ts += 0.01
+            b.on_book(ts, bid, rng.randint(50, 900), bid + RAW,
+                      rng.randint(50, 900))
+        return b
+
+    def test_the_path_is_never_shorter_than_the_range(self):
+        """Price cannot get from the low to the high without covering
+        at least that much ground. If it can, the accumulator is wrong."""
+        b = self._walk()
+        assert len(b.bars) > 3
+        for bar in b.bars:
+            assert bar.path >= bar.tr - 1e-6, "path under-counted"
+
+    def test_efficiency_is_one_on_a_straight_line(self):
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 9, max_s=1e9,
+                          min_updates=2, max_bars=10 ** 7)
+        base = 7_700 * 10 ** 9
+        for k in range(10):
+            px = base + k * RAW
+            b.on_book(k * 0.01, px, 100, px + RAW, 100)
+        bar = b.live_bar
+        assert bar is not None
+        assert abs(bar.efficiency - 1.0) < 1e-9
+
+    def test_efficiency_is_zero_on_a_round_trip(self):
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 9, max_s=1e9,
+                          min_updates=2, max_bars=10 ** 7)
+        base = 7_700 * 10 ** 9
+        for n, k in enumerate((0, 1, 2, 3, 2, 1, 0)):
+            px = base + k * RAW
+            b.on_book(n * 0.01, px, 100, px + RAW, 100)
+        bar = b.live_bar
+        assert bar is not None
+        assert bar.path > 0
+        assert bar.efficiency < 1e-9, "it went nowhere and said otherwise"
+
+    def test_speed_is_distance_over_time_and_not_over_updates(self):
+        b = OfiBarBuilder(tick_size=0.25, threshold=10 ** 9, max_s=1e9,
+                          min_updates=2, max_bars=10 ** 7)
+        base = 7_700 * 10 ** 9
+        for k in range(5):
+            px = base + k * RAW
+            b.on_book(k * 1.0, px, 100, px + RAW, 100)   # 1s apart
+        bar = b.live_bar
+        assert bar is not None
+        # 4 ticks covered over 4 seconds.
+        assert abs(bar.ticks_per_sec - 1.0) < 1e-6
+        assert abs(bar.tr_ticks - 4.0) < 1e-6
+
+    def test_a_call_carries_the_bar_as_it_was_when_it_fired(self):
+        """Not as the bar finished -- the finished figures include
+        everything that happened after the call, which the call could
+        not have known."""
+        b = self._walk()
+        seen = 0
+        for bar in b.bars:
+            for e in bar.episodes:
+                seen += 1
+                assert e.atr0 <= bar.tr + 1e-6, "it used the closed bar"
+        assert seen > 0, "no calls to check"
+
+    def test_nothing_is_gated_on_speed(self):
+        import re
+        src = open("liqmap/ofibar.py").read()
+        i = src.index("def on_touch")
+        body = src[i:src.index("def on_book")]
+        for name in ("ticks_per_sec", "efficiency", "range_per_sec",
+                     "tps0", "atr0"):
+            assert not re.search(r"(if|and|or)\s[^\n]*\b" + name + r"\b",
+                                 body), f"{name} is being used as a filter"

@@ -102,7 +102,7 @@ _COLUMNS = ("target", "ts_open", "ts_close", "open", "high", "low",
             "buy_vol", "sell_vol", "trade_count",
             "trade_high", "trade_low", "trade_last",
             "call_side", "call_px", "call_ts",
-            "push_up", "push_dn", "episodes", "written_at")
+            "push_up", "push_dn", "episodes", "path", "written_at")
 
 # Columns added after the table first shipped. A CREATE TABLE IF NOT
 # EXISTS does nothing to a table that already exists, so a database
@@ -117,7 +117,8 @@ _ADDED = (("trade_high", "REAL NOT NULL DEFAULT 0"),
           ("call_ts", "REAL NOT NULL DEFAULT 0"),
           ("episodes", "TEXT NOT NULL DEFAULT ''"),
           ("push_up", "INTEGER NOT NULL DEFAULT 0"),
-          ("push_dn", "INTEGER NOT NULL DEFAULT 0"))
+          ("push_dn", "INTEGER NOT NULL DEFAULT 0"),
+          ("path", "REAL NOT NULL DEFAULT 0"))
 
 
 def _row_of(target: int, b: OfiBar, now: float) -> tuple:
@@ -130,7 +131,8 @@ def _row_of(target: int, b: OfiBar, now: float) -> tuple:
             float(b.buy_vol), float(b.sell_vol), int(b.trade_count),
             float(b.trade_high), float(b.trade_low), float(b.trade_last),
             str(b.call_side or ""), float(b.call_px), float(b.call_ts),
-            int(b.push_up), int(b.push_dn), _eps_out(b), float(now))
+            int(b.push_up), int(b.push_dn), _eps_out(b),
+            float(getattr(b, "path", 0.0) or 0.0), float(now))
 
 
 def _eps_out(b: OfiBar) -> str:
@@ -165,11 +167,17 @@ def _eps_in(raw) -> list:
             first = {int(k): v for k, v in (d.get("first") or {}).items()}
             out.append(Episode(
                 side=str(d.get("side", "")),
+                rule=str(d.get("rule", "") or ""),
                 level=int(d.get("level", 0) or 0),
                 px0=float(d.get("px0", 0.0)),
                 ts0=float(d.get("ts0", 0.0)),
                 px_end=float(d.get("px_end", 0.0)),
                 ts_end=float(d.get("ts_end", 0.0)),
+                took=bool(d.get("took", False)),
+                entry_px=float(d.get("entry_px", 0.0) or 0.0),
+                entry_ts=float(d.get("entry_ts", 0.0) or 0.0),
+                atr0=float(d.get("atr0", 0.0) or 0.0),
+                tps0=float(d.get("tps0", 0.0) or 0.0),
                 updates=int(d.get("updates", 0)),
                 mfe=float(d.get("mfe", 0.0)), mae=float(d.get("mae", 0.0)),
                 end=str(d.get("end", "")),
@@ -210,6 +218,7 @@ def _bar_of(r: sqlite3.Row) -> OfiBar:
                   call_ts=_opt(r, "call_ts"),
                   push_up=int(_opt(r, "push_up")),
                   push_dn=int(_opt(r, "push_dn")),
+                  path=_opt(r, "path"),
                   episodes=_eps_in(_txt(r, "episodes")))
 
 

@@ -294,3 +294,70 @@ class TestItDecidesNothing:
         assert "nothing here predicts" in src
         for w in ("will rise", "will fall", "buy signal", "sell signal"):
             assert w not in src, w
+
+
+class TestTheTallyWithNoStop:
+    """A win rate on its own cannot say whether a stopless rule makes
+    money, because the losses have no fixed size. These check that the
+    numbers that CAN say it are present and right."""
+
+    def _eps(self, *specs):
+        """(hit, entry, exit) -> episodes, up-side, entry below exit."""
+        from liqmap.ofibar import Episode, RAW_TICK
+
+        class Bar:
+            def __init__(self, eps):
+                self.episodes = eps
+        out = []
+        for hit, entry, px in specs:
+            e = Episode(side="up", rule="r", level=500,
+                        px0=entry * RAW_TICK, ts0=0.0,
+                        px_end=px * RAW_TICK, ts_end=1.0,
+                        took=hit != "skip",
+                        entry_px=entry * RAW_TICK if hit != "skip" else 0.0,
+                        hit=hit, hit_px=px * RAW_TICK)
+            out.append(e)
+        return [Bar(out)]
+
+    def test_a_skip_is_not_a_loss(self):
+        bars = self._eps(("win", 0, 4), ("skip", 0, 0))
+        t = A.observation_table(bars, points=(1,), level=500, rule="r")
+        assert t["won"] == 1 and t["failed"] == 0
+        assert t["skipped"] == 1
+        assert t["settled"] == 1, "the skip was settled against the rule"
+        assert t["win_rate"] == 1.0
+
+    def test_the_loss_size_is_reported_not_assumed(self):
+        bars = self._eps(("win", 0, 4), ("loss", 0, -9))
+        t = A.observation_table(bars, points=(1,), level=500, rule="r")
+        assert t["avg_win_ticks"] == 4.0
+        assert t["avg_loss_ticks"] == -9.0
+        assert t["net_ticks"] == -5.0
+        assert t["win_rate"] == 0.5
+
+    def test_a_good_rate_can_still_be_a_losing_rule(self):
+        """The exact failure the win rate hides: eleven four-tick wins
+        against one nine-tick loss is 92% and loses money per trade
+        only once costs are in -- and the net is what shows it."""
+        specs = [("win", 0, 4)] * 11 + [("loss", 0, -45)]
+        t = A.observation_table(self._eps(*specs), points=(1,),
+                                level=500, rule="r")
+        assert t["win_rate"] > 0.9
+        assert t["net_ticks"] < 0, "a 92% rate reported as profitable"
+        assert t["net_per_trade"] < 0
+
+    def test_confirmation_slip_is_charged_and_shown(self):
+        from liqmap.ofibar import Episode, RAW_TICK
+
+        class Bar:
+            episodes: list
+        b = Bar()
+        b.episodes = [Episode(side="up", rule="r", level=500,
+                              px0=0.0, px_end=4 * RAW_TICK,
+                              took=True, entry_px=1 * RAW_TICK,
+                              hit="win", hit_px=5 * RAW_TICK)]
+        t = A.observation_table([b], points=(1,), level=500, rule="r")
+        assert t["avg_slip_ticks"] == 1.0
+        # And the win is measured from the FILL, so it is four ticks
+        # from 1 to 5 -- not five from the call.
+        assert t["avg_win_ticks"] == 4.0

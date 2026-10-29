@@ -251,7 +251,8 @@ def summary(bars, horizons=HORIZONS, tick: float = 1.0,
 
 # ------------------------------------------- observations inside the bar
 
-def observations(bars, level: int | None = None) -> list:
+def observations(bars, level: int | None = None,
+                 rule: str | None = None) -> list:
     """Every observation across these bars, oldest first.
 
     An observation is one stretch during which the running imbalance
@@ -264,13 +265,30 @@ def observations(bars, level: int | None = None) -> list:
     out = []
     for b in bars:
         for e in (getattr(b, "episodes", ()) or ()):
-            if level is None or getattr(e, "level", 0) == level:
-                out.append(e)
+            if level is not None and getattr(e, "level", 0) != level:
+                continue
+            if rule is not None and getattr(e, "rule", "") != rule:
+                continue
+            out.append(e)
     return out
 
 
+def stale(bars, level: int | None = None, rule: str | None = None) -> int:
+    """Observations left out of the tally, and why it matters.
+
+    Stored observations outlive the rule that made them. A tally that
+    silently drops them reports a number that shrinks with no
+    explanation, which is worse than a wrong one.
+    """
+    total = 0
+    for b in bars:
+        total += len(getattr(b, "episodes", ()) or ())
+    return total - len(observations(bars, level, rule))
+
+
 def observation_table(bars, points=(1, 2, 3, 4),
-                      level: int | None = None) -> dict:
+                      level: int | None = None,
+                      rule: str | None = None) -> dict:
     """Win, loss and unresolved at each distance, plus how it behaved.
 
     UNRESOLVED IS NOT A DRAW AND IT IS NOT A LOSS. It means the bar
@@ -284,7 +302,7 @@ def observation_table(bars, points=(1, 2, 3, 4),
     median is three the table below it is not measuring the rule -- it
     is measuring a gate that is set too low.
     """
-    eps = observations(bars, level)
+    eps = observations(bars, level, rule)
     n_bars = len(bars)
     rows = []
     for pts in points:
@@ -298,13 +316,39 @@ def observation_table(bars, points=(1, 2, 3, 4),
             "pct_of_decided": round(win / dec, 4) if dec else 0.0,
             "pct_resolved": round(dec / len(eps), 4) if eps else 0.0,
         })
-    # THE TALLY, at the objective. Three outcomes and none of them is
-    # "it drifted": it made the point, it lost the same distance
-    # first, or the bar ended before either. The third is not a loss
-    # and is never counted as one.
+    # THE TALLY, at the objective. Four outcomes, and three of them
+    # are not losses:
+    #
+    #   won     made the point from the fill
+    #   failed  the call lapsed first -- and it cost whatever price
+    #           had done by then, which is `lost_ticks` below
+    #   skipped price never confirmed, so NO TRADE WAS TAKEN. Counting
+    #           these as losses would charge the rule for trades it
+    #           declined; counting them as wins is worse.
+    #   open    the bar ended underneath a live trade
     won = sum(1 for e in eps if getattr(e, "hit", "") == "win")
     failed = sum(1 for e in eps if getattr(e, "hit", "") == "loss")
+    skipped = sum(1 for e in eps if getattr(e, "hit", "") == "skip")
     settled = won + failed
+
+    # WHAT THE WINNERS MADE AND WHAT THE LOSERS COST, in ticks. With
+    # no stop the losses have no fixed size, so the win rate on its
+    # own cannot say whether this makes money: eleven wins of four
+    # ticks against one loss of nine is a losing rule with a 92% hit
+    # rate. These two numbers are the ones that decide it, and they
+    # are reported next to the rate rather than underneath it.
+    w_ticks = [e.result_ticks for e in eps
+               if getattr(e, "hit", "") == "win"]
+    l_ticks = [e.result_ticks for e in eps
+               if getattr(e, "hit", "") == "loss"]
+    net = sum(w_ticks) + sum(l_ticks)
+
+    def _avg(xs):
+        return round(sum(xs) / len(xs), 3) if xs else 0.0
+
+    # Ticks given up waiting for confirmation, averaged over the
+    # trades that were actually taken. It is the price of the filter.
+    slips = [e.slip for e in eps if getattr(e, "entered", False)]
 
     ups = sorted(e.updates for e in eps)
     ends: dict = {}
@@ -313,15 +357,24 @@ def observation_table(bars, points=(1, 2, 3, 4),
     return {
         "bars": n_bars, "observations": len(eps),
         "per_bar": round(len(eps) / n_bars, 2) if n_bars else 0.0,
-        "level": level,
+        "level": level, "rule": rule,
+        "left_out": stale(bars, level, rule),
         "silent_bars": sum(
             1 for b in bars
             if not [e for e in (getattr(b, "episodes", ()) or ())
-                    if level is None or getattr(e, "level", 0) == level]),
-        "won": won, "failed": failed,
-        "open_at_close": len(eps) - settled,
+                    if (level is None or getattr(e, "level", 0) == level)
+                    and (rule is None or getattr(e, "rule", "") == rule)]),
+        "won": won, "failed": failed, "skipped": skipped,
+        "open_at_close": len(eps) - settled - skipped,
         "settled": settled,
         "win_rate": round(won / settled, 4) if settled else 0.0,
+        # The figures that decide it. `net_ticks` is the whole claim
+        # in one number; the two averages say how it got there.
+        "avg_win_ticks": _avg(w_ticks),
+        "avg_loss_ticks": _avg(l_ticks),
+        "net_ticks": round(net, 2),
+        "net_per_trade": round(net / settled, 3) if settled else 0.0,
+        "avg_slip_ticks": _avg(slips),
         "median_updates": ups[len(ups) // 2] if ups else 0,
         "ends": ends,
         "up": sum(1 for e in eps if e.side == UP),

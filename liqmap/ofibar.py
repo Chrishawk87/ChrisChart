@@ -120,6 +120,22 @@ PAI_SELL = 0.30
 # sides carry that the net does not is the size of the fight behind it.
 
 
+# WHICH RULE MADE AN OBSERVATION.
+#
+# Stored observations outlive the rule that made them. An episode
+# written by the OFI-and-delta agreement, or by the latched call, is
+# still on disk and still has a level on it, and a tally that counts
+# it is reporting on a strategy that no longer exists.
+#
+# So every observation is stamped, the tally filters on the stamp,
+# and the ones left out are COUNTED AND REPORTED rather than silently
+# dropped -- a number that quietly shrinks is worse than one that is
+# wrong, because nothing on screen says it moved.
+#
+# Bump this whenever the entry rule changes meaning.
+CALL_RULE = "imb-confirm-v2"
+
+
 # THE CALL LEVEL, in contracts of running imbalance.
 #
 # The imbalance is the signal, on its own. At +500 the call is up, at
@@ -139,14 +155,43 @@ CALL_LEVEL = 500
 # One ES point in raw feed units. A point is four ticks.
 POINT = 1_000_000_000
 
+# One tick, derived rather than stated, so the two can never disagree.
+RAW_TICK = POINT // 4
+
 # The win/lose distances an observation is scored at, in points.
 OUTCOME_POINTS: tuple[int, ...] = (1, 2, 3, 4)
 
-# THE OBJECTIVE. One point is four ticks on ES, and the same distance
-# the other way is a failure -- so every call resolves one of three
-# ways and none of them is "it drifted". The price it resolved at is
-# recorded, because that is where the mark goes on the chart.
+# THE OBJECTIVE, AND THE ONLY TWO WAYS OUT.
+#
+#     WIN   price made the objective from the entry
+#     LOSS  the call went back to no-call before it got there
+#
+# THERE IS NO STOP. The old rule failed a trade at one point against,
+# whether or not the call was still live, and that is a different
+# strategy: it closed trades the signal had not given up on, and it
+# left trades open that the signal had. The signal is the imbalance,
+# so the signal is what ends the trade.
+#
+# This cuts both ways and the measurement has to say so. Without a
+# stop, the loss has NO FIXED SIZE -- it is however far price got
+# while the call was dying. Eleven wins of four ticks and one loss of
+# nine is not a winning rule, so the tick count on the losers is the
+# figure that decides this, not the win rate. It is recorded on every
+# losing call for exactly that reason.
 OBJECTIVE_POINTS = 1.0
+
+# CONFIRMATION BEFORE ENTRY.
+#
+# The call fires on the imbalance; the trade waits until price has
+# actually gone that way by this many ticks. It costs those ticks on
+# every trade taken and skips the calls that fire into a turn -- the
+# ones entered "right before price reverses".
+#
+# A call that lapses before price ever confirms is NOT A LOSS. No
+# trade was taken. It is counted separately as a skip, because
+# folding skips into losses understates the rule and folding them
+# into wins is worse.
+CONFIRM_TICKS = 1
 
 # Most observations a single bar may hold.
 MAX_EPISODES = 64
@@ -158,20 +203,37 @@ BURST_S = 0.005
 
 @dataclass(slots=True)
 class Episode:
-    """One stretch of the bar during which the call held one direction.
+    """One call, and what happened to the trade it asked for.
 
-    Starts the moment imbalance and delta agree, ends when they stop
-    agreeing, when they agree the OTHER way, or when the bar closes --
-    whichever comes first. Nothing outlives its bar.
+    The call starts when the imbalance crosses the level and ends when
+    it comes back through it, goes straight through to the other side,
+    or the bar closes -- whichever comes first. Nothing outlives its
+    bar.
+
+    THE CALL AND THE TRADE ARE NOT THE SAME EVENT.
+
+        px0 / ts0          where the CALL fired. The arrow goes here.
+        entry_px/entry_ts  where the TRADE was taken -- the first
+                           update at which price had moved
+                           CONFIRM_TICKS the call's way. Everything is
+                           measured from here, because this is the
+                           first price that could actually have been
+                           had.
+
+    A call that lapses before price ever confirms produced no trade at
+    all, and is recorded as a skip rather than a loss.
 
     `first` records, for each distance in OUTCOME_POINTS, whether price
-    got that far the call's way BEFORE it got that far against it.
-    Recorded as it happens rather than worked out afterwards from the
-    high and the low, because a high and a low cannot say which came
-    first and that is the entire question.
+    got that far the call's way before the call lapsed. Recorded as it
+    happens rather than worked out afterwards from the high and the
+    low, because a high and a low cannot say which came first and that
+    is the entire question.
     """
 
     side: str = ""              # "up" or "down"
+    # Which entry rule made it. Empty means an older build, whose
+    # observations describe a strategy that no longer exists.
+    rule: str = ""
     # The level this observation was made at. Recorded because the
     # level can be changed while the service runs, and a table that
     # mixed observations from two levels would be a measurement of
@@ -189,11 +251,27 @@ class Episode:
     # "bar"      -- the bar closed under it
     end: str = ""
     first: dict = field(default_factory=dict)   # points -> "win" | "loss"
-    # Where it resolved against the objective: "win" at the objective
-    # distance, "loss" at the same distance the other way, empty if
-    # the bar ended before either. `hit_px` is the mid at that moment
-    # -- the truth, not the target price, so a move that gapped past
-    # the objective shows where it actually was.
+    # Where the trade was taken. `took` is the flag rather than a
+    # price of zero, because a price is a measurement and a sentinel
+    # is not -- and the one place they get confused is the one place
+    # it matters.
+    took: bool = False
+    entry_px: float = 0.0
+    entry_ts: float = 0.0
+    # The bar's expansion and speed at the instant the call fired, so
+    # the winners and the losers can be compared on them later. Carried
+    # only; nothing here is gated on them.
+    atr0: float = 0.0           # intrabar true range so far, raw units
+    tps0: float = 0.0           # ticks per second so far
+    # HOW IT ENDED, one of four:
+    #   "win"   made the objective from the entry
+    #   "loss"  the call lapsed after entry, before the objective
+    #   "skip"  the call lapsed before price ever confirmed -- NO
+    #           TRADE WAS TAKEN, and this is not a loss
+    #   ""      the bar closed with the trade still live
+    # `hit_px` is the mid at that moment -- the truth, not the target
+    # price, so a move that gapped past the objective shows where it
+    # actually was.
     hit: str = ""
     hit_px: float = 0.0
     hit_ts: float = 0.0
@@ -203,10 +281,45 @@ class Episode:
         return self.ts_end - self.ts0
 
     @property
+    def entered(self) -> bool:
+        """Whether price ever confirmed and a trade was taken."""
+        return self.took
+
+    @property
     def move(self) -> float:
-        """Where it finished, the call's way, in raw units."""
+        """Where the CALL finished, its way, in raw units."""
         d = self.px_end - self.px0
         return d if self.side == "up" else -d
+
+    @property
+    def result(self) -> float:
+        """What the TRADE made, the call's way, in raw units.
+
+        Zero on a skip, because there was no trade. On a win it is
+        measured to the price the objective was reached at, not to the
+        objective itself -- a gap through it is worth what it was
+        worth. On a loss it is measured to where the call lapsed,
+        which is the whole point of the rule: the loss has no fixed
+        size and this is the number that says what it cost.
+        """
+        if not self.entered:
+            return 0.0
+        end = self.hit_px if self.hit in ("win", "loss") else self.px_end
+        d = end - self.entry_px
+        return d if self.side == "up" else -d
+
+    @property
+    def result_ticks(self) -> float:
+        return self.result / RAW_TICK
+
+    @property
+    def slip(self) -> float:
+        """Ticks given up waiting for confirmation."""
+        if not self.entered:
+            return 0.0
+        d = self.entry_px - self.px0
+        fav = d if self.side == "up" else -d
+        return fav / RAW_TICK
 
     def outcome(self, points: int) -> str:
         """win / loss / unresolved at a given distance."""
@@ -214,13 +327,16 @@ class Episode:
 
     @property
     def resolved(self) -> str:
-        """win / loss / unresolved at the objective."""
+        """win / loss / skip / unresolved at the objective."""
         return self.hit or "unresolved"
 
     def as_dict(self) -> dict:
-        return {"side": self.side, "level": self.level,
+        return {"side": self.side, "rule": self.rule, "level": self.level,
                 "px0": self.px0, "ts0": self.ts0,
                 "px_end": self.px_end, "ts_end": self.ts_end,
+                "took": self.took,
+                "entry_px": self.entry_px, "entry_ts": self.entry_ts,
+                "atr0": self.atr0, "tps0": self.tps0,
                 "updates": self.updates, "mfe": self.mfe, "mae": self.mae,
                 "end": self.end, "hit": self.hit,
                 "hit_px": self.hit_px, "hit_ts": self.hit_ts,
@@ -278,6 +394,11 @@ class OfiBar:
     call_side: str = ""
     call_px: float = 0.0
     call_ts: float = 0.0
+    # TOTAL DISTANCE THE MID COVERED, summed step by step. Not the
+    # range: a bar that went up two points and came back covered four
+    # and ranged two. The two together say whether the movement went
+    # anywhere, which the range alone cannot.
+    path: float = 0.0
     # Every observation inside this bar, oldest first. A bar where the
     # call reversed has two; one where it never fired has none.
     episodes: list = field(default_factory=list)
@@ -285,6 +406,51 @@ class OfiBar:
     @property
     def seconds(self) -> float:
         return self.ts_close - self.ts_open
+
+    # ---- MICROSTRUCTURE: EXPANSION AND SPEED -------------------------
+    #
+    # An imbalance of 500 in four seconds and an imbalance of 500 in
+    # four minutes are the same number and not the same event. These
+    # say which one it was. NOTHING IS GATED ON THEM -- they are
+    # recorded on every bar and stamped onto every call so that the
+    # winners and losers can be compared on them, which has to happen
+    # before any of it is used to filter anything.
+
+    @property
+    def tr(self) -> float:
+        """Intrabar true range, raw units. High minus low, this bar."""
+        return self.high - self.low
+
+    @property
+    def tr_ticks(self) -> float:
+        return self.tr / RAW_TICK
+
+    @property
+    def path_ticks(self) -> float:
+        return self.path / RAW_TICK
+
+    @property
+    def ticks_per_sec(self) -> float:
+        """Speed: ticks of distance covered per second."""
+        s = self.seconds
+        return (self.path_ticks / s) if s > 0 else 0.0
+
+    @property
+    def range_per_sec(self) -> float:
+        """Expansion rate: ticks of RANGE opened per second."""
+        s = self.seconds
+        return (self.tr_ticks / s) if s > 0 else 0.0
+
+    @property
+    def efficiency(self) -> float:
+        """How much of the distance covered went somewhere. 0..1.
+
+        |close - open| over the path. 1.0 is a straight line; 0.1 is
+        a bar that worked hard and arrived back where it started. The
+        same imbalance means something different at each end of that,
+        which is the reason to have it.
+        """
+        return (abs(self.close - self.open) / self.path) if self.path else 0.0
 
     @property
     def strength(self) -> int:
@@ -468,6 +634,12 @@ class OfiBar:
                 "call_side": self.call_side,
                 "call_px": self.call_px,
                 "call_ts": self.call_ts,
+                "path": self.path,
+                "tr_ticks": round(self.tr_ticks, 4),
+                "path_ticks": round(self.path_ticks, 4),
+                "ticks_per_sec": round(self.ticks_per_sec, 4),
+                "range_per_sec": round(self.range_per_sec, 4),
+                "efficiency": round(self.efficiency, 4),
                 "seconds": round(self.seconds, 6)}
 
 
@@ -491,13 +663,15 @@ class OfiBarBuilder:
                  "_buy_vol", "_sell_vol", "_trades",
                  "_t_hi", "_t_lo", "_t_last",
                  "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
-                 "_level", "_obj", "_ep", "_eps", "_meas", "_pu", "_pd")
+                 "_level", "_obj", "_confirm", "_ep", "_eps", "_meas",
+                 "_pu", "_pd")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
                  max_bars: int = 20_000,
                  call_level: int = CALL_LEVEL,
-                 objective_points: float = OBJECTIVE_POINTS) -> None:
+                 objective_points: float = OBJECTIVE_POINTS,
+                 confirm_ticks: float = CONFIRM_TICKS) -> None:
         if tick_size <= 0:
             raise ValueError("tick_size must be positive")
         if threshold < 1:
@@ -562,17 +736,19 @@ class OfiBarBuilder:
         # same rule means the same thing on every rung of the ladder.
         self._level = max(1, int(call_level))
         self._obj = max(1.0, float(objective_points) * POINT)
+        # How far price must go the call's way before the trade is
+        # taken. Zero means take it at the call, which is what it did
+        # before and is still reachable by passing zero.
+        self._confirm = max(0.0, float(confirm_ticks)) * RAW_TICK
         # Both sides of the imbalance for the bar in progress.
         self._pu = 0
         self._pd = 0
         self._ep: Episode | None = None
         self._eps: list = []
-        # Observations still being MEASURED. A call can lapse -- the
-        # imbalance comes back inside the band -- long before price has
-        # gone anywhere, and the question being asked is what happened
-        # to the TRADE, not to the call. So the objective keeps being
-        # tracked until the bar closes, while `end` still records when
-        # the call itself stopped.
+        # The observation still being MEASURED -- a list, but it holds
+        # at most one. A trade ends when it makes the objective or
+        # when the call that asked for it lapses, and both of those
+        # take it out of here, so there is never a second one waiting.
         self._meas: list = []
 
     def reset(self) -> None:
@@ -695,6 +871,31 @@ class OfiBarBuilder:
         return list(self._eps)
 
     @property
+    def live_bar(self) -> OfiBar | None:
+        """The bar in progress. Read-only by convention, not by force.
+
+        The panel needs the running expansion and speed, and every
+        one of those is a property of OfiBar already -- a second copy
+        of each as a `live_` accessor would be four more things that
+        can disagree with the four that exist.
+        """
+        return self._bar
+
+    @property
+    def live_speed(self) -> dict:
+        """Expansion and speed of the bar in progress, for the panel.
+
+        Ticks, not raw units, because this one is read by a person.
+        """
+        bar = self._bar
+        if bar is None:
+            return {"tr": 0.0, "path": 0.0, "tps": 0.0, "rps": 0.0,
+                    "eff": 0.0, "secs": 0.0}
+        return {"tr": bar.tr_ticks, "path": bar.path_ticks,
+                "tps": bar.ticks_per_sec, "rps": bar.range_per_sec,
+                "eff": bar.efficiency, "secs": bar.seconds}
+
+    @property
     def live_traded(self) -> tuple[float, float, float]:
         """Traded high, low and last of the bar in progress.
 
@@ -799,6 +1000,18 @@ class OfiBarBuilder:
             bar = self._bar
             assert bar is not None
 
+        # DISTANCE COVERED, before `close` is overwritten with the new
+        # mid. The sum of every step the mid took, which is not the
+        # same as the range: a bar that went up two points and came
+        # back covered four and ranged two, and the gap between those
+        # two numbers is what `efficiency` reports.
+        # `bar.close` holds the PREVIOUS mid until the line below
+        # overwrites it, and on the bar's first update it holds the
+        # opening mid -- so there is no update to skip and no guard
+        # here. A guard was the bug: it dropped the open-to-first-tick
+        # step, which made the path come out shorter than the range on
+        # bars that only went one way.
+        bar.path += abs(mid - bar.close)
         bar.updates += 1
         if mid > bar.high:
             bar.high = mid
@@ -820,6 +1033,14 @@ class OfiBarBuilder:
         # DELTA DOES NOT GATE THIS. It is still measured, still drawn
         # and still carried in the data -- it is simply not part of
         # the trigger.
+        # PRICE IS MEASURED BEFORE THE CALL IS RE-EVALUATED, and the
+        # order matters on exactly one update: the one where price
+        # reaches the objective and the imbalance comes back through
+        # the level at the same instant. A resting order at the
+        # objective is filled by the price, not by the book update
+        # that followed it, so the win is taken first.
+        if self._meas:
+            self._track(ts, mid)
         _side = ""
         if self._acc >= self._level:
             _side = "up"
@@ -832,11 +1053,6 @@ class OfiBarBuilder:
             self._c_ts = ts if _side else 0.0
             if _side:
                 self._start_episode(_side, ts, mid)
-        # Measured whether or not the call is still live: the
-        # objective is a fact about the trade, and a call that lapsed
-        # with price unmoved has not resolved either way.
-        if self._meas:
-            self._track(ts, mid)
         if self._acc > bar.ofi_high:
             bar.ofi_high = self._acc
         if self._acc < bar.ofi_low:
@@ -877,56 +1093,133 @@ class OfiBarBuilder:
         if len(self._eps) >= MAX_EPISODES:
             self._ep = None
             return
-        ep = Episode(side=side, level=self._level, px0=mid, ts0=ts,
-                     px_end=mid, ts_end=ts)
+        # What the bar looked like at the instant the call fired, so a
+        # losing call can be asked afterwards whether it fired into a
+        # bar that was expanding or one that was grinding. Taken from
+        # the bar in progress, not the finished one -- the finished
+        # figures include everything that happened AFTER the call,
+        # which the call could not have known.
+        bar = self._bar
+        atr0 = tps0 = 0.0
+        if bar is not None:
+            atr0 = bar.high - bar.low
+            el = ts - bar.ts_open
+            if el > 0:
+                tps0 = (bar.path / RAW_TICK) / el
+        ep = Episode(side=side, rule=CALL_RULE, level=self._level,
+                     px0=mid, ts0=ts, px_end=mid, ts_end=ts,
+                     atr0=atr0, tps0=tps0)
+        if self._confirm <= 0:
+            # No confirmation asked for: the trade is the call, taken
+            # at the call price, and there is nothing to wait for.
+            ep.took = True
+            ep.entry_px = mid
+            ep.entry_ts = ts
         self._eps.append(ep)
         self._meas.append(ep)
         self._ep = ep
 
     def _end_episode(self, why: str, ts: float, mid: float) -> None:
+        """The call stopped. THIS IS ALSO HOW A TRADE LOSES.
+
+        There is no stop distance. A trade ends badly when the thing
+        that asked for it stops asking -- the imbalance comes back
+        through the level, or goes through to the other side. What
+        that cost is whatever price had done by then, which is why
+        `hit_px` is recorded here and not assumed.
+
+        The bar closing is NOT a loss. It is the bar ending underneath
+        a trade that had not resolved either way, and calling that a
+        loss would charge the rule for something it never did.
+        """
         ep = self._ep
         if ep is None:
             return
         ep.end = why
         ep.px_end = mid
         ep.ts_end = ts
+        if not ep.hit:
+            if not ep.entered:
+                # Price never confirmed. No trade was taken, so there
+                # is nothing to win or lose.
+                ep.hit = "skip"
+                ep.hit_px = mid
+                ep.hit_ts = ts
+            elif why in ("reversal", "flip"):
+                ep.hit = "loss"
+                ep.hit_px = mid
+                ep.hit_ts = ts
+            # why == "bar": live when the bar ended. Stays unresolved.
+        if ep.entered and why != "bar":
+            # The call is over, so every distance it never reached is
+            # a loss at that distance. On a bar end they stay
+            # unresolved instead: the bar ran out, the call did not.
+            for pts in OUTCOME_POINTS:
+                ep.first.setdefault(pts, "loss")
+        # Resolved or not, it stops being measured: the call is over
+        # and nothing outlives it.
+        self._meas = [e for e in self._meas if e is not ep]
         self._ep = None
 
     def _track(self, ts: float, mid: float) -> None:
+        """Wait for confirmation, then measure to the objective.
+
+        A WIN CLOSES THE TRADE. It reaches the objective, the price it
+        reached it at is recorded, and it stops being measured -- it
+        does not carry on and get re-decided by what price did
+        afterwards. That was the complaint and it was a fair one: a
+        trade that made its point and then gave it back was being
+        shown giving it back, which is not what the trade did.
+        """
         live = self._ep
+        if live is not None:
+            # `updates` measures the CALL, not the trade, because it
+            # is what says whether the level is set too low.
+            live.updates += 1
+            live.px_end = mid
+            live.ts_end = ts
+        if not self._meas:
+            return
         for ep in self._meas:
-            if ep is live:
-                # `updates` measures the CALL, not the trade, because
-                # it is what says whether the level is set too low.
-                ep.updates += 1
-                ep.px_end = mid
-                ep.ts_end = ts
-            d = mid - ep.px0
+            if not ep.entered:
+                # CONFIRMATION. Nothing is measured until price has
+                # gone the call's way by CONFIRM_TICKS, and the fill
+                # is the mid at that update -- not the confirmation
+                # price, because a gap through it was not available.
+                d = mid - ep.px0
+                if (d if ep.side == "up" else -d) < self._confirm:
+                    continue
+                ep.took = True
+                ep.entry_px = mid
+                ep.entry_ts = ts
+            d = mid - ep.entry_px
             fav = d if ep.side == "up" else -d
             adv = -fav
             if fav > ep.mfe:
                 ep.mfe = fav
             if adv > ep.mae:
                 ep.mae = adv
-            # THE OBJECTIVE, AND WHERE IT RESOLVED. Four ticks either
-            # way from the call price, first one wins, and the mid at
-            # that instant is kept because that is where the mark goes.
-            if not ep.hit:
-                if fav >= self._obj:
-                    ep.hit, ep.hit_px, ep.hit_ts = "win", mid, ts
-                elif adv >= self._obj:
-                    ep.hit, ep.hit_px, ep.hit_ts = "loss", mid, ts
-            # WHICH CAME FIRST, recorded as it happens. A high and a
-            # low cannot say which of them was reached first, and that
-            # is the entire question being asked.
+            # THE OBJECTIVE. One point from the entry, and the mid at
+            # that instant is kept because that is where the mark
+            # goes. There is no losing distance here -- a trade loses
+            # when the call lapses, which `_end_episode` handles.
+            # THE TRADE CLOSES AT THE FIRST TOUCH AND STAYS CLOSED.
+            # `hit` and `hit_px` latch here and nothing later moves
+            # them, so a trade that made its point and then gave it
+            # back is recorded as having made its point -- which is
+            # what it did. That was the complaint, and it was right.
+            if not ep.hit and fav >= self._obj:
+                ep.hit, ep.hit_px, ep.hit_ts = "win", mid, ts
+            # The OTHER distances keep being read after the objective
+            # has been taken, because this table answers a different
+            # question -- what a two- or four-point objective would
+            # have done on the same calls. It changes nothing about
+            # the trade above.
             for pts in OUTCOME_POINTS:
                 if pts in ep.first:
                     continue
-                need = pts * POINT
-                if fav >= need:
+                if fav >= pts * POINT:
                     ep.first[pts] = "win"
-                elif adv >= need:
-                    ep.first[pts] = "loss"
 
     def _close(self, direction: str, ts: float, mid: float) -> OfiBar:
         bar = self._bar
