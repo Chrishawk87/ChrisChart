@@ -166,14 +166,16 @@ class ImbSim:
     """One entry level, one exit rule, one direction convention."""
 
     __slots__ = ("level", "target", "policy", "flip", "min_share",
-                 "confirm", "skipped", "trades", "bar", "_side", "_t",
+                 "confirm", "max_calls", "skipped", "trades", "bar",
+                 "_calls", "_side", "_t",
                  "_armed_up", "_armed_down", "_per_bar", "_share",
                  "_gross", "_call_side", "_call_px", "_call_ts")
 
     def __init__(self, level: int, target_points: float = TARGET_POINTS,
                  policy: str = HOLD, flip: bool = False,
                  min_share: float = 0.0,
-                 confirm_ticks: float = 0.0) -> None:
+                 confirm_ticks: float = 0.0,
+                 max_calls: int = 0) -> None:
         if level < 1:
             raise ValueError("level must be at least 1")
         if target_points <= 0:
@@ -196,6 +198,14 @@ class ImbSim:
         # counted in `skipped` and never lands in `trades`, because a
         # trade nobody took cannot win or lose.
         self.confirm = max(0.0, float(confirm_ticks)) * (POINT / 4.0)
+        # ONE CALL PER CANDLE, when set. The imbalance crossing the
+        # level twenty times is one push; counting it as twenty
+        # trades measures how finely it oscillates around a line.
+        # Counts CALLS, not fills -- counting fills lets a candle keep
+        # trying after each unconfirmed call, which is a cap in name
+        # only.
+        self.max_calls = max(0, int(max_calls))
+        self._calls = 0
         self.skipped = 0
         self._call_side = ""
         self._call_px = 0.0
@@ -267,11 +277,15 @@ class ImbSim:
                     self.skipped += 1
                     self._call_side = ""
                 return
+            if self.max_calls and self._calls >= self.max_calls:
+                return
             if self.confirm <= 0:
+                self._calls += 1
                 self._open(want, ts, mid, acc, mid, ts)
                 return
             if self._call_side != want:
                 # A fresh call. Note where it fired and wait.
+                self._calls += 1
                 self._call_side = want
                 self._call_px = mid
                 self._call_ts = ts
@@ -288,6 +302,8 @@ class ImbSim:
             self._close("bar", ts, px)
         self._per_bar.append(self.bar)
         self.bar = 0
+        self._calls = 0
+        self._call_side = ""
 
     # -- internals -------------------------------------------------------
 
@@ -400,6 +416,7 @@ class Sweep:
     # these; the sweep runs all of them on the same tape so the choice
     # can be checked rather than argued about.
     confirms: tuple = (0.0,)
+    max_calls: int = 0
     sims: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -410,7 +427,7 @@ class Sweep:
                         for flip in (False, True):
                             self.sims[(lv, pol, cf, flip)] = ImbSim(
                                 lv, self.target_points, pol, flip,
-                                self.min_share, cf)
+                                self.min_share, cf, self.max_calls)
 
     def tick(self, ts: float, acc: int, mid: float,
              share: float = 0.5, gross: int = 0) -> None:

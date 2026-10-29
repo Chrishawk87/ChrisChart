@@ -478,3 +478,54 @@ class TestConfirmationInTheSimulation:
         for s in (a, b):
             s.tick(0.0, 200, 1000 * self.RAW)
             assert s._t is None, "one of them entered at the call"
+
+
+class TestTheCandleCapInTheSimulation:
+    """The sweep has to cap the same way the chart does, or it is
+    validating a strategy nobody is running."""
+
+    RAW = 250_000_000
+
+    def _sim(self, cap=1, confirm=0.0, level=100):
+        return ImbSim(level=level, target_points=1.0, policy=BAND,
+                      confirm_ticks=confirm, max_calls=cap)
+
+    def _chatter(self, s, n=6):
+        """Cross the level, fall back inside, repeat."""
+        t = 0.0
+        for _ in range(n):
+            s.tick(t, 200, 1000 * self.RAW)
+            t += 0.01
+            s.tick(t, 10, 1000 * self.RAW)
+            t += 0.01
+
+    def test_one_push_is_not_twenty_trades(self):
+        s = self._sim()
+        self._chatter(s)
+        assert len(s.trades) <= 1, f"{len(s.trades)} trades from one push"
+
+    def test_uncapped_takes_them_all(self):
+        """The control. If this did not chatter, the test above would
+        be proving nothing."""
+        s = self._sim(cap=0)
+        self._chatter(s)
+        assert len(s.trades) > 1
+
+    def test_the_cap_resets_with_the_candle(self):
+        s = self._sim()
+        self._chatter(s, n=3)
+        first = len(s.trades)
+        s.bar_close(9.0, 1000 * self.RAW)
+        self._chatter(s, n=3)
+        assert len(s.trades) > first, "the next candle got no call"
+
+    def test_an_unconfirmed_call_still_spends_the_candle(self):
+        """Counting fills instead of calls lets a candle keep trying
+        after every unconfirmed call, which is a cap in name only."""
+        s = self._sim(confirm=1.0)
+        s.tick(0.0, 200, 1000 * self.RAW)      # calls, does not fill
+        s.tick(0.1, 10, 1000 * self.RAW)       # dies -> skip
+        assert s.skipped == 1
+        s.tick(0.2, 200, 1000 * self.RAW)      # would call again
+        s.tick(0.3, 200, 1001 * self.RAW)      # and would fill
+        assert not s.trades, "the candle got a second call"

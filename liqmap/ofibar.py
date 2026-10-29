@@ -133,7 +133,7 @@ PAI_SELL = 0.30
 # wrong, because nothing on screen says it moved.
 #
 # Bump this whenever the entry rule changes meaning.
-CALL_RULE = "imb-confirm-v2"
+CALL_RULE = "imb-onecall-v3"
 
 
 # THE CALL LEVEL, in contracts of running imbalance.
@@ -192,6 +192,44 @@ OBJECTIVE_POINTS = 1.0
 # folding skips into losses understates the rule and folding them
 # into wins is worse.
 CONFIRM_TICKS = 1
+
+# ONE CALL PER CANDLE.
+#
+# The imbalance does not cross the level once and stay there. It
+# crosses, falls back a contract, crosses again -- and a stateless
+# rule starts a fresh trade on every one of those. Measured on a
+# random walk at target 2,000 that is 6.41 trades a candle, almost
+# all of them dying within two book updates, and every one of them
+# landing in the tally as a loss.
+#
+# The candle gets one call. The second crossing and the twentieth are
+# the same push as the first, and counting them separately was
+# measuring how finely the imbalance oscillates around a line.
+#
+# THE COST OF THIS IS REAL AND IS NOT HIDDEN: if the candle's one
+# call never confirms, the candle trades nothing, even if a later
+# crossing would have run. That is the price of not counting one push
+# as twenty.
+MAX_CALLS_PER_BAR = 1
+
+# THE PULLING-AWAY GATE.
+#
+# push_up - push_dn == acc identically -- there is a test -- so "the
+# buy side is 500 greater than the sell side" IS the accumulator at
+# +500, and asking for it twice adds nothing. What the net cannot say
+# is whether that gap is still WIDENING.
+#
+# So the trade is taken only on an update where the imbalance sets a
+# NEW EXTREME for the bar in the call's direction. While it keeps
+# making new highs the buy side is still pulling away from the sell
+# side; the moment it stops, the side that was winning has stopped
+# winning -- which is precisely when the old rule was still happy to
+# buy, and precisely the entry that was arriving just before price
+# turned over.
+#
+# Stated as an extreme rather than as a slope over N updates, because
+# a lookback length would be a number with nothing behind it.
+WIDEN = True
 
 # Most observations a single bar may hold.
 MAX_EPISODES = 64
@@ -663,15 +701,17 @@ class OfiBarBuilder:
                  "_buy_vol", "_sell_vol", "_trades",
                  "_t_hi", "_t_lo", "_t_last",
                  "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
-                 "_level", "_obj", "_confirm", "_ep", "_eps", "_meas",
-                 "_pu", "_pd")
+                 "_level", "_obj", "_confirm", "_max_calls", "_widen",
+                 "_ep", "_eps", "_meas", "_pu", "_pd")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
                  max_bars: int = 20_000,
                  call_level: int = CALL_LEVEL,
                  objective_points: float = OBJECTIVE_POINTS,
-                 confirm_ticks: float = CONFIRM_TICKS) -> None:
+                 confirm_ticks: float = CONFIRM_TICKS,
+                 max_calls: int = MAX_CALLS_PER_BAR,
+                 widen: bool = WIDEN) -> None:
         if tick_size <= 0:
             raise ValueError("tick_size must be positive")
         if threshold < 1:
@@ -740,6 +780,12 @@ class OfiBarBuilder:
         # taken. Zero means take it at the call, which is what it did
         # before and is still reachable by passing zero.
         self._confirm = max(0.0, float(confirm_ticks)) * RAW_TICK
+        # Calls a single candle may make. 0 means no cap, which is
+        # what it did before and is still reachable.
+        self._max_calls = max(0, int(max_calls))
+        # Whether entry waits for the imbalance to still be pulling
+        # away. Off reproduces the previous entry exactly.
+        self._widen = bool(widen)
         # Both sides of the imbalance for the bar in progress.
         self._pu = 0
         self._pd = 0
@@ -804,6 +850,21 @@ class OfiBarBuilder:
     @property
     def call_level(self) -> int:
         return self._level
+
+    @property
+    def max_calls(self) -> int:
+        """Calls one candle may make. 0 means no cap."""
+        return self._max_calls
+
+    @property
+    def widen(self) -> bool:
+        """Whether entry waits for the imbalance to still be widening."""
+        return self._widen
+
+    @property
+    def confirm_ticks(self) -> float:
+        """Ticks of price confirmation required before entry."""
+        return self._confirm / RAW_TICK
 
     @property
     def objective(self) -> float:
@@ -1033,6 +1094,17 @@ class OfiBarBuilder:
         # DELTA DOES NOT GATE THIS. It is still measured, still drawn
         # and still carried in the data -- it is simply not part of
         # the trigger.
+        # THE EXTREMES ARE TAKEN FIRST, because the entry gate reads
+        # them. `new_hi` is true on an update where the imbalance has
+        # gone further the buy side's way than at any point in this
+        # bar -- which is what "still pulling away from the sell
+        # side" means, measured rather than assumed.
+        new_hi = self._acc > bar.ofi_high
+        new_lo = self._acc < bar.ofi_low
+        if new_hi:
+            bar.ofi_high = self._acc
+        if new_lo:
+            bar.ofi_low = self._acc
         # PRICE IS MEASURED BEFORE THE CALL IS RE-EVALUATED, and the
         # order matters on exactly one update: the one where price
         # reaches the objective and the imbalance comes back through
@@ -1040,7 +1112,7 @@ class OfiBarBuilder:
         # objective is filled by the price, not by the book update
         # that followed it, so the win is taken first.
         if self._meas:
-            self._track(ts, mid)
+            self._track(ts, mid, new_hi, new_lo)
         _side = ""
         if self._acc >= self._level:
             _side = "up"
@@ -1053,11 +1125,6 @@ class OfiBarBuilder:
             self._c_ts = ts if _side else 0.0
             if _side:
                 self._start_episode(_side, ts, mid)
-        if self._acc > bar.ofi_high:
-            bar.ofi_high = self._acc
-        if self._acc < bar.ofi_low:
-            bar.ofi_low = self._acc
-
         if bar.updates >= self.min_updates:
             if self._acc >= self.threshold:
                 return self._close(GREEN, ts, mid)
@@ -1086,6 +1153,18 @@ class OfiBarBuilder:
     # -- observations inside the bar -----------------------------------
 
     def _start_episode(self, side: str, ts: float, mid: float) -> None:
+        # ONE CALL PER CANDLE. The imbalance crossing the level
+        # twenty times is one push, not twenty trades, and counting
+        # it as twenty is what put eighty-eight failures on a chart
+        # showing a handful of marks.
+        #
+        # The cap counts CALLS, not fills. Counting fills instead
+        # lets a candle keep trying after each unconfirmed call, and
+        # measured on a random walk that is 5.61 calls a bar again --
+        # the cap in name only.
+        if self._max_calls and len(self._eps) >= self._max_calls:
+            self._ep = None
+            return
         # A hard ceiling on how many a single bar may hold. Without it a
         # chopping bar can spend a minute flickering across the gate and
         # produce thousands of one-update observations, which is a
@@ -1161,7 +1240,8 @@ class OfiBarBuilder:
         self._meas = [e for e in self._meas if e is not ep]
         self._ep = None
 
-    def _track(self, ts: float, mid: float) -> None:
+    def _track(self, ts: float, mid: float,
+               new_hi: bool = True, new_lo: bool = True) -> None:
         """Wait for confirmation, then measure to the objective.
 
         A WIN CLOSES THE TRADE. It reaches the objective, the price it
@@ -1182,12 +1262,23 @@ class OfiBarBuilder:
             return
         for ep in self._meas:
             if not ep.entered:
-                # CONFIRMATION. Nothing is measured until price has
-                # gone the call's way by CONFIRM_TICKS, and the fill
-                # is the mid at that update -- not the confirmation
-                # price, because a gap through it was not available.
+                # TWO CONDITIONS, AND BOTH HAVE TO HOLD.
+                #
+                # PRICE has gone the call's way by CONFIRM_TICKS, and
+                # the fill is the mid at that update -- not the
+                # confirmation price, because a gap through it was
+                # not available.
+                #
+                # THE IMBALANCE is still pulling away: this update set
+                # a new extreme for the bar on the call's side. A call
+                # whose imbalance has stopped widening is a side that
+                # has stopped winning, and buying it is the entry that
+                # lands just before the turn.
                 d = mid - ep.px0
                 if (d if ep.side == "up" else -d) < self._confirm:
+                    continue
+                if self._widen and not (new_hi if ep.side == "up"
+                                        else new_lo):
                     continue
                 ep.took = True
                 ep.entry_px = mid

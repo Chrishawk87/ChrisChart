@@ -622,11 +622,11 @@ class TestTheImbalanceIsTheTrigger:
       it means the same number on every rung
     """
 
-    def _one_bar(self, level=500):
+    def _one_bar(self, level=500, max_calls=1):
         """A bar large enough to hold a whole reversal."""
         return OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
                              min_updates=2, max_bars=10 ** 7,
-                             call_level=level)
+                             call_level=level, max_calls=max_calls)
 
     def _push(self, b, n, side, bid, ts=0.0, sz=100):
         """Drive the book one way, and the prints with it."""
@@ -691,8 +691,12 @@ class TestTheImbalanceIsTheTrigger:
     def test_it_reverses_inside_one_bar(self):
         """The bug it replaced: it said one thing and never took it
         back. One bar throughout, so nothing but the rule can clear
-        it."""
-        b = self._one_bar()
+        it.
+
+        UNCAPPED, because this is about the call tracking the
+        imbalance, not about how many trades a candle may take. The
+        cap has its own tests below."""
+        b = self._one_bar(max_calls=0)
         base = 7_700 * 10 ** 9
         b.on_book(0.0, base, 100, base + RAW, 100)
         ts, sz = self._push(b, 60, "sell", base)
@@ -745,11 +749,12 @@ class TestTheImbalanceIsTheTrigger:
 
 class TestObservationsInsideTheBar:
 
-    def _run(self, n=300_000, seed=11, threshold=2000):
+    def _run(self, n=300_000, seed=11, threshold=2000, max_calls=1):
         import random
         rng = random.Random(seed)
         b = OfiBarBuilder(tick_size=0.25, threshold=threshold, max_s=900.0,
-                          min_updates=2, max_bars=10 ** 7)
+                          min_updates=2, max_bars=10 ** 7,
+                          max_calls=max_calls)
         bid, ts = 7_700 * 10 ** 9, 0.0
         for _ in range(n):
             if rng.random() < 0.06:
@@ -777,9 +782,17 @@ class TestObservationsInsideTheBar:
         assert closed and all(e.end for e in closed)
         assert any(e.end == "bar" for e in closed)
 
-    def test_a_bar_can_hold_several(self):
-        b = self._run()
+    def test_a_bar_can_hold_several_when_uncapped(self):
+        b = self._run(max_calls=0)
         assert any(len(bar.episodes) > 1 for bar in b.bars)
+
+    def test_but_the_default_is_one_a_bar(self):
+        """The whole point of the cap. 6.41 calls a bar on a random
+        walk is one push counted twenty times, and every one of those
+        counts lands in the tally as a loss."""
+        b = self._run()
+        assert b.bars, "no bars closed"
+        assert all(len(bar.episodes) <= 1 for bar in b.bars)
 
     def test_the_count_is_capped(self):
         from liqmap.ofibar import MAX_EPISODES
@@ -1205,3 +1218,142 @@ class TestExpansionAndSpeed:
                      "tps0", "atr0"):
             assert not re.search(r"(if|and|or)\s[^\n]*\b" + name + r"\b",
                                  body), f"{name} is being used as a filter"
+
+
+class TestOneCallPerCandle:
+    """The imbalance crossing the level twenty times is ONE PUSH.
+
+    Counting it as twenty trades is what put 88 failures on a chart
+    showing a handful of marks: 6.41 calls a bar on a random walk,
+    almost all of them dead inside two book updates, every one of them
+    landing in the tally.
+    """
+
+    def _walk(self, n=120_000, seed=3, max_calls=1, widen=True):
+        import random
+        rng = random.Random(seed)
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=900.0,
+                          min_updates=2, max_bars=10 ** 7,
+                          call_level=500, objective_points=1.0,
+                          confirm_ticks=1.0, max_calls=max_calls,
+                          widen=widen)
+        bid, ts = 7_700 * 10 ** 9, 0.0
+        for _ in range(n):
+            if rng.random() < 0.12:
+                bid += RAW if rng.random() < 0.5 else -RAW
+            ts += 0.01
+            b.on_book(ts, bid, rng.randint(50, 900), bid + RAW,
+                      rng.randint(50, 900))
+        return b
+
+    def test_no_candle_makes_two_calls(self):
+        b = self._walk()
+        assert len(b.bars) > 50
+        worst = max(len(bar.episodes) for bar in b.bars)
+        assert worst <= 1, f"a candle made {worst} calls"
+
+    def test_it_cuts_the_count_by_an_order_of_magnitude(self):
+        """The number that matters, measured rather than asserted."""
+        capped = self._walk()
+        loose = self._walk(max_calls=0, widen=False)
+        a = sum(len(x.episodes) for x in capped.bars)
+        z = sum(len(x.episodes) for x in loose.bars)
+        assert z > 5 * a, f"uncapped {z} vs capped {a} is not a cap"
+        assert a / len(capped.bars) <= 1.0
+        # And the figure that actually reaches the tally: trades
+        # TAKEN, not calls made.
+        fa = sum(1 for x in capped.bars for e in x.episodes if e.entered)
+        fz = sum(1 for x in loose.bars for e in x.episodes if e.entered)
+        assert fz > 5 * fa, f"uncapped {fz} fills vs capped {fa}"
+
+    def test_the_cap_counts_calls_not_fills(self):
+        """Counting fills lets a candle keep trying after every
+        unconfirmed call, which on the same walk is 5.61 calls a bar
+        again -- a cap in name only."""
+        b = self._walk()
+        for bar in b.bars:
+            # A candle whose one call never filled gets no second go.
+            if bar.episodes and not bar.episodes[0].entered:
+                assert len(bar.episodes) == 1
+
+    def test_uncapped_is_still_reachable(self):
+        b = self._walk(max_calls=0, widen=False)
+        assert any(len(bar.episodes) > 1 for bar in b.bars)
+
+
+class TestTheImbalanceMustStillBePullingAway:
+    """push_up - push_dn == acc identically, so asking for the buy
+    side to exceed the sell side by 500 IS the accumulator at +500 and
+    adds nothing. What the net cannot say is whether the gap is still
+    WIDENING, and that is the whole of what this gate adds."""
+
+    def _b(self, widen=True, level=200):
+        return OfiBarBuilder(tick_size=0.25, threshold=10 ** 7, max_s=1e9,
+                             min_updates=2, max_bars=10 ** 7,
+                             call_level=level, objective_points=1.0,
+                             confirm_ticks=1.0, max_calls=0, widen=widen)
+
+    def _no_longer_widening(self, b):
+        """An up call whose imbalance has peaked and fallen back, then
+        a one-tick uptick. Price confirms; the gap does not."""
+        base = 7_700 * 10 ** 9
+        b.on_book(0.00, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 2000, base + RAW, 100)   # call up, acc 1900
+        b.on_book(0.02, base, 500, base + RAW, 100)    # falls to 620
+        b.on_book(0.03, base + RAW, 120, base + 2 * RAW, 100)
+        return b
+
+    def test_it_waits_for_a_new_extreme(self):
+        """Price confirms, but the imbalance has stopped widening, so
+        no trade is taken -- which is the entry that was landing just
+        before the turn."""
+        b = self._no_longer_widening(self._b())
+        ep = b.live_episodes[-1]
+        assert b.live_call[0] == "up", "the call should still stand"
+        assert b.live_bar.ofi_high == 1900
+        assert b.accumulated == 620, "the gap narrowed, as intended"
+        assert b.accumulated >= 200, "it must still be past the level"
+        assert not ep.entered, "it entered while the gap was closing"
+
+    def test_without_the_gate_the_same_update_fills(self):
+        """The control for the test above: same book, gate off. If
+        this one did not fill either, the test above would be
+        measuring the price confirmation and not the gate."""
+        b = self._no_longer_widening(self._b(widen=False))
+        ep = b.live_episodes[-1]
+        assert ep.entered, "the gate is on when it should be off"
+
+    def test_a_new_extreme_with_price_confirmed_does_fill(self):
+        base = 7_700 * 10 ** 9
+        b = self._b()
+        b.on_book(0.00, base, 100, base + RAW, 100)
+        b.on_book(0.01, base, 400, base + RAW, 100)      # call up
+        ep = b.live_episodes[-1]
+        b.on_book(0.02, base + RAW, 2000, base + 2 * RAW, 50)
+        assert b.accumulated > b.live_bar.ofi_high - 1, "not a new high"
+        assert ep.entered, "price confirmed and the gap widened"
+        assert ep.entry_px > ep.px0
+
+    def test_the_gate_never_turns_a_skip_into_a_loss(self):
+        """A call the gate declined took no trade, so it cannot lose.
+        Folding these into losses would make the filter look like the
+        thing it is filtering."""
+        import random
+        rng = random.Random(9)
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000, max_s=900.0,
+                          min_updates=2, max_bars=10 ** 7,
+                          call_level=500, objective_points=1.0,
+                          confirm_ticks=1.0, widen=True)
+        bid, ts = 7_700 * 10 ** 9, 0.0
+        for _ in range(120_000):
+            if rng.random() < 0.12:
+                bid += RAW if rng.random() < 0.5 else -RAW
+            ts += 0.01
+            b.on_book(ts, bid, rng.randint(50, 900), bid + RAW,
+                      rng.randint(50, 900))
+        for bar in b.bars:
+            for e in bar.episodes:
+                if e.hit == "loss":
+                    assert e.entered, "a trade nobody took was failed"
+                if not e.entered:
+                    assert e.hit in ("skip", ""), e.hit

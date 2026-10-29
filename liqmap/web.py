@@ -1048,6 +1048,9 @@ class Runtime:
                     self._ofirec = _rec
                 except Exception:                       # noqa: BLE001
                     self._ofirec = None
+            if svc.tape.flowread is None:
+                from .flowread import FlowRead
+                svc.tape.flowread = FlowRead()
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -6472,6 +6475,15 @@ def create_app() -> FastAPI:
                        "share": round(b.live_share, 4),
                        "obs": _liveobs,
                        "obs_so_far": len(b.live_episodes),
+                       # ONE CALL PER CANDLE. When the candle has
+                       # already used it, the imbalance can go on
+                       # crossing the level and no trade follows --
+                       # and the panel has to say so, or it looks
+                       # broken at exactly the moment it is working.
+                       "max_calls": b.max_calls,
+                       "spent": bool(b.max_calls
+                                     and len(b.live_episodes)
+                                     >= b.max_calls),
                        "open": cur.open * sc, "high": cur.high * sc,
                        "low": cur.low * sc, "close": cur.close * sc,
                        "ofi": b.accumulated, "updates": cur.updates,
@@ -6495,7 +6507,25 @@ def create_app() -> FastAPI:
         if off > 0:
             forming = None
 
+        # THE READING, which is not about these bars at all.
+        #
+        # Chris trades a five-minute candle on another platform and
+        # uses this to decide which way. So it is carried whatever
+        # target is on screen, it does not depend on the level in the
+        # dropdown, and it does not reset when a bar closes -- all
+        # three of which the per-bar call above does the other way
+        # round, because that one IS about these bars.
+        _fr = getattr(tape, "flowread", None)
+        _read = None
+        if _fr is not None:
+            try:
+                _fr.set_level(b.call_level)
+                _read = _fr.snapshot.as_dict()
+            except Exception:                           # noqa: BLE001
+                _read = None
+
         return {"ok": True, "coin": coin, "target": t,
+                "read": _read,
                 "targets": list(_OFI_LADDER),
                 "total": total, "offset": off, "window": n,
                 "dropped": getattr(b, "dropped", 0),
@@ -10506,7 +10536,8 @@ function ofiChart(d, w, h) {
        which is the most expensive sentence a chart can print. */
     if (!o.took) {
       return ' &middot; <b>WAITING</b> &mdash; called at '
-        + o.px0.toFixed(2) + ', no entry until price confirms it. If '
+        + o.px0.toFixed(2) + ', no entry until price confirms it by a '
+        + 'tick AND the imbalance makes a new extreme this bar. If '
         + 'the call dies first, no trade was taken and it counts as '
         + 'neither.';
     }
@@ -10544,6 +10575,66 @@ function ofiChart(d, w, h) {
          : (v.eff || 0) >= 0.2 ? '(grinding)' : '(round-tripping)')
       + ' &middot; nothing is filtered on this</span>';
   };
+  /* THE READING, and it goes ABOVE everything else because it is
+     the only line here that is about the trade being taken.
+
+     Everything below it describes these OFI bars. This describes the
+     flow underneath them, over a rolling window, and it is what says
+     which way to take a five-minute candle somewhere else. It does
+     not depend on the level in the dropdown and it does not reset
+     when a bar closes -- a reading that blanked every time a bar
+     ended would blank several times inside one position.
+
+     THE RAW SIGN IS SHOWN NEXT TO THE STEADY ONE. Hiding it would
+     make the smoothing unfalsifiable: if the steady read is wrong,
+     the first thing worth knowing is whether the raw one had already
+     turned. */
+  const readLine = r => {
+    if (!r) return '';
+    const mins = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
+                               : s.toFixed(0) + 's');
+    const dir = r.read === 'up'
+      ? '<b class="long">UP</b>'
+      : r.read === 'down' ? '<b class="short">DOWN</b>'
+      : '<b>NO READ</b>';
+    let why;
+    if (!r.read) {
+      /* Saying nothing is a result, and the reason for it is the
+         most useful sentence on the panel: it separates "the sides
+         are even" from "the side that was winning has stopped". */
+      why = (Math.abs(r.lead) < 1)
+        ? ' &mdash; the two sides are level'
+        : (r.lead > 0) === (r.recent > 0)
+          ? ' &mdash; waiting for it to hold'
+          : ' &mdash; ' + (r.lead > 0 ? 'buying' : 'selling')
+            + ' is still ahead over the window but has stopped '
+            + 'winning right now, which is where a push ends';
+    } else {
+      why = ' for ' + mins(r.held_s)
+        + ' &middot; ' + (r.read === 'up' ? 'buying' : 'selling')
+        + ' ahead by ' + Math.abs(Math.round(r.lead)).toLocaleString()
+        + ' of ' + Math.round(r.gross).toLocaleString() + ' ('
+        + (100 * r.share).toFixed(0) + '% buy)'
+        + (r.strength === 'strong'
+            ? ' &middot; <b>past your level</b>'
+            : ' &middot; short of your level');
+    }
+    const turning = (r.raw !== r.read)
+      ? ' &middot; <b>turning</b> &mdash; it has read '
+        + (r.raw ? r.raw.toUpperCase() : 'nothing') + ' for '
+        + mins(r.pending_s) + ' and publishes if that holds'
+      : '';
+    const shaky = (r.flips_1m > 6)
+      ? ' &middot; <b class="short">' + r.flips_1m + ' changes of mind '
+        + 'in the last minute</b> &mdash; too unsettled to take'
+      : '';
+    return '<span class="stamp" style="width:100%">READ &mdash; ' + dir
+      + why + turning + shaky
+      + ' &middot; this is the five-minute direction, not a trade on '
+      + 'these bars; it ignores the level dropdown and does not reset '
+      + 'when a candle closes</span>';
+  };
+
   let liveCall;
   if (d && d.reachable === false) {
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
@@ -10562,6 +10653,11 @@ function ofiChart(d, w, h) {
       + ' &middot; it reverses if it comes back through '
       + (fm.call_side === 'up' ? '+' : '-') + lvl.toLocaleString()
       + pointsLine(obsNow)
+      + (fm.spent
+          ? ' &middot; <b>this candle has had its one call</b> '
+            + '&mdash; the imbalance can cross the level again and no '
+            + 'trade follows until the next bar'
+          : '')
       + ' &middot; ' + (fm.obs_so_far || 0) + ' so far this bar</span>';
   } else if (fm) {
     const oi = fm.ofi || 0;
@@ -10575,13 +10671,16 @@ function ofiChart(d, w, h) {
       + ' &middot; delta ' + (fm.delta > 0 ? '+' : '')
       + Math.round(fm.delta || 0).toLocaleString()
       + ', which does not gate this'
+      + (fm.spent
+          ? ' &middot; <b>this candle has had its one call</b>'
+          : '')
       + ' &middot; ' + (fm.obs_so_far || 0) + ' observation'
       + ((fm.obs_so_far === 1) ? '' : 's') + ' so far this bar</span>';
   } else {
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
       + 'no bar is forming</span>';
   }
-  liveCall += speedLine(fm);
+  liveCall = readLine(d && d.read) + liveCall + speedLine(fm);
 
   const dLast = all[all.length - 1] || {};
   const dSum = all.reduce((a, b) => a + (b.delta || 0), 0);

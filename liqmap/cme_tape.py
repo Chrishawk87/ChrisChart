@@ -126,6 +126,14 @@ class Tape:
     # until it refilled, which is useless for eyeballing a session.
     # The cost is a handful of integer adds per book update.
     ofibars: dict | None = None
+    # WHICH SIDE IS WINNING, continuously, independent of the bars.
+    # One instance, not one per target: the five builders are five
+    # slicings of one tape, and the flow underneath them is one thing.
+    # It deliberately does NOT reset at a bar close -- the position
+    # being read for is a five-minute candle elsewhere, and a reading
+    # that blanked every time an OFI bar ended would blank several
+    # times inside one trade.
+    flowread: object = None
     # The two drawn lines: book CVD as the reader, time-smoothed
     # traded CVD as the confirmation. Fed from the same decoded trade
     # as everything else above, so the lines and the candles can never
@@ -344,6 +352,11 @@ class Tape:
                     asz = int(dbn._get(l0, "ask_sz", 0) or 0)
                     for _b in self.ofibars.values():
                         _b.on_book(bts, bpx, bsz, apx, asz)
+                    if self.flowread is not None:
+                        # The same book update, through the same OFI
+                        # formula. The reading and the candles cannot
+                        # disagree about what happened.
+                        self.flowread.on_book(bts, bpx, bsz, apx, asz)
             except Exception:                           # noqa: BLE001
                 pass            # a display must not stop the tape
         if self.cvdcross is not None:

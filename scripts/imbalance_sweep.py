@@ -71,7 +71,7 @@ TICK = 0.25
 
 def run(paths: list[str], targets: list[int], levels, target_points: float,
         limit: int = 0, min_share: float = 0.0,
-        confirms: tuple = (0.0,)):
+        confirms: tuple = (0.0,), max_calls: int = 1):
     """One pass over the records, every target and level at once."""
     import databento as db
 
@@ -81,7 +81,8 @@ def run(paths: list[str], targets: list[int], levels, target_points: float,
                                  min_updates=2, max_bars=10_000_000)
                 for t in targets}
     sweeps = {t: Sweep(levels=tuple(levels), target_points=target_points,
-                       min_share=min_share, confirms=tuple(confirms))
+                       min_share=min_share, confirms=tuple(confirms),
+                       max_calls=max_calls)
               for t in targets}
     n = 0
     for path in paths:
@@ -294,6 +295,10 @@ def main() -> int:
                                                                2.0],
                     help="ticks of confirmation to wait before entry;"
                          " several values fan out over the same tape")
+    ap.add_argument("--max-calls", type=int, default=1,
+                    help="calls one candle may make; 0 for no cap."
+                         " Uncapped, one push crossing the level"
+                         " repeatedly is counted as separate trades")
     ap.add_argument("--min-share", type=float, default=0.0,
                     help="require this share of the bar's gross flow on"
                          " the side taken; 0 takes every signal")
@@ -319,7 +324,8 @@ def main() -> int:
     builders, sweeps = run(a.files, targets, levels, a.points, a.limit,
                            a.min_share,
                            tuple(sorted({float(x) for x in a.confirm
-                                         if x >= 0})) or (0.0,))
+                                         if x >= 0})) or (0.0,),
+                           a.max_calls)
 
     base = Path(a.files[0]).resolve().parent
     for t in targets:

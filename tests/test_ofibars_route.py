@@ -1689,7 +1689,7 @@ class TestTheTallyStatesItsOwnBias:
                           min_updates=2, max_bars=10 ** 7,
                           call_level=300, objective_points=1.0)
         bid, ts = 7_700 * 10 ** 9, 0.0
-        for _ in range(200_000):
+        for _ in range(400_000):
             if rng.random() < 0.12:
                 bid += 250_000_000 if rng.random() < 0.5 else -250_000_000
             ts += 0.01
@@ -1801,3 +1801,79 @@ class TestTheTallyMatchesWhatIsOnScreen:
 
     def test_the_panel_says_what_it_left_out(self):
         assert "made by an earlier rule or at another level" in WEB
+
+
+class TestTheReadIsAboutTheOtherTrade:
+    """Chris does not scalp these bars. He reads the direction off
+    this panel and takes a five-minute candle on another platform, so
+    the reading has to be independent of everything that is about
+    these bars: the target on screen, the level in the dropdown, and
+    where the bar boundaries happen to fall.
+    """
+
+    def _chart(self):
+        i = WEB.index("function ofiChart(")
+        return WEB[i:WEB.index("\n}", i)]
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_carries_it(self):
+        r = self._route()
+        assert '"read": _read' in r
+        assert "flowread" in r
+
+    def test_it_is_drawn_above_everything_else(self):
+        """It is the only line on the panel about the trade actually
+        being taken. Under the per-bar call it reads as a footnote to
+        a scalp."""
+        c = self._chart()
+        assert "readLine(d && d.read) + liveCall" in c
+
+    def test_it_names_what_it_is_not(self):
+        c = self._chart()
+        assert "five-minute direction" in c
+        assert "not a trade on " in c
+
+    def test_the_level_only_labels_it(self):
+        r = self._route()
+        i = r.index("_fr.set_level")
+        assert "set_level" in r[i:i + 80]
+        from liqmap import flowread as F
+        src = (ROOT / "liqmap" / "flowread.py").read_text()
+        j = src.index("def _decide")
+        assert "self.level" not in src[j:src.index("# ---", j)]
+        assert F is not None
+
+    def test_saying_nothing_says_why(self):
+        """The most useful sentence on the panel: it separates the
+        sides being level from the winning side having stopped."""
+        c = self._chart()
+        assert "the two sides are level" in c
+        assert "stopped " in c and "which is where a push ends" in c
+
+    def test_the_raw_sign_is_shown_beside_the_steady_one(self):
+        """Hiding it would make the smoothing unfalsifiable."""
+        c = self._chart()
+        assert "turning" in c
+        assert "r.raw !== r.read" in c
+        assert "publishes if that holds" in c
+
+    def test_it_says_when_it_is_too_unstable_to_take(self):
+        c = self._chart()
+        assert "changes of mind" in c
+        assert "too unsettled to take" in c
+
+    def test_an_absent_read_draws_nothing_rather_than_zeros(self):
+        """A reading that has not started must not render as a
+        confident NO READ with zeros behind it."""
+        c = self._chart()
+        i = c.index("const readLine")
+        assert "if (!r) return '';" in c[i:i + 120]
+
+    def test_the_reading_does_not_reset_with_a_bar(self):
+        src = (ROOT / "liqmap" / "flowread.py").read_text()
+        body = src.split('"""', 2)[2]
+        for word in ("ofibar", "OfiBar", "bar_close", "on_bar"):
+            assert word not in body, word

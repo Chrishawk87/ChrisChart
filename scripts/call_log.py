@@ -42,7 +42,8 @@ from liqmap.ofibar import (CALL_RULE, LADDER, OfiBarBuilder,   # noqa: E402
 TICK = 0.25
 
 
-def load(paths, target: int, level: int, confirm: float, limit: int = 0):
+def load(paths, target: int, level: int, confirm: float, limit: int = 0,
+         max_calls: int = 1, widen: bool = True):
     import databento as db
 
     from liqmap import dbn
@@ -50,7 +51,8 @@ def load(paths, target: int, level: int, confirm: float, limit: int = 0):
     b = OfiBarBuilder(tick_size=TICK, threshold=target, max_s=900.0,
                       min_updates=2, max_bars=10_000_000,
                       call_level=level, objective_points=1.0,
-                      confirm_ticks=confirm)
+                      confirm_ticks=confirm, max_calls=max_calls,
+                      widen=widen)
     n = 0
     for path in paths:
         for rec in db.DBNStore.from_file(path):
@@ -103,6 +105,11 @@ def main() -> int:
     ap.add_argument("--level", type=int, default=500)
     ap.add_argument("--confirm", type=float, default=1.0,
                     help="ticks of confirmation before entry")
+    ap.add_argument("--max-calls", type=int, default=1,
+                    help="calls one candle may make; 0 for no cap")
+    ap.add_argument("--no-widen", action="store_true",
+                    help="take the entry without requiring the"
+                         " imbalance to still be pulling away")
     ap.add_argument("--bars", type=int, default=20,
                     help="how many of the most recent bars to list")
     ap.add_argument("--limit", type=int, default=0)
@@ -114,7 +121,8 @@ def main() -> int:
         print("  No call is possible at this pair. Use a larger target.")
         return 2
 
-    b = load(a.files, a.target, a.level, a.confirm, a.limit)
+    b = load(a.files, a.target, a.level, a.confirm, a.limit,
+             max_calls=a.max_calls, widen=not a.no_widen)
     bars = b.bars[-a.bars:]
     if not bars:
         print("  No bars closed. Check the files and the target.")
@@ -123,6 +131,9 @@ def main() -> int:
     print(f"\n{'=' * 100}")
     print(f"TARGET {a.target:,}   LEVEL {a.level}   "
           f"{a.confirm:g}-tick confirmation   "
+          f"{'widening required' if not a.no_widen else 'no widen gate'}"
+          f"   {a.max_calls or 'no'} call"
+          f"{'' if a.max_calls == 1 else 's'} a candle   "
           f"last {len(bars):,} of {len(b.bars):,} bars")
     print("=" * 100)
     show(bars, a.level)
@@ -156,6 +167,16 @@ def main() -> int:
           f" · {100 * whole['win_rate']:.1f}% of"
           f" {whole['settled']} settled"
           f" · {whole['net_per_trade']:+.2f} ticks a trade.")
+    calls_per_bar = whole["observations"] / max(1, len(b.bars))
+    print(f"  {calls_per_bar:.2f} calls a candle"
+          f" ({whole['observations']:,} across {len(b.bars):,}).")
+    if calls_per_bar > 1.05:
+        print("  MORE THAN ONE A CANDLE means the cap is off. The same"
+              " push crossing the")
+        print("  level repeatedly is counted as separate trades, and on"
+              " a random walk")
+        print("  that is 6.41 a candle with almost all of them dead"
+              " inside two updates.")
     print("\n  A random walk through this same builder returns 0.0%, so"
           " the figure to")
     print("  beat is zero rather than fifty. Costs run about 0.4 ticks a"
