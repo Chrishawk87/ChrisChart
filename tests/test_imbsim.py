@@ -48,12 +48,12 @@ def feed(sim, steps):
 class TestTheRule:
 
     def test_it_enters_at_the_level(self):
-        s = ImbSim(200)
+        s = ImbSim(200, target_points=3.0)
         feed(s, [(100, 0), (199, 0), (200, 0)])
         assert s._t is not None and s._t.side == UP
 
     def test_it_enters_short_at_the_mirror(self):
-        s = ImbSim(200)
+        s = ImbSim(200, target_points=3.0)
         feed(s, [(-199, 0), (-200, 0)])
         assert s._t is not None and s._t.side == DOWN
 
@@ -78,14 +78,16 @@ class TestTheRule:
         assert s.trades == [] and s._t is not None
 
     def test_the_opposite_level_reverses_it(self):
-        s = ImbSim(200)
+        s = ImbSim(200, target_points=3.0)
         feed(s, [(200, 0), (-200, 0)])
         assert len(s.trades) == 1
         assert s.trades[0].why == "reverse"
         assert s._t is not None and s._t.side == DOWN
 
     def test_the_bar_close_flattens_it(self):
-        s = ImbSim(200)
+        # Target pinned: these tests are about the exit, not about
+        # whatever the default objective happens to be this week.
+        s = ImbSim(200, target_points=3.0)
         feed(s, [(200, 0), (200, 1)])
         s.bar_close(99.0, PX + 1 * POINT)
         assert len(s.trades) == 1
@@ -94,14 +96,14 @@ class TestTheRule:
         assert s._t is None
 
     def test_nothing_survives_the_bar(self):
-        s = ImbSim(200)
+        s = ImbSim(200, target_points=3.0)
         feed(s, [(200, 0)])
         s.bar_close(99.0, PX)
         feed(s, [(0, 0)])
         assert s._t is None
 
     def test_only_the_target_counts_as_a_win(self):
-        s = ImbSim(200)
+        s = ImbSim(200, target_points=3.0)
         feed(s, [(200, 0), (200, 2)])
         s.bar_close(9.0, PX + 2 * POINT)
         t = s.trades[0]
@@ -113,13 +115,13 @@ class TestTheTwoExitRules:
     """They differ on one question, and it changes which level wins."""
 
     def test_hold_ignores_the_band(self):
-        s = ImbSim(200, policy=HOLD)
+        s = ImbSim(200, target_points=3.0, policy=HOLD)
         feed(s, [(200, 0), (50, 0), (50, 1)])
         assert s.trades == [], "it closed on something it should hold"
         assert s._t is not None
 
     def test_band_exits_on_the_band(self):
-        s = ImbSim(200, policy=BAND)
+        s = ImbSim(200, target_points=3.0, policy=BAND)
         feed(s, [(200, 0), (50, 0)])
         assert len(s.trades) == 1 and s.trades[0].why == "band"
 
@@ -128,7 +130,8 @@ class TestTheTwoExitRules:
         rng = random.Random(3)
         steps = [(rng.randint(-400, 400), rng.randint(-4, 4) * 0.25)
                  for _ in range(4_000)]
-        a, b = ImbSim(200, policy=HOLD), ImbSim(200, policy=BAND)
+        a = ImbSim(200, target_points=3.0, policy=HOLD)
+        b = ImbSim(200, target_points=3.0, policy=BAND)
         for s in (a, b):
             feed(s, steps)
             s.bar_close(9e9, PX)
@@ -177,7 +180,7 @@ class TestTheControl:
     """The only number that says whether the signal carries anything."""
 
     def test_the_flip_takes_the_other_side(self):
-        s = ImbSim(200, flip=True)
+        s = ImbSim(200, target_points=3.0, flip=True)
         feed(s, [(200, 0)])
         assert s._t is not None and s._t.side == DOWN
 
@@ -186,7 +189,8 @@ class TestTheControl:
         rng = random.Random(5)
         steps = [(rng.randint(-400, 400), rng.randint(-8, 8) * 0.25)
                  for _ in range(4_000)]
-        a, b = ImbSim(200), ImbSim(200, flip=True)
+        a = ImbSim(200, target_points=3.0)
+        b = ImbSim(200, target_points=3.0, flip=True)
         for s in (a, b):
             feed(s, steps)
             s.bar_close(9e9, PX)
@@ -256,9 +260,9 @@ class TestTheSweep:
     def test_every_sim_sees_the_same_tape(self):
         """Two passes would compare two tapes."""
         src = (ROOT / "liqmap" / "imbsim.py").read_text()
-        i = src.index("    def tick(self, ts: float, acc: int, mid: float) -> None:",
-                      src.index("class Sweep") if "class Sweep" in src else 0)
-        assert "for s in self.sims.values():" in src
+        body = src[src.index("class Sweep"):]
+        assert "for s in self.sims.values():" in body
+        assert "s.tick(ts, acc, mid, share, gross)" in body
 
     def test_the_trades_come_back_in_order(self):
         import random
@@ -307,3 +311,108 @@ class TestItDecidesNothing:
             ImbSim(0)
         with pytest.raises(ValueError):
             ImbSim(200, target_points=0)
+
+
+class TestOneSidednessAtEntry:
+    """Does the fight behind the net separate the winners?
+
+    In order of how badly each would mislead:
+
+      banding on the raw share rather than the side taken. A short
+      entered at 0.38 is as one-sided as a long at 0.62; grouping them
+      by raw share splits every band in two and compares shorts
+      against longs
+
+      the control facing a different filter from the rule. Then it is
+      not a control of the same thing
+
+      a flat gradient read as a finding
+    """
+
+    def test_the_share_is_recorded_on_every_trade(self):
+        s = ImbSim(200, target_points=3.0)
+        ts = 0.0
+        for acc, px, sh in ((0, 0, 0.5), (200, 0, 0.64)):
+            ts += 1.0
+            s.tick(ts, acc, PX + px * POINT, sh, 5_000)
+        assert s._t is not None
+        assert s._t.entry_share == pytest.approx(0.64)
+        assert s._t.entry_gross == 5_000
+
+    def test_a_short_is_banded_on_the_side_it_took(self):
+        from liqmap.imbsim import _band_of
+        assert _band_of(0.62, UP) == _band_of(0.38, DOWN)
+
+    def test_a_contested_entry_lands_in_the_lowest_band(self):
+        from liqmap.imbsim import _band_of
+        assert _band_of(0.51, UP) == 0.50
+        assert _band_of(0.49, DOWN) == 0.50
+
+    def test_the_bands_split_outcomes_and_keep_the_reasons(self):
+        from liqmap.imbsim import bands
+        made = []
+        for sh, won in ((0.51, False), (0.51, False), (0.72, True)):
+            s = ImbSim(200, target_points=1.0)
+            s.tick(1.0, 0, PX, sh, 1000)
+            s.tick(2.0, 400, PX, sh, 1000)
+            if won:
+                s.tick(3.0, 400, PX + 1 * POINT, sh, 1000)
+            else:
+                s.bar_close(3.0, PX)
+            made.extend(s.trades)
+        rows = {r["band"]: r for r in bands(made)}
+        assert rows[0.50]["trades"] == 2 and rows[0.50]["cleared"] == 0
+        assert rows[0.70]["trades"] == 1 and rows[0.70]["cleared"] == 1
+        assert rows[0.50]["why"] == {"bar": 2}
+
+    def test_how_far_the_misses_got_is_kept(self):
+        """A failure at nine tenths is not the same animal as one that
+        never left the entry."""
+        from liqmap.imbsim import bands
+        s = ImbSim(200, target_points=1.0)
+        s.tick(1.0, 0, PX, 0.51, 1000)
+        s.tick(2.0, 400, PX, 0.51, 1000)
+        s.tick(3.0, 400, PX + 0.9 * POINT, 0.51, 1000)   # nearly there
+        s.bar_close(4.0, PX)
+        r = bands(s.trades)[0]
+        assert r["median_missed_mfe"] == pytest.approx(0.9)
+        assert r["missed_near"] == 1
+
+    def test_the_filter_is_off_by_default(self):
+        s = ImbSim(200, target_points=3.0)
+        s.tick(1.0, 400, PX, 0.50, 1000)
+        assert s._t is not None, "it filtered with no filter set"
+
+    def test_the_filter_refuses_a_contested_entry(self):
+        s = ImbSim(200, target_points=3.0, min_share=0.60)
+        s.tick(1.0, 400, PX, 0.52, 1000)
+        assert s._t is None
+        s.tick(2.0, 400, PX, 0.65, 1000)
+        assert s._t is not None and s._t.side == UP
+
+    def test_the_short_filter_mirrors(self):
+        s = ImbSim(200, target_points=3.0, min_share=0.60)
+        s.tick(1.0, -400, PX, 0.48, 1000)
+        assert s._t is None
+        s.tick(2.0, -400, PX, 0.35, 1000)
+        assert s._t is not None and s._t.side == DOWN
+
+    def test_the_control_faces_the_same_filter(self):
+        """Read on the rule's side, not the flipped one, or it is not
+        a control of the same thing."""
+        a = ImbSim(200, target_points=3.0, min_share=0.60)
+        b = ImbSim(200, target_points=3.0, min_share=0.60, flip=True)
+        for s in (a, b):
+            s.tick(1.0, 400, PX, 0.52, 1000)
+        assert a._t is None and b._t is None
+        for s in (a, b):
+            s.tick(2.0, 400, PX, 0.65, 1000)
+        assert a._t is not None and b._t is not None
+        assert a._t.side == UP and b._t.side == DOWN
+
+    def test_the_sweep_passes_both_sides_through(self):
+        sw = Sweep(levels=(200,), policies=(HOLD,), target_points=3.0)
+        sw.tick(1.0, 400, PX, 0.66, 9_000)
+        t = sw.sims[(200, HOLD, False)]._t
+        assert t is not None and t.entry_share == pytest.approx(0.66)
+        assert t.entry_gross == 9_000

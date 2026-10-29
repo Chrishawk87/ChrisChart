@@ -6308,6 +6308,8 @@ def create_app() -> FastAPI:
                         "price_aggression": x.aggression,
                         "price_agg_burst": round(x.pai_burst, 4),
                         "agrees": x.agrees,
+                        "push_up": x.push_up, "push_dn": x.push_dn,
+                        "share": round(x.share, 4),
                         "call_side": x.call_side,
                         "call_px": x.call_px * sc,
                         "delta": x.delta, "trade_count": x.trade_count,
@@ -6395,6 +6397,7 @@ def create_app() -> FastAPI:
         if cur is not None and cur.updates > 0:
             _lp = b.live_pai
             _cs, _cpx, _cts = b.live_call
+            _pu, _pd = b.live_push
             _ep = b.live_episode
             _liveobs = None
             if _ep is not None:
@@ -6406,6 +6409,8 @@ def create_app() -> FastAPI:
                     "mae_pts": round(_ep.mae / 1e9, 2),
                     "at2": _ep.outcome(2), "at4": _ep.outcome(4)}
             forming = {"call_side": _cs, "call_px": _cpx * sc,
+                       "push_up": _pu, "push_dn": _pd,
+                       "share": round(b.live_share, 4),
                        "obs": _liveobs,
                        "obs_so_far": len(b.live_episodes),
                        "open": cur.open * sc, "high": cur.high * sc,
@@ -10331,6 +10336,26 @@ function ofiChart(d, w, h) {
   const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
   const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
   const nb = bars.length - ba - sa;
+  /* BOTH SIDES OF THE IMBALANCE, because the net hides the fight.
+
+     +300 from 350 buying and 50 selling is a one-sided push. +300
+     from 9,000 buying and 8,700 selling is a brawl that happened to
+     tilt. The net calls them the same thing, and the second is where
+     a trade gets taken right before price turns over. */
+  const pushLine = f => {
+    if (!f) return '';
+    const u = f.push_up || 0, dn = f.push_dn || 0;
+    if (!(u + dn)) return '';
+    const sh = f.share === undefined ? 0.5 : f.share;
+    const own = Math.max(sh, 1 - sh);
+    const word = own >= 0.60 ? 'one-sided'
+      : own >= 0.55 ? 'leaning' : 'an even fight';
+    return ' &middot; <b class="long">' + Math.round(u).toLocaleString()
+      + ' buying</b> vs <b class="short">' + Math.round(dn).toLocaleString()
+      + ' selling</b> (' + (sh * 100).toFixed(0) + '% buy &mdash; '
+      + word + ')';
+  };
+
   /* THE CALL: THE IMBALANCE, PAST A LEVEL, AND NOTHING ELSE.
 
      Past +level it is up, past -level it is down, and between them
@@ -10372,6 +10397,7 @@ function ofiChart(d, w, h) {
       + '</b> right now &middot; imbalance ' + (fm.ofi > 0 ? '+' : '')
       + (fm.ofi || 0).toLocaleString() + ', past '
       + (fm.call_side === 'up' ? '+' : '-') + lvl.toLocaleString()
+      + pushLine(fm)
       + ' &middot; it reverses if it comes back through '
       + (fm.call_side === 'up' ? '+' : '-') + lvl.toLocaleString()
       + pointsLine(obsNow)
@@ -10384,6 +10410,7 @@ function ofiChart(d, w, h) {
       + oi.toLocaleString() + ', inside &plusmn;' + lvl.toLocaleString()
       + ' &middot; ' + Math.round(away).toLocaleString() + ' from a '
       + (oi >= 0 ? 'buy' : 'sell')
+      + pushLine(fm)
       + ' &middot; delta ' + (fm.delta > 0 ? '+' : '')
       + Math.round(fm.delta || 0).toLocaleString()
       + ', which does not gate this'

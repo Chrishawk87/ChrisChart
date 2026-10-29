@@ -1,5 +1,20 @@
 """The imbalance rule as trades, so entry levels can be compared.
 
+BOTH SIDES OF THE IMBALANCE, NOT JUST THE NET
+
+The net cannot tell a one-sided push from a brawl that happened to
+tilt: +300 from 350 buying and 50 selling is the same number as +300
+from 9,000 buying and 8,700 selling. The second is where a trade gets
+taken just before price turns over, because the opposing flow is
+sitting right there and the net has hidden it.
+
+So every trade records the SHARE at entry -- how much of the bar's
+gross flow had been buying, 0.5 for an even fight and 1.0 for one-way
+traffic -- and the sweep bands the outcomes by it. If the trades that
+fail are the contested ones, that shows up as a gradient across the
+bands and a filter is one parameter away. If it does not, the net was
+not hiding anything worth having.
+
 THE RULE
 
     enter   the running imbalance reaches +level (buy) or -level (sell)
@@ -72,7 +87,13 @@ POINT = 1_000_000_000
 # The entry levels worth comparing, in contracts of imbalance.
 LEVELS: tuple[int, ...] = (100, 150, 200, 250, 300, 400, 500)
 
-TARGET_POINTS = 3.0
+TARGET_POINTS = 1.0
+
+# Entry-share bands the outcomes are grouped into. The edges are what
+# "how one-sided was it" looks like in practice: a bar past the level
+# is typically 0.51, so the interesting question is whether the few
+# that reach 0.6 and beyond behave differently.
+SHARE_BANDS: tuple[float, ...] = (0.50, 0.52, 0.55, 0.60, 0.70)
 
 
 @dataclass(slots=True)
@@ -85,6 +106,10 @@ class Trade:
     entry_px: float = 0.0
     entry_ts: float = 0.0
     entry_acc: int = 0
+    # How one-sided the bar's flow was at the moment of entry, and how
+    # much flow there had been. The net alone cannot say either.
+    entry_share: float = 0.5
+    entry_gross: int = 0
     exit_px: float = 0.0
     exit_ts: float = 0.0
     why: str = ""               # target | reverse | band | bar
@@ -108,6 +133,9 @@ class Trade:
 
     def as_dict(self) -> dict:
         return {"side": self.side, "level": self.level, "bar": self.bar,
+                "entry_share": round(self.entry_share, 4),
+                "entry_gross": self.entry_gross,
+                "dominance": round(abs(self.entry_share - 0.5) * 2.0, 4),
                 "entry_px": self.entry_px, "entry_ts": self.entry_ts,
                 "entry_acc": self.entry_acc, "exit_px": self.exit_px,
                 "exit_ts": self.exit_ts, "why": self.why,
@@ -122,11 +150,13 @@ class Trade:
 class ImbSim:
     """One entry level, one exit rule, one direction convention."""
 
-    __slots__ = ("level", "target", "policy", "flip", "trades", "bar",
-                 "_side", "_t", "_armed_up", "_armed_down", "_per_bar")
+    __slots__ = ("level", "target", "policy", "flip", "min_share",
+                 "trades", "bar", "_side", "_t", "_armed_up",
+                 "_armed_down", "_per_bar", "_share", "_gross")
 
     def __init__(self, level: int, target_points: float = TARGET_POINTS,
-                 policy: str = HOLD, flip: bool = False) -> None:
+                 policy: str = HOLD, flip: bool = False,
+                 min_share: float = 0.0) -> None:
         if level < 1:
             raise ValueError("level must be at least 1")
         if target_points <= 0:
@@ -139,6 +169,12 @@ class ImbSim:
         # The control: take the opposite side of every signal. Same
         # entries, same exits, same bars.
         self.flip = bool(flip)
+        # 0.0 means off: take every signal and let the bands do the
+        # talking. Set it only once the bands say there is something
+        # to filter on.
+        self.min_share = float(min_share)
+        self._share = 0.5
+        self._gross = 0
         self.trades: list[Trade] = []
         self.bar = 0
         self._side = ""
@@ -149,8 +185,16 @@ class ImbSim:
 
     # -- the loop --------------------------------------------------------
 
-    def tick(self, ts: float, acc: int, mid: float) -> None:
-        """One book update: the imbalance now, and the mid now."""
+    def tick(self, ts: float, acc: int, mid: float,
+             share: float = 0.5, gross: int = 0) -> None:
+        """One book update: the imbalance, the mid, and both sides.
+
+        `share` is how much of the bar's gross flow has been buying so
+        far. It never gates anything unless `min_share` is set; it is
+        recorded on every trade so the outcomes can be banded by it.
+        """
+        self._share = float(share)
+        self._gross = int(gross)
         t = self._t
         if t is not None:
             t.updates += 1
@@ -186,9 +230,9 @@ class ImbSim:
 
         if self._t is None:
             want = self._signal(acc)
-            if want == UP and self._armed_up:
+            if want == UP and self._armed_up and self._one_sided(UP):
                 self._open(UP, ts, mid, acc)
-            elif want == DOWN and self._armed_down:
+            elif want == DOWN and self._armed_down and self._one_sided(DOWN):
                 self._open(DOWN, ts, mid, acc)
 
     def bar_close(self, ts: float, px: float) -> None:
@@ -199,6 +243,21 @@ class ImbSim:
         self.bar = 0
 
     # -- internals -------------------------------------------------------
+
+    def _one_sided(self, side: str) -> bool:
+        """Is the flow one-sided enough to take this side?
+
+        Read on the RULE's side, not the flipped one: the control has
+        to face the same filter as the rule or it is not a control of
+        the same thing.
+        """
+        if self.min_share <= 0.0:
+            return True
+        raw = side
+        if self.flip:
+            raw = DOWN if side == UP else UP
+        return (self._share >= self.min_share if raw == UP
+                else self._share <= 1.0 - self.min_share)
 
     def _signal(self, acc: int) -> str:
         if acc >= self.level:
@@ -213,7 +272,8 @@ class ImbSim:
 
     def _open(self, side: str, ts: float, mid: float, acc: int) -> None:
         self._t = Trade(side=side, level=self.level, entry_px=mid,
-                        entry_ts=ts, entry_acc=int(acc))
+                        entry_ts=ts, entry_acc=int(acc),
+                        entry_share=self._share, entry_gross=self._gross)
         self._side = side
         self.bar += 1
 
@@ -286,6 +346,7 @@ class Sweep:
     levels: tuple = LEVELS
     target_points: float = TARGET_POINTS
     policies: tuple = POLICIES
+    min_share: float = 0.0
     sims: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -294,11 +355,13 @@ class Sweep:
                 for pol in self.policies:
                     for flip in (False, True):
                         self.sims[(lv, pol, flip)] = ImbSim(
-                            lv, self.target_points, pol, flip)
+                            lv, self.target_points, pol, flip,
+                            self.min_share)
 
-    def tick(self, ts: float, acc: int, mid: float) -> None:
+    def tick(self, ts: float, acc: int, mid: float,
+             share: float = 0.5, gross: int = 0) -> None:
         for s in self.sims.values():
-            s.tick(ts, acc, mid)
+            s.tick(ts, acc, mid, share, gross)
 
     def bar_close(self, ts: float, px: float) -> None:
         for s in self.sims.values():
@@ -327,3 +390,69 @@ class Sweep:
             out.extend(self.sims[(lv, policy, False)].trades)
         out.sort(key=lambda t: (t.entry_ts, t.level))
         return out
+
+
+# ----------------------------------------- did one-sidedness separate them
+
+def _band_of(share: float, side: str, edges=SHARE_BANDS) -> float:
+    """Which one-sidedness band a trade entered in.
+
+    Measured on the SIDE IT TOOK, so a short entered at share 0.38 is
+    as one-sided as a long entered at 0.62 and lands in the same band.
+    Grouping on the raw share instead would split every band in two
+    and compare shorts against longs.
+    """
+    own = share if side == UP else 1.0 - share
+    pick = edges[0]
+    for e in edges:
+        if own >= e:
+            pick = e
+    return pick
+
+
+def bands(trades, edges=SHARE_BANDS) -> list[dict]:
+    """Outcomes grouped by how one-sided the flow was at entry.
+
+    THE QUESTION THIS ANSWERS. The net cannot tell a one-sided push
+    from a brawl that tilted, and the brawl is where a trade gets
+    taken just before price turns. If that is true, the clear rate
+    rises across these bands. If it does not rise, the two sides were
+    not hiding anything worth having and no filter will help.
+
+    `why` is kept per band, because HOW a trade failed is a different
+    fact from how often: a trade that got most of the way and ran out
+    of bar is not the same failure as one that went straight against.
+    """
+    by: dict = {}
+    for t in trades:
+        b = _band_of(t.entry_share, t.side, edges)
+        row = by.setdefault(b, {"band": b, "trades": 0, "cleared": 0,
+                                "why": {}, "mfe_missed": [],
+                                "points": 0.0})
+        row["trades"] += 1
+        row["why"][t.why] = row["why"].get(t.why, 0) + 1
+        row["points"] += t.points
+        if t.won:
+            row["cleared"] += 1
+        else:
+            # How far the ones that did not clear actually got. A
+            # failure at nine tenths of the distance is a different
+            # animal from one that never left the entry.
+            row["mfe_missed"].append(t.mfe / POINT)
+    out = []
+    for b in sorted(by):
+        r = by[b]
+        n = r["trades"]
+        missed = sorted(r["mfe_missed"])
+        out.append({
+            "band": b, "trades": n,
+            "cleared": r["cleared"],
+            "missed": n - r["cleared"],
+            "clear_rate": round(r["cleared"] / n, 4) if n else 0.0,
+            "mean_points": round(r["points"] / n, 4) if n else 0.0,
+            "why": r["why"],
+            "median_missed_mfe": round(
+                missed[len(missed) // 2], 4) if missed else 0.0,
+            "missed_near": sum(1 for m in missed if m >= 0.5),
+        })
+    return out

@@ -445,3 +445,31 @@ class TestTheObservationsSurvive:
         assert _eps_in("not json at all") == []
         assert _eps_in("") == []
         assert _eps_in("[{}]")[0].side == ""
+
+
+class TestBothSidesSurviveTheRestart:
+    """They are the only record of how contested a closed bar was, and
+    they cannot be recomputed from anything else the row carries."""
+
+    def test_they_round_trip(self, tmp_path):
+        lad = builders((250,))
+        feed(lad)
+        assert any(b.gross for b in lad[250].bars)
+        rec = OfiBarRecorder(OfiBarStore(tmp_path / "t.db"), lad)
+        rec.seed()
+        rec.flush()
+        fresh = builders((250,))
+        OfiBarRecorder(OfiBarStore(tmp_path / "t.db"),
+                       fresh).load_into_builders()
+        for a, b in zip(lad[250].bars, fresh[250].bars):
+            assert a.push_up == b.push_up and a.push_dn == b.push_dn
+            assert b.push_up - b.push_dn == b.ofi
+
+    def test_an_older_row_reads_back_as_no_flow_not_as_selling(self, store):
+        """Zero on both sides reports an even share, which is what
+        'nothing recorded' should look like."""
+        store.record(250, OfiBar(ts_open=1.0, ts_close=2.0, open=1, high=2,
+                                 low=0, close=1, direction="green",
+                                 ofi=250, updates=9))
+        got = store.recent(250)[0]
+        assert got.gross == 0 and got.share == 0.5

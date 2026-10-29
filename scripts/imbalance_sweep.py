@@ -62,14 +62,15 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from liqmap.imbsim import BAND, HOLD, LEVELS, Sweep       # noqa: E402
+from liqmap.imbsim import (BAND, HOLD, LEVELS, Sweep,      # noqa: E402
+                           bands)
 from liqmap.ofibar import LADDER, OfiBarBuilder           # noqa: E402
 
 TICK = 0.25
 
 
 def run(paths: list[str], targets: list[int], levels, target_points: float,
-        limit: int = 0):
+        limit: int = 0, min_share: float = 0.0):
     """One pass over the records, every target and level at once."""
     import databento as db
 
@@ -78,7 +79,8 @@ def run(paths: list[str], targets: list[int], levels, target_points: float,
     builders = {t: OfiBarBuilder(tick_size=TICK, threshold=t, max_s=900.0,
                                  min_updates=2, max_bars=10_000_000)
                 for t in targets}
-    sweeps = {t: Sweep(levels=tuple(levels), target_points=target_points)
+    sweeps = {t: Sweep(levels=tuple(levels), target_points=target_points,
+                       min_share=min_share)
               for t in targets}
     n = 0
     for path in paths:
@@ -104,12 +106,13 @@ def run(paths: list[str], targets: list[int], levels, target_points: float,
             for t, b in builders.items():
                 closed = b.on_book(ts, bpx, bsz, apx, asz)
                 sw = sweeps[t]
+                pu, pd = b.live_push
                 # The close first, so the trade is flattened at the
                 # bar's own closing price rather than at whatever the
                 # next bar opens on.
                 if closed is not None:
                     sw.bar_close(closed.ts_close, closed.close)
-                sw.tick(ts, b.accumulated, mid)
+                sw.tick(ts, b.accumulated, mid, b.live_share, pu + pd)
             n += 1
             if limit and n >= limit:
                 break
@@ -208,6 +211,61 @@ def show(target: int, bars_list, sweep: Sweep, target_points: float) -> None:
           " honest column.")
 
 
+def show_bands(sweep: Sweep, level: int, policy: str,
+               target_points: float) -> None:
+    """Did one-sidedness separate the winners from the losers?
+
+    The net cannot tell a one-sided push from a brawl that happened to
+    tilt, and the brawl is where a trade gets taken just before price
+    turns over. If that is true here, the clear rate rises across these
+    bands. If it is flat, the two sides were not hiding anything a
+    filter could use.
+    """
+    tr = sweep.sims[(level, policy, False)].trades
+    if not tr:
+        print(f"\n  No trades at level {level} to break out.")
+        return
+    print(f"\n  ONE-SIDEDNESS AT ENTRY  (level {level}, {policy.upper()},"
+          f" {target_points:g} point)")
+    print(f"  {'band':>6}{'trades':>9}{'cleared':>9}{'clear%':>9}"
+          f"{'mean pt':>9}{'got to':>9}{'near':>7}   why they did not clear")
+    rows = bands(tr)
+    for r in rows:
+        why = ", ".join(f"{k} {v:,}" for k, v in sorted(r["why"].items())
+                        if k != "target")
+        print(f"  {r['band']:>6.2f}{r['trades']:>9,}{r['cleared']:>9,}"
+              f"{100 * r['clear_rate']:>8.1f}%{r['mean_points']:>+9.3f}"
+              f"{r['median_missed_mfe']:>9.2f}{r['missed_near']:>7,}   {why}")
+    print("  BAND is how much of the bar's gross flow was on the side"
+          " taken: 0.50 is an")
+    print("  even fight, 0.70 is one-way traffic. GOT TO is the median"
+          " distance the")
+    print("  ones that did not clear actually reached -- a failure at"
+          " nine tenths is")
+    print("  not the same animal as one that never left the entry. NEAR"
+          " counts the")
+    print("  misses that got at least half a point.")
+    usable = [r for r in rows if r["trades"] >= 200]
+    if len(usable) >= 2:
+        lo, hi = usable[0], usable[-1]
+        gap = hi["clear_rate"] - lo["clear_rate"]
+        print(f"\n  Across the bands the clear rate moves"
+              f" {100 * lo['clear_rate']:.1f}% -> {100 * hi['clear_rate']:.1f}%"
+              f" ({100 * gap:+.1f} points).")
+        if abs(gap) < 0.03:
+            print("  WHICH IS FLAT. One-sidedness is not separating these"
+                  " trades, so a")
+            print("  filter on it would thin the sample without improving"
+                  " it. The two")
+            print("  sides were not hiding anything the net was not"
+                  " already saying.")
+        else:
+            print("  Worth a filter. Re-run with --min-share set to the"
+                  " band where it")
+            print("  turns, then check the trade count has not collapsed"
+                  " with it.")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("files", nargs="+", help=".dbn / .dbn.zst MBP files")
@@ -215,9 +273,15 @@ def main() -> int:
     ap.add_argument("--all-targets", action="store_true")
     ap.add_argument("--levels", type=int, nargs="+", default=list(LEVELS),
                     help="imbalance entry levels to compare")
-    ap.add_argument("--points", type=float, default=3.0,
+    ap.add_argument("--points", type=float, default=1.0,
                     help="objective in ES points")
+    ap.add_argument("--band-level", type=int, default=0,
+                    help="entry level to break out by one-sidedness;"
+                         " defaults to the one with the largest edge")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--min-share", type=float, default=0.0,
+                    help="require this share of the bar's gross flow on"
+                         " the side taken; 0 takes every signal")
     ap.add_argument("--csv", default="",
                     help="write every trade here; defaults to"
                          " imbalance_trades_<target>.csv beside the data")
@@ -237,11 +301,17 @@ def main() -> int:
 
     print(f"\nIMBALANCE SWEEP   targets {targets}   levels {levels}")
     print("  building...", flush=True)
-    builders, sweeps = run(a.files, targets, levels, a.points, a.limit)
+    builders, sweeps = run(a.files, targets, levels, a.points, a.limit,
+                           a.min_share)
 
     base = Path(a.files[0]).resolve().parent
     for t in targets:
         show(t, builders[t].bars, sweeps[t], a.points)
+        rws = [r for r in sweeps[t].rows() if r["trades"] >= 200]
+        pick = (a.band_level if a.band_level else
+                (max(rws, key=lambda r: r["edge"])["level"] if rws
+                 else levels[0]))
+        show_bands(sweeps[t], pick, HOLD, a.points)
         rows = []
         for pol in (HOLD, BAND):
             for tr in sweeps[t].trades(pol):

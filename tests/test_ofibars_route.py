@@ -1443,3 +1443,63 @@ class TestNoDictLiteralHasADuplicateKey:
         assert '"keep_n": keep_n, "levels": lvls,' in WEB
         c = WEB[WEB.index("function ofiChart"):WEB.index("let _ofiTimer")]
         assert "const lvls = (d && d.levels) || [];" in c
+
+
+class TestBothSidesOnScreen:
+    """The net hides the fight it came out of, so the panel shows it."""
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def _chart(self):
+        i = WEB.index("function ofiChart")
+        return WEB[i:WEB.index("let _ofiTimer")]
+
+    def test_the_route_sends_both_sides_per_bar(self):
+        r = self._route()
+        assert '"push_up": x.push_up, "push_dn": x.push_dn' in r
+        assert '"share": round(x.share, 4)' in r
+
+    def test_the_forming_bar_carries_them_live(self):
+        r = self._route()
+        assert "_pu, _pd = b.live_push" in r
+        assert '"share": round(b.live_share, 4)' in r
+
+    def test_the_live_line_shows_the_fight(self):
+        c = self._chart()
+        assert "const pushLine" in c
+        assert "buying</b> vs" in c and "selling</b>" in c
+
+    def test_it_names_the_state_rather_than_only_the_numbers(self):
+        c = self._chart()
+        blk = c[c.index("const pushLine"):][:1200]
+        assert "one-sided" in blk and "an even fight" in blk
+
+    def test_it_is_shown_whether_or_not_there_is_a_call(self):
+        """A near-even fight is most of the reason a call fails, so it
+        cannot only appear once a call has been made."""
+        c = self._chart()
+        assert c.count("pushLine(fm)") >= 2
+
+    def test_a_bar_with_no_flow_shows_nothing_rather_than_zero(self):
+        c = self._chart()
+        blk = c[c.index("const pushLine"):][:1200]
+        assert "if (!(u + dn)) return '';" in blk
+
+    def test_the_sweep_bands_the_outcomes(self):
+        src = (ROOT / "scripts" / "imbalance_sweep.py").read_text()
+        assert "ONE-SIDEDNESS AT ENTRY" in src
+        assert "--min-share" in src
+        assert "why they did not clear" in src
+
+    def test_the_sweep_calls_a_flat_gradient_flat(self):
+        src = (ROOT / "scripts" / "imbalance_sweep.py").read_text()
+        assert "WHICH IS FLAT" in src
+        assert "not separating these" in src
+
+    def test_the_objective_defaults_to_one_point(self):
+        from liqmap.imbsim import TARGET_POINTS
+        assert TARGET_POINTS == 1.0
+        src = (ROOT / "scripts" / "imbalance_sweep.py").read_text()
+        assert '"--points", type=float, default=1.0' in src

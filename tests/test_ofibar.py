@@ -820,3 +820,100 @@ class TestObservationsInsideTheBar:
                 assert bar.call_px == bar.episodes[0].px0
             else:
                 assert bar.call_side == ""
+
+
+class TestBothSidesOfTheImbalance:
+    """The net hides the fight it came out of.
+
+    In order of how badly each would mislead:
+
+      the two sides not summing back to the net. They are the same
+      quantity split in two, and if they drift apart one of them is
+      being counted wrong with nothing on screen to say which
+
+      carrying them across a bar close. They describe ONE bar's fight,
+      and a running total wearing a per-bar label is the latching
+      failure the accumulator reset exists to prevent
+
+      a bar with no flow reporting a share of zero, which reads as
+      maximum selling rather than as nothing having happened
+    """
+
+    def _run(self, n=200_000, seed=5, threshold=2000):
+        import random
+        rng = random.Random(seed)
+        b = OfiBarBuilder(tick_size=0.25, threshold=threshold, max_s=900.0,
+                          min_updates=2, max_bars=10 ** 7)
+        bid, ts = 7_700 * 10 ** 9, 0.0
+        for _ in range(n):
+            if rng.random() < 0.06:
+                bid += RAW if rng.random() < 0.5 else -RAW
+            ts += 0.01
+            b.on_book(ts, bid, rng.randint(50, 900), bid + RAW,
+                      rng.randint(50, 900))
+        return b
+
+    def test_the_two_sides_sum_back_to_the_net(self):
+        """An identity, so any drift is a counting bug."""
+        b = self._run()
+        assert b.bars
+        for x in b.bars:
+            assert x.push_up - x.push_dn == x.ofi, x.as_dict()
+
+    def test_neither_side_is_ever_negative(self):
+        b = self._run()
+        for x in b.bars:
+            assert x.push_up >= 0 and x.push_dn >= 0
+
+    def test_the_gross_dwarfs_the_net(self):
+        """Which is the whole point: a bar that crossed the target is
+        usually a near-even fight, not a one-sided push."""
+        b = self._run()
+        big = [x for x in b.bars if x.gross > 0]
+        assert big
+        ratio = sum(abs(x.ofi) / x.gross for x in big) / len(big)
+        assert ratio < 0.5, ratio
+
+    def test_they_reset_at_the_bar_close(self):
+        b = self._run()
+        assert len(b.bars) > 5
+        # Carried forward, the gross would only ever climb.
+        gs = [x.gross for x in b.bars]
+        assert gs != sorted(gs), "the gross never fell: it is carrying over"
+
+    def test_a_bar_with_no_flow_reports_an_even_share(self):
+        from liqmap.ofibar import OfiBar
+        x = OfiBar()
+        assert x.gross == 0
+        assert x.share == 0.5, "zero would read as maximum selling"
+        assert x.dominance == 0.0
+
+    def test_dominance_is_direction_free(self):
+        from liqmap.ofibar import OfiBar
+        a = OfiBar(push_up=700, push_dn=300)
+        c = OfiBar(push_up=300, push_dn=700)
+        assert a.share > 0.5 > c.share
+        assert a.dominance == pytest.approx(c.dominance)
+
+    def test_the_live_pair_matches_the_bar_it_closes(self):
+        b = self._run(n=20_000)
+        before = b.live_push
+        assert before == (b._pu, b._pd)
+        closed = None
+        import random
+        rng = random.Random(1)
+        bid = 7_700 * 10 ** 9
+        ts = 1e6
+        while closed is None:
+            ts += 0.01
+            closed = b.on_book(ts, bid, rng.randint(50, 900), bid + RAW,
+                               rng.randint(50, 900))
+        assert closed.push_up >= 0 and closed.push_dn >= 0
+        assert closed.push_up - closed.push_dn == closed.ofi
+
+    def test_it_serialises(self):
+        import json
+        b = self._run(n=20_000)
+        d = json.loads(json.dumps(b.bars[0].as_dict()))
+        for k in ("push_up", "push_dn", "gross", "share", "dominance"):
+            assert k in d, k

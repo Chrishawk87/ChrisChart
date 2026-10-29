@@ -98,6 +98,28 @@ BALANCED_FLOW = "BALANCED_PRICE_FLOW"
 PAI_BUY = 0.70
 PAI_SELL = 0.30
 
+# BOTH SIDES OF THE IMBALANCE, NOT JUST THE NET.
+#
+# The accumulator is the net, and the net cannot tell these apart:
+#
+#     +300 from 350 buying and 50 selling      a one-sided push
+#     +300 from 9,000 buying and 8,700 selling a brawl that tilted
+#
+# They are the same number to a rule that reads the net, and they are
+# not remotely the same state. The second is where a trade gets taken
+# just before price turns over, because the opposing flow is sitting
+# right there and the net has hidden it.
+#
+# So the positive and the negative contributions are summed SEPARATELY
+# as well, per bar, reset with everything else at the close. `gross`
+# is how much flow there was in total and `share` is how much of it
+# was buying -- 0.5 is an even fight, 1.0 is one-way traffic.
+#
+# The DIFFERENCE between the two is just the net again, by definition:
+# push_up - push_dn == ofi, exactly, and there is a test. What the two
+# sides carry that the net does not is the size of the fight behind it.
+
+
 # THE CALL LEVEL, in contracts of running imbalance.
 #
 # The imbalance is the signal, on its own. At +500 the call is up, at
@@ -212,6 +234,11 @@ class OfiBar:
     buy_vol: float = 0.0
     sell_vol: float = 0.0
     trade_count: int = 0
+    # Both sides of the imbalance, summed separately over the bar.
+    # push_up - push_dn == ofi, exactly; what they add is the size of
+    # the fight the net came out of.
+    push_up: int = 0
+    push_dn: int = 0
     # Prices that ACTUALLY TRADED inside the bar, in the same raw feed
     # units as open/high/low/close. Zero means no print landed here --
     # not a price of zero, and never filled in from the mid.
@@ -274,6 +301,27 @@ class OfiBar:
         """The same, over the last BURST_S of the bar only."""
         total = self.buy_burst + self.sell_burst
         return (self.buy_burst / total) if total > 0 else 0.5
+
+    @property
+    def gross(self) -> int:
+        """All the imbalance that moved, both ways. Never negative."""
+        return self.push_up + self.push_dn
+
+    @property
+    def share(self) -> float:
+        """How much of the gross was buying. 0.5 even, 1.0 one-way.
+
+        A bar with no flow at all reports 0.5, because an even split
+        is what "nothing happened" looks like and a zero there would
+        read as maximum selling.
+        """
+        g = self.gross
+        return (self.push_up / g) if g > 0 else 0.5
+
+    @property
+    def dominance(self) -> float:
+        """How one-sided it was, regardless of direction. 0 to 1."""
+        return abs(self.share - 0.5) * 2.0
 
     @property
     def traded(self) -> bool:
@@ -394,6 +442,9 @@ class OfiBar:
                 "trade_low": self.trade_low,
                 "trade_last": self.trade_last,
                 "traded": self.traded,
+                "push_up": self.push_up, "push_dn": self.push_dn,
+                "gross": self.gross, "share": round(self.share, 4),
+                "dominance": round(self.dominance, 4),
                 "call_side": self.call_side,
                 "call_px": self.call_px,
                 "call_ts": self.call_ts,
@@ -420,7 +471,7 @@ class OfiBarBuilder:
                  "_buy_vol", "_sell_vol", "_trades",
                  "_t_hi", "_t_lo", "_t_last",
                  "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
-                 "_level", "_ep", "_eps")
+                 "_level", "_ep", "_eps", "_pu", "_pd")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
@@ -489,6 +540,9 @@ class OfiBarBuilder:
         # counts as a direction at all. Scaled to the target, so the
         # same rule means the same thing on every rung of the ladder.
         self._level = max(1, int(call_level))
+        # Both sides of the imbalance for the bar in progress.
+        self._pu = 0
+        self._pd = 0
         self._ep: Episode | None = None
         self._eps: list = []
 
@@ -512,6 +566,8 @@ class OfiBarBuilder:
         self._c_ts = 0.0
         self._ep = None
         self._eps = []
+        self._pu = 0
+        self._pd = 0
 
     @property
     def current(self) -> OfiBar | None:
@@ -572,6 +628,16 @@ class OfiBarBuilder:
         rather than the market.
         """
         return self._level < self.threshold
+
+    @property
+    def live_push(self) -> tuple[int, int]:
+        """(buying, selling) in the bar in progress, as magnitudes."""
+        return (self._pu, self._pd)
+
+    @property
+    def live_share(self) -> float:
+        g = self._pu + self._pd
+        return (self._pu / g) if g > 0 else 0.5
 
     @property
     def live_call(self) -> tuple[str, float, float]:
@@ -687,6 +753,10 @@ class OfiBarBuilder:
 
         self._prev = touch
         self._acc += e
+        if e > 0:
+            self._pu += e
+        elif e < 0:
+            self._pd -= e
 
         bar = self._bar
         if bar is None:
@@ -833,6 +903,10 @@ class OfiBarBuilder:
         bar.call_side = first.side if first else ""
         bar.call_px = first.px0 if first else 0.0
         bar.call_ts = first.ts0 if first else 0.0
+        # Both sides of the imbalance this bar was built from. Taken
+        # before the reset below, which is the only place they exist.
+        bar.push_up = self._pu
+        bar.push_dn = self._pd
         self.bars.append(bar)
         if len(self.bars) > self.max_bars:
             # Trim in blocks. Popping one per close is O(n) each time
@@ -864,5 +938,7 @@ class OfiBarBuilder:
         self._c_ts = 0.0
         self._ep = None
         self._eps = []
+        self._pu = 0
+        self._pd = 0
         self._open_bar(ts, mid)
         return bar

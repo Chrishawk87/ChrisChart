@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS ofi_bars (
     call_side   TEXT    NOT NULL DEFAULT '',
     call_px     REAL    NOT NULL DEFAULT 0,
     call_ts     REAL    NOT NULL DEFAULT 0,
+    push_up     INTEGER NOT NULL DEFAULT 0,
+    push_dn     INTEGER NOT NULL DEFAULT 0,
     episodes    TEXT    NOT NULL DEFAULT '',
     written_at  REAL    NOT NULL
 );
@@ -99,7 +101,8 @@ _COLUMNS = ("target", "ts_open", "ts_close", "open", "high", "low",
             "buy_agg", "sell_agg", "buy_burst", "sell_burst",
             "buy_vol", "sell_vol", "trade_count",
             "trade_high", "trade_low", "trade_last",
-            "call_side", "call_px", "call_ts", "episodes", "written_at")
+            "call_side", "call_px", "call_ts",
+            "push_up", "push_dn", "episodes", "written_at")
 
 # Columns added after the table first shipped. A CREATE TABLE IF NOT
 # EXISTS does nothing to a table that already exists, so a database
@@ -112,7 +115,9 @@ _ADDED = (("trade_high", "REAL NOT NULL DEFAULT 0"),
           ("call_side", "TEXT NOT NULL DEFAULT ''"),
           ("call_px", "REAL NOT NULL DEFAULT 0"),
           ("call_ts", "REAL NOT NULL DEFAULT 0"),
-          ("episodes", "TEXT NOT NULL DEFAULT ''"))
+          ("episodes", "TEXT NOT NULL DEFAULT ''"),
+          ("push_up", "INTEGER NOT NULL DEFAULT 0"),
+          ("push_dn", "INTEGER NOT NULL DEFAULT 0"))
 
 
 def _row_of(target: int, b: OfiBar, now: float) -> tuple:
@@ -125,7 +130,7 @@ def _row_of(target: int, b: OfiBar, now: float) -> tuple:
             float(b.buy_vol), float(b.sell_vol), int(b.trade_count),
             float(b.trade_high), float(b.trade_low), float(b.trade_last),
             str(b.call_side or ""), float(b.call_px), float(b.call_ts),
-            _eps_out(b), float(now))
+            int(b.push_up), int(b.push_dn), _eps_out(b), float(now))
 
 
 def _eps_out(b: OfiBar) -> str:
@@ -199,6 +204,8 @@ def _bar_of(r: sqlite3.Row) -> OfiBar:
                   call_side=_txt(r, "call_side"),
                   call_px=_opt(r, "call_px"),
                   call_ts=_opt(r, "call_ts"),
+                  push_up=int(_opt(r, "push_up")),
+                  push_dn=int(_opt(r, "push_dn")),
                   episodes=_eps_in(_txt(r, "episodes")))
 
 
