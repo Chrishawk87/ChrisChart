@@ -20,6 +20,10 @@ THE FOUR
                     buckets of equal VOLUME rather than equal clock.
                     High means one side is doing most of the taking.
 
+    TAKING          the same buckets WITHOUT the absolute value, so
+                    it carries a side. VPIN says how lopsided; this
+                    says which way.
+
     CANCEL RATE     how much of the size posted at the touch was
                     pulled rather than traded. High means the book
                     being read may not have been there to hit.
@@ -27,6 +31,20 @@ THE FOUR
     GROSS           the size of the fight behind the net. Carried
                     because a 500 net out of 600 and a 500 net out of
                     9,000 are one number and not one state.
+
+VPIN CANNOT CONFIRM A DIRECTION, AND IT IS WORTH BEING EXACT ABOUT
+WHY. It is a mean of |buy - sell| / V. The absolute value is the
+metric: a bucket where sellers did 80% of the lifting and one where
+buyers did produce the IDENTICAL number. So it can tell you the
+taking was lopsided and never which way, which is exactly why it
+belongs in the veto-or-size column and nowhere near the direction.
+
+Drop the absolute value and the same buckets give `taking`, which
+does carry a side. That one is comparable with the read: the book
+says up and the aggressive taking is also up, or it is not. It is
+not the same as the delta already on the chart -- that is clocked by
+TIME, and this by VOLUME, so 500 contracts of taking weighs the same
+whether it took four seconds or four minutes.
 
 VPIN IS BUILT ON THE STATED AGGRESSOR, NOT ON THE PAPER'S ESTIMATE.
 The original construction infers the buy/sell split from price
@@ -111,6 +129,7 @@ class RegimeSnapshot:
 
     spread_ticks: float = 0.0
     vpin: float = 0.0
+    taking: float = 0.0         # signed: + buyers lifting, - sellers
     cancel_rate: float = 0.0
     gross: float = 0.0
 
@@ -121,6 +140,34 @@ class RegimeSnapshot:
     vpin_n: int = 0             # samples behind the vpin percentile
     cancel_n: int = 0
     buckets: int = 0            # completed volume buckets so far
+
+    @property
+    def taking_side(self) -> str:
+        """Which way the aggressive taking has gone. '' when level.
+
+        THIS IS NOT A SIGNAL AND MUST NOT BECOME ONE. It is here to
+        be compared with the read -- 'the book and the tape agree' --
+        and the comparison is drawn by whoever holds both. Nothing in
+        this module knows what the read says.
+        """
+        if self.taking > 0:
+            return "up"
+        if self.taking < 0:
+            return "down"
+        return ""
+
+    def agrees_with(self, read: str) -> str:
+        """'agree' / 'disagree' / '' against a direction from outside.
+
+        Takes the read as an ARGUMENT rather than reaching for it, so
+        that this module still cannot see the reading -- the rule
+        that a tag may never change a direction is kept by the shape
+        of the code and not by anyone remembering it.
+        """
+        side = self.taking_side
+        if not side or read not in ("up", "down"):
+            return ""
+        return "agree" if side == read else "disagree"
 
     @property
     def known(self) -> bool:
@@ -143,6 +190,8 @@ class RegimeSnapshot:
     def as_dict(self) -> dict:
         return {"spread_ticks": round(self.spread_ticks, 2),
                 "vpin": round(self.vpin, 4),
+                "taking": round(self.taking, 4),
+                "taking_side": self.taking_side,
                 "cancel_rate": round(self.cancel_rate, 4),
                 "gross": round(self.gross, 1),
                 "spread_band": self.spread_band,
@@ -198,9 +247,9 @@ class Regime:
     __slots__ = ("bucket_vol", "buckets", "cancel_window_s",
                  "high_pct", "min_samples",
                  "_spread", "_gross", "_last_ts",
-                 "_b_buy", "_b_sell", "_b_vol", "_bkts",
-                 "_vpin", "_vp", "_events", "_cp", "_cancel",
-                 "_added", "_pulled")
+                 "_b_buy", "_b_sell", "_b_vol", "_bkts", "_signed",
+                 "_vpin", "_taking", "_vp", "_events", "_cp",
+                 "_cancel", "_added", "_pulled")
 
     def __init__(self, bucket_vol: float = BUCKET_VOL,
                  buckets: int = BUCKETS,
@@ -226,7 +275,11 @@ class Regime:
         self._b_sell = 0.0
         self._b_vol = 0.0
         self._bkts: deque = deque(maxlen=self.buckets)
+        # The same buckets before the absolute value. VPIN is the
+        # mean of |these|; `taking` is the mean of these.
+        self._signed: deque = deque(maxlen=self.buckets)
         self._vpin = 0.0
+        self._taking = 0.0
         self._vp = Percentile()
 
         # (ts, action, size) for the cancel window.
@@ -281,11 +334,13 @@ class Regime:
             buy = self._b_buy * share
             sell = self._b_sell * share
             self._bkts.append(abs(buy - sell) / take)
+            self._signed.append((buy - sell) / take)
             self._b_buy -= buy
             self._b_sell -= sell
             self._b_vol -= take
             if self._bkts:
                 self._vpin = sum(self._bkts) / len(self._bkts)
+                self._taking = sum(self._signed) / len(self._signed)
                 self._vp.add(self._vpin)
 
     def on_action(self, ts: float, action: str, size: float) -> None:
@@ -329,6 +384,7 @@ class Regime:
         return RegimeSnapshot(
             spread_ticks=sp,
             vpin=self._vpin,
+            taking=self._taking,
             cancel_rate=self._cancel,
             gross=self._gross,
             # The market defines the minimum increment, so this one
@@ -347,7 +403,9 @@ class Regime:
     def reset(self) -> None:
         self._b_buy = self._b_sell = self._b_vol = 0.0
         self._bkts.clear()
+        self._signed.clear()
         self._vpin = 0.0
+        self._taking = 0.0
         self._vp = Percentile()
         self._events.clear()
         self._added = self._pulled = 0.0

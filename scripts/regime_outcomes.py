@@ -135,7 +135,15 @@ def run(events, period_s, warmup_s, hold_s, bucket_vol):
         # which is the most flattering mistake available here.
         if settled is None and s.read:
             rg.set_gross(s.gross)
-            settled = (s.read, rg.snapshot.tag, mid)
+            rs = rg.snapshot
+            # The agreement is part of the regime for scoring: "the
+            # book said up and the tape was also lifting" is a
+            # different state from "the book said up and the tape was
+            # hitting bids", and folding them together would measure
+            # neither.
+            ag = rs.agrees_with(s.read)
+            tag = f"{rs.tag}-{ag}" if (rs.tag and ag) else rs.tag
+            settled = (s.read, tag, mid)
         last_px = mid
     return rows
 

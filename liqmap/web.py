@@ -6114,7 +6114,8 @@ def create_app() -> FastAPI:
                     bars: int = 140, offset: int = 0,
                     pivot: int = 5, confirm: int = 1,
                     keep: int = 4, higher: int = 1,
-                    level: int = 0) -> dict[str, Any]:
+                    level: int = 0, clear: float = 1.0
+                    ) -> dict[str, Any]:
         """OFI-closed candles for one target, newest last.
 
         Every target in the ladder is accumulating all the time, so
@@ -6170,6 +6171,21 @@ def create_app() -> FastAPI:
         # believing it, and every bar of it is latency on the chart.
         pv = max(1, min(int(pivot), 20))
         cf = max(1, min(int(confirm), 10))
+        # HOW FAR A SWING MUST STAND CLEAR, as a multiple of what a
+        # bar at this target typically spans.
+        #
+        # An ordinal extreme is not a swing. Measured on 26,000 bars
+        # the old rule marked a bar that merely TIED its neighbours as
+        # readily as one standing eight points above, and most of the
+        # chevrons on the chart were the former. Requiring a swing to
+        # clear its neighbourhood by one typical bar's range removed
+        # 79% of them.
+        #
+        # Expressed as a multiple rather than in ticks because a bar
+        # at target 125 and one at 2,000 are different sizes, and a
+        # number in ticks would mean something different on every
+        # rung of the ladder. Zero restores the old behaviour exactly.
+        cl = max(0.0, min(float(clear), 5.0))
         wide_lo = max(0, start - pv)
         wide_hi = min(total, end + cf)
         wide = b.bars[wide_lo:wide_hi]
@@ -6190,8 +6206,16 @@ def create_app() -> FastAPI:
         from . import levels as _lv
         from . import pivots as _pv
         w_idx, w_hi, w_lo, w_cl, w_ts = _lv.traded_series(wide, 1e-9)
+        # The typical span of a bar at THIS target, taken from the
+        # bars on screen rather than from a constant. The median
+        # rather than the mean: one violent bar should not raise the
+        # bar for every swing after it.
+        _spans = sorted(h - l for h, l in zip(w_hi, w_lo) if h >= l)
+        _typ = _spans[len(_spans) // 2] if _spans else 0.0
+        _min_clear = cl * _typ
         if len(w_idx) > pv + cf:
-            for q in _pv.find(w_hi, w_lo, left=pv, right=cf, ts=w_ts):
+            for q in _pv.find(w_hi, w_lo, left=pv, right=cf, ts=w_ts,
+                              min_clear=_min_clear):
                 abs_i = wide_lo + w_idx[q.index]
                 if start <= abs_i < end:
                     marks.append({"i": abs_i - start, "kind": q.kind,
@@ -6201,7 +6225,8 @@ def create_app() -> FastAPI:
             # settled pass has already judged them all.
             if off == 0:
                 for q in _pv.find_provisional(w_hi, w_lo, left=pv,
-                                              right=cf, ts=w_ts):
+                                              right=cf, ts=w_ts,
+                                              min_clear=_min_clear):
                     abs_i = wide_lo + w_idx[q.index]
                     if start <= abs_i < end:
                         prov.append({"i": abs_i - start, "kind": q.kind,
@@ -6238,7 +6263,8 @@ def create_app() -> FastAPI:
         if len(h_idx) > pv + cf:
             # Found on the SAME numbers the levels are judged against,
             # so a pivot price and the bar that made it stay equal.
-            found = _pv.find(hh, ll, left=pv, right=cf, ts=tt)
+            found = _pv.find(hh, ll, left=pv, right=cf, ts=tt,
+                             min_clear=_min_clear)
             rows = _lv.traded_bars(hh, ll, cc, tt)
             for sw in _lv.swing_levels(found, rows, keep=keep_n):
                 abs_i = look + h_idx[sw.index]
@@ -6295,7 +6321,8 @@ def create_app() -> FastAPI:
                 if len(i2) <= pv + cf:
                     continue
                 rows2 = _lv.traded_bars(hh2, ll2, cc2, tt2)
-                found2 = _pv.find(hh2, ll2, left=pv, right=cf, ts=tt2)
+                found2 = _pv.find(hh2, ll2, left=pv, right=cf, ts=tt2,
+                                  min_clear=_min_clear)
                 for sw in _lv.swing_levels(found2, rows2, keep=2):
                     hi.append({"target": ht,
                                "kind": "high" if sw.high_side else "low",
@@ -6536,7 +6563,14 @@ def create_app() -> FastAPI:
             try:
                 if _read:
                     _rg.set_gross(_read.get("gross", 0.0))
-                _regime = _rg.snapshot.as_dict()
+                _snap = _rg.snapshot
+                _regime = _snap.as_dict()
+                # THE COMPARISON IS DRAWN HERE, by the one place that
+                # holds both. The regime module is handed the read as
+                # an argument and never reaches for it, so a tag
+                # still cannot change a direction.
+                _regime["agrees"] = _snap.agrees_with(
+                    (_read or {}).get("read", ""))
             except Exception:                           # noqa: BLE001
                 _regime = None
 
@@ -6551,6 +6585,8 @@ def create_app() -> FastAPI:
                 "call_levels": [100, 150, 200, 250, 300, 400, 500],
                 "reachable": b.reachable(),
                 "pivot_n": pv, "confirm_n": cf,
+                "clear_n": cl,
+                "clear_ticks": round(_min_clear / 250_000_000.0, 2),
                 "traded_bars": sum(1 for x in window if x.traded),
                 "keep_n": keep_n, "levels": lvls,
                 "agree": agree, "obs": obs,
@@ -10708,6 +10744,17 @@ function ofiChart(d, w, h) {
       'VPIN <b>' + (g.vpin || 0).toFixed(3) + '</b> '
         + (g.vpin_band ? '(' + g.vpin_band + ')'
            : '(' + n(g.vpin_n) + ' of 30 samples)'),
+      /* VPIN CANNOT SAY WHICH WAY -- it is a mean of |buy - sell|,
+         identical whether buyers or sellers did the lifting. This is
+         the same buckets without the absolute value, so it has a
+         side, and the side is what can agree with the read. */
+      'taking <b>' + ((g.taking || 0) >= 0 ? '+' : '')
+        + (g.taking || 0).toFixed(3) + '</b>'
+        + (g.agrees === 'agree'
+            ? ' <b class="long">agrees with the read</b>'
+            : g.agrees === 'disagree'
+              ? ' <b class="short">disagrees with the read</b>'
+              : ''),
       'cancelled <b>' + (100 * (g.cancel_rate || 0)).toFixed(0)
         + '%</b> of posted size '
         + (g.cancel_band ? '(' + g.cancel_band + ')'

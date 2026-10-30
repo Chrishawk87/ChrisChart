@@ -1915,7 +1915,7 @@ class TestTheRegimeTagsTheReadAndNothingMore:
     def test_the_route_carries_it_beside_the_read_not_inside_it(self):
         r = self._route()
         assert '"read": _read, "regime": _regime' in r
-        assert "_rg.snapshot.as_dict()" in r
+        assert "_snap.as_dict()" in r
 
     def test_the_reading_cannot_see_the_regime(self):
         fr = (ROOT / "liqmap" / "flowread.py").read_text()
@@ -1952,3 +1952,64 @@ class TestTheRegimeTagsTheReadAndNothingMore:
         c = self._chart()
         i = c.index("const regimeLine")
         assert "if (!g) return '';" in c[i:i + 120]
+
+
+class TestASwingHasToBeBigEnoughToBeOne:
+    """An ordinal extreme is not a swing. Measured on 26,000 bars the
+    old rule marked a bar that merely TIED its neighbours as readily
+    as one standing eight points above, and most of the chevrons on
+    the chart were the former."""
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_takes_a_clearance(self):
+        r = self._route()
+        assert "clear: float = 1.0" in r
+        assert "min_clear=_min_clear" in r
+
+    def test_it_is_a_multiple_of_the_bar_size_not_a_tick_count(self):
+        """A bar at target 125 and one at 2,000 are different sizes,
+        so a number in ticks would mean something different on every
+        rung of the ladder."""
+        r = self._route()
+        assert "cl * _typ" in r
+        assert "median" in r.lower()
+
+    def test_the_provisional_marks_are_held_to_the_same_standard(self):
+        """A faint chevron on a tie is still a chevron on a tie."""
+        r = self._route()
+        i = r.index("find_provisional")
+        assert "min_clear=_min_clear" in r[i:i + 260]
+
+    def test_zero_restores_the_old_behaviour(self):
+        from liqmap import pivots as P
+        highs = [1, 2, 3, 3, 2, 1, 2, 9, 2, 1, 1, 1]
+        lows = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        loose = P.find(highs, lows, left=2, right=1, min_clear=0.0)
+        assert loose, "nothing found at all"
+
+    def test_a_tie_is_dropped_and_a_real_turn_is_kept(self):
+        from liqmap import pivots as P
+        # One bar clears by 6; one clears by nothing at all.
+        highs = [5, 5, 5, 5, 5, 5, 11, 5, 5, 5, 5, 5, 5]
+        lows = [1] * len(highs)
+        got = P.find(highs, lows, left=3, right=1, min_clear=2.0)
+        kinds = [(p.index, p.kind) for p in got]
+        assert (6, "high") in kinds, "the real turn was dropped"
+        assert not [i for i, k in kinds if k == "high" and i != 6], \
+            "a tie survived the clearance"
+
+    def test_a_double_top_survives(self):
+        """The plateau is part of the pivot, not competition for it.
+        Measuring clearance against the nearest neighbour would score
+        a double top zero and throw away the turn most worth
+        keeping."""
+        from liqmap import pivots as P
+        highs = [3, 3, 3, 9, 9, 3, 3, 3]
+        lows = [1] * len(highs)
+        got = [p for p in P.find(highs, lows, left=3, right=1,
+                                 min_clear=4.0) if p.kind == "high"]
+        assert got, "the double top was thrown away"
+        assert got[0].price == 9

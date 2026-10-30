@@ -26,6 +26,27 @@ is worse than no level: you remember it was there and not that it was
 provisional. So `find` returns settled pivots only, and reports how
 many bars at the right edge are still pending.
 
+AN ORDINAL EXTREME IS NOT A SWING, and this was the bug.
+
+Standing above the neighbours by one tick and standing above them by
+eight points were the same thing to this module: both were pivots,
+both drew a level, both got a chevron. Measured on 26,000 bars, THE
+MEDIAN PIVOT CLEARED ITS NEIGHBOURS BY ZERO TICKS -- more than half
+of every mark on the chart was a bar that merely tied the bars
+around it, and 59% cleared by less than a tick. Those are not weak
+turns; they are not turns.
+
+So a pivot now also has to stand clear by `min_clear`. Zero keeps
+the old behaviour exactly, which is how the two can be compared
+rather than argued about.
+
+CLEARANCE IGNORES THE PLATEAU, which is the whole difficulty. A
+genuine double top has two bars at the same high, and measuring
+clearance against the nearest neighbour would score it zero and
+throw away exactly the turn most worth keeping. So clearance is
+measured against the best neighbour STRICTLY BELOW the pivot --
+the plateau is part of the pivot, not competition for it.
+
 PLATEAUS RESOLVE TO THEIR LAST BAR. Two bars sharing the same high are
 ordinary on a tick grid, and a strict comparison on both sides would
 find no pivot at all in that case -- quietly dropping some of the most
@@ -65,13 +86,44 @@ class Pivot:
                 "left": self.left, "right": self.right}
 
 
+def clearance(series: list[float], i: int, left: int, right: int,
+              kind: str) -> float:
+    """How far bar `i` stands clear of its neighbourhood.
+
+    MEASURED AGAINST THE BEST NEIGHBOUR STRICTLY BELOW IT (above, for
+    a low), so a plateau does not score itself to zero. Two bars at
+    the same high are one turn, not two bars competing; measuring
+    against the nearer of them would throw away the double top, which
+    is the turn most worth keeping.
+
+    Returns 0.0 when every neighbour ties the bar -- a perfectly flat
+    stretch has no extreme in it, whatever the comparisons say.
+    """
+    px = series[i]
+    lo_i = max(0, i - left)
+    hi_i = min(len(series), i + right + 1)
+    if kind == HIGH:
+        others = [series[k] for k in range(lo_i, hi_i)
+                  if k != i and series[k] < px]
+        return (px - max(others)) if others else 0.0
+    others = [series[k] for k in range(lo_i, hi_i)
+              if k != i and series[k] > px]
+    return (min(others) - px) if others else 0.0
+
+
 def find(highs: list[float], lows: list[float],
          left: int = 5, right: int = 1,
-         ts: list[float] | None = None) -> list[Pivot]:
+         ts: list[float] | None = None,
+         min_clear: float = 0.0) -> list[Pivot]:
     """Settled pivots in `highs`/`lows`, oldest first.
 
     `left` and `right` are how many bars either side must be cleared.
     Larger means fewer, more structural turns.
+
+    `min_clear` is how far the bar must stand clear of its
+    neighbourhood, in the same price units as the series. Zero is the
+    old behaviour: any ordinal extreme counts, including one that
+    merely ties everything around it.
     """
     if left < 1 or right < 1:
         raise ValueError("left and right must be at least 1")
@@ -96,6 +148,8 @@ def find(highs: list[float], lows: list[float],
                 if highs[k] >= h:
                     is_high = False
                     break
+        if is_high and min_clear > 0:
+            is_high = clearance(highs, i, left, right, HIGH) >= min_clear
         if is_high:
             out.append(Pivot(index=i, kind=HIGH, price=h,
                              ts=(ts[i] if ts else 0.0),
@@ -112,6 +166,8 @@ def find(highs: list[float], lows: list[float],
                 if lows[k] <= lo:
                     is_low = False
                     break
+        if is_low and min_clear > 0:
+            is_low = clearance(lows, i, left, right, LOW) >= min_clear
         if is_low:
             out.append(Pivot(index=i, kind=LOW, price=lo,
                              ts=(ts[i] if ts else 0.0),
@@ -123,7 +179,8 @@ def find(highs: list[float], lows: list[float],
 
 def find_provisional(highs: list[float], lows: list[float],
                      left: int = 5, right: int = 1,
-                     ts: list[float] | None = None) -> list[Pivot]:
+                     ts: list[float] | None = None,
+                     min_clear: float = 0.0) -> list[Pivot]:
     """Turns in the unsettled region, cleared only by the bars so far.
 
     These appear the moment a bar is a local extreme against everything
@@ -151,6 +208,17 @@ def find_provisional(highs: list[float], lows: list[float],
             if highs[k] >= h:
                 is_high = False
             if lows[k] <= lo:
+                is_low = False
+        # AND THE SAME CLEARANCE THE SETTLED ONES NEED. A provisional
+        # mark held to a looser standard would seed the chart with
+        # exactly the ties this exists to remove, and they would
+        # simply look fainter while doing it.
+        if min_clear > 0:
+            if is_high and clearance(highs, i, left, n - i - 1,
+                                     HIGH) < min_clear:
+                is_high = False
+            if is_low and clearance(lows, i, left, n - i - 1,
+                                    LOW) < min_clear:
                 is_low = False
         when = ts[i] if ts else 0.0
         if is_high:

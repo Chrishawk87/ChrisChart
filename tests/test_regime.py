@@ -55,18 +55,41 @@ class TestARegimeCanNeverFlipTheRead:
         assert "regime" not in fr.lower().split('"""', 2)[2], \
             "the reading can see the regime"
 
-    def test_nothing_here_returns_a_direction(self):
-        """If it cannot produce 'up' or 'down' it cannot override
-        one, whatever anybody wires it to later."""
+    def test_the_tape_has_a_direction_and_the_read_is_not_it(self):
+        """`taking_side` IS a direction -- that is the point of the
+        signed version. What must stay true is narrower and more
+        important: nothing here produces a RECOMMENDATION, and the
+        read is never derived from any of it.
+
+        So the agreement can only be formed by handing this module
+        the read from outside. It has no way to fetch one.
+        """
         r = _r()
         for i in range(400):
-            ts = i * 0.05
-            _book(r, ts)
-            r.on_trade(ts, 10, "buy")
-            r.on_action(ts, "A", 20)
-        d = r.snapshot.as_dict()
-        for k, v in d.items():
-            assert v not in ("up", "down"), f"{k} carries a direction"
+            r.on_trade(i * 0.1, 10, "buy")
+        s = r.snapshot
+        assert s.taking_side == "up", "the tape's side should be there"
+        # It can only speak about a read it is GIVEN.
+        assert s.agrees_with("up") == "agree"
+        src = SRC
+        i = src.index("def agrees_with")
+        body = src[i:src.index("@property", i)]
+        assert "import" not in body
+        # The only mention of the reading anywhere is the docstring
+        # explaining that this module cannot see it.
+        code = src.split('"""', 2)[2]
+        assert "flowread" not in code
+
+    def test_the_route_never_builds_the_read_from_the_regime(self):
+        """The one place that holds both. If the read could be
+        assigned from a regime field, every other guard here would be
+        decoration."""
+        web = (ROOT / "liqmap" / "web.py").read_text()
+        i = web.index("_rg = getattr(tape")
+        blk = web[i:web.index('"read": _read', i)]
+        for bad in ('_read["read"] =', "_read.update(",
+                    '_read["read"]='):
+            assert bad not in blk, bad
 
     def test_the_module_states_the_rule(self):
         assert "nothing in this module may change" in SRC
@@ -375,3 +398,61 @@ class TestItCanKeepUpWithTheTape:
         total = added + pulled
         want = (pulled / total) if total else 0.0
         assert r.snapshot.cancel_rate == pytest.approx(want)
+
+
+class TestVpinCannotConfirmADirection:
+    """It is a mean of |buy - sell|. A bucket where sellers did 80%
+    of the lifting and one where buyers did produce the IDENTICAL
+    number, so it can say how lopsided and never which way."""
+
+    def test_the_mirror_image_gives_the_same_vpin(self):
+        a, b = _r(), _r()
+        for i in range(400):
+            a.on_trade(i * 0.1, 10, "buy")
+            b.on_trade(i * 0.1, 10, "sell")
+        assert a.snapshot.vpin == pytest.approx(b.snapshot.vpin)
+
+    def test_but_the_signed_version_tells_them_apart(self):
+        a, b = _r(), _r()
+        for i in range(400):
+            a.on_trade(i * 0.1, 10, "buy")
+            b.on_trade(i * 0.1, 10, "sell")
+        assert a.snapshot.taking > 0 and b.snapshot.taking < 0
+        assert a.snapshot.taking_side == "up"
+        assert b.snapshot.taking_side == "down"
+
+    def test_the_module_states_why(self):
+        assert "CANNOT CONFIRM A DIRECTION" in SRC
+        assert "IDENTICAL number" in SRC
+
+    def test_level_taking_has_no_side(self):
+        r = _r()
+        for i in range(400):
+            r.on_trade(i * 0.1, 10, "buy" if i % 2 else "sell")
+        assert r.snapshot.taking_side == ""
+
+    def test_agreement_is_computed_from_an_argument_not_a_lookup(self):
+        """The read is handed in. If this module could reach for it,
+        the rule that a tag may never change a direction would be
+        kept by someone remembering rather than by the code."""
+        r = _r()
+        for i in range(400):
+            r.on_trade(i * 0.1, 10, "buy")
+        s = r.snapshot
+        assert s.agrees_with("up") == "agree"
+        assert s.agrees_with("down") == "disagree"
+        assert s.agrees_with("") == ""
+        i = SRC.index("def agrees_with")
+        body = SRC[i:SRC.index("@property", i)]
+        assert "read" in body
+        assert "flowread" not in body and "import" not in body
+
+    def test_taking_is_volume_clocked_not_time_clocked(self):
+        """Which is what makes it different from the delta already on
+        the chart: 500 contracts weighs the same whether it took four
+        seconds or four minutes."""
+        fast, slow = _r(), _r()
+        for i in range(200):
+            fast.on_trade(i * 0.001, 10, "buy")
+            slow.on_trade(i * 10.0, 10, "buy")
+        assert fast.snapshot.taking == pytest.approx(slow.snapshot.taking)
