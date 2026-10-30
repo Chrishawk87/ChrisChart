@@ -127,15 +127,41 @@ class IngestHub:
 # tick micro-delta
 # --------------------------------------------------------------------------
 
-def tick_frame(trade: Any, exec_track: Any) -> dict:
+def tick_frame(trade: Any, exec_track: Any, tape: Any = None) -> dict:
     """One processed print, ready for the WebGL / dashboard buffers.
 
     The frontend applies this to a typed array / profile buffer. It is
     not a component-state update and it is not a full snapshot.
+
+    IT ALSO CARRIES THE READ AND THE PRICE DIRECTION, because those
+    two are the only things on the panel whose whole point is to be
+    current. Everything else there describes closed bars and is
+    happy on the two-second poll; a line saying which way the market
+    is being taken RIGHT NOW cannot be two seconds old.
+
+    THE REGIME IS DELIBERATELY NOT HERE. Its bands are percentiles,
+    which means a sort, and a sort on every print is a cost paid
+    thousands of times a second for a number that moves slowly. It
+    stays on the poll.
     """
     st = exec_track.state()
     pulse = st.pulse
+    extra: dict = {}
+    if tape is not None:
+        fr = getattr(tape, "flowread", None)
+        if fr is not None:
+            try:
+                extra["read"] = fr.snapshot.as_dict()
+            except Exception:                           # noqa: BLE001
+                pass
+        pd = getattr(tape, "pricedir", None)
+        if pd is not None:
+            try:
+                extra["price"] = pd.snapshot
+            except Exception:                           # noqa: BLE001
+                pass
     return {
+        **extra,
         "kind": "tick",
         "ts": float(getattr(trade, "ts", 0.0) or 0.0),
         "px": float(getattr(trade, "px", 0.0) or 0.0),
@@ -230,6 +256,7 @@ class DeltaWorker:
                         # crossing from this thread into the event loop.
                         self.hub.notify(eng.frame())
                 if self.hub.connections:
-                    self.hub.notify(tick_frame(trade, self.exec_track))
+                    self.hub.notify(tick_frame(trade, self.exec_track,
+                                               self.tape))
             except Exception:                           # noqa: BLE001
                 self.dropped += 1

@@ -139,6 +139,10 @@ class Tape:
     # MBP-10 records already carry. Tags only: nothing here may
     # change the reading's direction, and flowread cannot see it.
     regime: object = None
+    # WHICH WAY PRICE ITSELF LAST MOVED. Traded prices, no reference
+    # point -- not the candle open, not where a read fired. Fed from
+    # the same decoded print as everything else.
+    pricedir: object = None
     # The two drawn lines: book CVD as the reader, time-smoothed
     # traded CVD as the confirmation. Fed from the same decoded trade
     # as everything else above, so the lines and the candles can never
@@ -347,6 +351,12 @@ class Tape:
                     _px = float(dbn._get(rec, "price", 0) or 0)
                     for _b in self.ofibars.values():
                         _b.on_trade(float(t.ts), _sz, _ag, _px)
+                    if self.pricedir is not None:
+                        # The RAW price off the record, same as the
+                        # bars use. t.px has been through dbn.price()
+                        # into dollars and mixing the two would put
+                        # this reading three zeros from the chart.
+                        self.pricedir.on_trade(float(t.ts), _px)
                 lv = dbn._get(rec, "levels")
                 if lv:
                     l0 = lv[0]

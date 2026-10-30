@@ -444,3 +444,81 @@ class FlowRead:
     def read(self) -> str:
         """The direction to act on, after the hold."""
         return self._read
+
+
+# ------------------------------------------------------- pure price
+
+# How long price must sit unchanged before it is called flat.
+#
+# THE ONLY PARAMETER HERE, and it exists because the two honest
+# definitions of "price is flat" are both useless on their own.
+# Comparing each print to the one before it calls ES flat almost
+# always -- most consecutive prints are at the same price. Comparing
+# to the last DIFFERENT price never calls it flat at all, because by
+# construction it differs. So the direction of the last change
+# stands, and expires when nothing has moved for this long.
+FLAT_S = 3.0
+
+
+class PriceDir:
+    """Which way price itself last moved. No reference point at all.
+
+    NOT MEASURED AGAINST ANYTHING -- not the candle's open, not where
+    a read fired, not a window. The question is only whether the last
+    change in the traded price was up or down, which is what "pure
+    price" means and is the one price reading that cannot be accused
+    of being relative to something convenient.
+
+    IT IS TRADED PRICES, NOT THE MID. On a one-tick spread the mid
+    sits exactly half a tick off the grid -- bid 7704.00 and ask
+    7704.25 give 7704.125, which is not a price that can print. A
+    direction read off the mid changes when the quote widens on one
+    side and nothing has traded at all.
+    """
+
+    __slots__ = ("flat_s", "_px", "_prev", "_dir", "_moved_ts", "_ts")
+
+    def __init__(self, flat_s: float = FLAT_S) -> None:
+        self.flat_s = max(0.0, float(flat_s))
+        self._px = 0.0
+        self._prev = 0.0
+        self._dir = NONE
+        self._moved_ts = 0.0
+        self._ts = 0.0
+
+    def on_trade(self, ts: float, px: float) -> None:
+        px = float(px or 0.0)
+        if px <= 0:
+            return
+        self._ts = float(ts)
+        if self._px <= 0:
+            self._px = px
+            self._moved_ts = self._ts
+            return
+        if px > self._px:
+            self._prev, self._px = self._px, px
+            self._dir = UP
+            self._moved_ts = self._ts
+        elif px < self._px:
+            self._prev, self._px = self._px, px
+            self._dir = DOWN
+            self._moved_ts = self._ts
+        # Equal: nothing changed. The standing direction keeps until
+        # it expires below.
+
+    def reset(self) -> None:
+        self._px = self._prev = 0.0
+        self._dir = NONE
+        self._moved_ts = self._ts = 0.0
+
+    @property
+    def snapshot(self) -> dict:
+        still = max(0.0, self._ts - self._moved_ts)
+        return {"px": self._px,
+                "prev": self._prev,
+                # Flat is a real state and is reported as one. Carrying
+                # the last direction through a dead market would have
+                # the line saying DOWN while nothing is happening.
+                "dir": self._dir if still < self.flat_s else NONE,
+                "still_s": round(still, 2),
+                "ts": self._ts}

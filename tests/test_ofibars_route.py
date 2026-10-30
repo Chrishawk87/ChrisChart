@@ -1803,6 +1803,14 @@ class TestTheTallyMatchesWhatIsOnScreen:
         assert "made by an earlier rule or at another level" in WEB
 
 
+def _read_fn():
+    """The read line's own source. It lives at top level now, so it
+    can be repainted on every live tick without redrawing the chart
+    behind it."""
+    i = WEB.index("function ofiReadLine(")
+    return WEB[i:WEB.index("\n}", i)]
+
+
 class TestTheReadIsAboutTheOtherTrade:
     """Chris does not scalp these bars. He reads the direction off
     this panel and takes a five-minute candle on another platform, so
@@ -1828,11 +1836,10 @@ class TestTheReadIsAboutTheOtherTrade:
         """It is the only line on the panel about the trade actually
         being taken. Under the per-bar call it reads as a footnote to
         a scalp."""
-        c = self._chart()
-        assert "readLine(d && d.read) + regimeLine(" in c
+        assert "readLine(d && d.read) + regimeLine(" in self._chart()
 
     def test_it_names_what_it_is_not(self):
-        c = self._chart()
+        c = _read_fn()
         assert "five-minute direction" in c
         assert "not a trade on " in c
 
@@ -1850,19 +1857,19 @@ class TestTheReadIsAboutTheOtherTrade:
         """Two different silences, and they mean opposite things: too
         early in the candle to say, versus the candle's two sides
         having finished level."""
-        c = self._chart()
+        c = _read_fn()
         assert "NEW CANDLE" in c and "too early to say" in c
         assert "buying and selling are level on this candle" in c
 
     def test_the_raw_sign_is_shown_beside_the_steady_one(self):
         """Hiding it would make the smoothing unfalsifiable."""
-        c = self._chart()
+        c = _read_fn()
         assert "turning" in c
         assert "r.raw !== r.read" in c
         assert "publishes if it holds" in c
 
     def test_it_says_when_it_is_too_unstable_to_take(self):
-        c = self._chart()
+        c = _read_fn()
         assert "changes of mind" in c
         assert "unsettled" in c
 
@@ -1871,25 +1878,24 @@ class TestTheReadIsAboutTheOtherTrade:
         zero every couple of seconds it never survives the hold, so
         the published read stops changing and sits on whichever side
         was ahead first. That reads as a rock-steady signal."""
-        c = self._chart()
+        c = _read_fn()
         assert "stuck on whichever was ahead first" in c
         assert "not tracking anything" in c
         assert "r.flips > 20" in c
 
     def test_it_shows_how_much_of_the_candle_is_left(self):
-        c = self._chart()
+        c = _read_fn()
         assert "left in this candle" in c
 
     def test_it_resets_only_with_the_candle(self):
-        c = self._chart()
-        assert "resets only " in c and "when your candle does" in c
+        c = _read_fn()
+        assert "resets only when your" in c and "candle does" in c
 
     def test_an_absent_read_draws_nothing_rather_than_zeros(self):
         """A reading that has not started must not render as a
         confident NO READ with zeros behind it."""
-        c = self._chart()
-        i = c.index("const readLine")
-        assert "if (!r) return '';" in c[i:i + 120]
+        c = _read_fn()
+        assert "if (!r) return '';" in c[:200]
 
     def test_the_reading_does_not_reset_with_a_bar(self):
         src = (ROOT / "liqmap" / "flowread.py").read_text()
@@ -2013,3 +2019,93 @@ class TestASwingHasToBeBigEnoughToBeOne:
                                  min_clear=4.0) if p.kind == "high"]
         assert got, "the double top was thrown away"
         assert got[0].price == 9
+
+
+class TestThePriceIsPureAndBothAreLive:
+    """Chris asked for price shown beside the read, measured against
+    nothing, and for neither of them to lag."""
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_carries_the_price_direction(self):
+        r = self._route()
+        assert '"price": _price' in r
+        assert "pricedir" in r
+
+    def test_price_is_not_measured_against_anything(self):
+        """Not the candle open, not where the read fired, not a
+        window. A reference point chosen to pair with the read would
+        agree with it by construction."""
+        src = (ROOT / "liqmap" / "flowread.py").read_text()
+        i = src.index("class PriceDir")
+        body = src[i:]
+        assert "NOT MEASURED AGAINST ANYTHING" in body
+        for word in ("candle_ts", "_open_ts", "window"):
+            assert word not in body.split('"""', 2)[2], word
+
+    def test_price_uses_traded_prices_not_the_mid(self):
+        """On a one-tick spread the mid is half a tick off the grid,
+        and a direction read off it changes when the quote widens on
+        one side and nothing has traded at all."""
+        src = (ROOT / "liqmap" / "flowread.py").read_text()
+        assert "TRADED PRICES, NOT THE MID" in src
+        tape = (ROOT / "liqmap" / "cme_tape.py").read_text()
+        i = tape.index("self.pricedir.on_trade")
+        assert "_px" in tape[i:i + 90], "it was fed the mid"
+
+    def test_flat_is_reported_as_flat(self):
+        from liqmap.flowread import PriceDir
+        p = PriceDir(flat_s=2.0)
+        p.on_trade(0.0, 100.0)
+        p.on_trade(1.0, 100.25)
+        assert p.snapshot["dir"] == "up"
+        p.on_trade(9.0, 100.25)
+        assert p.snapshot["dir"] == "", "it held a stale direction"
+
+    def test_an_unchanged_print_does_not_flip_it(self):
+        from liqmap.flowread import PriceDir
+        p = PriceDir()
+        p.on_trade(0.0, 100.0)
+        p.on_trade(0.1, 100.25)
+        for i in range(20):
+            p.on_trade(0.2 + i * 0.01, 100.25)
+        assert p.snapshot["dir"] == "up"
+
+    def test_the_line_shows_both_and_says_when_they_oppose(self):
+        c = _read_fn()
+        assert "PRICE &mdash;" in c
+        assert "both the same way" in c and "opposed" in c
+
+    def test_the_read_line_repaints_on_every_print(self):
+        """Two seconds is fine for a chart of closed bars and far too
+        slow for a line whose purpose is to say what is true now."""
+        i = WEB.index("if (kind === 'tick')")
+        blk = WEB[i:i + 1400]
+        assert "ofiReadLine(" in blk
+        assert "ofiReadLine" in WEB[:WEB.index("function ofiChart")], \
+            "the line must be at top level to be repainted alone"
+
+    def test_it_repaints_one_element_not_the_whole_chart(self):
+        """Thousands of full re-renders a second for bars that have
+        not changed."""
+        i = WEB.index("if (kind === 'tick')")
+        blk = WEB[i:i + 1400]
+        assert "ofiReadLine" in blk
+        assert "drawOfi(" not in blk and "ofiTick(" not in blk
+
+    def test_the_tick_frame_carries_the_read_and_the_price(self):
+        src = (ROOT / "liqmap" / "pipeline.py").read_text()
+        assert 'extra["read"]' in src and 'extra["price"]' in src
+        assert "tick_frame(trade, self.exec_track,\n" in src
+
+    def test_the_regime_stays_off_the_tick_frame(self):
+        """Its bands are percentiles, which means a sort, and a sort
+        on every print is a cost paid thousands of times a second
+        for a number that moves slowly."""
+        src = (ROOT / "liqmap" / "pipeline.py").read_text()
+        i = src.index("def tick_frame")
+        body = src[i:src.index("# ---", i)]
+        assert "regime" not in body.lower().split('"""', 2)[2]
+        assert "REGIME IS DELIBERATELY NOT HERE" in src

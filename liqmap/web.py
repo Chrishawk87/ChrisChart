@@ -1054,6 +1054,9 @@ class Runtime:
             if svc.tape.regime is None:
                 from .regime import Regime
                 svc.tape.regime = Regime()
+            if svc.tape.pricedir is None:
+                from .flowread import PriceDir
+                svc.tape.pricedir = PriceDir()
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -6557,6 +6560,15 @@ def create_app() -> FastAPI:
         # tape and carried beside the reading, never folded into it:
         # the direction is the imbalance's and these only say what
         # state it arrived in.
+        _pd = getattr(tape, "pricedir", None)
+        _price = None
+        if _pd is not None:
+            try:
+                _price = dict(_pd.snapshot)
+                _price["px"] = _price["px"] * sc
+                _price["prev"] = _price["prev"] * sc
+            except Exception:                           # noqa: BLE001
+                _price = None
         _rg = getattr(tape, "regime", None)
         _regime = None
         if _rg is not None:
@@ -6575,7 +6587,7 @@ def create_app() -> FastAPI:
                 _regime = None
 
         return {"ok": True, "coin": coin, "target": t,
-                "read": _read, "regime": _regime,
+                "read": _read, "regime": _regime, "price": _price,
                 "targets": list(_OFI_LADDER),
                 "total": total, "offset": off, "window": n,
                 "dropped": getattr(b, "dropped", 0),
@@ -10156,6 +10168,108 @@ function fpClearRow(d) {
    had held at that moment: a filled ring for confirmed, a hollow one
    for not. Both are shown, because how the unconfirmed ones behave is
    the thing worth watching. */
+/* THE READ LINE, AT TOP LEVEL so it can be repainted on its own.
+
+   The OFI panel redraws on a two-second poll. That is fine for a
+   chart of closed bars and far too slow for a line whose whole
+   purpose is to say what is true RIGHT NOW -- at two seconds the
+   reading is describing a market that has already moved on, which
+   is the one failure this line cannot have.
+
+   So it is a function of its own, it renders into an element with
+   its own id, and every live tick frame rewrites just that element.
+   The chart behind it keeps its two-second cadence; the line does
+   not. */
+function ofiReadLine(r, pr) {
+  if (!r) return '';
+  const clock = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
+                              : Math.round(s) + 's');
+  const left = ' &middot; ' + clock(r.left_s) + ' left in this candle';
+
+  /* PRICE, AND IT IS NOT MEASURED AGAINST ANYTHING. Not the
+     candle's open, not where the read fired, not a window -- just
+     which way the last change in the TRADED price went. That is
+     what makes it a second opinion rather than a restatement: a
+     reference point chosen to pair with the read would agree with
+     it by construction. */
+  const pd = pr && pr.dir;
+  const price = pr
+    ? ' &nbsp; PRICE &mdash; ' + (pd === 'up'
+        ? '<b class="long">UP</b>' : pd === 'down'
+        ? '<b class="short">DOWN</b>' : '<b>FLAT</b>')
+      + (pr.px ? ' <b>' + pr.px.toFixed(2) + '</b>' : '')
+      + (!pd && pr.still_s ? ' (unchanged ' + clock(pr.still_s) + ')'
+         : '')
+    : '';
+  /* AGREEMENT IS SHOWN, NOT COMPUTED INTO ANYTHING. Whether the
+     flow and the price pointing the same way means anything is a
+     question for scripts/read_accuracy.py, not for this line. */
+  const both = (r.read && pd)
+    ? (r.read === pd
+        ? ' &middot; <b class="long">both the same way</b>'
+        : ' &middot; <b class="short">opposed</b>')
+    : '';
+
+  if (!r.warm) {
+    return '<span id="ofiReadLine" class="stamp" style="width:100%">'
+      + 'READ &mdash; <b>NEW CANDLE</b>, ' + Math.round(r.into_s)
+      + 's in &mdash; too early to say which way it is being taken'
+      + price + left + '</span>';
+  }
+  const dir = r.read === 'up'
+    ? '<b class="long">UP</b>'
+    : r.read === 'down' ? '<b class="short">DOWN</b>'
+    : '<b>NO READ</b>';
+  let why;
+  if (!r.read) {
+    why = (Math.abs(r.lead) < 1)
+      ? ' &mdash; buying and selling are level on this candle'
+      : ' &mdash; waiting for it to hold';
+  } else {
+    /* The word follows the LEAD, not the read. During a turn the
+       published read is still UP while the candle's lead has
+       already gone negative, and taking the word from the read
+       would print "buying ahead" over a number that is selling's. */
+    why = ' &middot; ' + (r.lead >= 0 ? 'buying' : 'selling')
+      + ' ahead by ' + Math.abs(Math.round(r.lead)).toLocaleString()
+      + ' of ' + Math.round(r.gross).toLocaleString() + ' ('
+      + (100 * r.share).toFixed(0) + '% buy) since this candle opened'
+      + (r.strength === 'strong'
+          ? ' &middot; <b>past your level</b>'
+          : ' &middot; short of your level');
+  }
+  const turning = (r.raw !== r.read)
+    ? ' &middot; <b>turning</b> &mdash; the candle has led '
+      + (r.raw ? r.raw.toUpperCase() : 'neither way') + ' for '
+      + clock(r.pending_s) + ' and this publishes if it holds'
+    : '';
+  /* A HIGH FLIP COUNT DOES NOT MAKE THE READ UNSTABLE -- it makes it
+     FROZEN, which looks the same and is worse. */
+  const shaky = (r.flips > 20)
+    ? ' &middot; <b class="short">the lead has crossed ' + r.flips
+      + ' times this candle</b> &mdash; the two sides are level and '
+      + 'the reading above is stuck on whichever was ahead first, '
+      + 'not tracking anything'
+    : (r.flips > 4)
+      ? ' &middot; <b class="short">' + r.flips + ' changes of mind '
+        + 'this candle</b> &mdash; unsettled'
+      : '';
+  const stall = (r.read && r.stalling)
+    ? ' &middot; though the last few seconds went the other way'
+    : '';
+  /* THE DURATION BELONGS TO THE READ, so it sits against the read
+     and not after the price -- otherwise 'for 1.6 min' reads as the
+     length of the agreement, which is a different and unmeasured
+     claim. */
+  const held = r.read ? ' for ' + clock(r.held_s) : '';
+  return '<span id="ofiReadLine" class="stamp" style="width:100%">'
+    + 'READ &mdash; ' + dir + held + price + both + why + turning
+    + stall + shaky + left
+    + ' &middot; the five-minute direction, not a trade on these '
+    + 'bars; it ignores the level dropdown and resets only when your '
+    + 'candle does</span>';
+}
+
 function ofiChart(d, w, h) {
   /* OFI-closed candlesticks.
 
@@ -10641,86 +10755,7 @@ function ofiChart(d, w, h) {
      make the smoothing unfalsifiable: if the steady read is wrong,
      the first thing worth knowing is whether the raw one had already
      turned. */
-  const readLine = r => {
-    if (!r) return '';
-    const clock = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
-                                : Math.round(s) + 's');
-    /* THE CANDLE IS THE WINDOW. Everything on this line is counted
-       from the five-minute candle's open and thrown away at its
-       close, which is the whole reason it answers "what is this
-       candle doing" rather than "what happened in the last thirty
-       seconds" -- two questions that are often opposites. */
-    const left = ' &middot; ' + clock(r.left_s) + ' left in this candle';
-    if (!r.warm) {
-      /* The first seconds are a handful of book updates. A direction
-         built from those is a coin toss with a label on it, so the
-         clock goes up instead. */
-      return '<span class="stamp" style="width:100%">READ &mdash; '
-        + '<b>NEW CANDLE</b>, ' + Math.round(r.into_s) + 's in '
-        + '&mdash; too early to say which way it is being taken'
-        + left + '</span>';
-    }
-    const dir = r.read === 'up'
-      ? '<b class="long">UP</b>'
-      : r.read === 'down' ? '<b class="short">DOWN</b>'
-      : '<b>NO READ</b>';
-    let why;
-    if (!r.read) {
-      why = (Math.abs(r.lead) < 1)
-        ? ' &mdash; buying and selling are level on this candle'
-        : ' &mdash; waiting for it to hold';
-    } else {
-      /* THE WORD FOLLOWS THE LEAD, NOT THE READ. During a turn the
-         published read is still UP while the candle's lead has
-         already gone negative, and taking the word from the read
-         would print "buying ahead" over a number that is selling's.
-         The two disagreeing IS the information; writing over it is
-         not a tidier line, it is a wrong one. */
-      why = ' for ' + clock(r.held_s) + ' &middot; '
-        + (r.lead >= 0 ? 'buying' : 'selling')
-        + ' ahead by ' + Math.abs(Math.round(r.lead)).toLocaleString()
-        + ' of ' + Math.round(r.gross).toLocaleString() + ' ('
-        + (100 * r.share).toFixed(0) + '% buy) since this candle opened'
-        + (r.strength === 'strong'
-            ? ' &middot; <b>past your level</b>'
-            : ' &middot; short of your level');
-    }
-    /* THE RAW SIGN IS SHOWN BESIDE THE STEADY ONE. Hiding it would
-       make the smoothing unfalsifiable: if the steady read is wrong,
-       the first thing worth knowing is whether the raw one had
-       already turned. */
-    const turning = (r.raw !== r.read)
-      ? ' &middot; <b>turning</b> &mdash; the candle has led '
-        + (r.raw ? r.raw.toUpperCase() : 'neither way') + ' for '
-        + clock(r.pending_s) + ' and this publishes if it holds'
-      : '';
-    /* A HIGH FLIP COUNT DOES NOT MAKE THE READ UNSTABLE -- it makes
-       it FROZEN, which looks the same and is worse. When the lead
-       crosses zero every couple of seconds it never survives the
-       hold, so the published read stops changing and sits on
-       whichever side happened to be ahead when it first settled. */
-    const shaky = (r.flips > 20)
-      ? ' &middot; <b class="short">the lead has crossed ' + r.flips
-        + ' times this candle</b> &mdash; the two sides are level and '
-        + 'the reading above is stuck on whichever was ahead first, '
-        + 'not tracking anything'
-      : (r.flips > 4)
-        ? ' &middot; <b class="short">' + r.flips + ' changes of mind '
-          + 'this candle</b> &mdash; unsettled'
-        : '';
-    /* Carried, not used. The read describes the candle; this says
-       whether the candle is still being taken that way right now,
-       which is a different question and sometimes the opposite
-       answer. */
-    const stall = (r.read && r.stalling)
-      ? ' &middot; though the last few seconds went the other way'
-      : '';
-    return '<span class="stamp" style="width:100%">READ &mdash; ' + dir
-      + why + turning + stall + shaky + left
-      + ' &middot; this is the five-minute direction, not a trade on '
-      + 'these bars; it ignores the level dropdown and resets only '
-      + 'when your candle does</span>';
-  };
+  const readLine = r => ofiReadLine(r, d && d.price);
 
   /* ERROR BARS FOR THE READ, on their own line below it.
 
@@ -11209,6 +11244,9 @@ function ofiCalls(d) {
 }
 
 let _ofiTimer = null;
+/* The last payload the OFI panel drew, kept so the live
+   stream can repaint the read line without refetching. */
+let _ofiLast = null;
 let _ofiOffset = 0;        // bars back from the live edge -- the pan
 let _ofiTotal = 0;
 
@@ -11222,7 +11260,7 @@ function _ofiSave() {
   try {
     localStorage.setItem('liqmap_ofi', JSON.stringify({
       t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm,
-      k: _ofiKeep, h: _ofiHigher, lv: _ofiLevel }));
+      k: _ofiKeep, h: _ofiHigher, lv: _ofiLevel, cl: _ofiClear }));
   } catch (e) { /* private mode, quota, blocked -- not worth a failure */ }
 }
 let _ofiTarget = 250;
@@ -11232,6 +11270,12 @@ let _ofiConfirm = 1;       // bars to the RIGHT before it is settled
 let _ofiKeep = 4;          // how many swing levels are carried forward
 let _ofiHigher = 1;        // show levels from the targets above this one
 let _ofiLevel = 500;       // imbalance at which a call is made
+/* HOW FAR A SWING MUST STAND CLEAR, as a multiple of what a bar at
+   this target spans. An ordinal extreme is not a swing: measured on
+   26,000 bars the old rule marked a bar that merely TIED its
+   neighbours as readily as one standing eight points above, and
+   most of the chevrons were the former. Zero restores that. */
+let _ofiClear = 1.0;
 try {
   const _s = JSON.parse(localStorage.getItem('liqmap_ofi') || '{}');
   if (_s.t) _ofiTarget = _s.t;
@@ -11241,6 +11285,7 @@ try {
   if (_s.k) _ofiKeep = _s.k;
   if (_s.h !== undefined) _ofiHigher = _s.h;
   if (_s.lv) _ofiLevel = _s.lv;
+  if (_s.cl !== undefined) _ofiClear = _s.cl;
 } catch (e) { /* nothing saved, or unreadable -- the defaults stand */ }
 
 function ofiSetTarget(v) {
@@ -11291,8 +11336,8 @@ async function ofiTick(fromTimer) {
       + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
       + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm
       + '&keep=' + _ofiKeep + '&higher=' + _ofiHigher
-      + '&level=' + _ofiLevel);
-    if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; }
+      + '&level=' + _ofiLevel + '&clear=' + _ofiClear);
+    if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; _ofiLast = d; }
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
         + (d.why || 'unavailable') + '</span>';
@@ -13365,6 +13410,30 @@ function applyLiveFrame(d) {
   const kind = d.kind || (d.profile ? 'snap' : (d.e_n !== undefined ? 'ofi' : ''));
   if (kind === 'tick') {
     tickFromStream({px: d.px, trades: d.raw});
+    /* THE READ LINE REPAINTS HERE, on the print, and nothing else
+       on the OFI panel does. Redrawing the whole chart per tick
+       would be thousands of full re-renders a second for bars that
+       have not changed; rewriting one element is one innerHTML. */
+    if (d.read || d.price) {
+      if (chartData) {
+        if (d.read) chartData.read = d.read;
+        if (d.price) chartData.price = d.price;
+      }
+      if (_ofiLast) {
+        if (d.read) _ofiLast.read = d.read;
+        if (d.price) _ofiLast.price = d.price;
+        const el = document.getElementById('ofiReadLine');
+        if (el && !document.hidden) {
+          /* The function returns the whole span, id and all, and
+             this element IS that span -- so it replaces itself.
+             outerHTML rather than picking the wrapper off with a
+             regex: the id has to survive for the next tick to find
+             it, and a regex that drifts from the markup would
+             silently repaint once and never again. */
+          el.outerHTML = ofiReadLine(_ofiLast.read, _ofiLast.price);
+        }
+      }
+    }
     if (d.dcd !== undefined) {
       paintExecState({
         pulse: {unconfirmed: d.unconfirmed, buy_flags: d.buy_flags,
