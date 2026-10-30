@@ -450,41 +450,89 @@ class FlowRead:
 
 # How long price must sit unchanged before it is called flat.
 #
-# THE ONLY PARAMETER HERE, and it exists because the two honest
-# definitions of "price is flat" are both useless on their own.
 # Comparing each print to the one before it calls ES flat almost
-# always -- most consecutive prints are at the same price. Comparing
-# to the last DIFFERENT price never calls it flat at all, because by
-# construction it differs. So the direction of the last change
-# stands, and expires when nothing has moved for this long.
+# always -- most consecutive prints are at the same price. So the
+# standing direction holds, and expires when nothing has moved for
+# this long.
 FLAT_S = 3.0
+
+# HOW FAR PRICE MUST REVERSE BEFORE THE DIRECTION FLIPS, in ticks.
+#
+# At one tick the reading changes its mind 523 times a minute on a
+# tick-level random walk. That is not a signal, it is a strobe, and
+# it is what the line did before this existed.
+#
+#   reversal   flips a minute (worst case)
+#     1 tick             523
+#     2 ticks            173
+#     4 ticks             52
+#     8 ticks             14
+#
+# A REVERSAL THRESHOLD IS THE ONE FILTER THAT COSTS NO LAG. A moving
+# average, a median, a hold timer all delay a real move in order to
+# suppress a fake one. This does not: a move of `reverse_ticks`
+# flips the direction on the print that completes it, exactly as
+# fast as no filter at all. What it removes is every wiggle smaller
+# than itself, completely.
+#
+# Four ticks is one ES point, which is the distance the OFI trade
+# already uses as its objective -- so "price went against me" means
+# the same thing in both places.
+#
+# The figures above come from a pure tick-level walk, which flips
+# far harder than a real book. They are a ceiling, not a forecast.
+REVERSE_TICKS = 4.0
+
+# One ES tick in raw feed units.
+TICK_RAW = 250_000_000.0
 
 
 class PriceDir:
     """Which way price itself last moved. No reference point at all.
 
     NOT MEASURED AGAINST ANYTHING -- not the candle's open, not where
-    a read fired, not a window. The question is only whether the last
-    change in the traded price was up or down, which is what "pure
-    price" means and is the one price reading that cannot be accused
-    of being relative to something convenient.
+    a read fired, not a window. The question is only whether price
+    has turned, which is what "pure price" means and is the one price
+    reading that cannot be accused of being relative to something
+    chosen to agree with the read.
 
     IT IS TRADED PRICES, NOT THE MID. On a one-tick spread the mid
     sits exactly half a tick off the grid -- bid 7704.00 and ask
     7704.25 give 7704.125, which is not a price that can print. A
     direction read off the mid changes when the quote widens on one
     side and nothing has traded at all.
+
+    THE DIRECTION IS FILTERED; THE NUMBER IS NOT. `px` is always the
+    true last traded price. Smoothing that too would put a level on
+    the line that never printed, and a level that does not exist on
+    the tape is worse than a noisy one that does.
     """
 
-    __slots__ = ("flat_s", "_px", "_prev", "_dir", "_moved_ts", "_ts")
+    __slots__ = ("flat_s", "reverse", "tick", "_px", "_anchor",
+                 "_dir", "_moved_ts", "_ts")
 
-    def __init__(self, flat_s: float = FLAT_S) -> None:
+    def __init__(self, flat_s: float = FLAT_S,
+                 reverse_ticks: float = REVERSE_TICKS,
+                 tick: float = TICK_RAW) -> None:
         self.flat_s = max(0.0, float(flat_s))
+        self.tick = float(tick) if tick else TICK_RAW
+        self.reverse = max(0.0, float(reverse_ticks)) * self.tick
         self._px = 0.0
-        self._prev = 0.0
+        # The extreme reached since the direction was last set. Price
+        # has to come back from THIS, not from wherever it happens to
+        # be, or a long run would arm a flip at its own starting
+        # point and reverse on nothing.
+        self._anchor = 0.0
         self._dir = NONE
         self._moved_ts = 0.0
         self._ts = 0.0
+
+    def set_reverse(self, ticks: float) -> None:
+        self.reverse = max(0.0, float(ticks)) * self.tick
+
+    @property
+    def reverse_ticks(self) -> float:
+        return self.reverse / self.tick if self.tick else 0.0
 
     def on_trade(self, ts: float, px: float) -> None:
         px = float(px or 0.0)
@@ -492,22 +540,41 @@ class PriceDir:
             return
         self._ts = float(ts)
         if self._px <= 0:
-            self._px = px
+            self._px = self._anchor = px
             self._moved_ts = self._ts
             return
-        if px > self._px:
-            self._prev, self._px = self._px, px
-            self._dir = UP
+        if px != self._px:
             self._moved_ts = self._ts
-        elif px < self._px:
-            self._prev, self._px = self._px, px
-            self._dir = DOWN
-            self._moved_ts = self._ts
-        # Equal: nothing changed. The standing direction keeps until
-        # it expires below.
+        self._px = px
+        need = self.reverse
+        if self._dir == UP:
+            if px > self._anchor:
+                self._anchor = px
+            elif self._anchor - px >= need > 0:
+                self._dir = DOWN
+                self._anchor = px
+            elif need <= 0 and px < self._anchor:
+                self._dir = DOWN
+                self._anchor = px
+        elif self._dir == DOWN:
+            if px < self._anchor:
+                self._anchor = px
+            elif px - self._anchor >= need > 0:
+                self._dir = UP
+                self._anchor = px
+            elif need <= 0 and px > self._anchor:
+                self._dir = UP
+                self._anchor = px
+        else:
+            if px - self._anchor >= need and px > self._anchor:
+                self._dir = UP
+                self._anchor = px
+            elif self._anchor - px >= need and px < self._anchor:
+                self._dir = DOWN
+                self._anchor = px
 
     def reset(self) -> None:
-        self._px = self._prev = 0.0
+        self._px = self._anchor = 0.0
         self._dir = NONE
         self._moved_ts = self._ts = 0.0
 
@@ -515,10 +582,11 @@ class PriceDir:
     def snapshot(self) -> dict:
         still = max(0.0, self._ts - self._moved_ts)
         return {"px": self._px,
-                "prev": self._prev,
+                "anchor": self._anchor,
                 # Flat is a real state and is reported as one. Carrying
                 # the last direction through a dead market would have
                 # the line saying DOWN while nothing is happening.
                 "dir": self._dir if still < self.flat_s else NONE,
                 "still_s": round(still, 2),
+                "reverse_ticks": round(self.reverse_ticks, 2),
                 "ts": self._ts}

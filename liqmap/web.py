@@ -6117,8 +6117,8 @@ def create_app() -> FastAPI:
                     bars: int = 140, offset: int = 0,
                     pivot: int = 5, confirm: int = 1,
                     keep: int = 4, higher: int = 1,
-                    level: int = 0, clear: float = 1.0
-                    ) -> dict[str, Any]:
+                    level: int = 0, clear: float = 1.0,
+                    rev: float = 4.0) -> dict[str, Any]:
         """OFI-closed candles for one target, newest last.
 
         Every target in the ladder is accumulating all the time, so
@@ -6564,6 +6564,12 @@ def create_app() -> FastAPI:
         _price = None
         if _pd is not None:
             try:
+                # HOW FAR PRICE MUST REVERSE before the direction
+                # flips. At one tick the line changes its mind 523
+                # times a minute on a tick-level walk; four is one ES
+                # point, the same distance the OFI trade already uses
+                # as its objective.
+                _pd.set_reverse(max(0.0, min(float(rev), 40.0)))
                 _price = dict(_pd.snapshot)
                 _price["px"] = _price["px"] * sc
                 _price["prev"] = _price["prev"] * sc
@@ -11260,7 +11266,8 @@ function _ofiSave() {
   try {
     localStorage.setItem('liqmap_ofi', JSON.stringify({
       t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm,
-      k: _ofiKeep, h: _ofiHigher, lv: _ofiLevel, cl: _ofiClear }));
+      k: _ofiKeep, h: _ofiHigher, lv: _ofiLevel, cl: _ofiClear,
+      rv: _ofiRev }));
   } catch (e) { /* private mode, quota, blocked -- not worth a failure */ }
 }
 let _ofiTarget = 250;
@@ -11276,6 +11283,12 @@ let _ofiLevel = 500;       // imbalance at which a call is made
    neighbours as readily as one standing eight points above, and
    most of the chevrons were the former. Zero restores that. */
 let _ofiClear = 1.0;
+/* HOW FAR PRICE MUST REVERSE before the PRICE reading flips, in
+   ticks. A reversal threshold is the one filter that costs no lag:
+   a move of this size flips the direction on the print that
+   completes it, exactly as fast as no filter at all, and every
+   wiggle smaller than it is removed completely. */
+let _ofiRev = 4.0;
 try {
   const _s = JSON.parse(localStorage.getItem('liqmap_ofi') || '{}');
   if (_s.t) _ofiTarget = _s.t;
@@ -11286,6 +11299,7 @@ try {
   if (_s.h !== undefined) _ofiHigher = _s.h;
   if (_s.lv) _ofiLevel = _s.lv;
   if (_s.cl !== undefined) _ofiClear = _s.cl;
+  if (_s.rv !== undefined) _ofiRev = _s.rv;
 } catch (e) { /* nothing saved, or unreadable -- the defaults stand */ }
 
 function ofiSetTarget(v) {
@@ -11319,6 +11333,8 @@ function ofiSetConfirm(v) { _ofiConfirm = parseInt(v, 10) || 1; _ofiSave(); ofiT
 function ofiSetKeep(v) { _ofiKeep = parseInt(v, 10) || 4; _ofiSave(); ofiTick(); }
 function ofiSetHigher(v) { _ofiHigher = (v === '1' ? 1 : 0); _ofiSave(); ofiTick(); }
 function ofiSetLevel(v) { _ofiLevel = parseInt(v, 10) || 500; _ofiSave(); ofiTick(); }
+function ofiSetRev(v) { _ofiRev = parseFloat(v) || 0; _ofiSave(); ofiTick(); }
+function ofiSetClear(v) { _ofiClear = parseFloat(v) || 0; _ofiSave(); ofiTick(); }
 function ofiLive() { _ofiOffset = 0; ofiTick(); }
 function ofiOldest() { _ofiOffset = Math.max(0, _ofiTotal - _ofiWindow); ofiTick(); }
 
@@ -11336,7 +11352,8 @@ async function ofiTick(fromTimer) {
       + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
       + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm
       + '&keep=' + _ofiKeep + '&higher=' + _ofiHigher
-      + '&level=' + _ofiLevel + '&clear=' + _ofiClear);
+      + '&level=' + _ofiLevel + '&clear=' + _ofiClear
+      + '&rev=' + _ofiRev);
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; _ofiLast = d; }
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
@@ -11367,7 +11384,31 @@ async function ofiTick(fromTimer) {
           style="margin:0 6px">${[1, 2, 3, 5].map(k =>
             `<option value="${k}"${k === d.confirm_n ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
-        &middot; dotted carets are not confirmed yet and can vanish</span>
+        &middot; dotted carets are not confirmed yet and can vanish
+        &middot; a swing must also stand clear of its neighbours by
+        <select onchange="ofiSetClear(this.value)"
+          style="margin:0 6px">${[0, 0.5, 1, 1.5, 2].map(k =>
+            `<option value="${k}"${k === d.clear_n ? ' selected' : ''}>${
+              k === 0 ? 'nothing' : k + '&times;'}</option>`
+          ).join('')}</select>
+        a typical bar (${(d.clear_ticks || 0).toFixed(1)} ticks here)
+        &mdash; at nothing, a bar that merely TIES its neighbours is
+        marked the same as one standing eight points above, which is
+        what most of these were</span>
+      <span class="stamp" style="width:100%">price direction flips
+        when price reverses by
+        <select onchange="ofiSetRev(this.value)"
+          style="margin:0 6px">${[1, 2, 4, 8, 12].map(k =>
+            `<option value="${k}"${
+              k === Math.round((d.price && d.price.reverse_ticks) || 4)
+                ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        ticks &middot; a move that size still flips it on the print
+        that completes it, so this costs no lag &mdash; it removes
+        what is smaller than itself and nothing else &middot; at one
+        tick the reading changes its mind about eight times a second
+        &middot; the PRICE NUMBER is never smoothed, only the
+        direction</span>
       <span class="stamp" style="width:100%">call the imbalance at
         &plusmn;<select onchange="ofiSetLevel(this.value)"
           style="margin:0 6px">${(d.call_levels || []).map(k =>

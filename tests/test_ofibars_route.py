@@ -2057,20 +2057,22 @@ class TestThePriceIsPureAndBothAreLive:
 
     def test_flat_is_reported_as_flat(self):
         from liqmap.flowread import PriceDir
-        p = PriceDir(flat_s=2.0)
-        p.on_trade(0.0, 100.0)
-        p.on_trade(1.0, 100.25)
+        T = 250_000_000.0
+        p = PriceDir(flat_s=2.0, reverse_ticks=1.0, tick=T)
+        p.on_trade(0.0, 100 * T)
+        p.on_trade(1.0, 101 * T)
         assert p.snapshot["dir"] == "up"
-        p.on_trade(9.0, 100.25)
+        p.on_trade(9.0, 101 * T)
         assert p.snapshot["dir"] == "", "it held a stale direction"
 
     def test_an_unchanged_print_does_not_flip_it(self):
         from liqmap.flowread import PriceDir
-        p = PriceDir()
-        p.on_trade(0.0, 100.0)
-        p.on_trade(0.1, 100.25)
+        T = 250_000_000.0
+        p = PriceDir(reverse_ticks=1.0, tick=T)
+        p.on_trade(0.0, 100 * T)
+        p.on_trade(0.1, 101 * T)
         for i in range(20):
-            p.on_trade(0.2 + i * 0.01, 100.25)
+            p.on_trade(0.2 + i * 0.01, 101 * T)
         assert p.snapshot["dir"] == "up"
 
     def test_the_line_shows_both_and_says_when_they_oppose(self):
@@ -2109,3 +2111,93 @@ class TestThePriceIsPureAndBothAreLive:
         body = src[i:src.index("# ---", i)]
         assert "regime" not in body.lower().split('"""', 2)[2]
         assert "REGIME IS DELIBERATELY NOT HERE" in src
+
+
+class TestPriceIsSmoothedWithoutBeingDelayed:
+    """Every other smoother trades lag for quiet. A reversal
+    threshold does not: a move of that size flips the direction on
+    the print that completes it, exactly as fast as no filter at
+    all, and every wiggle smaller than it is erased completely."""
+
+    T = 250_000_000.0
+
+    def _p(self, ticks=4.0, flat_s=999.0):
+        from liqmap.flowread import PriceDir
+        return PriceDir(flat_s=flat_s, reverse_ticks=ticks,
+                        tick=self.T)
+
+    def _feed(self, p, ticks, base=6800 * 4):
+        for i, k in enumerate(ticks):
+            p.on_trade(i * 0.1 + 1.0, (base + k) * self.T)
+        return p.snapshot
+
+    def test_a_wiggle_under_the_threshold_is_erased(self):
+        s = self._feed(self._p(4.0), [0, 1, 2, 3, 2, 1, 0])
+        assert s["dir"] == "", "a three-tick wiggle moved it"
+
+    def test_a_move_at_the_threshold_flips_it_at_once(self):
+        """The whole claim: no lag beyond the threshold itself."""
+        p = self._p(4.0)
+        self._feed(p, [0, 1, 2, 3])
+        assert p.snapshot["dir"] == ""
+        p.on_trade(99.0, (6800 * 4 + 4) * self.T)
+        assert p.snapshot["dir"] == "up", "it waited past the move"
+
+    def test_it_reverses_from_the_extreme_not_from_anywhere(self):
+        """Price has to come back from the high it made. Measuring
+        from wherever it happens to be would arm a flip at the start
+        of a long run and reverse on nothing."""
+        p = self._p(4.0)
+        self._feed(p, [0, 4, 8, 12, 16])
+        assert p.snapshot["dir"] == "up"
+        p.on_trade(50.0, (6800 * 4 + 13) * self.T)   # back 3 from 16
+        assert p.snapshot["dir"] == "up", "it flipped on a pullback"
+        p.on_trade(51.0, (6800 * 4 + 12) * self.T)   # back 4 from 16
+        assert p.snapshot["dir"] == "down"
+
+    def test_the_number_is_never_smoothed(self):
+        """A filtered price is a level that never printed, which is
+        worse than a noisy one that did."""
+        p = self._p(8.0)
+        s = self._feed(p, [0, 1, 2, 3])
+        assert s["px"] == (6800 * 4 + 3) * self.T
+        assert s["dir"] == "", "the direction should still be filtered"
+
+    def test_a_bigger_threshold_flips_strictly_less(self):
+        import random
+        rng = random.Random(7)
+        walk = [0]
+        for _ in range(4_000):
+            walk.append(walk[-1] + (1 if rng.random() < 0.5 else -1))
+        counts = {}
+        for t in (1.0, 2.0, 4.0, 8.0):
+            p = self._p(t)
+            n, last = 0, ""
+            for i, k in enumerate(walk):
+                p.on_trade(i * 0.01 + 1.0, (6800 * 4 + k) * self.T)
+                d = p.snapshot["dir"]
+                if d and d != last:
+                    n += 1
+                    last = d
+            counts[t] = n
+        assert counts[1.0] > counts[2.0] > counts[4.0] > counts[8.0], \
+            counts
+
+    def test_the_threshold_is_a_setting(self):
+        i = WEB.index("def api_ofibars")
+        r = WEB[i:WEB.index("def api_dexarb")]
+        assert "rev: float = 4.0" in r
+        assert "_pd.set_reverse(" in r
+        assert "function ofiSetRev(" in WEB
+        assert "rv: _ofiRev" in WEB
+
+    def test_the_flow_does_not_smooth_the_price(self):
+        """The moment flow gates price, 'opposed' can never appear
+        and price stops being an independent check -- it becomes the
+        read wearing a second name."""
+        src = (ROOT / "liqmap" / "flowread.py").read_text()
+        i = src.index("class PriceDir")
+        body = src[i:]
+        code = body.split('"""', 2)[2]
+        for word in ("lead", "gross", "_up", "_dn", "read"):
+            assert word not in code, f"flow leaked into price: {word}"
