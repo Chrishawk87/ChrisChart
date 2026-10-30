@@ -336,7 +336,9 @@ class TestScrollback:
 
     def test_the_window_size_is_bounded(self):
         r = self._route()
-        assert "max(20, min(int(bars), 600))" in r
+        assert "min(int(bars), 600))" in r
+        assert "max(6, min(int(bars), 600))" in r, \
+            "the floor must allow zooming in to a handful of bars"
 
     def test_the_pivot_window_is_bounded(self):
         r = self._route()
@@ -362,7 +364,14 @@ class TestThePanAndZoomControls:
     def test_zooming_holds_the_right_edge(self):
         i = WEB.index("function ofiSetWindow")
         j = WEB.index("function ofiPan")
-        assert "_ofiOffset + (was - _ofiWindow)" in WEB[i:j]
+        # The arithmetic moved into ofiZoomTo, which takes the point
+        # to hold still as an argument -- 1.0 from the dropdown (the
+        # right edge, where the live bar is) and the cursor's
+        # position from the wheel.
+        blk = WEB[i:j]
+        assert "function ofiZoomTo(bars, frac)" in blk
+        assert "_ofiOffset - added * (1 - frac)" in blk
+        assert "ofiZoomTo(parseInt(v, 10) || 140, 1.0)" in blk
 
     def test_pan_cannot_go_negative(self):
         i = WEB.index("function ofiPan")
@@ -464,12 +473,24 @@ class TestSettingsSurviveAReload:
             assert k in blk, k
 
     def test_every_setter_persists(self):
+        """Directly, or through the one function it delegates to --
+        ofiSetWindow now hands the arithmetic to ofiZoomTo so the
+        wheel and the dropdown cannot drift apart, and the save
+        happens there."""
         i = WEB.index("function _ofiSave")
         blk = WEB[i:WEB.index("async function ofiTick")]
+        delegates = {"ofiSetWindow": "ofiZoomTo"}
         for fn in ("ofiSetTarget", "ofiSetWindow", "ofiSetPivot",
-                   "ofiSetConfirm", "ofiSetKeep"):
+                   "ofiSetConfirm", "ofiSetKeep", "ofiSetRev",
+                   "ofiSetClear", "ofiSetLevel"):
             k = blk.index("function " + fn)
-            assert "_ofiSave()" in blk[k:k + 340], fn
+            body = blk[k:k + 340]
+            if "_ofiSave()" in body:
+                continue
+            to = delegates.get(fn)
+            assert to and to in body, fn
+            j = blk.index("function " + to)
+            assert "_ofiSave()" in blk[j:j + 700], f"{fn} -> {to}"
 
     def test_the_scroll_position_is_NOT_saved(self):
         """Coming back to a page scrolled into history, with nothing
@@ -2201,3 +2222,76 @@ class TestPriceIsSmoothedWithoutBeingDelayed:
         code = body.split('"""', 2)[2]
         for word in ("lead", "gross", "_up", "_dn", "read"):
             assert word not in code, f"flow leaked into price: {word}"
+
+
+class TestTheChartPansAndZoomsLikeAChart:
+    """Wheel to zoom, drag to scroll, double-click back to the live
+    edge. The arithmetic is checked by TestThePanAndZoomControls; this
+    is about the handlers behaving like a chart rather than a form."""
+
+    def _blk(self):
+        i = WEB.index("function ofiBindChart")
+        return WEB[i:WEB.index("async function ofiTick")]
+
+    def test_the_handlers_go_on_the_host_not_the_svg(self):
+        """The host survives every redraw -- only its innerHTML is
+        replaced. Binding to the svg would lose them on the next
+        tick, and the chart would be draggable exactly once."""
+        b = self._blk()
+        assert "const host = $('ofiBars')" in b
+        for ev in ("wheel", "pointerdown", "pointermove", "pointerup"):
+            assert "host.addEventListener('" + ev + "'" in b, ev
+
+    def test_it_binds_only_once(self):
+        b = self._blk()
+        assert "if (!host || _ofiBound) return;" in b
+        assert "_ofiBound = true;" in b
+
+    def test_the_wheel_does_not_scroll_the_page(self):
+        b = self._blk()
+        assert "e.preventDefault()" in b
+        assert "{passive: false}" in b, \
+            "preventDefault is ignored on a passive listener"
+
+    def test_the_wheel_zooms_about_the_cursor(self):
+        b = self._blk()
+        assert "e.clientX - r.left" in b
+        assert "ofiZoomTo(_ofiWindow * step, frac)" in b
+
+    def test_a_drag_moves_the_chart_before_anything_is_fetched(self):
+        """The data is paged server-side, so a pan is a round trip.
+        Without this the chart sits still until it returns and the
+        drag feels broken rather than slow."""
+        b = self._blk()
+        assert "style.transform = 'translateX('" in b
+        assert "style.transform = ''" in b, "the transform must be cleared"
+
+    def test_dragging_right_goes_back_in_time(self):
+        """A chart drags like a sheet of paper, not like a scrollbar."""
+        b = self._blk()
+        assert "_ofiDrag.off + bars" in b
+        assert "dx / _ofiDrag.per" in b
+
+    def test_a_click_on_a_control_is_not_a_drag(self):
+        b = self._blk()
+        assert "closest('select, button, a, input')" in b
+
+    def test_double_click_returns_to_the_live_edge(self):
+        b = self._blk()
+        assert "dblclick" in b and "_ofiOffset = 0" in b
+
+    def test_the_refetch_is_coalesced(self):
+        """A flick of the wheel sends many notches and a drag sends a
+        move every frame. Firing the route on each would queue
+        requests that arrive out of order and paint the view
+        backwards."""
+        i = WEB.index("function ofiSoon")
+        blk = WEB[i:i + 400]
+        assert "clearTimeout(_ofiSoon)" in blk
+        assert "setTimeout" in blk
+
+    def test_the_zoom_is_clamped_at_both_ends(self):
+        i = WEB.index("function ofiZoomTo")
+        blk = WEB[i:i + 700]
+        assert "OFI_MIN_BARS" in blk and "OFI_MAX_BARS" in blk
+        assert "const OFI_MIN_BARS = 6;" in WEB

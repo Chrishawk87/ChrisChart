@@ -6154,7 +6154,12 @@ def create_app() -> FastAPI:
         if t not in builders:
             t = min(builders, key=lambda x: abs(x - t))
         b = builders[t]
-        n = max(20, min(int(bars), 600))
+        # ZOOMING IN IS THE POINT, so the floor is a handful of
+        # bars rather than twenty. At six, a 2,000-contract candle
+        # fills a sixth of the screen and its wick structure is
+        # readable, which is what "tick by tick" means on a chart
+        # whose unit is a quantity of flow rather than a clock.
+        n = max(6, min(int(bars), 600))
         total = len(b.bars)
         # `offset` is how many bars back from the live edge the window
         # starts. Clamped rather than wrapped: asking to scroll past the
@@ -6569,10 +6574,17 @@ def create_app() -> FastAPI:
                 # times a minute on a tick-level walk; four is one ES
                 # point, the same distance the OFI trade already uses
                 # as its objective.
-                _pd.set_reverse(max(0.0, min(float(rev), 40.0)))
+                _pd.set_reverse(max(1.0, min(float(rev), 12.0)))
                 _price = dict(_pd.snapshot)
-                _price["px"] = _price["px"] * sc
-                _price["prev"] = _price["prev"] * sc
+                # SCALE WHATEVER PRICE KEYS ARE THERE, by name rather
+                # than by a list written out here. A hard-coded key
+                # that the snapshot no longer carries raises, the
+                # except below swallows it, and the whole price
+                # disappears off the line -- which is exactly what
+                # happened when `prev` became `anchor`.
+                for _k in ("px", "anchor"):
+                    if _price.get(_k):
+                        _price[_k] = _price[_k] * sc
             except Exception:                           # noqa: BLE001
                 _price = None
         _rg = getattr(tape, "regime", None)
@@ -6604,6 +6616,12 @@ def create_app() -> FastAPI:
                 "reachable": b.reachable(),
                 "pivot_n": pv, "confirm_n": cf,
                 "clear_n": cl,
+                # The REQUESTED reversal, echoed back. The dropdown
+                # marks its selection from this and not from the
+                # price snapshot -- when the snapshot was missing the
+                # control fell back to its default on every render
+                # and read as stuck.
+                "rev_n": max(1.0, min(float(rev), 12.0)),
                 "clear_ticks": round(_min_clear / 250_000_000.0, 2),
                 "traded_bars": sum(1 for x in window if x.traded),
                 "keep_n": keep_n, "levels": lvls,
@@ -11312,14 +11330,124 @@ function ofiSetTarget(v) {
   ofiTick();
 }
 
+const OFI_MIN_BARS = 6;      // zoomed all the way in
+const OFI_MAX_BARS = 600;    // and all the way out -- the route's cap
+
 function ofiSetWindow(v) {
+  ofiZoomTo(parseInt(v, 10) || 140, 1.0);
+}
+
+/* ZOOM, ANCHORED ON A POINT IN THE VIEW.
+
+   `frac` is where on the chart to hold still, 0 at the left edge and
+   1 at the right. The dropdown passes 1 -- zoom about the newest bar,
+   which is what you want when you are watching the live edge. The
+   wheel passes the cursor's position, which is what you want when you
+   are looking at something in the middle of the screen: the bar under
+   the pointer stays under the pointer.
+
+   Without the anchor the view jumps on every notch of the wheel and
+   zooming becomes a game of chasing what you were reading. */
+function ofiZoomTo(bars, frac) {
   const was = _ofiWindow;
-  _ofiWindow = parseInt(v, 10) || 140;
-  // Zoom about the RIGHT edge of what is on screen, so the bar you were
-  // looking at stays put instead of the view jumping.
-  if (_ofiOffset > 0) _ofiOffset = Math.max(0, _ofiOffset + (was - _ofiWindow));
+  const next = Math.max(OFI_MIN_BARS, Math.min(OFI_MAX_BARS,
+                                               Math.round(bars)));
+  if (next === was) return;
+  _ofiWindow = next;
+  const added = next - was;
+  if (_ofiOffset > 0) {
+    _ofiOffset = Math.max(0, Math.round(_ofiOffset - added * (1 - frac)));
+  }
   _ofiSave();
-  ofiTick();
+  ofiSoon();
+}
+
+/* ONE REFETCH, NOT THIRTY. A wheel sends many notches in a flick and
+   a drag sends a move on every frame; firing the route on each would
+   queue requests that arrive out of order and paint the view
+   backwards. The pending redraw coalesces them. */
+let _ofiSoon = null;
+function ofiSoon(ms) {
+  if (_ofiSoon) clearTimeout(_ofiSoon);
+  _ofiSoon = setTimeout(() => { _ofiSoon = null; ofiTick(); },
+                        ms === undefined ? 90 : ms);
+}
+
+/* WHEEL TO ZOOM, DRAG TO PAN.
+
+   The host element survives every redraw -- only its innerHTML is
+   replaced -- so the handlers go on the host once and keep working
+   through every repaint. Binding to the svg instead would lose them
+   on the next tick.
+
+   DURING A DRAG THE EXISTING CHART IS TRANSLATED, before anything is
+   fetched. The data is paged server-side, so a pan is a round trip;
+   without the transform the chart would sit still until it returned
+   and the drag would feel broken rather than slow. */
+let _ofiBound = false;
+let _ofiDrag = null;
+
+function ofiPxPerBar(svg) {
+  const r = svg.getBoundingClientRect();
+  return Math.max(1, (r.width - 64) / Math.max(1, _ofiWindow));
+}
+
+function ofiBindChart() {
+  const host = $('ofiBars');
+  if (!host || _ofiBound) return;
+  _ofiBound = true;
+
+  host.addEventListener('wheel', (e) => {
+    const svg = e.target.closest && e.target.closest('svg');
+    if (!svg) return;
+    e.preventDefault();          // the page must not scroll with it
+    const r = svg.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const step = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+    ofiZoomTo(_ofiWindow * step, frac);
+  }, {passive: false});
+
+  host.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const svg = e.target.closest && e.target.closest('svg');
+    if (!svg) return;
+    // A click on a control inside the panel is not a drag.
+    if (e.target.closest('select, button, a, input')) return;
+    _ofiDrag = {x: e.clientX, svg: svg, off: _ofiOffset,
+                per: ofiPxPerBar(svg), moved: false};
+    try { host.setPointerCapture(e.pointerId); } catch (err) {}
+    host.style.cursor = 'grabbing';
+  });
+
+  host.addEventListener('pointermove', (e) => {
+    if (!_ofiDrag) return;
+    const dx = e.clientX - _ofiDrag.x;
+    if (Math.abs(dx) < 2 && !_ofiDrag.moved) return;
+    _ofiDrag.moved = true;
+    // Dragging RIGHT moves the view back in time, the way a chart
+    // drags a sheet of paper rather than a scrollbar.
+    _ofiDrag.svg.style.transform = 'translateX(' + dx + 'px)';
+    const bars = Math.round(dx / _ofiDrag.per);
+    const want = Math.max(0, Math.min(_ofiDrag.off + bars,
+                                      Math.max(0, _ofiTotal - _ofiWindow)));
+    if (want !== _ofiOffset) { _ofiOffset = want; ofiSoon(60); }
+  });
+
+  const end = (e) => {
+    if (!_ofiDrag) return;
+    _ofiDrag.svg.style.transform = '';
+    const moved = _ofiDrag.moved;
+    _ofiDrag = null;
+    host.style.cursor = '';
+    try { host.releasePointerCapture(e.pointerId); } catch (err) {}
+    if (moved) { _ofiSave(); ofiSoon(0); }
+  };
+  host.addEventListener('pointerup', end);
+  host.addEventListener('pointercancel', end);
+  host.addEventListener('dblclick', () => {
+    // Back to the live edge, the way double-clicking a chart does.
+    _ofiOffset = 0; _ofiSave(); ofiTick();
+  });
 }
 
 function ofiPan(bars) {
@@ -11355,6 +11483,7 @@ async function ofiTick(fromTimer) {
       + '&level=' + _ofiLevel + '&clear=' + _ofiClear
       + '&rev=' + _ofiRev);
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; _ofiLast = d; }
+    ofiBindChart();
     if (!d.ok) {
       host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
         + (d.why || 'unavailable') + '</span>';
@@ -11371,10 +11500,13 @@ async function ofiTick(fromTimer) {
           ).join('')}</select>
         contracts &middot; show
         <select onchange="ofiSetWindow(this.value)"
-          style="margin:0 6px">${[60, 100, 140, 220, 320, 500].map(k =>
+          style="margin:0 6px">${[6, 12, 25, 40, 60, 100, 140, 220,
+            320, 500].map(k =>
             `<option value="${k}"${k === d.window ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
-        bars &middot; swing
+        bars &middot; or roll the wheel over the chart to zoom and
+        drag it to scroll, double-click to come back to the live
+        edge &middot; swing
         <select onchange="ofiSetPivot(this.value)"
           style="margin:0 6px">${[3, 5, 8, 12, 20].map(k =>
             `<option value="${k}"${k === d.pivot_n ? ' selected' : ''}>${k}</option>`
@@ -11398,9 +11530,9 @@ async function ofiTick(fromTimer) {
       <span class="stamp" style="width:100%">price direction flips
         when price reverses by
         <select onchange="ofiSetRev(this.value)"
-          style="margin:0 6px">${[1, 2, 4, 8, 12].map(k =>
-            `<option value="${k}"${
-              k === Math.round((d.price && d.price.reverse_ticks) || 4)
+          style="margin:0 6px">${
+            Array.from({length: 12}, (_, n) => n + 1).map(k =>
+            `<option value="${k}"${k === Math.round(d.rev_n || 4)
                 ? ' selected' : ''}>${k}</option>`
           ).join('')}</select>
         ticks &middot; a move that size still flips it on the print
