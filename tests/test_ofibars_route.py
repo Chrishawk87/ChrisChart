@@ -1829,7 +1829,7 @@ class TestTheReadIsAboutTheOtherTrade:
         being taken. Under the per-bar call it reads as a footnote to
         a scalp."""
         c = self._chart()
-        assert "readLine(d && d.read) + liveCall" in c
+        assert "readLine(d && d.read) + regimeLine(" in c
 
     def test_it_names_what_it_is_not(self):
         c = self._chart()
@@ -1896,3 +1896,59 @@ class TestTheReadIsAboutTheOtherTrade:
         body = src.split('"""', 2)[2]
         for word in ("ofibar", "OfiBar", "bar_close", "on_bar"):
             assert word not in body, word
+
+
+class TestTheRegimeTagsTheReadAndNothingMore:
+    """Spread, VPIN and cancellation intensity are error bars on the
+    imbalance, not a second opinion about direction. The panel says
+    so, the route carries them separately, and the reading cannot
+    see them."""
+
+    def _chart(self):
+        i = WEB.index("function ofiChart(")
+        return WEB[i:WEB.index("\n}", i)]
+
+    def _route(self):
+        i = WEB.index("def api_ofibars")
+        return WEB[i:WEB.index("def api_dexarb")]
+
+    def test_the_route_carries_it_beside_the_read_not_inside_it(self):
+        r = self._route()
+        assert '"read": _read, "regime": _regime' in r
+        assert "_rg.snapshot.as_dict()" in r
+
+    def test_the_reading_cannot_see_the_regime(self):
+        fr = (ROOT / "liqmap" / "flowread.py").read_text()
+        body = fr.split('"""', 2)[2]
+        assert "regime" not in body.lower()
+
+    def test_the_panel_says_it_never_changes_direction(self):
+        c = self._chart()
+        assert "they never change its " in c and "direction" in c
+
+    def test_the_interpretations_are_not_printed(self):
+        """'High confidence', 'toxic', 'suspect' are hypotheses about
+        this market. Printing them before anything measured them
+        would be the chart asserting what it was told."""
+        c = self._chart()
+        i = c.index("const regimeLine")
+        blk = c[i:c.index("let liveCall")]
+        for word in ("toxic", "dangerous", "high confidence",
+                     "suspect", "fragile"):
+            assert word not in blk.lower(), word
+
+    def test_it_points_at_what_would_fill_them_in(self):
+        c = self._chart()
+        assert "regime_outcomes.py" in c
+
+    def test_it_says_how_far_off_a_band_is(self):
+        """A threshold built from nine observations is not a
+        threshold, and the panel has to show the count rather than
+        quietly showing a band."""
+        c = self._chart()
+        assert "of 30 samples" in c
+
+    def test_an_absent_regime_draws_nothing(self):
+        c = self._chart()
+        i = c.index("const regimeLine")
+        assert "if (!g) return '';" in c[i:i + 120]

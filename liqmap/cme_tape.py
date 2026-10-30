@@ -134,6 +134,11 @@ class Tape:
     # that blanked every time an OFI bar ended would blank several
     # times inside one trade.
     flowread: object = None
+    # ERROR BARS FOR THAT READING. Spread, VPIN on the stated
+    # aggressor, and cancellation intensity from the action codes the
+    # MBP-10 records already carry. Tags only: nothing here may
+    # change the reading's direction, and flowread cannot see it.
+    regime: object = None
     # The two drawn lines: book CVD as the reader, time-smoothed
     # traded CVD as the confirmation. Fed from the same decoded trade
     # as everything else above, so the lines and the candles can never
@@ -357,6 +362,20 @@ class Tape:
                         # formula. The reading and the candles cannot
                         # disagree about what happened.
                         self.flowread.on_book(bts, bpx, bsz, apx, asz)
+                    if self.regime is not None:
+                        self.regime.on_book(bts, bpx, bsz, apx, asz,
+                                            250_000_000.0)
+                        # THE ACTION IS STATED ON THE RECORD. Cancels
+                        # are counted, not inferred from size going
+                        # down -- which would also catch every fill
+                        # and every modify.
+                        self.regime.on_action(
+                            bts, dbn._action(rec),
+                            float(dbn._get(rec, "size", 0) or 0))
+                        if t is not None:
+                            self.regime.on_trade(float(t.ts),
+                                                 float(t.sz),
+                                                 t.aggressor)
             except Exception:                           # noqa: BLE001
                 pass            # a display must not stop the tape
         if self.cvdcross is not None:

@@ -1051,6 +1051,9 @@ class Runtime:
             if svc.tape.flowread is None:
                 from .flowread import FlowRead
                 svc.tape.flowread = FlowRead()
+            if svc.tape.regime is None:
+                from .regime import Regime
+                svc.tape.regime = Regime()
             from .bookdiag import BookDiagonal
             svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
             # And whether the flow can get THROUGH that standing size.
@@ -6523,9 +6526,22 @@ def create_app() -> FastAPI:
                 _read = _fr.snapshot.as_dict()
             except Exception:                           # noqa: BLE001
                 _read = None
+        # ERROR BARS, NOT A SECOND SIGNAL. Computed from the same
+        # tape and carried beside the reading, never folded into it:
+        # the direction is the imbalance's and these only say what
+        # state it arrived in.
+        _rg = getattr(tape, "regime", None)
+        _regime = None
+        if _rg is not None:
+            try:
+                if _read:
+                    _rg.set_gross(_read.get("gross", 0.0))
+                _regime = _rg.snapshot.as_dict()
+            except Exception:                           # noqa: BLE001
+                _regime = None
 
         return {"ok": True, "coin": coin, "target": t,
-                "read": _read,
+                "read": _read, "regime": _regime,
                 "targets": list(_OFI_LADDER),
                 "total": total, "offset": off, "window": n,
                 "dropped": getattr(b, "dropped", 0),
@@ -10670,6 +10686,45 @@ function ofiChart(d, w, h) {
       + 'when your candle does</span>';
   };
 
+  /* ERROR BARS FOR THE READ, on their own line below it.
+
+     The imbalance decides the direction. These say what state it
+     arrived in -- a tight book or a thin one, one-sided taking or
+     two-way, size that stood or size that was pulled. They can tell
+     you to stand down or to size smaller. THEY NEVER CHANGE THE
+     DIRECTION ABOVE, and nothing wires them to it.
+
+     The interpretations -- which combination is "high confidence"
+     and which is "toxic" -- are deliberately NOT printed here. They
+     are hypotheses about this market and nothing has measured them
+     yet. scripts/regime_outcomes.py fills them in from real tape,
+     and until it has, the line shows the metrics and says so. */
+  const regimeLine = g => {
+    if (!g) return '';
+    const n = x => (x === null || x === undefined) ? '--' : x;
+    const bits = [
+      'spread <b>' + (g.spread_ticks || 0).toFixed(2) + '</b> '
+        + (g.spread_band ? '(' + g.spread_band + ')' : ''),
+      'VPIN <b>' + (g.vpin || 0).toFixed(3) + '</b> '
+        + (g.vpin_band ? '(' + g.vpin_band + ')'
+           : '(' + n(g.vpin_n) + ' of 30 samples)'),
+      'cancelled <b>' + (100 * (g.cancel_rate || 0)).toFixed(0)
+        + '%</b> of posted size '
+        + (g.cancel_band ? '(' + g.cancel_band + ')'
+           : '(' + n(g.cancel_n) + ' of 30 samples)'),
+    ];
+    const tail = g.known
+      ? ' &middot; regime <b>' + g.tag + '</b> &mdash; what this one '
+        + 'has actually done is not known yet; run '
+        + 'scripts/regime_outcomes.py on your files to fill it in'
+      : ' &middot; not enough of this session yet to call any of these '
+        + 'high or low, so there is no regime tag';
+    return '<span class="stamp" style="width:100%">CHECK &mdash; '
+      + bits.join(' &middot; ') + tail
+      + ' &middot; these tag the read, they never change its '
+      + 'direction</span>';
+  };
+
   let liveCall;
   if (d && d.reachable === false) {
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
@@ -10715,7 +10770,8 @@ function ofiChart(d, w, h) {
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
       + 'no bar is forming</span>';
   }
-  liveCall = readLine(d && d.read) + liveCall + speedLine(fm);
+  liveCall = readLine(d && d.read) + regimeLine(d && d.regime)
+    + liveCall + speedLine(fm);
 
   const dLast = all[all.length - 1] || {};
   const dSum = all.reduce((a, b) => a + (b.delta || 0), 0);
