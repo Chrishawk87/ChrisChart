@@ -5319,7 +5319,11 @@ def create_app() -> FastAPI:
         from .structure import Candle
         from .live import INTERVALS as _LIVE_INTERVALS
 
-        step = _LIVE_INTERVALS.get(interval) or client.INTERVALS.get(interval, 900)
+        # The length of a label is arithmetic, not a venue's menu.
+        # Reading it off the crypto client's table made the whole read
+        # depend on Hyperliquid listing a timeframe for a market
+        # Hyperliquid does not carry at all.
+        step = _LIVE_INTERVALS.get(interval) or _seconds_of(interval) or 900
         now_s = time.time()
 
         # If a socket is feeding this market, the current bar is BUILT from
@@ -5561,7 +5565,13 @@ def create_app() -> FastAPI:
                 tf_list = [higher, "1h", interval, "5m", "1m"]
             seen, want = set(), []
             for t in tf_list:
-                if t in client.INTERVALS and t not in seen:
+                # A label earns its row by being a length this service
+                # can build a bar for -- NOT by appearing in the crypto
+                # venue's interval table. That test silently emptied the
+                # whole ladder on CME, which the panel showed as "no
+                # read on 15m, 5m, 1m" rather than as a filter nobody
+                # had meant to apply.
+                if (_seconds_of(t) or _LIVE_INTERVALS.get(t)) and t not in seen:
                     seen.add(t)
                     want.append(t)
 
@@ -5575,9 +5585,28 @@ def create_app() -> FastAPI:
             # the direction read was built from, rather than fetching them
             # a second time and possibly getting a different slice.
             tf_hist: dict[str, Any] = {}
+            # EVERY TIMEFRAME THE STACK WANTS gets a builder, not just
+            # the one being traded: a CME tape opened on 1m/15m and
+            # asked for the 5m had none, and the missing row read on
+            # the panel as "no read on 5m" rather than as a timeframe
+            # nobody had switched on.
+            #
+            # `_candle_rows` is what starts it, on the fallback path
+            # every unbuilt timeframe takes by definition. A separate
+            # pre-loop here was tried and removed: it created the same
+            # builder on the same request, and a builder created today
+            # still has no closed bars today, so neither version can
+            # make a brand-new timeframe read any sooner. It reads from
+            # its next bar on, either way.
             for tf in want:
-                iv = float(client.INTERVALS[tf])
-                bar = feed.candle(tf) if (use_feed and feed) else None
+                iv = _seconds_of(tf) or float(_LIVE_INTERVALS.get(tf) or 0.0)
+                if iv <= 0:
+                    continue
+                # Each timeframe is judged on ITS OWN bar. `use_feed`
+                # is about the interval being traded; gating the whole
+                # ladder on it sent every row to the polled fallback
+                # the moment that one bar was unseeded.
+                bar = feed.candle(tf) if feed else None
                 if bar is not None and bar.seeded:
                     cov = (min(1.0, (now_s - feed.started_at) / iv)
                            if feed.started_at else 0.0)
@@ -5594,14 +5623,21 @@ def create_app() -> FastAPI:
                     ages[tf] = _feed_age(feed)
                     srcs[tf] = "tape"
                     continue
-                try:
-                    # Enough bars to learn what a normal one looks like here,
-                    # not just enough to read the last few.
-                    tf_bars = (bars if tf == interval
-                               else client.candles(
-                                   coin, tf, bars=pr.TYPICAL_BARS + 6))
-                except Exception:
-                    continue
+                # Enough bars to learn what a normal one looks like
+                # here, not just enough to read the last few.
+                #
+                # THROUGH THE SHARED ACCESSOR, which is the whole
+                # point of it: this used to call the crypto client
+                # directly, so a CME symbol asked Hyperliquid for ES,
+                # got an exception, hit the `continue` below, and left
+                # the row missing. Three timeframes doing that is the
+                # "stack is incomplete" message with no hint that the
+                # cause was a venue mix-up.
+                if tf == interval and bars:
+                    tf_bars = bars
+                else:
+                    tf_bars, _tfwhy, _tfsrc = _candle_rows(
+                        coin, tf, pr.TYPICAL_BARS + 6)
                 if not tf_bars:
                     continue
                 # A polled bar is as old as the moment it was last written,
@@ -8548,6 +8584,12 @@ has to be running before the gate stops refusing.">spike
            behind it are still taken on every poll and still go out in the
            payload -- they are just not on the screen. -->
       <div id="traceLine"></div>
+      <!-- READ, PRICE and THIS BAR, repeated from the footprint panel
+           so the stack and the flow reading can be taken in together
+           instead of by scrolling between them. NOT a second opinion:
+           these are the same strings that panel draws, and nothing in
+           the stack above is computed from them or changed by them. -->
+      <div id="stackStrip" style="margin-top:10px"></div>
     </div>
 
     <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
@@ -10287,8 +10329,13 @@ function fpClearRow(d) {
    its own id, and every live tick frame rewrites just that element.
    The chart behind it keeps its two-second cadence; the line does
    not. */
-function ofiReadLine(r, pr) {
+/* `id` so the SAME line can be drawn twice -- once on the footprint
+   and once at the foot of the stack panel -- without two elements
+   sharing an id, which would leave getElementById repainting one of
+   them forever and the other frozen at whatever it said on load. */
+function ofiReadLine(r, pr, id) {
   if (!r) return '';
+  id = id || 'ofiReadLine';
   const clock = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
                               : Math.round(s) + 's');
   const left = ' &middot; ' + clock(r.left_s) + ' left in this candle';
@@ -10318,7 +10365,7 @@ function ofiReadLine(r, pr) {
     : '';
 
   if (!r.warm) {
-    return '<span id="ofiReadLine" class="stamp" style="width:100%">'
+    return '<span id="' + id + '" class="stamp" style="width:100%">'
       + 'READ &mdash; <b>NEW CANDLE</b>, ' + Math.round(r.into_s)
       + 's in &mdash; too early to say which way it is being taken'
       + price + left + '</span>';
@@ -10369,7 +10416,7 @@ function ofiReadLine(r, pr) {
      length of the agreement, which is a different and unmeasured
      claim. */
   const held = r.read ? ' for ' + clock(r.held_s) : '';
-  return '<span id="ofiReadLine" class="stamp" style="width:100%">'
+  return '<span id="' + id + '" class="stamp" style="width:100%">'
     + 'READ &mdash; ' + dir + held + price + both + why + turning
     + stall + shaky + left
     + ' &middot; the five-minute direction, not a trade on these '
@@ -11007,6 +11054,20 @@ function ofiChart(d, w, h) {
     return '';
   };
 
+  /* KEPT FOR THE STACK PANEL, as the finished string rather than as
+     the parts to rebuild from. THIS BAR is assembled out of four
+     branches and three closures that live in here; a second copy of
+     that arithmetic downstairs would be a second thing to keep in
+     step, and the first time the two disagreed the screen would be
+     showing two different answers about one bar.
+     The market is stamped with it because a failed poll leaves the
+     last good payload in place, and ES's reading under a crypto
+     symbol is exactly the wrong-market display this panel just got
+     fixed for. */
+  _ofiThisBar = liveCall;
+  _ofiStripCoin = coin();
+  paintStackStrip();
+
   liveCall = feedLine(d && d.feed)
     + readLine(d && d.read) + regimeLine(d && d.regime)
     + liveCall + speedLine(fm);
@@ -11403,6 +11464,10 @@ let _ofiTimer = null;
 /* The last payload the OFI panel drew, kept so the live
    stream can repaint the read line without refetching. */
 let _ofiLast = null;
+/* What THIS BAR last said on the footprint, and the market it said it
+   about, so the stack panel can show the same three readings without a
+   second fetch and without a second copy of the arithmetic. */
+let _ofiThisBar = '', _ofiStripCoin = '';
 let _ofiOffset = 0;        // bars back from the live edge -- the pan
 let _ofiTotal = 0;
 
@@ -11636,6 +11701,12 @@ async function ofiTick(fromTimer) {
               + 'every panel, including this one, follows it.'
             : 'OFI candles &mdash; ' + esc(d.why || 'unavailable'))
         + '</span>';
+      /* The footprint just replaced itself with the reason it has
+         nothing. The copy downstairs has to go too, or the stack
+         panel keeps showing a reading from before the failure with
+         no sign that it stopped. */
+      _ofiThisBar = ''; _ofiStripCoin = '';
+      paintStackStrip();
       return;
     }
     const w = Math.max(320, host.clientWidth || 900);
@@ -13236,7 +13307,30 @@ const CASC_WORD = {
   unread:    ['flag',      'not enough to read']
 };
 
+/* The three footprint readings, at the foot of the stack panel.
+
+   MIRRORED, NEVER RECOMPUTED. Both panels sit on the same tab and the
+   footprint already polls; this draws what it drew. The stack above is
+   untouched by it -- no row reads these, and the cascade's verdict is
+   the same whether this strip is on the screen or not.
+
+   It goes blank rather than stale when the selected market is not the
+   one the readings were taken on. A failed OFI poll leaves the last
+   good payload in place, and a crypto symbol showing ES's bar is worse
+   than showing nothing. */
+function paintStackStrip() {
+  const el = $('stackStrip');
+  if (!el) return;
+  if (!_ofiLast || _ofiStripCoin !== coin()) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = ofiReadLine(_ofiLast.read, _ofiLast.price, 'stackReadLine')
+    + _ofiThisBar;
+}
+
 function paintCascade(d) {
+  paintStackStrip();
   const el = $('cascRows'), head = $('cascSay');
   if (!el) return;
   const C = (d && d.cascade) || {};
@@ -13753,6 +13847,15 @@ function applyLiveFrame(d) {
              it, and a regex that drifts from the markup would
              silently repaint once and never again. */
           el.outerHTML = ofiReadLine(_ofiLast.read, _ofiLast.price);
+        }
+        /* The copy on the stack panel repaints on the same print.
+           Leaving it to the slower poll would put two different
+           READ lines on one screen, and the stale one would be the
+           one sitting under the stack it is meant to be read with. */
+        const sEl = document.getElementById('stackReadLine');
+        if (sEl && !document.hidden && _ofiStripCoin === coin()) {
+          sEl.outerHTML = ofiReadLine(_ofiLast.read, _ofiLast.price,
+                                      'stackReadLine');
         }
       }
     }

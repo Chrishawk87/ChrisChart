@@ -35,6 +35,12 @@ def client(monkeypatch):
         monkeypatch.setenv("LIQMAP_DB", str(Path(tmp) / "web.db"))
         monkeypatch.setenv("LIQMAP_TOKEN", TOKEN)
         monkeypatch.setenv("LIQMAP_AUTO", "false")
+        # The CME routes refuse outright when the engine is off, which
+        # is correct and is not the state Chris is in -- his candles
+        # work. Without this the tests below would pass on the early
+        # return and prove nothing.
+        monkeypatch.setenv("LIQMAP_OFI", "true")
+        monkeypatch.setenv("DATABENTO_API_KEY", "db-test-not-a-real-key")
         monkeypatch.delenv("LIQMAP_WALLETS", raising=False)
         web.RT = None
         with TestClient(web.create_app()) as c:
@@ -49,28 +55,68 @@ class _Boom:
         raise AssertionError("a CME symbol reached the crypto venue")
 
 
-def _cme(monkeypatch, minutes=1500):
+class _Rec:
+    """One MBP-10 record, in the shape `dbn._get` reads.
+
+    FED THROUGH THE TAPE'S REAL ENTRY POINT rather than seeded as
+    OHLCV, because the difference is the whole bug. `from_candles`
+    never marks a reading MEASURED -- only the bar being built from
+    actual fills does -- and the cascade reads measured rows only. A
+    fixture of seeded candles therefore reproduces "the stack is
+    incomplete" for a reason Chris does not have, and would have
+    passed whatever the route did.
+    """
+
+    __slots__ = ("ts_event", "action", "side", "price", "size",
+                 "levels")
+
+    def __init__(self, ts_ns, px_raw, sz, side, bid, ask, bsz, asz,
+                 action="T"):
+        self.ts_event = ts_ns
+        self.action = action
+        self.side = side
+        self.price = px_raw
+        self.size = sz
+        self.levels = [_Lvl(bid, bsz, ask, asz)]
+
+
+class _Lvl:
+    __slots__ = ("bid_px", "bid_sz", "ask_px", "ask_sz")
+
+    def __init__(self, bid, bsz, ask, asz):
+        self.bid_px, self.bid_sz = bid, bsz
+        self.ask_px, self.ask_sz = ask, asz
+
+
+def _cme(monkeypatch, minutes=400, per_minute=12):
+    """A CME tape fed the way the live one is: record by record."""
+    import time as _t
+
     from liqmap.cme_tape import Tape
-    from liqmap.structure import Candle
 
     rt = web.runtime()
-    monkeypatch.setattr(rt, "is_cme", lambda c: str(c).upper() == "ES")
+    monkeypatch.setattr(rt, "is_cme",
+                        lambda c: str(c).upper().startswith("ES"))
     monkeypatch.setattr(rt, "client", lambda *a, **k: _Boom())
     monkeypatch.setattr(rt, "feed", None, raising=False)
 
     tape = Tape(symbol="ES")
     rng = random.Random(4)
-    px, ts = 6800.0, 1_762_000_000.0
-    out = []
-    for i in range(minutes):
-        o = px
-        px += rng.choice((-0.5, -0.25, 0.0, 0.25, 0.5))
-        out.append(Candle(ts=ts + i * 60, open=o,
-                          high=max(o, px) + 0.25,
-                          low=min(o, px) - 0.25, close=px,
-                          volume=float(rng.randint(100, 900))))
-    for iv in ("1m", "5m", "15m"):
-        tape.seed_interval(iv, out)
+    tick = 250_000_000
+    px = 6800 * 4 * tick // 4            # raw units
+    now = _t.time()
+    start = now - minutes * 60.0
+    step = 60.0 / max(1, per_minute)
+    t = start
+    while t < now:
+        if rng.random() < 0.45:
+            px += tick if rng.random() < 0.5 else -tick
+        bid, ask = int(px), int(px + tick)
+        tape.offer(_Rec(int(t * 1e9), int(px), float(rng.randint(1, 9)),
+                        "B" if rng.random() < 0.5 else "A",
+                        bid, ask, rng.randint(40, 400),
+                        rng.randint(40, 400)))
+        t += step
     monkeypatch.setattr(rt.ofi, "tape", tape, raising=False)
     return rt, tape
 
@@ -106,10 +152,18 @@ class TestTheStackRunsOnCme:
         assert "CME tape" in d["why"] or "one-minute bars" in d["why"]
 
     def test_a_short_tape_says_how_short(self, client, monkeypatch):
-        _cme(monkeypatch, minutes=30)
+        """The number in the message is the number of bars there are.
+
+        Asserted against the tape rather than against the literal the
+        fixture was built with: the tape also carries the minute still
+        forming, so the two differ by one and the hardcoded figure was
+        testing the fixture, not the message.
+        """
+        _rt, tape = _cme(monkeypatch, minutes=30)
+        have = len(list(tape.history("1m", limit=500)))
         d = _get(client, "/api/mtf")
         assert d["ok"] is False
-        assert "30" in d["why"], d["why"]
+        assert f"only {have} one-minute bars" in d["why"], d["why"]
 
 
 class TestTheOtherPanelsRunOnCmeToo:
@@ -230,3 +284,121 @@ class TestOnePickerDrivesEveryPanel:
         d = _get(client, "/api/ofibars", coin="ES.Z26", target=250,
                  bars=20)
         assert d["ok"] is True, d.get("why")
+
+
+class TestTheStackUnderTheTimeframeReadsCme:
+    """Chris saw: UNREAD / no read on 15m, 5m, 1m -- the stack is
+    incomplete.
+
+    Three separate things sent every row to the crypto venue, and the
+    panel could only report the consequence. The message was accurate
+    and said nothing about the cause.
+    """
+
+    def _read(self, client, **kw):
+        """THE STACK IS SERVED BY /api/read, not /api/flow.
+
+        Worth stating, because the first version of these tests asked
+        the wrong route and its empty answer looked exactly like the
+        bug they were written to catch.
+        """
+        params = {"coin": "ES", "interval": "5m",
+                  "timeframes": "15m,5m,1m"}
+        params.update(kw)
+        r = client.get("/api/read", params=params, headers=AUTH)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def test_the_rows_are_there_at_all(self, client, monkeypatch):
+        _cme(monkeypatch)
+        d = self._read(client)
+        assert not d.get("pressure_error"), d["pressure_error"]
+        rows = d.get("timeframes") or []
+        assert {r["timeframe"] for r in rows} >= {"15m", "5m", "1m"}, rows
+        # Measured means the row was built from the bar this service
+        # assembled out of fills -- the only kind the stack reads. A
+        # row present but unmeasured is the same blank on the panel.
+        unmeasured = [r["timeframe"] for r in rows if not r["measured"]]
+        assert not unmeasured, f"present but unmeasured: {unmeasured}"
+        assert all(r["source"] == "tape" for r in rows), rows
+
+    def test_the_rungs_are_present(self, client, monkeypatch):
+        _cme(monkeypatch)
+        d = self._read(client)
+        casc = d.get("cascade") or {}
+        assert "error" not in casc, casc
+        rungs = casc.get("rungs") or []
+        assert rungs, casc
+        missing = [r["timeframe"] for r in rungs if not r.get("present")]
+        assert not missing, f"still missing: {missing}"
+
+    def test_it_does_not_say_the_stack_is_incomplete(self, client,
+                                                     monkeypatch):
+        _cme(monkeypatch)
+        why = (self._read(client).get("cascade") or {}).get("why") or ""
+        assert "stack is incomplete" not in why, why
+        assert "not enough to read" not in why, why
+
+    def test_nothing_asked_the_crypto_venue(self, client, monkeypatch):
+        """_Boom raises on any candle fetch, so a single leak fails
+        here rather than quietly reading the wrong market."""
+        _cme(monkeypatch)
+        d = self._read(client)
+        assert not d.get("pressure_error"), d["pressure_error"]
+
+    def test_a_label_is_not_gated_on_the_crypto_venues_menu(self, client,
+                                                            monkeypatch):
+        """The ladder filtered `want` through the Hyperliquid client's
+        INTERVALS table. On a market that venue does not list, that
+        test emptied the whole stack -- and the panel could only
+        report the consequence."""
+        _cme(monkeypatch)
+        d = self._read(client, timeframes="15m,5m,1m")
+        assert len(d.get("timeframes") or []) == 3, d.get("timeframes")
+        i = WEB.index("for t in tf_list:")
+        assert "client.INTERVALS" not in WEB[i:i + 500]
+
+    def test_every_wanted_timeframe_gets_a_builder(self, client,
+                                                    monkeypatch):
+        """A tape opened on 1m/15m and asked for the 5m had no builder
+        for it, so the row came back missing.
+
+        The guarantee, not the line that provides it: by the end of
+        the request the tape is building every timeframe the stack
+        asked for, however it got there.
+        """
+        _rt, tape = _cme(monkeypatch)
+        assert "30m" not in tape.builders
+        self._read(client, timeframes="30m,15m,1m", interval="15m")
+        assert "30m" in tape.builders
+
+    def test_a_brand_new_timeframe_is_absent_not_wrong(self, client,
+                                                        monkeypatch):
+        """And it does NOT read yet.
+
+        Worth pinning down, because it is the one thing the builder
+        cannot buy: a 30m builder started on this request has no
+        closed 30m bar behind it, and a row invented for it would be
+        a reading of nothing. It appears when its first bar does.
+        """
+        _cme(monkeypatch)
+        rows = self._read(client, timeframes="30m,15m,1m",
+                          interval="15m").get("timeframes") or []
+        got = {r["timeframe"] for r in rows}
+        assert "30m" not in got, got
+        assert {"15m", "1m"} <= got, got
+
+    def test_a_timeframe_is_judged_on_its_own_bar(self):
+        """`use_feed` is about the interval being traded. Gating the
+        whole ladder on it sent every row to the polled fallback the
+        moment that one bar was unseeded."""
+        i = WEB.index("for tf in want:")
+        blk = WEB[i:i + 700]
+        assert "bar = feed.candle(tf) if feed else None" in blk
+        assert "use_feed and feed" not in blk
+
+    def test_the_fallback_goes_through_the_shared_accessor(self):
+        i = WEB.index("for tf in want:")
+        blk = WEB[i:i + 2600]
+        assert "_candle_rows(" in blk
+        assert "client.candles(" not in blk
