@@ -255,12 +255,18 @@ def test_the_readout_element_the_script_writes_to_exists():
 
 def test_the_profile_uses_the_same_candle_source_as_the_chart():
     """Two routes disagreeing about where bars come from would draw a
-    profile that does not match the candles beside it."""
+    profile that does not match the candles beside it.
+
+    They now share ONE accessor rather than two copies of the same
+    logic -- which is a stronger guarantee than both copies happening
+    to say the same thing, and is also what let a CME symbol reach
+    the crypto venue from one of them while the other refused."""
     src = open("liqmap/web.py").read()
-    route = src[src.index('@app.get("/api/profile"'):
-                src.index('@app.get("/api/chart"')]
-    assert "feed.history(interval)" in route
-    assert "rt.client().candles(" in route
+    for name in ("profile", "chart", "mtf"):
+        route = src[src.index('@app.get("/api/%s"' % name):]
+        route = route[:route.index("\n    @app.")]
+        assert "_candle_rows(" in route, name
+        assert "rt.client().candles(" not in route, name
 
 
 def test_the_read_is_taken_against_the_reference_not_the_session():

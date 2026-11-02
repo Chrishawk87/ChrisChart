@@ -419,9 +419,13 @@ def test_the_route_always_reads_one_minute_bars():
     src = _src()
     route = src[src.index('@app.get("/api/mtf"'):
                 src.index('@app.get("/api/chart"')]
-    assert 'feed.history("1m")' in route
-    assert 'rt.client().candles(coin, "1m"' in route
+    assert '_candle_rows(coin, "1m", n)' in route, \
+        "the route must ask for minute bars, and only minute bars"
     assert '"15m"' not in route and '"4h"' not in route
+    # And the accessor it asks must not reach the crypto venue for a
+    # CME symbol, or the stack would be scanning the wrong market.
+    acc = src[src.index("def _candle_rows"):src.index("def _feed_health")]
+    assert "rt.cme_feed(" in acc
 
 
 def test_the_route_returns_the_survival_count():

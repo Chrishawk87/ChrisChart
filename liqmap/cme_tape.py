@@ -42,7 +42,19 @@ from .flow import FlowTape
 from .live import STALE_AFTER_S, CandleBuilder, LiveCandle
 
 DEFAULT_INTERVALS = (60.0, 300.0, 900.0)      # 1m, 5m, 15m
-KEEP_CLOSED = 300                             # per interval
+# PER INTERVAL, and 300 was chosen when these candles only fed the
+# panels that read the last few hours.
+#
+# The 4H/15m/1m stack resamples its higher timeframes from the MINUTE
+# bars, so what it can see of the four-hour chart is bounded entirely
+# by how many minutes are kept here. At 300 that is five hours --
+# barely one 4H block, which is not a timeframe, it is a single bar.
+# 1,500 is a little over a day of minutes and gives the block
+# structure something to be measured against.
+#
+# The cost is a deque of 1,500 small dataclasses per interval, which
+# is a few hundred kilobytes for the whole ladder.
+KEEP_CLOSED = 1_500                           # per interval
 
 # How much raw tape the flow ladder can reach back through. An hour is
 # what the other venues keep, and the ladder reports coverage honestly,
@@ -179,8 +191,22 @@ class Tape:
         for s in self.intervals:
             name = label(s)
             self.closed[name] = deque(maxlen=self.keep)
-            self.builders[name] = CandleBuilder(
-                s, on_close=self._closer(name))
+            self.builders[name] = self._builder(s, name)
+
+    def _builder(self, secs: float, name: str) -> CandleBuilder:
+        """One interval's builder, holding this tape's depth.
+
+        CandleBuilder defaults to 400 closed bars, which is shared
+        with the Hyperliquid feed and is right for it -- that feed
+        refetches deeper history from its venue's REST API whenever a
+        panel needs more. There is no such refetch on this side, so
+        whatever the builder holds is the whole of what the CME
+        panels can ever see, and 400 minutes is under seven hours.
+        Raised here only, leaving the crypto feed exactly as it was.
+        """
+        b = CandleBuilder(secs, on_close=self._closer(name))
+        b.max_closed = max(b.max_closed, int(self.keep))
+        return b
 
     def _closer(self, name: str):
         def on_close(candle) -> None:
@@ -271,7 +297,7 @@ class Tape:
             if not secs:
                 return
             self.closed.setdefault(interval, deque(maxlen=self.keep))
-            b = CandleBuilder(secs, on_close=self._closer(interval))
+            b = self._builder(secs, interval)
             self.builders[interval] = b
 
         if not candles:

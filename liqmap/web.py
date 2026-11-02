@@ -4608,17 +4608,9 @@ def create_app() -> FastAPI:
         # when the live feed is running, the venue's candles otherwise. Two
         # routes that disagree about where bars come from would draw a
         # profile that does not match the candles beside it.
-        rows: list[Any] = []
-        feed = rt.feed_for(coin)
-        if feed is not None:
-            hist = feed.history(interval)
-            if len(hist) >= 10:
-                rows = list(hist[-n:])
-        if not rows:
-            try:
-                rows = rt.client().candles(coin, interval, bars=n)
-            except Exception as exc:
-                return {"ok": False, "why": f"candles unavailable: {exc}"}
+        rows, why, _src = _candle_rows(coin, interval, n)
+        if why:
+            return {"ok": False, "why": why}
         if not rows:
             return {"ok": False, "why": "no candles for that market yet"}
 
@@ -4673,18 +4665,11 @@ def create_app() -> FastAPI:
 
         if base_step < step:
             need = int(svp_m * 60.0 / base_step) + 20
-            got: list[Any] = []
-            fine_feed = rt.feed_for(coin)
-            if fine_feed is not None:
-                hist = fine_feed.history(base)
-                if len(hist) >= 10:
-                    got = list(hist[-need:])
-            if not got:
-                try:
-                    got = rt.client().candles(coin, base,
-                                              bars=min(need, 5000))
-                except Exception:
-                    got = []
+            # The finer series, through the same accessor -- so a CME
+            # symbol cannot quietly take the Hyperliquid branch here
+            # while the coarse series above correctly did not.
+            got, _why2, _s2 = _candle_rows(coin, base,
+                                            min(need, 5000))
             if len(got) >= 10:
                 fine = got
             else:
@@ -4854,19 +4839,13 @@ def create_app() -> FastAPI:
         coin = rt.resolve_symbol(coin)[0] or coin
         n = max(120, min(bars, 5000))
 
-        rows: list[Any] = []
-        feed = rt.feed_for(coin)
-        if feed is not None:
-            hist = feed.history("1m")
-            if len(hist) >= 60:
-                rows = list(hist[-n:])
-        if not rows:
-            try:
-                rows = rt.client().candles(coin, "1m", bars=n)
-            except Exception as exc:
-                return {"ok": False, "why": f"candles unavailable: {exc}"}
+        rows, why, _src = _candle_rows(coin, "1m", n)
+        if why:
+            return {"ok": False, "why": why}
         if len(rows) < 60:
-            return {"ok": False, "why": "not enough 1m history yet"}
+            return {"ok": False, "why":
+                    f"only {len(rows)} one-minute bars so far, and the "
+                    "stack needs 60 before it can say anything"}
 
         found = _mtf.scan(rows, cost_ticks=float(cost_ticks),
                           target_ticks=float(target_ticks))
@@ -4908,28 +4887,16 @@ def create_app() -> FastAPI:
 
         # CME (ES) bars come from the Databento tape, not from Hyperliquid.
         # `feed_for` is deliberately HL-only, so CME is asked for by name.
+        # THE SAME ACCESSOR THE PROFILE AND THE STACK USE. Two routes
+        # with their own idea of where candles come from draw a
+        # profile that does not line up with the candles beside it,
+        # and the disagreement is invisible until someone measures
+        # off both.
         cme = rt.cme_feed(coin)
-        feed = rt.feed_for(coin) if cme is None else None
-        candles: list[Any] = []
-        source = "polled"
-
-        if cme is not None:
-            cme.ensure_interval(interval)
-            hist = cme.history(interval, limit=n)
-            if hist:
-                candles = list(hist)
-                source = "cme (built from Databento fills)"
-        elif feed is not None:
-            hist = feed.history(interval)
-            if len(hist) >= 10:
-                candles = list(hist[-n:])
-                source = "websocket (built from fills)"
-
+        candles, _why, source = _candle_rows(coin, interval, n)
         if not candles and cme is None:
-            try:
-                candles = rt.client().candles(coin, interval, bars=n)
-            except Exception as exc:
-                return {**out, "error": f"candles unavailable: {exc}"}
+            if _why:
+                return {**out, "error": _why}
         elif not candles and cme is not None:
             # CME tape has no closed bars yet (engine just started or
             # market is closed). Return a useful message rather than an
@@ -4943,7 +4910,11 @@ def create_app() -> FastAPI:
                         f"engine start"
                         + (f" — {why}" if why else ""))}
 
-        live_feed = cme or feed
+        # The forming bar comes from whichever feed is actually live.
+        # `_candle_rows` returns the closed history; only a live feed
+        # has the bar still being built, and asking the wrong one for
+        # it would draw a forming candle from another market.
+        live_feed = cme or rt.feed_for(coin)
         live = live_feed.candle(interval) if live_feed is not None else None
         rows = [{"ts": c.ts, "o": c.open, "h": c.high, "l": c.low,
                  "c": c.close, "v": c.volume} for c in candles]
@@ -5047,7 +5018,14 @@ def create_app() -> FastAPI:
 
         return {**out, "source": source, "bars": rows, "marks": marks,
                 "profile": profile, "tick_ppo": tick, "tick_bps": tick_bps,
-                "interval_s": rt.client().INTERVALS.get(interval, 900)}
+                # PARSED, NOT LOOKED UP ON THE CRYPTO CLIENT. This is
+                # a label turned into seconds -- '15m' is 900 on every
+                # venue there is. Asking Hyperliquid's client for it
+                # made a CME chart depend on a crypto connection for
+                # arithmetic, and on a box where that client cannot be
+                # built the whole panel went down with it.
+                "interval_s": (_seconds_of(interval)
+                               or _hl_interval_s(interval))}
 
     @app.get("/api/agreement", dependencies=[Depends(require_token)])
     def api_agreement(coin: str = "", interval: str = "",
@@ -6111,6 +6089,66 @@ def create_app() -> FastAPI:
     def _pivot_pending(n: int, right: int) -> int:
         from .pivots import pending
         return pending(n, right)
+
+    from .cme_tape import seconds_of as _seconds_of
+
+    def _hl_interval_s(interval: str) -> float:
+        """The crypto client's own table, for a label `seconds_of`
+        cannot parse. Still best-effort: it must never be the reason a
+        panel fails."""
+        try:
+            return float(rt.client().INTERVALS.get(interval, 900))
+        except Exception:                               # noqa: BLE001
+            return 900.0
+
+    def _candle_rows(coin_: str, interval: str, n: int):
+        """Candles for a panel that needs nothing else from the feed.
+
+        THREE SOURCES AND THE ORDER MATTERS. The live crypto feed
+        first, then the CME tape, then the crypto venue's REST API.
+
+        A CME SYMBOL MUST NEVER REACH THAT LAST ONE. `rt.client()` is
+        Hyperliquid; asked for "ES" it answers about something else
+        entirely, and a chart full of plausible candles from the wrong
+        instrument is the worst failure available here -- it cannot be
+        spotted by looking. So the CME branch returns, empty-handed if
+        it has to, rather than falling through.
+
+        Only for panels whose whole need is `history` and `candle`.
+        `feed_for` stays deliberately crypto-only because seventeen
+        callers between them touch thirty attributes of LiveFeed, and
+        the CME tape can answer four of them honestly.
+
+        Returns (rows, why, source). `why` is empty when the rows are
+        good; `source` is for the panel to say where they came from,
+        which matters when two of them disagree.
+        """
+        cme = rt.cme_feed(coin_)
+        if cme is not None:
+            # The tape ships with 1m/5m/15m. A panel asking for an
+            # interval outside that ladder gets a builder made for it
+            # rather than an empty chart.
+            try:
+                cme.ensure_interval(interval)
+            except Exception:                           # noqa: BLE001
+                pass
+            rows = list(cme.history(interval, limit=n) or ())
+            if rows:
+                return rows, "", "cme (built from Databento fills)"
+            return [], (f"the CME tape has no {interval} bars yet -- "
+                        "it fills from the live feed and a historical "
+                        "seed at startup"), "cme"
+        feed = rt.feed_for(coin_)
+        if feed is not None:
+            hist = feed.history(interval)
+            if hist:
+                return (list(hist[-n:]), "",
+                        "websocket (built from fills)")
+        try:
+            return (list(rt.client().candles(coin_, interval, bars=n)),
+                    "", "polled")
+        except Exception as exc:                        # noqa: BLE001
+            return [], f"candles unavailable: {exc}", "polled"
 
     def _feed_health(rt_, builder) -> dict:
         """Is the ingest thread alive, and how stale is the chart?
