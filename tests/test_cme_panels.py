@@ -388,17 +388,35 @@ class TestTheStackUnderTheTimeframeReadsCme:
         assert "30m" not in got, got
         assert {"15m", "1m"} <= got, got
 
+    @staticmethod
+    def _ladder_loop() -> str:
+        """The whole `for tf in want:` body, found by indentation.
+
+        These two used to slice a fixed 700 and 2,600 characters from
+        the loop, which made them assertions about how long the
+        comments are: adding one pushed the code being checked out of
+        the window and failed a test whose claim was still true. The
+        body ends at the first line indented no further than the
+        `for`, which is what a reader means by "the loop".
+        """
+        i = WEB.index("for tf in want:")
+        lines = WEB[i:i + 20000].split("\n")
+        out = [lines[0]]
+        for line in lines[1:]:
+            if line.strip() and len(line) - len(line.lstrip()) <= 12:
+                break
+            out.append(line)
+        return "\n".join(out)
+
     def test_a_timeframe_is_judged_on_its_own_bar(self):
         """`use_feed` is about the interval being traded. Gating the
         whole ladder on it sent every row to the polled fallback the
         moment that one bar was unseeded."""
-        i = WEB.index("for tf in want:")
-        blk = WEB[i:i + 700]
+        blk = self._ladder_loop()
         assert "bar = feed.candle(tf) if feed else None" in blk
         assert "use_feed and feed" not in blk
 
     def test_the_fallback_goes_through_the_shared_accessor(self):
-        i = WEB.index("for tf in want:")
-        blk = WEB[i:i + 2600]
+        blk = self._ladder_loop()
         assert "_candle_rows(" in blk
         assert "client.candles(" not in blk

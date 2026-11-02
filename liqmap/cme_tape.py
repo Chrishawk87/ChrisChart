@@ -669,6 +669,27 @@ class LadderFeed:
     def history(self, interval: str, limit: int = 200):
         return self.src.history(interval, limit=limit)
 
+    def last_closed(self, interval: str):
+        """The newest COMPLETED bar, with its buy/sell split intact.
+
+        `history` hands back `Candle`, which is four prices and a
+        volume -- the flow is dropped in the conversion. The ladder's
+        direction comes from buy against sell, so a reader that has to
+        fall back to a finished bar needs the LiveCandle itself.
+
+        This exists for the moment after a restart. The closed history
+        is restored from disk but the bar in progress is not -- it was
+        in progress when the process died -- so for up to one whole
+        bar there is nothing live to read, and every row on the stack
+        came back unmeasured with no way to tell that from a market
+        nobody was trading.
+        """
+        b = self.src.builders.get(interval)
+        if b is None:
+            return None
+        closed = getattr(b, "closed", None)
+        return closed[-1] if closed else None
+
 
     # ---- the rest of the feed surface the candle read expects ------
     #

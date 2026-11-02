@@ -353,6 +353,109 @@ class TestItIsActuallyWiredIn:
                    for c in tape.builders["15m"].closed)
 
 
+class TestTheStackReadsImmediatelyAfterARestart:
+    """Restoring the candles was necessary and not sufficient.
+
+    With the history back the ten-bar gate opens, but there is still
+    no bar IN PROGRESS -- it was in progress when the process died --
+    and the first bar built mid-period is unseeded by definition,
+    because its open was never observed. The live branch was skipped
+    either way, every row fell to stored candles that carry no
+    aggressor, and the stack came back unmeasured for up to a full
+    bar: fifteen minutes of "the stack is incomplete" on the 15m, with
+    nothing to tell it from a market nobody was trading.
+
+    Chris saw exactly that after deploying the candle store, which is
+    how this was found.
+    """
+
+    def _restarted(self, monkeypatch):
+        from liqmap.candlestore import CandleRecorder, CandleStore
+        from tests.test_cme_panels import _cme
+
+        rt, tape = _cme(monkeypatch)
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        rec = rt._candlerec
+        rec.flush()
+        rec.stop()
+        for b in tape.builders.values():
+            b.closed.clear()
+            b.current = None
+        CandleRecorder(CandleStore(rec.store.path),
+                       tape).load_into_builders()
+        assert tape.builders["15m"].current is None
+        return rt, tape
+
+    def _read(self, client):
+        r = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers={"Authorization": "Bearer t0ken"})
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def test_every_row_is_measured(self, client, monkeypatch):
+        self._restarted(monkeypatch)
+        rows = self._read(client).get("timeframes") or []
+        assert {r["timeframe"] for r in rows} >= {"15m", "5m", "1m"}
+        unmeasured = [r["timeframe"] for r in rows if not r["measured"]]
+        assert not unmeasured, f"unmeasured after restart: {unmeasured}"
+
+    def test_the_stack_is_not_incomplete(self, client, monkeypatch):
+        self._restarted(monkeypatch)
+        why = (self._read(client).get("cascade") or {}).get("why") or ""
+        assert "stack is incomplete" not in why, why
+
+    def test_the_rungs_carry_a_direction(self, client, monkeypatch):
+        """Rows that are present and colourless are the other half of
+        what Chris was looking at."""
+        self._restarted(monkeypatch)
+        rungs = (self._read(client).get("cascade") or {}).get("rungs") or []
+        assert rungs
+        assert all(g["present"] for g in rungs), rungs
+        assert any(g["qualified"] for g in rungs), rungs
+
+    def test_the_row_says_it_is_reading_a_finished_bar(self, client,
+                                                       monkeypatch):
+        """IT MUST NOT PASS AS LIVE. A reading of the last closed bar
+        can be most of an interval old, and reporting the feed's age
+        for it would make a fifteen-minute-old row look current."""
+        self._restarted(monkeypatch)
+        rows = self._read(client).get("timeframes") or []
+        byname = {r["timeframe"]: r for r in rows}
+        assert byname["15m"]["source"] == "last closed"
+        assert byname["15m"]["age_s"] > byname["1m"]["age_s"]
+
+    def test_it_goes_back_to_the_live_bar_once_there_is_one(
+            self, client, monkeypatch):
+        """The fallback is for the gap, not for good."""
+        from liqmap.live import LiveCandle
+
+        _rt, tape = self._restarted(monkeypatch)
+        b = tape.builders["1m"]
+        last = b.closed[-1]
+        b.current = LiveCandle(
+            interval_s=60.0, start_ts=last.start_ts + 60.0,
+            open=last.close, high=last.close + 1, low=last.close - 1,
+            close=last.close + 0.5, volume=50.0, trades=9,
+            buy_notional=800.0, sell_notional=100.0, seeded=True)
+        rows = self._read(client).get("timeframes") or []
+        row = {r["timeframe"]: r for r in rows}["1m"]
+        assert row["source"] == "tape", row
+        assert row["measured"] is True
+
+    def test_an_unmeasured_closed_bar_is_not_used(self, client,
+                                                  monkeypatch):
+        """A bar restored without flow would hand the ladder an
+        invented direction. Better no row than a made-up one."""
+        _rt, tape = self._restarted(monkeypatch)
+        for c in tape.builders["5m"].closed:
+            c.flow_measured = False
+        rows = self._read(client).get("timeframes") or []
+        row = {r["timeframe"]: r for r in rows}.get("5m")
+        assert row is None or row["measured"] is False
+
+
 class TestTheThread:
     def test_it_starts_and_stops(self, store):
         t = Tape()

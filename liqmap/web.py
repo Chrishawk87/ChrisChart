@@ -5649,9 +5649,40 @@ def create_app() -> FastAPI:
                 # ladder on it sent every row to the polled fallback
                 # the moment that one bar was unseeded.
                 bar = feed.candle(tf) if feed else None
-                if bar is not None and bar.seeded:
+                # NO USABLE BAR IN PROGRESS IS NOT THE SAME AS NO DATA.
+                #
+                # Straight after a restart the closed history is back
+                # from disk but the forming bar is not -- it was in
+                # progress when the process died -- and the first bar
+                # built mid-period is unseeded by definition, because
+                # its open was never observed. Either way the live
+                # branch was skipped, the row fell to stored candles,
+                # which carry no aggressor, and the whole stack came
+                # back unmeasured for up to a full bar. On the 15m
+                # that is fifteen minutes of "the stack is incomplete"
+                # with nothing to distinguish it from a dead market.
+                #
+                # The last COMPLETED bar is real, measured, and the
+                # honest thing to read in that gap. It is marked as
+                # what it is so the row's age says the reading is of a
+                # finished bar rather than of this one.
+                closed_fallback = False
+                if (bar is None or not bar.seeded) and feed is not None:
+                    try:
+                        last = feed.last_closed(tf)
+                    except Exception:                   # noqa: BLE001
+                        last = None
+                    if last is not None and getattr(
+                            last, "flow_measured", False):
+                        bar, closed_fallback = last, True
+                if bar is not None and (bar.seeded or closed_fallback):
                     cov = (min(1.0, (now_s - feed.started_at) / iv)
                            if feed.started_at else 0.0)
+                    if closed_fallback:
+                        # A finished bar is fully covered. Reporting a
+                        # fraction would make a complete bar read as a
+                        # partial one and scale every figure on it.
+                        cov = 1.0
                     # This timeframe's own completed bars, so the reading
                     # knows how far a bar of this length normally travels
                     # HERE. Without it the flat band falls back to a prior,
@@ -5662,8 +5693,19 @@ def create_app() -> FastAPI:
                         tf, iv, bar, book, coverage=max(cov, 0.05),
                         history=feed.history(tf)))
                     tf_hist[tf] = feed.history(tf)
-                    ages[tf] = _feed_age(feed)
-                    srcs[tf] = "tape"
+                    # THE AGE TELLS THE TWO APART. A reading of the bar
+                    # in progress is as old as the last print; a
+                    # reading of the last finished bar is as old as
+                    # that bar's close, which can be most of an
+                    # interval. Reporting the feed's age for both would
+                    # make a fifteen-minute-old reading look current.
+                    if closed_fallback:
+                        ages[tf] = round(max(
+                            0.0, now_s - (float(bar.start_ts) + iv)), 1)
+                        srcs[tf] = "last closed"
+                    else:
+                        ages[tf] = _feed_age(feed)
+                        srcs[tf] = "tape"
                     continue
                 # Enough bars to learn what a normal one looks like
                 # here, not just enough to read the last few.
