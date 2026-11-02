@@ -71,8 +71,13 @@ def main() -> int:
               " LIQMAP_TOKEN.")
         return 2
 
+    # JUDGED ON THE ROWS, NOT ON THIS LABEL. The route reports
+    # 'websocket' when the live socket is what answered, which is a
+    # true statement about the transport and says nothing about which
+    # venue the bars came from. The per-row `source` column below is
+    # the one that settles it.
     print(f"  source reported: {d.get('source')!r}"
-          f"   (anything but 'cme' means this is NOT the futures tape)")
+          f"   (transport, not venue -- read the source column below)")
     for k in ("error", "why", "pressure_error", "feed_interval_error"):
         if d.get(k):
             print(f"  {k}: {d[k]}")
@@ -86,16 +91,66 @@ def main() -> int:
         print("  on a symbol this service does not treat as CME.")
     else:
         print(f"\n  {'tf':>6}{'measured':>10}{'source':>9}{'seeded':>8}"
-              f"{'forming':>9}{'trades':>8}{'bars':>7}{'age s':>8}")
+              f"{'forming':>9}{'winner':>11}{'bps':>9}{'trades':>8}")
         for r in rows:
             print(f"  {r.get('timeframe', ''):>6}"
                   f"{str(r.get('measured')):>10}"
                   f"{str(r.get('source')):>9}"
                   f"{str(r.get('seeded')):>8}"
                   f"{str(r.get('forming')):>9}"
-                  f"{str(r.get('trades')):>8}"
-                  f"{str(r.get('bars_used')):>7}"
-                  f"{str(r.get('age_s')):>8}")
+                  f"{str(r.get('winner')):>11}"
+                  f"{r.get('move_bps') or 0:>9.1f}"
+                  f"{str(r.get('trades')):>8}")
+
+        # WHAT THE ROW BECAME ON THE PANEL. A row can be measured,
+        # present and still show "no colour" -- `colour_of` returns
+        # "none" for a FORMING bar whatever its winner is, and the bar
+        # you are trading is forming by definition. That path renders
+        # as rows that are there, carry no direction, and never
+        # resolve, which is a different fault from a missing row and
+        # looks nothing like one in the code.
+        rungs = (d.get("cascade") or {}).get("rungs") or []
+        if rungs:
+            print(f"\n  {'tf':>6}{'present':>9}{'colour':>9}"
+                  f"{'qualified':>11}{'conflicted':>12}   what the"
+                  f" panel shows")
+            for g in rungs:
+                if not g.get("present"):
+                    shows = "not read"
+                elif g.get("conflicted"):
+                    shows = "THROWN OUT"
+                elif g.get("qualified") == "up":
+                    shows = "UP"
+                elif g.get("qualified") == "down":
+                    shows = "DOWN"
+                else:
+                    shows = "no colour  <-- present but directionless"
+                print(f"  {g.get('timeframe', ''):>6}"
+                      f"{str(g.get('present')):>9}"
+                      f"{str(g.get('colour')):>9}"
+                      f"{str(g.get('qualified')):>11}"
+                      f"{str(g.get('conflicted')):>12}   {shows}")
+            blank = [g["timeframe"] for g in rungs
+                     if g.get("present") and not g.get("qualified")
+                     and not g.get("conflicted")]
+            forming = {r["timeframe"] for r in rows if r.get("forming")}
+            if blank:
+                print(f"\n    >> {', '.join(blank)} are present with no"
+                      " direction.")
+                if set(blank) & forming:
+                    print("       They are FORMING, and colour_of"
+                          " returns 'none' for a forming")
+                    print("       bar whatever its winner is. A row"
+                          " that is always forming can")
+                    print("       therefore never show a direction --"
+                          " that is the cause, and it")
+                    print("       is in the colour rule, not in the"
+                          " feed.")
+                else:
+                    print("       They are not forming, so the winner"
+                          " itself is neither buyers")
+                    print("       nor sellers -- a contested bar."
+                          " That is a market state.")
 
     meas = [r["timeframe"] for r in rows if r.get("measured")]
     poll = [r["timeframe"] for r in rows if not r.get("measured")]
@@ -148,8 +203,15 @@ def main() -> int:
                   f"   front={r.get('front_month')!r}"
                   f"   deferred={r.get('deferred')!r}"
                   f"   has_data={r.get('has_data')}")
+        # THE ACTIVE CONTRACT COUNTS TOO, and so does the bare
+        # product. `is_cme` accepts the product name as well as the
+        # two contracts, so a check built only from the picker's rows
+        # calls a working 'ES' a mismatch -- which is the diagnostic
+        # inventing a fault.
         names = {str(r.get("symbol")) for r in cme_rows}
         names |= {str(r.get("front_month")) for r in cme_rows}
+        names |= {str(r.get("active_contract")) for r in cme_rows
+                  if r.get("active_contract")}
         names |= {str(r.get("deferred")) for r in cme_rows if r.get("deferred")}
         if coin.upper() not in {n.upper() for n in names}:
             print(f"\n    >> {coin!r} IS NOT ONE OF THEM. That is the"
