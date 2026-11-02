@@ -456,3 +456,54 @@ class TestVpinCannotConfirmADirection:
             fast.on_trade(i * 0.001, 10, "buy")
             slow.on_trade(i * 10.0, 10, "buy")
         assert fast.snapshot.taking == pytest.approx(slow.snapshot.taking)
+
+
+class TestTheWindowCannotEatTheContainer:
+    """The window is trimmed by TIMESTAMP, which is correct and is
+    not enough. A record whose ts_event is missing arrives as 0.0,
+    the cutoff goes negative, nothing is ever old enough to drop, and
+    the deque grows on every book update at thousands a second until
+    the container is killed.
+
+    A feed that dies looks exactly like a feed that was never
+    connected, which is how this reached a running service.
+    """
+
+    def test_a_dead_clock_does_not_grow_it_without_limit(self):
+        r = Regime(max_events=2_000)
+        for i in range(200_000):
+            r.on_action(0.0, "C" if i % 2 else "A", 10)
+        assert len(r._events) <= 2_000
+
+    def test_time_going_backwards_does_not_either(self):
+        r = Regime(max_events=2_000)
+        for i in range(50_000):
+            r.on_action(-float(i), "A", 10)
+        assert len(r._events) <= 2_000
+
+    def test_the_count_trim_keeps_the_totals_exact(self):
+        """Both trims share the accounting, so the running totals
+        must still equal a full re-sum of what is left. If they
+        drift, the cancel rate drifts with them and nothing says
+        so."""
+        rng = random.Random(3)
+        r = Regime(max_events=500)
+        for i in range(20_000):
+            r.on_action(0.0, "C" if rng.random() < 0.4 else "A",
+                        rng.randint(1, 40))
+        added = sum(s for _, x, s in r._events if x == "A")
+        pulled = sum(s for _, x, s in r._events if x == "C")
+        assert r._added == pytest.approx(added)
+        assert r._pulled == pytest.approx(pulled)
+        total = added + pulled
+        want = (pulled / total) if total else 0.0
+        assert r.snapshot.cancel_rate == pytest.approx(want)
+
+    def test_a_good_clock_still_trims_by_time_first(self):
+        """The cap is a backstop, not the mechanism. With working
+        timestamps the window must still be the window."""
+        r = Regime(cancel_window_s=10.0, max_events=10 ** 9)
+        for i in range(40_000):
+            r.on_action(i * 0.001, "A", 10)
+        held = [t for t, _, _ in r._events]
+        assert max(held) - min(held) <= 10.01

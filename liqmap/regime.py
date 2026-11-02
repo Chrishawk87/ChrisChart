@@ -109,6 +109,24 @@ BUCKETS = 50
 # Seconds, because cancels are not synchronised to anything.
 CANCEL_WINDOW_S = 30.0
 
+# AND A HARD CEILING ON HOW MANY EVENTS THAT WINDOW MAY HOLD.
+#
+# The window is trimmed by TIMESTAMP, which is correct and is not
+# enough. A record whose `ts_event` is missing arrives as 0.0, the
+# cutoff goes negative, and nothing is ever old enough to drop --
+# so the deque grows on every book update, at thousands a second,
+# until the container runs out of memory and is killed. That is not
+# a display bug; it takes the whole feed down, and a feed that dies
+# looks exactly like a feed that was never connected.
+#
+# Measured: 200,000 records at ts=0 left 200,000 events held and
+# released none of them.
+#
+# Thirty seconds at four thousand records a second is 120,000, so
+# this is the same window expressed in a unit that cannot be
+# poisoned by a bad clock.
+MAX_EVENTS = 120_000
+
 # Where a reading becomes "high" -- as a percentile of what this
 # session has produced, never as an absolute.
 HIGH_PCT = 0.70
@@ -245,7 +263,7 @@ class Regime:
     """
 
     __slots__ = ("bucket_vol", "buckets", "cancel_window_s",
-                 "high_pct", "min_samples",
+                 "max_events", "high_pct", "min_samples",
                  "_spread", "_gross", "_last_ts",
                  "_b_buy", "_b_sell", "_b_vol", "_bkts", "_signed",
                  "_vpin", "_taking", "_vp", "_events", "_cp",
@@ -255,7 +273,8 @@ class Regime:
                  buckets: int = BUCKETS,
                  cancel_window_s: float = CANCEL_WINDOW_S,
                  high_pct: float = HIGH_PCT,
-                 min_samples: int = MIN_SAMPLES) -> None:
+                 min_samples: int = MIN_SAMPLES,
+                 max_events: int = MAX_EVENTS) -> None:
         if bucket_vol <= 0:
             raise ValueError("bucket_vol must be positive")
         if buckets < 2:
@@ -263,6 +282,7 @@ class Regime:
         self.bucket_vol = float(bucket_vol)
         self.buckets = int(buckets)
         self.cancel_window_s = float(cancel_window_s)
+        self.max_events = max(1, int(max_events))
         self.high_pct = float(high_pct)
         self.min_samples = int(min_samples)
 
@@ -364,14 +384,24 @@ class Regime:
             self._pulled += size
         cut = ts - self.cancel_window_s
         while self._events and self._events[0][0] < cut:
-            _, x, sz = self._events.popleft()
-            if x == ADD:
-                self._added -= sz
-            else:
-                self._pulled -= sz
+            self._drop()
+        # AND BY COUNT, which the clock cannot poison. Both trims use
+        # the same accounting, so the running totals stay exactly
+        # what a full re-sum of the deque would give -- there is a
+        # test that they do.
+        while len(self._events) > self.max_events:
+            self._drop()
         total = self._added + self._pulled
         self._cancel = (self._pulled / total) if total > 0 else 0.0
         self._cp.add(self._cancel)
+
+    def _drop(self) -> None:
+        """Release the oldest event, keeping the totals honest."""
+        _, x, sz = self._events.popleft()
+        if x == ADD:
+            self._added -= sz
+        else:
+            self._pulled -= sz
 
     def set_gross(self, gross: float) -> None:
         """The size of the fight behind the net, from the reading."""

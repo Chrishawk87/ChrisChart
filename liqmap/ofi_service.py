@@ -268,6 +268,22 @@ class OfiService:
         self._last: dict | None = None
         self._history: deque = deque(maxlen=HISTORY)
         self.started_at: float | None = None
+        # THE INGEST THREAD DIES AND NOTHING USED TO NOTICE.
+        #
+        # `_run` iterates the live feed. When that generator ends or
+        # raises -- which is what happens at the session close, on a
+        # dropped socket, on a credential blip -- the thread records
+        # the error and exits. The web server stays up serving the
+        # bars it already had, so the chart looks normal and is
+        # frozen. Over a weekend that is two days of a chart that
+        # reads like a quiet market.
+        #
+        # These are the supervisor's state, and they are reported so
+        # a frozen chart can say WHY rather than being discovered.
+        self.restarts = 0
+        self.died_at: float | None = None
+        self.retry_at: float | None = None
+        self._sup: threading.Thread | None = None
         self.updated_at: float | None = None
         self.readings = 0
         self.error = ""
@@ -312,6 +328,7 @@ class OfiService:
             target=self._run, name="ofi", daemon=True)
         self._thread.start()
         self.started_at = time.time()
+        self._supervise()
         # Seed the chart with recent history so a newly-started engine
         # does not open to a blank chart. Runs on a background thread
         # so it does not block the main thread or the live stream.
@@ -426,6 +443,73 @@ class OfiService:
     def stop(self) -> None:
         self._stop.set()
 
+    # ------------------------------------------------------ supervisor
+
+    # How long to wait before the first restart, and the ceiling.
+    # Backoff, because the two reasons a feed will not start are a
+    # closed market and bad credentials, and hammering either is
+    # pointless -- but a minute is short enough that a reopen is
+    # picked up without anyone watching.
+    RETRY_MIN_S = 5.0
+    RETRY_MAX_S = 60.0
+    # How often the supervisor looks. A second is far below any
+    # backoff it will choose, so it costs nothing and bounds how
+    # long a death goes unnoticed.
+    POLL_S = 1.0
+
+    def _supervise(self) -> None:
+        """Bring the ingest thread back when it dies.
+
+        One supervisor per service, started by `start` and outliving
+        every thread it restarts. It never starts a feed that was
+        deliberately stopped, and it never fights `blocked_by` -- a
+        missing key or a closed market is reported, waited out, and
+        tried again rather than retried in a loop.
+        """
+        if self._sup is not None and self._sup.is_alive():
+            return
+        self._sup = threading.Thread(target=self._watch, name="ofi-sup",
+                                     daemon=True)
+        self._sup.start()
+
+    def _watch(self) -> None:
+        wait = self.RETRY_MIN_S
+        while not self._stop.is_set():
+            time.sleep(self.POLL_S)
+            if self._stop.is_set():
+                return
+            t = self._thread
+            if t is not None and t.is_alive():
+                # Healthy: forget the backoff so the next outage is
+                # picked up quickly rather than inheriting a minute
+                # of waiting from the last one.
+                wait = self.RETRY_MIN_S
+                self.died_at = None
+                self.retry_at = None
+                continue
+            now = time.time()
+            if self.died_at is None:
+                self.died_at = now
+                self.retry_at = now + wait
+                continue
+            if now < (self.retry_at or 0):
+                continue
+            why = self.config.blocked_by()
+            if why:
+                # Not something a restart fixes. Say so and wait.
+                self.error = why
+                self.retry_at = now + wait
+                wait = min(self.RETRY_MAX_S, wait * 2.0)
+                continue
+            self.restarts += 1
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._run, name="ofi", daemon=True)
+            self._thread.start()
+            self.started_at = time.time()
+            self.retry_at = now + wait
+            wait = min(self.RETRY_MAX_S, wait * 2.0)
+
     @property
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -496,6 +580,10 @@ class OfiService:
             "z_enter": cfg.z_enter,
             "readings": self.readings,
             "started_at": self.started_at,
+            "restarts": self.restarts,
+            "died_at": self.died_at,
+            "retry_in": (round(max(0.0, (self.retry_at or 0) - time.time()), 1)
+                         if self.died_at else None),
             "updated_at": self.updated_at,
             "age_s": (None if self.updated_at is None
                       else round(time.time() - self.updated_at, 3)),

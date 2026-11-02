@@ -6112,6 +6112,43 @@ def create_app() -> FastAPI:
         from .pivots import pending
         return pending(n, right)
 
+    def _feed_health(rt_, builder) -> dict:
+        """Is the ingest thread alive, and how stale is the chart?
+
+        Age is measured from the newest bar the builder holds, which
+        is the only thing that says the chart is current. A running
+        thread that has stopped producing is still a stopped chart.
+        """
+        svc = getattr(rt_, "ofi", None)
+        out: dict[str, Any] = {"running": False, "error": "",
+                               "restarts": 0, "retry_in": None,
+                               "last_bar_age_s": None}
+        if svc is None:
+            return out
+        try:
+            out["running"] = bool(svc.running)
+            out["error"] = str(getattr(svc, "error", "") or "")
+            out["restarts"] = int(getattr(svc, "restarts", 0) or 0)
+            retry = getattr(svc, "retry_at", None)
+            if getattr(svc, "died_at", None) and retry:
+                out["retry_in"] = round(max(0.0, retry - time.time()), 1)
+        except Exception:                               # noqa: BLE001
+            pass
+        try:
+            bars = getattr(builder, "bars", None)
+            cur = getattr(builder, "current", None)
+            newest = 0.0
+            if cur is not None and getattr(cur, "ts_close", 0):
+                newest = float(cur.ts_close)
+            elif bars:
+                newest = float(bars[-1].ts_close)
+            if newest > 0:
+                out["last_bar_age_s"] = round(
+                    max(0.0, time.time() - newest), 1)
+        except Exception:                               # noqa: BLE001
+            pass
+        return out
+
     @app.get("/api/ofibars", dependencies=[Depends(require_token)])
     def api_ofibars(coin: str = "ES", target: int = 250,
                     bars: int = 140, offset: int = 0,
@@ -6606,6 +6643,14 @@ def create_app() -> FastAPI:
 
         return {"ok": True, "coin": coin, "target": t,
                 "read": _read, "regime": _regime, "price": _price,
+                # WHETHER THE FEED IS ALIVE, carried with the bars.
+                #
+                # A dead ingest thread draws exactly the same chart as
+                # a quiet market: the bars it already had, in the
+                # right places, with nothing new. The panel cannot
+                # tell those apart from the bars alone and must not
+                # have to.
+                "feed": _feed_health(rt, b),
                 "targets": list(_OFI_LADDER),
                 "total": total, "offset": off, "window": n,
                 "dropped": getattr(b, "dropped", 0),
@@ -10876,7 +10921,56 @@ function ofiChart(d, w, h) {
     liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
       + 'no bar is forming</span>';
   }
-  liveCall = readLine(d && d.read) + regimeLine(d && d.regime)
+  /* A DEAD FEED MUST NOT LOOK LIKE A QUIET MARKET.
+
+     This is the failure that cost Chris a weekend: the ingest thread
+     died at the session close, the web server kept serving the bars
+     it already had, and the chart was indistinguishable from a
+     market that simply was not trading. Every other line on this
+     panel describes those stale bars perfectly well and none of them
+     can say the tape stopped.
+
+     So it goes FIRST, above the read, and it is loud. */
+  const feedLine = f => {
+    if (!f) return '';
+    const age = f.last_bar_age_s;
+    const clock = s => (s >= 3600 ? (s / 3600).toFixed(1) + ' hours'
+                      : s >= 90 ? (s / 60).toFixed(0) + ' minutes'
+                      : Math.round(s) + 's');
+    if (!f.running) {
+      return '<span class="stamp" style="width:100%">'
+        + '<b class="short">THE FEED IS NOT RUNNING.</b> Every bar '
+        + 'below is history &mdash; nothing on this chart is live'
+        + (age !== null && age !== undefined
+            ? ' &middot; the newest bar is <b>' + clock(age)
+              + '</b> old' : '')
+        + (f.error ? ' &middot; ' + f.error : '')
+        + (f.retry_in !== null && f.retry_in !== undefined
+            ? ' &middot; trying again in ' + clock(f.retry_in)
+            : '')
+        + (f.restarts ? ' &middot; restarted ' + f.restarts
+            + (f.restarts === 1 ? ' time' : ' times') + ' so far'
+            : '')
+        + '</span>';
+    }
+    /* Running and producing nothing is still a stopped chart. At
+       target 2,000 a bar can legitimately take many minutes, so this
+       says how old rather than calling it broken. */
+    if (age !== null && age !== undefined && age > 900) {
+      return '<span class="stamp" style="width:100%">'
+        + '<b class="short">The feed is running but the newest bar is '
+        + clock(age) + ' old.</b> Either the market is not trading or '
+        + 'records have stopped arriving &mdash; the chart below is '
+        + 'that old either way'
+        + (f.restarts ? ' &middot; the feed has restarted '
+            + f.restarts + ' times' : '')
+        + '</span>';
+    }
+    return '';
+  };
+
+  liveCall = feedLine(d && d.feed)
+    + readLine(d && d.read) + regimeLine(d && d.regime)
     + liveCall + speedLine(fm);
 
   const dLast = all[all.length - 1] || {};
