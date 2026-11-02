@@ -702,7 +702,8 @@ class OfiBarBuilder:
                  "_t_hi", "_t_lo", "_t_last",
                  "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
                  "_level", "_obj", "_confirm", "_max_calls", "_widen",
-                 "_ep", "_eps", "_meas", "_pu", "_pd")
+                 "_ep", "_eps", "_meas", "_pu", "_pd",
+                 "_r_sign", "_r_flips", "_r_since")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
@@ -789,6 +790,11 @@ class OfiBarBuilder:
         # Both sides of the imbalance for the bar in progress.
         self._pu = 0
         self._pd = 0
+        # The read on the bar in progress: which way it has gone from
+        # its own open, and how often that has changed inside this bar.
+        self._r_sign = 0
+        self._r_flips = 0
+        self._r_since = 0.0
         self._ep: Episode | None = None
         self._eps: list = []
         # The observation still being MEASURED -- a list, but it holds
@@ -801,6 +807,9 @@ class OfiBarBuilder:
         self._prev = None
         self._acc = 0
         self._bar = None
+        self._r_sign = 0
+        self._r_flips = 0
+        self._r_since = 0.0
         self.bars.clear()
         self.dropped = 0
         self._buy_agg = 0.0
@@ -943,6 +952,63 @@ class OfiBarBuilder:
         return self._bar
 
     @property
+    def bar_read(self) -> dict:
+        """What the bar in progress is doing, right now.
+
+        THE READ IS THE BAR. It says where price is against this
+        bar's own open, it resets when the bar does, and it is not
+        derived from the imbalance -- the imbalance decides when the
+        bar ENDS, which is a different question from which way it has
+        gone while it was open.
+
+        `flat` is reported rather than suppressed. Price back at the
+        open is a real state and the commonest one in the first
+        moments of a bar; printing the previous direction through it
+        would be a reading of the last bar wearing this one's name.
+
+        `ticks` is signed and is the evidence for the word, so a
+        reading of UP by a quarter of a tick can be seen for what it
+        is instead of looking like a reading of UP by four points.
+        """
+        bar = self._bar
+        if bar is None:
+            return {"read": "", "open_px": 0.0, "last_px": 0.0,
+                    "ticks": 0.0, "points": 0.0, "into_s": 0.0,
+                    "held_s": 0.0, "flips": 0, "bar_ts": 0.0,
+                    "target": int(self.threshold), "forming": False}
+        # RAW UNITS IN, TICKS OUT. The bar's prices are raw -- a point
+        # is 1_000_000_000 of them -- and `self.tick` is 0.25, a price
+        # tick. Dividing one by the other gives a number four billion
+        # times too big, which on the panel reads as a one-tick move
+        # being a thousand points. Every other converter on this class
+        # goes through RAW_TICK and so does this one.
+        d = bar.close - bar.open
+        ticks = d / RAW_TICK
+        return {
+            "read": ("up" if d > 0 else "down" if d < 0 else "flat"),
+            "open_px": float(bar.open), "last_px": float(bar.close),
+            "ticks": round(ticks, 2),
+            "points": round(d / POINT, 4),
+            "into_s": round(max(0.0, bar.ts_close - bar.ts_open), 2),
+            # How long it has read this way INSIDE this bar. It can
+            # never exceed the bar's own age, which is the point: a
+            # duration that outlived the window it was measured in
+            # would be describing the previous bar.
+            #
+            # ZERO WHILE FLAT. `_r_sign` deliberately survives a
+            # passage through the open -- up, flat, up is one reading,
+            # not two -- but reporting its age next to the word FLAT
+            # would put a duration on a direction the line is not
+            # currently showing.
+            "held_s": (round(max(0.0, bar.ts_close - self._r_since), 2)
+                       if d else 0.0),
+            "flips": int(self._r_flips),
+            "bar_ts": float(bar.ts_open),
+            "target": int(self.threshold),
+            "forming": True,
+        }
+
+    @property
     def live_speed(self) -> dict:
         """Expansion and speed of the bar in progress, for the panel.
 
@@ -1080,6 +1146,26 @@ class OfiBarBuilder:
             bar.low = mid
         bar.close = mid
         bar.ts_close = ts
+        # ---- the read on this bar -----------------------------------
+        #
+        # WHERE PRICE IS AGAINST WHERE THIS BAR OPENED. Not the
+        # imbalance, which is what ends the bar rather than what the
+        # bar is doing, and not a clock window: the bar is the window,
+        # and when it closes this starts again from the next open.
+        #
+        # Tracked HERE, on the same update that moves the close, so the
+        # flip count is every change the bar actually made. Deriving it
+        # in a property at read time would count only the changes a
+        # caller happened to look at, which on a polled panel is a
+        # different number every time it is asked.
+        sign = (1 if mid > bar.open else -1 if mid < bar.open else 0)
+        if sign and self._r_sign and sign != self._r_sign:
+            self._r_flips += 1
+            self._r_since = ts
+        elif sign and not self._r_sign:
+            self._r_since = ts
+        if sign:
+            self._r_sign = sign
         # THE IMBALANCE IS THE SIGNAL, ON ITS OWN.
         #
         # Past +level the call is up, past -level it is down, and
@@ -1149,6 +1235,13 @@ class OfiBarBuilder:
     def _open_bar(self, ts: float, mid: float) -> None:
         self._bar = OfiBar(ts_open=ts, ts_close=ts, open=mid, high=mid,
                            low=mid, close=mid, direction=CHOP)
+        # THE READ STARTS OVER WITH THE BAR, because the read IS the
+        # bar. Nothing is carried across: a count of direction changes
+        # that survived into the next candle would describe two bars
+        # and belong to neither.
+        self._r_sign = 0
+        self._r_flips = 0
+        self._r_since = ts
 
     # -- observations inside the bar -----------------------------------
 

@@ -1940,9 +1940,22 @@ class TestTheRegimeTagsTheReadAndNothingMore:
         return WEB[i:WEB.index("def api_dexarb")]
 
     def test_the_route_carries_it_beside_the_read_not_inside_it(self):
+        """THE CLAIM, NOT THE SPELLING.
+
+        This asserted the exact substring `"read": _read, "regime":
+        _regime`, which broke the moment another key was added between
+        them -- a change that does not touch the separation at all.
+        What matters is that both are keys of the returned payload and
+        that nothing writes a regime into the read.
+        """
         r = self._route()
-        assert '"read": _read, "regime": _regime' in r
+        assert '"read": _read' in r
+        assert '"regime": _regime' in r
         assert "_snap.as_dict()" in r
+        # The one thing that WOULD fold them together.
+        for bad in ('_read["regime"]', "_read['regime']",
+                    '_read.update(_regime', '**_regime'):
+            assert bad not in r, bad
 
     def test_the_reading_cannot_see_the_regime(self):
         fr = (ROOT / "liqmap" / "flowread.py").read_text()

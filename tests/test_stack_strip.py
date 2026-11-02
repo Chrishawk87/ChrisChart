@@ -135,6 +135,14 @@ THIS_BAR = ('<span class="stamp" style="width:100%">THIS BAR &mdash; '
             '<b class="long">UP</b> right now &middot; imbalance +640'
             '</span>')
 
+# THE READ AS IT IS NOW: the OFI bar in progress, measured against its
+# own open. `ticks` is what tells the two shapes apart, so a payload
+# without it still draws the old flow line and this suite covers both.
+BAR_READ = {"read": "up", "open_px": 6700.0, "last_px": 6701.0,
+            "ticks": 4.0, "points": 1.0, "into_s": 42.0, "held_s": 30.0,
+            "flips": 1, "bar_ts": 1000.0, "target": 2000,
+            "forming": True}
+
 
 @pytest.fixture(scope="module")
 def page_js() -> str:
@@ -221,6 +229,79 @@ class TestTheStripRenders:
     def test_the_id_defaults_for_the_footprint(self, page_js):
         line = run_js(page_js, "readLine", READ_UP, PRICE_UP, None)
         assert 'id="ofiReadLine"' in line
+
+
+class TestTheReadIsTheOfiBarNow:
+    """It used to be a flow reading on a five-minute clock. Chris asked
+    for what the candle on the screen is doing, so it is now price
+    against that bar's open, resetting when the bar does."""
+
+    def test_it_renders_at_all(self, page_js):
+        line = run_js(page_js, "readLine", BAR_READ, PRICE_UP,
+                      "stackReadLine")
+        assert "READ &mdash;" in line, line[:300]
+        assert "UP" in line
+
+    def test_it_shows_the_distance_from_the_open(self, page_js):
+        """UP by a quarter of a tick and UP by four points are the same
+        word and not the same thing."""
+        line = run_js(page_js, "readLine", BAR_READ, PRICE_UP,
+                      "stackReadLine")
+        assert "4.00 ticks from its open" in line, line
+        assert "+1.00 pts" in line, line
+
+    def test_it_says_how_long_the_bar_has_been_open(self, page_js):
+        line = run_js(page_js, "readLine", BAR_READ, PRICE_UP,
+                      "stackReadLine")
+        assert "this bar has been open" in line
+
+    def test_it_never_claims_time_left_in_the_candle(self, page_js):
+        """There is no time left in an OFI bar -- it ends when the
+        imbalance says so. The old line said '4.0 min left in this
+        candle' because its window was a clock; carrying that wording
+        onto a flow window would be inventing a number."""
+        line = run_js(page_js, "readLine", BAR_READ, PRICE_UP,
+                      "stackReadLine")
+        assert "left in this candle" not in line, line
+
+    def test_flat_is_printed(self, page_js):
+        line = run_js(page_js, "readLine",
+                      {**BAR_READ, "read": "flat", "ticks": 0.0,
+                       "points": 0.0, "held_s": 0.0},
+                      PRICE_UP, "stackReadLine")
+        assert "FLAT" in line
+        assert "back at its open" in line, line
+
+    def test_a_bar_crossing_its_own_open_says_so(self, page_js):
+        """The word is UP or DOWN either way. Only the count can say
+        the bar is going nowhere."""
+        quiet = run_js(page_js, "readLine", BAR_READ, PRICE_UP, "x")
+        assert "going nowhere" not in quiet
+        busy = run_js(page_js, "readLine", {**BAR_READ, "flips": 9},
+                      PRICE_UP, "x")
+        assert "crossed its open 9 times" in busy, busy
+        assert "going nowhere" in busy
+
+    def test_no_bar_forming_says_so(self, page_js):
+        line = run_js(page_js, "readLine",
+                      {**BAR_READ, "forming": False}, PRICE_UP, "x")
+        assert "no bar is forming" in line, line
+
+    def test_price_is_still_its_own_reading(self, page_js):
+        """It has no reference point at all -- not this bar's open --
+        so it stays a second opinion rather than a restatement."""
+        line = run_js(page_js, "readLine", BAR_READ,
+                      {"dir": "down", "px": 6699.25}, "x")
+        assert "PRICE &mdash;" in line
+        assert "6699.25" in line
+        assert "opposed" in line, line
+
+    def test_the_old_flow_line_still_draws(self, page_js):
+        """The accuracy scripts still score the flow reading, and it is
+        still carried in the payload. A payload in the old shape must
+        not fall through the new branch."""
+        line = run_js(page_js, "readLine", READ_UP, PRICE_UP, "x")
+        assert "left in this candle" in line, line
 
 
 class TestItGoesBlankRatherThanStale:

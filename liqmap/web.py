@@ -6664,14 +6664,42 @@ def create_app() -> FastAPI:
         # dropdown, and it does not reset when a bar closes -- all
         # three of which the per-bar call above does the other way
         # round, because that one IS about these bars.
-        _fr = getattr(tape, "flowread", None)
+        # THE READ IS THE BAR NOW, not a five-minute clock window.
+        #
+        # It was a flow reading on a clock: buying minus selling since
+        # the last five-minute boundary. Chris asked for the other
+        # thing -- what the OFI candle on the screen is doing at this
+        # moment -- so it is where price sits against THAT bar's open,
+        # and it starts again when that bar does.
+        #
+        # It comes off the builder for the target being displayed,
+        # which is the only honest source: a read of "the candle"
+        # taken from a different target would be a read of a
+        # different candle.
+        #
+        # `flowread` is still fed and still carried, under `flow`, for
+        # the accuracy scripts that score it. Those scripts measure
+        # the OLD reading, so none of their numbers describe what is
+        # on the panel now.
         _read = None
+        try:
+            _read = b.bar_read
+        except Exception:                               # noqa: BLE001
+            _read = None
+        # Remember which target the panel is showing, so the per-print
+        # frames push the read for the same bar the poll drew.
+        try:
+            tape.read_target = int(t)
+        except Exception:                               # noqa: BLE001
+            pass
+        _fr = getattr(tape, "flowread", None)
+        _flow = None
         if _fr is not None:
             try:
                 _fr.set_level(b.call_level)
-                _read = _fr.snapshot.as_dict()
+                _flow = _fr.snapshot.as_dict()
             except Exception:                           # noqa: BLE001
-                _read = None
+                _flow = None
         # ERROR BARS, NOT A SECOND SIGNAL. Computed from the same
         # tape and carried beside the reading, never folded into it:
         # the direction is the imbalance's and these only say what
@@ -6702,8 +6730,13 @@ def create_app() -> FastAPI:
         _regime = None
         if _rg is not None:
             try:
-                if _read:
-                    _rg.set_gross(_read.get("gross", 0.0))
+                # The regime's bands are scaled by how much flow is in
+                # the window, which is the FLOW reading's number. The
+                # bar read has no gross -- it is a price measurement --
+                # so this keeps taking it from where it has always
+                # come from.
+                if _flow:
+                    _rg.set_gross(_flow.get("gross", 0.0))
                 _snap = _rg.snapshot
                 _regime = _snap.as_dict()
                 # THE COMPARISON IS DRAWN HERE, by the one place that
@@ -6716,7 +6749,8 @@ def create_app() -> FastAPI:
                 _regime = None
 
         return {"ok": True, "coin": coin, "target": t,
-                "read": _read, "regime": _regime, "price": _price,
+                "read": _read, "flow": _flow,
+                "regime": _regime, "price": _price,
                 # WHETHER THE FEED IS ALIVE, carried with the bars.
                 #
                 # A dead ingest thread draws exactly the same chart as
@@ -10333,11 +10367,88 @@ function fpClearRow(d) {
    and once at the foot of the stack panel -- without two elements
    sharing an id, which would leave getElementById repainting one of
    them forever and the other frozen at whatever it said on load. */
+function ofiBarReadLine(r, pr, id, clock) {
+  const word = r.read === 'up'   ? '<b class="long">UP</b>'
+             : r.read === 'down' ? '<b class="short">DOWN</b>'
+             : '<b>FLAT</b>';
+  if (!r.forming) {
+    return '<span id="' + id + '" class="stamp" style="width:100%">'
+      + 'READ &mdash; <b>no bar is forming</b> &mdash; nothing to '
+      + 'read yet</span>';
+  }
+  /* THE SIGNED DISTANCE FROM THIS BAR'S OPEN. The word without it is
+     the same word for a quarter of a tick and for four points. */
+  const t = r.ticks || 0;
+  const dist = (t === 0)
+    ? 'back at its open'
+    : (t > 0 ? '+' : '') + t.toFixed(2) + (Math.abs(t) === 1
+        ? ' tick' : ' ticks') + ' from its open'
+      + (Math.abs(r.points) >= 1
+          ? ' (' + (r.points > 0 ? '+' : '') + r.points.toFixed(2)
+            + ' pts)' : '');
+  const held = (r.read !== 'flat' && r.held_s)
+    ? ' for ' + clock(r.held_s) : '';
+  /* PRICE IS STILL ITS OWN READING. It has no reference point at all
+     -- not this bar's open, not anything -- so it stays a second
+     opinion rather than a restatement of the line it sits on. */
+  const pd = pr && pr.dir;
+  const price = pr
+    ? ' &nbsp; PRICE &mdash; ' + (pd === 'up'
+        ? '<b class="long">UP</b>' : pd === 'down'
+        ? '<b class="short">DOWN</b>' : '<b>FLAT</b>')
+      + (pr.px ? ' <b>' + pr.px.toFixed(2) + '</b>' : '')
+    : '';
+  const both = (r.read !== 'flat' && pd)
+    ? (r.read === pd
+        ? ' &middot; <b class="long">both the same way</b>'
+        : ' &middot; <b class="short">opposed</b>')
+    : '';
+  /* A BAR THAT KEEPS CROSSING ITS OWN OPEN IS NOT GOING ANYWHERE, and
+     the word on the left cannot say that -- it is UP or DOWN either
+     way. The count is the only thing on the line that can. */
+  const shaky = (r.flips > 6)
+    ? ' &middot; <b class="short">it has crossed its open ' + r.flips
+      + ' times</b> &mdash; this bar is going nowhere'
+    : (r.flips > 2)
+      ? ' &middot; ' + r.flips + ' crossings of its open' : '';
+  return '<span id="' + id + '" class="stamp" style="width:100%">'
+    + 'READ &mdash; ' + word + held + price + both
+    + ' &middot; ' + dist
+    + ' &middot; this bar has been open ' + clock(r.into_s)
+    + shaky
+    + ' &middot; the candle in progress at target '
+    + (r.target || 0).toLocaleString() + ', not the imbalance &mdash; '
+    + 'it starts again when this bar closes, which is flow and not a '
+    + 'clock</span>';
+}
+
+/* READ -- WHAT THE OFI CANDLE ON THE SCREEN IS DOING.
+
+   It used to be a flow reading on a five-minute clock: buying minus
+   selling since the last boundary, reset every five minutes whatever
+   the bars were doing. It is now where price sits against the open of
+   the bar in progress, and it starts again when that bar does.
+
+   TWO THINGS FOLLOW AND BOTH ARE VISIBLE ON THE LINE.
+
+   The window is a quantity of FLOW, not of clock, so it can reset
+   twice in a minute in fast tape and not for ten in slow tape. The
+   line says how long this bar has been open rather than how long is
+   left in it, because there is no "left" -- the bar ends when the
+   imbalance says so and nothing here knows when that will be.
+
+   FLAT IS PRINTED, NOT SUPPRESSED. Price back at the bar's open is a
+   real state, and showing the last direction through it would be a
+   reading of a moment that has passed.
+
+   The number is the evidence for the word. UP by a quarter of a tick
+   and UP by four points are the same word and not the same thing. */
 function ofiReadLine(r, pr, id) {
   if (!r) return '';
   id = id || 'ofiReadLine';
   const clock = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
                               : Math.round(s) + 's');
+  if (r.ticks !== undefined) return ofiBarReadLine(r, pr, id, clock);
   const left = ' &middot; ' + clock(r.left_s) + ' left in this candle';
 
   /* PRICE, AND IT IS NOT MEASURED AGAINST ANYTHING. Not the

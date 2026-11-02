@@ -138,6 +138,12 @@ class Tape:
     # until it refilled, which is useless for eyeballing a session.
     # The cost is a handful of integer adds per book update.
     ofibars: dict | None = None
+    # WHICH TARGET THE PANEL IS SHOWING. The read is now a property of
+    # the OFI bar, and there is one builder per target, so the
+    # per-print frames need to know which of them the person is
+    # actually looking at. Set by the poll, read by the frame; zero
+    # until the first poll says.
+    read_target: int = 0
     # WHICH SIDE IS WINNING, continuously, independent of the bars.
     # One instance, not one per target: the five builders are five
     # slicings of one tape, and the flow underneath them is one thing.

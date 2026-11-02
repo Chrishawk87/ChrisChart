@@ -148,10 +148,33 @@ def tick_frame(trade: Any, exec_track: Any, tape: Any = None) -> dict:
     pulse = st.pulse
     extra: dict = {}
     if tape is not None:
+        # THE READ COMES OFF THE BAR BEING DISPLAYED. The panel tells
+        # the tape which target it is showing on each poll; without
+        # that this would have to pick one, and a read of a 250-bar
+        # pushed onto a screen showing 2,000-bars would be a reading
+        # of a candle the person cannot see.
+        bars = getattr(tape, "ofibars", None)
+        if bars:
+            tgt = getattr(tape, "read_target", 0)
+            b = bars.get(tgt) if tgt else None
+            if b is None:
+                # No poll has said yet. The largest target is the one
+                # Chris trades and the safest default, but the frame
+                # names which bar it came from either way so the page
+                # is never guessing.
+                try:
+                    b = bars[max(bars)]
+                except Exception:                       # noqa: BLE001
+                    b = None
+            if b is not None:
+                try:
+                    extra["read"] = b.bar_read
+                except Exception:                       # noqa: BLE001
+                    pass
         fr = getattr(tape, "flowread", None)
         if fr is not None:
             try:
-                extra["read"] = fr.snapshot.as_dict()
+                extra["flow"] = fr.snapshot.as_dict()
             except Exception:                           # noqa: BLE001
                 pass
         pd = getattr(tape, "pricedir", None)
