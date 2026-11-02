@@ -11608,7 +11608,13 @@ async function ofiTick(fromTimer) {
   const host = $('ofiBars');
   if (!host) return;
   try {
-    const d = await api('/api/ofibars?coin=ES&target=' + _ofiTarget
+    /* FOLLOW THE PICKER. This used to ask for 'ES' outright, which
+       made the whole app look like it was on CME while every other
+       tab quietly followed the selector and its crypto default. One
+       panel disagreeing with the rest about which market is on screen
+       is worse than either answer on its own. */
+    const d = await api('/api/ofibars?coin=' + encodeURIComponent(coin())
+      + '&target=' + _ofiTarget
       + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
       + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm
       + '&keep=' + _ofiKeep + '&higher=' + _ofiHigher
@@ -11617,8 +11623,19 @@ async function ofiTick(fromTimer) {
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; _ofiLast = d; }
     ofiBindChart();
     if (!d.ok) {
-      host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
-        + (d.why || 'unavailable') + '</span>';
+      /* "ES is not a CME symbol" is true and useless. The reason this
+         panel is blank is almost always that a crypto market is
+         selected, and the fix is a dropdown away -- so it says that
+         rather than restating the rejection. */
+      const notCme = (d.why || '').indexOf('not a CME symbol') >= 0;
+      host.innerHTML = '<span class="stamp" style="width:100%">'
+        + (notCme
+            ? 'OFI candles are built from the CME tape, and <b>'
+              + esc(coin()) + '</b> is not a CME market. Pick the '
+              + 'futures contract in the market selector above and '
+              + 'every panel, including this one, follows it.'
+            : 'OFI candles &mdash; ' + esc(d.why || 'unavailable'))
+        + '</span>';
       return;
     }
     const w = Math.max(320, host.clientWidth || 900);
@@ -16485,7 +16502,17 @@ function renderCoins() {
     + '</optgroup>').join('');
 
   const still = keep.some(r => r.symbol === lastCoin);
-  if (still) $('coin').value = lastCoin;
+  if (still) {
+    $('coin').value = lastCoin;
+  } else {
+    /* NOTHING CHOSEN YET: start on the CME contract when there is
+       one. This is a futures chart that also knows about crypto, and
+       opening it on BTC meant every panel but the candles was
+       answering about a market the user was not looking at. */
+    const cme = keep.find(r => r.source === 'cme' && r.has_data)
+             || keep.find(r => r.source === 'cme');
+    if (cme) $('coin').value = cme.symbol;
+  }
   $('mktCount').textContent = keep.length === allMarkets.length
     ? allMarkets.length + ' markets'
     : keep.length + ' of ' + allMarkets.length;

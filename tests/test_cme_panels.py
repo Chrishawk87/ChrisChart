@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient                  # noqa: E402
 
 from liqmap import web                                     # noqa: E402
 
+WEB = (ROOT / "liqmap" / "web.py").read_text()
 TOKEN = "t0ken"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -165,3 +166,67 @@ class TestTheAccessorRefusesTheWrongVenue:
         assert cme_at < rest_at
         assert "return [], (" in code[cme_at:rest_at], \
             "the CME branch can fall through to the crypto venue"
+
+
+class TestOnePickerDrivesEveryPanel:
+    """The bug behind 'the rest of the tabs read Hyperliquid data'.
+
+    The candle panel asked for 'ES' outright. Every other tab read the
+    market selector, which defaults to a crypto market. So the app
+    showed CME candles beside crypto everything-else, and nothing on
+    screen said the two were different markets -- the candles looked
+    like proof the whole page was on ES.
+    """
+
+    def _tick(self):
+        i = WEB.index("async function ofiTick")
+        return WEB[i:WEB.index("\n}", i)]
+
+    def test_the_candle_panel_no_longer_hardcodes_a_symbol(self):
+        t = self._tick()
+        assert "coin=ES" not in t, "the panel still pins its own market"
+        assert "'/api/ofibars?coin=' + encodeURIComponent(coin())" in t
+
+    def test_it_asks_for_whatever_the_picker_holds(self):
+        t = self._tick()
+        assert "coin()" in t
+
+    def test_a_crypto_market_explains_itself(self):
+        """'ES is not a CME symbol' is true and useless. The reason the
+        panel is blank is that a crypto market is selected."""
+        t = self._tick()
+        assert "not a CME symbol" in t
+        assert "market selector" in t
+        assert "every panel, including this one, follows it" in t
+
+    def test_the_selector_opens_on_the_futures_contract(self):
+        """Opening on BTC meant every panel but the candles was
+        answering about a market the user was not looking at."""
+        i = WEB.index("function renderCoins")
+        blk = WEB[i:WEB.index("\n}", i)]
+        assert "r.source === 'cme'" in blk
+        assert "has_data" in blk
+
+    def test_a_chosen_market_still_wins(self):
+        """The default must not fight a selection."""
+        i = WEB.index("function renderCoins")
+        blk = WEB[i:WEB.index("\n}", i)]
+        k = blk.index("const still =")
+        assert "if (still) {" in blk[k:k + 120]
+        assert blk.index("$('coin').value = lastCoin") < blk.index(
+            "r.source === 'cme'")
+
+    def test_the_route_accepts_the_dated_contract(self, client,
+                                                   monkeypatch):
+        """The picker lists ES.Z26, not ES. If the routes only took
+        the product name, selecting from the picker would blank every
+        CME panel."""
+        rt = web.runtime()
+        monkeypatch.setattr(rt, "is_cme",
+                            lambda c: str(c).upper().startswith("ES"))
+        _cme(monkeypatch)
+        monkeypatch.setattr(rt, "is_cme",
+                            lambda c: str(c).upper().startswith("ES"))
+        d = _get(client, "/api/ofibars", coin="ES.Z26", target=250,
+                 bars=20)
+        assert d["ok"] is True, d.get("why")
