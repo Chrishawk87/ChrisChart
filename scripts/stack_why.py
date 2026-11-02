@@ -83,6 +83,15 @@ def main() -> int:
             print(f"  {k}: {d[k]}")
 
     rows = d.get("timeframes") or []
+    # THE ROUTE'S OWN ERROR OUTRANKS EVERY GUESS BELOW. When /api/read
+    # bails before building a ladder it says exactly why, and leading
+    # with "check the market selector" over the top of that sends the
+    # reader after a symbol that was never wrong.
+    if d.get("error") and not rows:
+        print("\n  THE ROUTE STOPPED BEFORE BUILDING ANY ROW, and said"
+              " why:")
+        print(f"    {d['error']}")
+        print("\n  That is the cause. Everything below is context.")
     if not rows:
         print("\n  NO ROWS AT ALL. The ladder never built one, so the"
               " cascade had nothing")
@@ -212,6 +221,10 @@ def main() -> int:
         names |= {str(r.get("front_month")) for r in cme_rows}
         names |= {str(r.get("active_contract")) for r in cme_rows
                   if r.get("active_contract")}
+        # AND THE BARE PRODUCT. `is_cme` accepts svc.config.market --
+        # plain 'ES' -- which no picker row carries, so a check built
+        # from the rows alone reported a working symbol as a mismatch.
+        names |= {n.split(".")[0] for n in list(names) if n}
         names |= {str(r.get("deferred")) for r in cme_rows if r.get("deferred")}
         if coin.upper() not in {n.upper() for n in names}:
             print(f"\n    >> {coin!r} IS NOT ONE OF THEM. That is the"

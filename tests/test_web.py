@@ -2826,14 +2826,27 @@ class TestTheCandleReadUsesTheCmeTape:
         assert "candles unavailable" not in d.get("error", "")
         assert "closed 15m bars so far" in d["error"]
 
-    def test_it_says_the_tape_keeps_no_history_from_before_it_started(
+    def test_a_thin_tape_says_whether_anything_was_kept(
             self, client, monkeypatch):
-        """A real limit, and the reason the panel is empty for hours
-        after a restart rather than minutes."""
+        """This used to assert the tape keeps NO history from before it
+        started, which was true and was the reason the panel sat empty
+        for hours after a restart. The candles are persisted now, so
+        that claim is false by design and the test could not be
+        satisfied -- only replaced.
+
+        What matters in its place: when the ladder is still too thin to
+        read, the message must say whether the stored history came
+        back. Without that, a working store, an empty one and a broken
+        one all read the same from the panel, which is how the
+        original fault stayed invisible.
+        """
         self._as_cme(monkeypatch)
         d = client.get("/api/read?coin=ES&interval=15m",
                        headers={"Authorization": f"Bearer {TOKEN}"}).json()
-        assert "before the engine started" in d["error"]
+        err = d.get("error") or ""
+        assert "closed 15m bars so far" in err, err
+        assert ("restored from disk" in err
+                or "nothing is saving these candles" in err), err
 
     def test_a_hyperliquid_symbol_still_reports_its_own_failure(
             self, client, monkeypatch):

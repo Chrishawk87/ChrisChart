@@ -1048,6 +1048,30 @@ class Runtime:
                     self._ofirec = _rec
                 except Exception:                       # noqa: BLE001
                     self._ofirec = None
+            # AND THE TIME CANDLES THE STACK READS.
+            #
+            # Same problem the OFI bars had and the same answer. The
+            # tape builds 1m/5m/15m from prints as they arrive and
+            # holds nothing from before the engine started, so every
+            # restart began with an empty history -- and /api/read
+            # refuses to build a ladder until the traded interval has
+            # ten closed bars, which at 15m is two and a half hours of
+            # session. The panel showed rows with no direction for all
+            # of it and could not say why.
+            if getattr(self, "_candlerec", None) is None:
+                try:
+                    from .candlestore import CandleRecorder, CandleStore
+                    _cs = CandleStore(self.db_path)
+                    _crec = CandleRecorder(_cs, svc.tape)
+                    _crec.load_into_builders()
+                    _crec.seed()
+                    _crec.start()
+                    self._candlerec = _crec
+                except Exception:                       # noqa: BLE001
+                    # Best effort, exactly like the OFI store above. A
+                    # disk that will not take it is a slow start, not a
+                    # dead feed.
+                    self._candlerec = None
             if svc.tape.flowread is None:
                 from .flowread import FlowRead
                 svc.tape.flowread = FlowRead()
@@ -5298,13 +5322,31 @@ def create_app() -> FastAPI:
             bars = list(cme.history(interval, limit=200))
             if len(bars) < 10:
                 why = cme.missing()
+                # SAY WHETHER THE STORED HISTORY CAME BACK. Without
+                # this the message is the same whether the candle
+                # store is working, empty or broken, and all three
+                # look like a quiet market from the panel.
+                _cr = getattr(rt, "_candlerec", None)
+                kept = ""
+                if _cr is not None:
+                    try:
+                        st = _cr.status()
+                        on_disk = (st.get("on_disk") or {}).get(interval)
+                        kept = (f" -- {st.get('restored', 0)} candles "
+                                f"were restored from disk and "
+                                f"{on_disk} {interval} bars are stored")
+                    except Exception:                   # noqa: BLE001
+                        kept = ""
+                else:
+                    kept = (" -- nothing is saving these candles, so "
+                            "every restart starts from empty")
                 return {**out,
                         "error": (
                             f"the CME tape has {len(bars)} closed "
                             f"{interval} bars so far. It builds candles "
-                            f"from prints as they arrive and holds none "
-                            f"from before the engine started, so this "
-                            f"fills in as the session runs"
+                            f"from prints as they arrive, so this fills "
+                            f"in as the session runs"
+                            + kept
                             + (f" -- {why}" if why else ""))}
         else:
             try:
