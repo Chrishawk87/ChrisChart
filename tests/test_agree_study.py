@@ -121,45 +121,81 @@ class TestItRunsAtAll:
         assert not t2.won
 
 
-class TestTakingProfitMeansSomething:
-    """The bug that would have made every sweep meaningless."""
+class TestTakingProfitMovesTheRateNotTheTotal:
+    """THE CONSEQUENCE OF IMMEDIATE RE-ENTRY, pinned rather than
+    prevented.
 
-    def test_the_target_changes_the_total(self, recs):
-        tight = ag.run(recs, 0.25, 0.25, target=2000, eval_s=1.0)
-        wide = ag.run(recs, 0.5, 0.25, target=2000, eval_s=1.0)
+    There was a gate here: after a target or a stop, the agreement
+    had to break before another trade could open. It existed because
+    without it the P&L telescopes -- the target closes the trade, the
+    signal that opened it is still there, the next look re-opens at
+    about the same price, and the two pieces sum to the one move.
+    Measured when it was written: 4/2, 2/2 and no levels at all came
+    out at +216.00 to the cent.
+
+    Chris chose immediate re-entry anyway, so the gate is gone and
+    the consequence is real. These tests state it plainly so nobody
+    reads a sweep of take profits as a sweep of outcomes.
+
+    Two tests were deleted rather than fixed -- "after a target it
+    waits for a fresh signal" and "levels never increase the trade
+    count" -- because both are false by design now.
+    """
+
+    def test_the_target_barely_moves_the_total(self, recs):
+        """It moves the WIN RATE a great deal and the total hardly at
+        all. A sweep that looks like it is finding an edge is mostly
+        finding different ways to slice the same move."""
         none = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
-        totals = {round(tight.points, 2), round(wide.points, 2),
-                  round(none.points, 2)}
-        assert len(totals) == 3, (
-            "the totals telescope -- taking profit and re-entering at "
-            f"the same price changes nothing: {totals}")
+        tight = ag.run(recs, 4.0, 2.0, target=2000, eval_s=1.0)
+        wide = ag.run(recs, 8.0, 4.0, target=2000, eval_s=1.0)
+        totals = [none.points, tight.points, wide.points]
+        spread = max(totals) - min(totals)
+        assert spread < 0.05 * abs(none.points), (
+            f"totals {totals} differ by {spread:.2f} -- if a target "
+            "really moved the result, the warning in this class would "
+            "need revisiting")
+        # The trade COUNT, by contrast, changes a lot.
+        assert tight.n > none.n * 2
 
-    def test_the_target_actually_fires(self, recs):
-        r = ag.run(recs, 0.25, 4.0, target=2000, eval_s=1.0)
+    def test_the_target_does_fire(self, recs):
+        r = ag.run(recs, 4.0, 2.0, target=2000, eval_s=1.0)
         assert r.by_reason().get("tp", {}).get("n", 0) > 0
 
-    def test_the_stop_actually_fires(self, recs):
-        r = ag.run(recs, 4.0, 0.25, target=2000, eval_s=1.0)
+    def test_the_stop_does_fire(self, recs):
+        r = ag.run(recs, 8.0, 0.5, target=2000, eval_s=1.0)
         assert r.by_reason().get("sl", {}).get("n", 0) > 0
 
-    def test_after_a_target_it_waits_for_a_fresh_signal(self, recs):
-        """No two trades may start while the same agreement runs.
 
-        Checked as: a trade that ended on tp or sl is never followed by
-        one opening at the same instant.
-        """
-        r = ag.run(recs, 0.25, 0.25, target=2000, eval_s=1.0)
-        ts = sorted(r.trades, key=lambda t: t.ts_in)
-        for a, b in zip(ts, ts[1:]):
-            if a.why in ("tp", "sl"):
-                assert b.ts_in > a.ts_out, (a.why, a.ts_out, b.ts_in)
+class TestLosingAgreementIsNotAnExit:
+    """Chris: it "continues to close -1 tick over and over".
 
-    def test_levels_never_increase_the_trade_count(self, recs):
-        """One signal, one trade. Re-entering inside a single
-        agreement is the telescoping bug wearing a different hat."""
-        none = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
-        tight = ag.run(recs, 0.25, 0.25, target=2000, eval_s=1.0)
-        assert tight.n <= none.n
+    The read is price against the OFI bar open and it crosses that
+    open constantly, so agreement broke for an instant, the trade
+    closed, and the next look re-opened it. Each round trip gave back
+    about a tick and none was a decision about the market.
+    """
+
+    def test_a_flip_closes_it_and_nothing_else_does(self, recs):
+        r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
+        reasons = set(r.by_reason())
+        assert "disagree" not in reasons, reasons
+        assert "flip" in reasons
+
+    def test_the_churn_is_gone(self, recs):
+        """The old rule took about 1,500 trades on this fixture, most
+        of them a tick or less. Held to a flip it takes a few dozen.
+        A property of this generator, not of the market -- what it
+        pins is that the exit stopped firing on noise."""
+        r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
+        assert r.n < 300, r.n
+        tiny = sum(1 for t in r.trades if abs(t.ticks) <= 1)
+        assert tiny < 0.25 * r.n, f"{tiny} of {r.n} are <=1 tick"
+
+    def test_trades_are_held_rather_than_flickered(self, recs):
+        r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
+        holds = sorted(t.held_s for t in r.trades)
+        assert holds[len(holds) // 2] > 20.0, holds[:5]
 
 
 class TestTheRuleIsThreeOfFour:

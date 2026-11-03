@@ -233,11 +233,16 @@ class TestTheExitRule:
         # Far enough past both for either to claim it.
         assert should_close(t, s, 6690.0, "up") == "sl"
 
-    def test_disagreement(self):
+    def test_a_flip_closes_it(self):
         assert should_close(self._open(), self.S, 6700.0,
-                            "down") == "disagree"
-        assert should_close(self._open(), self.S, 6700.0,
-                            "") == "disagree"
+                            "down") == "flip"
+
+    def test_neutral_does_not(self):
+        """THE CHANGE. Exiting on lost agreement closed for about -1
+        tick over and over: the read crosses its bar open constantly,
+        so agreement breaks for an instant and the next look re-opens.
+        None of those round trips was a decision about the market."""
+        assert should_close(self._open(), self.S, 6700.0, "") == ""
 
     def test_agreement_holds_it(self):
         assert should_close(self._open(), self.S, 6700.25, "up") == ""
@@ -285,12 +290,16 @@ class TestTheAutoSwitch:
     def test_no_price_does_nothing(self):
         assert decide(None, self.OPEN, 0.0, "up") == ("", "")
 
-    def test_an_auto_row_closes_on_disagreement(self):
+    def test_an_auto_row_closes_on_a_flip(self):
         t = Trade(side="up", open_px=6700.0, mode="auto")
         assert decide(t, self.OPEN, 6700.0, "down") == ("close",
-                                                        "disagree")
+                                                        "flip")
 
-    def test_a_manual_row_does_not(self):
+    def test_an_auto_row_holds_through_neutral(self):
+        t = Trade(side="up", open_px=6700.0, mode="auto")
+        assert decide(t, self.OPEN, 6700.0, "") == ("", "")
+
+    def test_a_manual_row_is_not_flipped_out_of(self):
         """Chris took it by hand; it is his to end."""
         t = Trade(side="up", open_px=6700.0, mode="manual")
         assert decide(t, self.OPEN, 6700.0, "down") == ("", "")
@@ -505,11 +514,32 @@ class TestTheColumnEndToEnd:
         assert d2["ok"] is True
         assert self._read(client)["journal"]["stats"]["trades"] == 0
 
+    @staticmethod
+    def _paint_fn() -> str:
+        """The whole of `paintJournal`, to its closing brace.
+
+        A fixed-width slice here is an assertion about how long the
+        function is: this one took 6,000 characters and started
+        failing the moment the verdict block pushed `jnlRecent` past
+        it, with every claim in it still true. That is the fourth
+        test to break that way today.
+        """
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function paintJournal(")
+        depth, j = 0, src.index("{", i)
+        for k in range(j, len(src)):
+            if src[k] == "{":
+                depth += 1
+            elif src[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return src[i:k + 1]
+        raise AssertionError("paintJournal has no closing brace")
+
     def test_the_page_draws_the_column(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
         assert 'id="jnlBox"' in src
-        i = src.index("function paintJournal(")
-        blk = src[i:i + 6000]
+        blk = self._paint_fn()
         for want in ("jnlStats", "jnlOpen", "jnlRecent", "jnlAgree",
                      "beats_costs"):
             assert want in blk, want
@@ -611,14 +641,19 @@ class TestAutoEntryAndExitFire:
         assert decide(None, self._s(), 6700.0, "down") == ("open",
                                                             "down")
 
-    def test_it_exits_when_they_stop_agreeing(self):
+    def test_it_exits_when_it_flips(self):
         from liqmap.journal import Trade, decide
 
         t = Trade(side="down", open_px=6700.0, mode="auto")
-        assert decide(t, self._s(), 6700.0, "up") == ("close",
-                                                       "disagree")
-        assert decide(t, self._s(), 6700.0, "") == ("close",
-                                                     "disagree")
+        assert decide(t, self._s(), 6700.0, "up") == ("close", "flip")
+
+    def test_it_holds_when_the_signal_merely_goes_quiet(self):
+        """Chris's change, and the reason for it: the old rule closed
+        for -1 tick over and over on a read crossing its own open."""
+        from liqmap.journal import Trade, decide
+
+        t = Trade(side="down", open_px=6700.0, mode="auto")
+        assert decide(t, self._s(), 6700.0, "") == ("", "")
 
     def test_it_exits_on_the_target(self):
         from liqmap.journal import Trade, decide
@@ -717,3 +752,158 @@ class TestThreeOfFour:
         blk = src[i:i + 3000]
         assert '"votes"' in blk
         assert '"against"' in blk
+
+
+class TestTheAutoButton:
+    """One button, two states, and neither of them trades.
+
+    Chris asked for "a button that i can switch between manual
+    trading and allowing the sites agent to do it". The switch here
+    changes who writes the journal rows. It does not reach a broker,
+    and the panel says so in the state the button is in rather than
+    only in a paragraph above it.
+    """
+
+    def test_the_button_exists(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert 'id="jnlAutoBtn"' in src
+        assert "function jnlToggleAuto(" in src
+
+    def test_it_shows_the_state_it_is_in(self):
+        """A toggle labelled with the mode it would switch TO is the
+        commonest way to end up in the one you thought you left."""
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        # TWO PLACES LABEL IT and both must agree: the click handler
+        # paints immediately so the word does not lag a poll, and the
+        # painter sets it from the server's state. An earlier version
+        # of this test found only the first and would have passed with
+        # the second one inverted.
+        spots = [i for i in range(len(src))
+                 if src.startswith("const btn = $('jnlAutoBtn');", i)]
+        assert len(spots) == 2, spots
+        labels = [src[i:i + 700] for i in spots]
+        assert "c.checked ? 'AUTO' : 'MANUAL'" in labels[0], labels[0]
+        assert "S.auto ? 'AUTO' : 'MANUAL'" in labels[1], labels[1]
+
+    def test_neither_state_places_an_order(self):
+        """The whole point. Both branches of the switch end at a row
+        in a table."""
+        from liqmap.journal import Settings, Trade, decide
+
+        for auto in (True, False):
+            s = Settings(auto=auto, tp_on=True, tp_ticks=4.0,
+                         sl_on=True, sl_ticks=2.0)
+            act, _ = decide(None, s, 6700.0, "up")
+            assert act in ("", "open")
+            t = Trade(side="up", open_px=6700.0, mode="auto")
+            act2, _ = decide(t, s, 6701.0, "up")
+            assert act2 in ("", "close")
+
+    def test_the_panel_says_where_auto_stops(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index('id="jnlBox"')
+        blk = src[i:i + 2500]
+        assert "nothing here reaches Ironbeam" in blk
+        assert "yours to place" in blk
+
+    def test_the_switch_still_persists(self, jn):
+        from liqmap.journal import Settings
+
+        jn.save_settings(Settings(coin="ES", auto=True))
+        assert jn.settings("ES").auto is True
+        jn.save_settings(Settings(coin="ES", auto=False))
+        assert jn.settings("ES").auto is False
+
+
+class TestWhetherItIsWorthTrusting:
+    """Chris: "once it has logged enough trades ill know whether or
+    not its worth trusting -- thats what i need it to show".
+
+    The totals answer that badly. What fools you at small sample size
+    is a run of wins, and a run of wins is exactly what a promising
+    start looks like. So the column reports the average against its
+    own standard error and against the cost of trading, and refuses
+    to call anything readable before thirty trades.
+    """
+
+    @staticmethod
+    def _stats(ticks):
+        from liqmap.journal import Stats, Trade
+
+        return Stats([Trade(side="up", open_px=6700.0,
+                            close_px=6700.0 + t * 0.25, closed_ts=1.0)
+                      for t in ticks])
+
+    def test_nothing_is_readable_at_three_trades(self):
+        v = self._stats([4, -2, 6]).verdict()
+        assert v["enough"] is False
+        assert "Under thirty" in v["say"] or "Nothing can be read" \
+            in v["say"]
+
+    def test_an_empty_log_says_so_without_dividing_by_zero(self):
+        v = self._stats([]).verdict()
+        assert v["enough"] is False
+        assert v["t"] == 0.0
+
+    def test_one_trade_does_not_crash_the_spread(self):
+        s = self._stats([4])
+        assert s.spread_ticks == 0.0
+        assert s.verdict()["enough"] is False
+
+    def test_a_winning_streak_is_not_enough(self):
+        """TEN STRAIGHT WINS AND IT STILL SAYS NO. This is the whole
+        point of the verdict: that record is exactly what both a real
+        edge and a lucky run look like."""
+        v = self._stats([4] * 10).verdict()
+        assert v["enough"] is False
+        assert v["need"] == 20
+
+    def test_a_losing_record_is_called_what_it_is(self):
+        v = self._stats([2, -6] * 20).verdict()
+        assert v["enough"] is False
+        assert "not paying for itself" in v["say"]
+
+    def test_a_noisy_average_is_not_mistaken_for_an_edge(self):
+        """Forty trades averaging well above costs, scattering far
+        wider. The average alone reads as a clear win.
+
+        Written out rather than generated from a seed: a seeded
+        fixture whose meaning quietly changes is how the first
+        version of this test came to assert a mean it did not have.
+        """
+        s = self._stats([9] * 24 + [-7] * 16)     # mean +2.6 ticks
+        d = s.to_dict()
+        assert d["per_trade_ticks"] > 2.0
+        assert d["spread_ticks"] > 7.0            # scatter dwarfs it
+        assert s.verdict()["enough"] is False
+        assert "noise" in s.verdict()["say"]
+
+    def test_a_clean_record_clears_the_floor(self):
+        """And is still described as a floor, not a result."""
+        s = self._stats([6, 5, 7, 6, 5, 6, 7, 5, 6, 6] * 5)
+        v = s.verdict()
+        assert v["enough"] is True
+        assert v["t"] >= 2.0
+        assert "not a result" in v["say"]
+
+    def test_the_streaks_are_read_in_order(self):
+        """Ten wins then ten losses and an alternating twenty have
+        the same totals and are not the same record."""
+        a = self._stats([4] * 10 + [-4] * 10).streaks()
+        b = self._stats([4, -4] * 10).streaks()
+        assert a == {"win": 10, "loss": 10}
+        assert b == {"win": 1, "loss": 1}
+
+    def test_the_verdict_reaches_the_payload(self):
+        d = self._stats([4, -2, 6]).to_dict()
+        assert "verdict" in d and "streaks" in d
+        assert "spread_ticks" in d
+
+    def test_the_panel_leads_with_it(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("const V = st.verdict")
+        blk = src[i:i + 2500]
+        assert "NOT YET READABLE" in blk
+        assert "WORTH A CLOSER LOOK" in blk
+        # Above the cost caveat, not buried under it.
+        assert blk.index("NOT YET READABLE") < blk.index("round trip")

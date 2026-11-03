@@ -9033,17 +9033,26 @@ has to be running before the gate stops refusing.">spike
           <span class="stamp" id="jnlMode"></span></h3>
         <div class="msg" style="margin-bottom:8px">Opens when
           <b>three of the four</b> &mdash; 15m, 5m, 1m and the read
-          &mdash; point the same way, and closes when they stop. A
+          &mdash; point the same way, and holds until three point the
+          <b>other</b> way. Losing agreement is not an exit: the read
+          crosses its bar open constantly, and closing on that was
+          giving back about a tick every time. A
           fourth pointing the other way does not block it, so every
           one of the four is named below and a trade taken into a
           disagreeing row can be seen for what it is. A tick is 0.25
           and <b>$12.50</b>. These are logged trades, not placed ones
-          &mdash; nothing here reaches Ironbeam.</div>
+          &mdash; <b>nothing here reaches Ironbeam</b>. On AUTO the
+          journal opens and closes its own rows on the rule, with your
+          take profit and stop loss; the order at the broker is still
+          yours to place.</div>
         <div id="jnlAgree" class="say" style="margin-bottom:10px">—</div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;
           align-items:center;margin-bottom:10px">
-          <label><input type="checkbox" id="jnlAuto"
-            onchange="jnlSet()"> auto-record</label>
+          <button id="jnlAutoBtn" onclick="jnlToggleAuto()"
+            title="Switches who writes the rows. Neither setting
+                   places an order.">MANUAL</button>
+          <input type="checkbox" id="jnlAuto" style="display:none"
+            onchange="jnlSet()">
           <label><input type="checkbox" id="jnlTpOn"
             onchange="jnlSet()"> take profit
             <input type="number" id="jnlTp" value="16" min="0" step="1"
@@ -13898,6 +13907,18 @@ function jnlFmt(t, d) {
        + ' <span class="thin">(' + sign + '$' + d.toFixed(2) + ')</span>';
 }
 
+function jnlToggleAuto() {
+  const c = $('jnlAuto');
+  if (!c) return;
+  c.checked = !c.checked;
+  const btn = $('jnlAutoBtn');
+  /* Painted immediately so the button does not sit on the old word
+     until the next poll comes back. */
+  if (btn) { btn.textContent = c.checked ? 'AUTO' : 'MANUAL';
+             btn.className = c.checked ? 'on' : ''; }
+  jnlSet();
+}
+
 async function jnlSet() {
   const q = new URLSearchParams({
     coin: coin(),
@@ -13951,6 +13972,19 @@ function paintJournal(d) {
   const mode = $('jnlMode');
   if (mode) mode.textContent = S.auto ? 'AUTO — rows write themselves'
                                       : 'MANUAL — you log the trades';
+  /* ONE BUTTON, TWO STATES, and the label says which one is live
+     rather than which one it would switch to -- a toggle that reads
+     as a command is the commonest way to end up in the mode you
+     thought you had just left. */
+  const btn = $('jnlAutoBtn');
+  if (btn) {
+    btn.textContent = S.auto ? 'AUTO' : 'MANUAL';
+    btn.className = S.auto ? 'on' : '';
+    btn.title = S.auto
+      ? 'The journal is opening and closing its own rows on the rule.'
+        + ' It still does not place orders.'
+      : 'You log each trade yourself. Click to let the journal do it.';
+  }
 
   /* WHICH OF THE FOUR AGREE, named individually. "no signal" tells
      you nothing about which one is holding it up. */
@@ -14006,6 +14040,7 @@ function paintJournal(d) {
   }
 
   const st = J.stats || {};
+  const V = st.verdict || {};
   const el = $('jnlStats');
   if (el) {
     el.innerHTML = st.trades
@@ -14023,6 +14058,26 @@ function paintJournal(d) {
         + st.per_trade_ticks.toFixed(2) + ' ticks ($'
         + st.per_trade_dollars.toFixed(2) + ')</span>'
         + '</div>'
+        /* IS IT WORTH TRUSTING YET -- the question the whole column
+           exists to answer. It goes above the caveats because the
+           totals on their own answer it badly: the thing that fools
+           you at small sample size is a run of wins, and a run of
+           wins is exactly what a promising start looks like. */
+        + '<div class="say" style="margin-top:8px">'
+        + (V.enough
+            ? '<b class="long">WORTH A CLOSER LOOK</b> '
+            : '<b>NOT YET READABLE</b> ')
+        + '<span class="thin">' + esc(V.say || '') + '</span>'
+        + (V.need ? ' <span class="thin">(' + V.need + ' more to reach '
+            + 'thirty)</span>' : '')
+        + '</div>'
+        + (st.streaks
+            ? '<div class="thin" style="margin-top:4px">longest run — '
+              + '<b class="long">' + st.streaks.win + ' wins</b>, '
+              + '<b class="short">' + st.streaks.loss + ' losses</b>'
+              + ' <span class="thin">· spread ' + st.spread_ticks
+              + ' ticks either way</span></div>'
+            : '')
         /* COSTS ARE NOT IN THE NUMBERS ABOVE and this is where that
            gets said. A round trip across the spread is about a tick;
            an average under that is a loss wearing a profit's clothes. */

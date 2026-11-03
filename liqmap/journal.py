@@ -194,6 +194,90 @@ class Stats:
     def lost_ticks(self) -> float:
         return round(sum(t.ticks for t in self.trades if t.ticks < 0), 2)
 
+    @property
+    def spread_ticks(self) -> float:
+        """How much the trades scatter, as a standard deviation.
+
+        Needed because the average on its own cannot say whether it
+        means anything. Twenty trades averaging +0.4 ticks with a
+        spread of 8 is indistinguishable from a coin.
+        """
+        if self.n < 2:
+            return 0.0
+        m = self.ticks / self.n
+        var = sum((t.ticks - m) ** 2 for t in self.trades) / (self.n - 1)
+        return var ** 0.5
+
+    def verdict(self) -> dict:
+        """Whether this record is long enough to mean anything yet.
+
+        THE QUESTION CHRIS IS ACTUALLY ASKING: let it log trades, then
+        decide whether to trust it. The totals alone answer that
+        badly, because the thing that fools you at small sample size
+        is a run of wins -- and a run of wins is exactly what a
+        promising start looks like.
+
+        So this reports the average per trade against its own standard
+        ERROR, and against the cost of trading. `t` is how many
+        standard errors the average sits above a round trip: under 2
+        the record cannot tell this rule from a coin that happens to
+        be ahead. It is a rough normal approximation and nothing more
+        -- trades are not independent, a trending session correlates
+        them, so 2 here is weaker evidence than 2 would be in a
+        textbook. It is a floor to clear, not a result.
+        """
+        if self.n < 2:
+            return {"enough": False, "t": 0.0, "se": 0.0,
+                    "need": max(0, 30 - self.n),
+                    "say": f"{self.n} trade"
+                           f"{'' if self.n == 1 else 's'} so far. "
+                           "Nothing can be read from this yet."}
+        m = self.ticks / self.n
+        se = self.spread_ticks / (self.n ** 0.5)
+        t = ((m - ROUND_TRIP_TICKS) / se) if se > 0 else 0.0
+        enough = self.n >= 30 and t >= 2.0
+        if self.n < 30:
+            say = (f"{self.n} trades. Under thirty, a good run and a "
+                   "real edge look the same -- keep logging.")
+        elif t >= 2.0:
+            say = (f"{self.n} trades averaging {m:+.2f} ticks, which "
+                   f"is {t:.1f} standard errors above what a round "
+                   "trip costs. That is a floor cleared, not a result: "
+                   "trades in one session are not independent, so this "
+                   "is weaker than the number looks. Check it against "
+                   "a stretch it has not seen.")
+        elif m <= ROUND_TRIP_TICKS:
+            say = (f"{self.n} trades averaging {m:+.2f} ticks, which "
+                   "does not cover the ~1 tick a round trip costs. On "
+                   "this record the rule is not paying for itself.")
+        else:
+            say = (f"{self.n} trades averaging {m:+.2f} ticks, but it "
+                   f"scatters {self.spread_ticks:.1f} ticks either "
+                   "way -- that average is within noise of the cost. "
+                   "Not yet distinguishable from a coin.")
+        return {"enough": enough, "t": round(t, 2),
+                "se": round(se, 3), "need": max(0, 30 - self.n),
+                "say": say}
+
+    def streaks(self) -> dict:
+        """Longest run of wins and of losses, oldest first.
+
+        A record is read in order or not at all: ten wins then ten
+        losses and an alternating twenty have the same totals and are
+        not the same thing.
+        """
+        best = {"win": 0, "loss": 0}
+        run, kind = 0, ""
+        for t in reversed(self.trades):          # `closed` is newest-first
+            k = "win" if t.ticks > 0 else "loss" if t.ticks < 0 else ""
+            if k and k == kind:
+                run += 1
+            else:
+                kind, run = k, 1 if k else 0
+            if k:
+                best[k] = max(best[k], run)
+        return best
+
     def to_dict(self) -> dict:
         per = (self.ticks / self.n) if self.n else 0.0
         return {
@@ -213,6 +297,9 @@ class Stats:
                              if self.wins else 0.0,
             "avg_loss_ticks": round(self.lost_ticks / self.losses, 2)
                               if self.losses else 0.0,
+            "spread_ticks": round(self.spread_ticks, 2),
+            "verdict": self.verdict(),
+            "streaks": self.streaks(),
         }
 
 
@@ -359,12 +446,24 @@ def should_close(t: Trade, s: Settings, px: float,
                  agree: str) -> str:
     """Why this open trade should end now, or "" to hold it.
 
-    THE ORDER IS THE ANSWER TO A QUESTION CHRIS ALREADY SETTLED:
-    whichever comes first. The stop is checked before the target
-    because a bar that traded through both is recorded as stopped out,
-    which is the pessimistic reading and the right one -- the
-    alternative assumes a fill that may not have happened, and
-    assuming a fill is how a journal invents money.
+    LOSING AGREEMENT IS NOT AN EXIT. ONLY A FLIP IS.
+
+    It used to exit the moment the four stopped agreeing, and Chris
+    watched it close for -1 tick over and over: the read is price
+    against the OFI bar open and it crosses that open constantly, so
+    agreement breaks for an instant, the trade closes, and the next
+    look re-opens it. Each of those round trips gives back about a
+    tick, and none of them was a decision about the market -- the
+    exit was firing on noise.
+
+    So a trade is held through anything that is not an opposite
+    signal. Neutral holds. One of the four going quiet holds. Two
+    against two holds. Only three of the four pointing the OTHER way
+    ends it, and then the position turns rather than flattening.
+
+    The stop is still checked before the target, because a move
+    through both is recorded as stopped out -- the pessimistic
+    reading, and the one that does not assume a fill.
     """
     if not t.open or not px:
         return ""
@@ -373,8 +472,9 @@ def should_close(t: Trade, s: Settings, px: float,
         return "sl"
     if s.tp_on and s.tp_ticks > 0 and ticks >= s.tp_ticks:
         return "tp"
-    if agree != t.side:
-        return "disagree"
+    other = "down" if t.side == "up" else "up"
+    if agree == other:
+        return "flip"
     return ""
 
 
@@ -393,15 +493,25 @@ def decide(t: Trade | None, s: Settings, px: float,
     AUTO ONLY EVER OPENS. Closing on a target or a stop happens
     whether auto is on or not, because those are settings Chris
     turned on: a journal that ignored them until he refreshed would
-    be scoring trades he had already said he was out of. Closing on
-    disagreement is for auto rows only -- a trade he took by hand is
-    his to end.
+    be scoring trades he had already said he was out of. Closing on a
+    FLIP is for auto rows only -- a trade he took by hand is his to
+    end.
+
+    RE-ENTRY IS IMMEDIATE AND THAT HAS A CONSEQUENCE. His rule: open
+    whenever three of the four agree. After a target, the signal that
+    opened the trade is usually still there, so the next look opens it
+    again at about the price it just closed. The two pieces sum to the
+    one move, which means the take profit changes the win RATE and not
+    the total. Measured on the backtest before this was written:
+    4/2, 2/2 and no levels at all came out at +216.00 to the cent.
+    It is his call, it is stated here, and the column counts the
+    re-entries so it can be seen happening rather than inferred.
     """
     if not px or px <= 0:
         return "", ""
     if t is not None and t.open:
         why = should_close(t, s, px, agree)
-        if why == "disagree" and t.mode != "auto":
+        if why == "flip" and t.mode != "auto":
             why = ""
         return ("close", why) if why else ("", "")
     if s.auto and agree in ("up", "down"):

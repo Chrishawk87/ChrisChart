@@ -195,21 +195,11 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
     open_t: Trade | None = None
     tp_raw, sl_raw = tp_pts * POINT, sl_pts * POINT
     next_eval, last_ts, last_mid = 0.0, 0.0, 0.0
-    # A TARGET OR A STOP ENDS THE SIGNAL, NOT JUST THE TRADE.
-    #
-    # Without this the rule takes profit and re-enters the same
-    # direction at the same price on the next look, and the P&L
-    # telescopes: the total comes out IDENTICAL whatever the take
-    # profit is, because the chopped-up pieces sum to the unchopped
-    # whole. Measured here first -- 4/2, 2/2 and no levels at all
-    # returned the same +216.00 to the cent, which is what sent me
-    # looking. Only the win rate moved, which is the statistic most
-    # likely to be mistaken for an edge.
-    #
-    # So after a target or a stop the agreement must BREAK before
-    # another trade can open. That is also what taking profit means
-    # to a person: done with this move, not out and straight back in.
-    armed = True
+    # NO RE-ENTRY GATE. There was one, and it existed because
+    # without it the P&L telescopes -- 4/2, 2/2 and no levels at all
+    # came out at +216.00 to the cent, with only the win rate moving.
+    # Chris chose immediate re-entry anyway; the consequence is
+    # reported instead of prevented.
 
     for ts, rec, mid in records:
         tape.offer(rec)
@@ -222,11 +212,11 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
             if sl_raw > 0 and fav <= -sl_raw:
                 open_t.ts_out, open_t.px_out, open_t.why = ts, mid, "sl"
                 res.trades.append(open_t)
-                open_t, armed = None, False
+                open_t = None
             elif tp_raw > 0 and fav >= tp_raw:
                 open_t.ts_out, open_t.px_out, open_t.why = ts, mid, "tp"
                 res.trades.append(open_t)
-                open_t, armed = None, False
+                open_t = None
 
         if ts < next_eval:
             continue
@@ -236,15 +226,27 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
         read = (ofi.bar_read or {}).get("read") or ""
         agree = _side(dirs, read)
 
-        if open_t is not None and agree != open_t.side:
+        # LOSING AGREEMENT IS NOT AN EXIT; ONLY A FLIP IS.
+        #
+        # Exiting the moment the four stopped agreeing closed for
+        # about -1 tick over and over: the read crosses its bar's
+        # open constantly, so agreement breaks for an instant and the
+        # next look re-opens. None of those round trips was a
+        # decision about the market.
+        other = "down" if (open_t and open_t.side == "up") else "up"
+        if open_t is not None and agree == other:
             open_t.ts_out, open_t.px_out = ts, mid
-            open_t.why = "disagree"
+            open_t.why = "flip"
             res.trades.append(open_t)
             open_t = None
-        if not armed and not agree:
-            # The signal has gone. The next one is a new move.
-            armed = True
-        if open_t is None and agree and armed:
+        # RE-ENTRY IS IMMEDIATE, by Chris's rule: open whenever three
+        # of the four agree. The `armed` gate is gone with it, and so
+        # is what it bought -- after a target the signal is usually
+        # still there, the next look re-opens at about the price it
+        # closed, and the pieces sum to the one move. The take profit
+        # therefore moves the win RATE and not the total. The report
+        # says so rather than leaving it to be noticed.
+        if open_t is None and agree:
             open_t = Trade(side=agree, ts_in=ts, px_in=mid)
 
     if open_t is not None:
