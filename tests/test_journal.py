@@ -1139,13 +1139,14 @@ class TestOneTradePerCandle:
         assert decide(None, self._s(), 6700.0, "up",
                       taken=("up",))[0] == ""
 
-    def test_the_other_direction_is_also_refused_now(self):
-        """It was two per candle. Chris: "taking one trade per OFI
-        candle"."""
+    def test_the_other_direction_is_allowed(self):
+        """One per DIRECTION. Chris: "a trade is taken 1 time per
+        direction per candle" -- so an up and a down in one candle,
+        never two the same way."""
         from liqmap.journal import decide
 
         assert decide(None, self._s(), 6700.0, "down",
-                      taken=("up",))[0] == ""
+                      taken=("up",)) == ("open", "down")
 
     def test_a_third_trade_is_refused(self):
         from liqmap.journal import decide
@@ -1168,10 +1169,13 @@ class TestOneTradePerCandle:
         assert decide(None, self._s(), 6700.0, "up",
                       taken=("down", "down"))[0] == ""
 
-    def test_the_cap_is_one(self):
+    def test_the_cap_is_two(self):
+        """Two, because there are two directions and one trade each.
+        It was one for a day; the per-direction rule is the one Chris
+        keeps restating and the cap follows from it."""
         from liqmap.journal import MAX_PER_BAR
 
-        assert MAX_PER_BAR == 1
+        assert MAX_PER_BAR == 2
 
     def test_the_count_comes_from_the_table(self, jn):
         """FROM THE TABLE, NOT FROM MEMORY. A cap counted in a

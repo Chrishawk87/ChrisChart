@@ -560,3 +560,92 @@ class TestThePanelCanBeFound:
         assert src.index('id="clockPanel"') > fp
         nested = src.count('id="fpPanel"', fp, cw)
         assert nested == 1
+
+
+class TestTheTwoOfisAreLabelledByTheirWindow:
+    """Chris watched the footprint candle read UP while this panel
+    read DOWN and took it for a misread.
+
+    IT IS NOT ONE. Both are `ofi.level_ofi` over the same raw events
+    -- the wiring was checked -- but one is the net over fifteen
+    minutes and the other is the bar in progress, so they oppose each
+    other often and legitimately. With only one of them on the screen
+    that is indistinguishable from the panel reading the wrong thing.
+    """
+
+    AUTH = {"Authorization": "Bearer t0ken"}
+
+    def test_the_route_carries_the_bucket_candle(self, client,
+                                                  monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        rt, tape = _cme(monkeypatch)
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        rec = getattr(rt, "_candlerec", None)
+        if rec is not None:
+            rec.stop()
+        cw = tape.clockwin
+        for i in range(30):
+            cw.on_book(i * 10.0, PX, 500 + i * 10, PX + T, 500)
+        d = client.get("/api/clockwindows", params={"coin": "ES"},
+                       headers=self.AUTH).json()
+        assert "bucket" in d
+        for k in ("read", "imbalance", "target", "level"):
+            assert k in d["bucket"], k
+
+    def test_the_panel_names_both_windows(self, page_js):
+        from tests.test_stack_strip import run_js
+
+        out = run_js(page_js, "clock", {
+            "ok": True, "period_s": 900, "candle": "", "ofi": "",
+            "bucket": {"read": "up", "imbalance": 900, "target": 2000,
+                       "level": 500, "price_dir": "up"},
+            "current": {"start_ts": 0, "ts_last": 60, "mid_dir": "up",
+                        "ticks": 2.0, "ofi_dir": "down",
+                        "net_ofi": -4000, "cvd_dir": "up",
+                        "net_cvd": 10.0, "agree": False, "books": 10,
+                        "trades": 2, "unknown": 0, "closed": False},
+            "windows": [], "summary": {}})
+        assert "net over 15 minutes" in out
+        assert "bar in progress" in out
+
+    def test_it_says_so_when_they_oppose(self):
+        """The sentence that would have saved this round trip."""
+        from tests.test_stack_strip import run_js
+        import pytest as _pt
+
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function paintClockWindows(")
+        blk = src[i:i + 9000]
+        assert "not a misread" in blk
+
+    def test_it_is_quiet_when_they_agree(self, page_js):
+        from tests.test_stack_strip import run_js
+
+        out = run_js(page_js, "clock", {
+            "ok": True, "period_s": 900, "candle": "", "ofi": "",
+            "bucket": {"read": "up", "imbalance": 900, "target": 2000,
+                       "level": 500, "price_dir": "up"},
+            "current": {"start_ts": 0, "ts_last": 60, "mid_dir": "up",
+                        "ticks": 2.0, "ofi_dir": "up",
+                        "net_ofi": 4000, "cvd_dir": "up",
+                        "net_cvd": 10.0, "agree": True, "books": 10,
+                        "trades": 2, "unknown": 0, "closed": False},
+            "windows": [], "summary": {}})
+        assert "not a misread" not in out
+        assert "bar in progress" in out
+
+    def test_no_bucket_means_no_line_not_a_crash(self, page_js):
+        from tests.test_stack_strip import run_js
+
+        out = run_js(page_js, "clock", {
+            "ok": True, "period_s": 900, "candle": "", "ofi": "",
+            "current": None, "windows": [], "summary": {}})
+        assert "15-MINUTE WINDOW" in out
+
+    def test_both_use_the_same_formula(self):
+        """If they ever stop, the disagreement really would be a
+        misread and this explanation would be wrong."""
+        cwin = (ROOT / "liqmap" / "clockwin.py").read_text()
+        obar = (ROOT / "liqmap" / "ofibar.py").read_text()
+        assert "level_ofi" in cwin and "level_ofi" in obar

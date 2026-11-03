@@ -670,7 +670,9 @@ def signal(says: dict, read: str, cvd: str = "",
     return side, ""
 
 
-# ONE TRADE PER OFI CANDLE. Chris: "we only ever use the current
-# candle and thats all taking one trade per OFI candle". It was two;
-# one is what he asked for after watching it run.
-MAX_PER_BAR = 1
+# ONE TRADE PER DIRECTION PER CANDLE, which is two at most since
+# there are only two directions. Chris: "a trade is taken 1 time per
+# direction per candle". It was two, then one, and is two again --
+# the per-direction rule is the one he keeps restating and the cap
+# follows from it.
+MAX_PER_BAR = 2

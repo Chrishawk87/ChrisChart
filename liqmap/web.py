@@ -5409,7 +5409,29 @@ def create_app() -> FastAPI:
             return {"ok": False, "why": "the CME engine is not "
                                         "configured"}
         out = cw.snapshot(limit=max(1, min(int(limit), 200)))
+        # THE BUCKET CANDLE'S OWN OFI, BESIDE THE WINDOW'S.
+        #
+        # They cover different windows -- fifteen minutes against the
+        # bar in progress -- so they oppose each other often and
+        # legitimately. Chris read that as the window misreading the
+        # footprint, which is exactly what it looks like when only
+        # one of them is on the screen.
+        bucket = {}
+        bars = getattr(tape, "ofibars", None)
+        if bars:
+            tgt = getattr(tape, "read_target", 0)
+            b = bars.get(tgt) or bars[max(bars)]
+            try:
+                br = b.bar_read or {}
+                bucket = {"read": br.get("read"),
+                          "imbalance": br.get("imbalance"),
+                          "level": br.get("level"),
+                          "target": br.get("target"),
+                          "price_dir": br.get("price_dir")}
+            except Exception:                           # noqa: BLE001
+                bucket = {}
         return {"ok": True, "coin": coin, "source": "cme",
+                "bucket": bucket,
                 "candle": "mid-price from the book",
                 "ofi": "level-level at the touch (MBP-10)",
                 "places_orders": False, **out}
@@ -14176,7 +14198,32 @@ function paintClockWindows(d) {
       }).join('')
     : '<div class="thin">no window has closed yet</div>';
 
-  el.innerHTML = head + stats
+  /* THE TWO OFIs, SIDE BY SIDE AND LABELLED BY THEIR WINDOW.
+     They oppose each other often and legitimately -- fifteen
+     minutes of net flow against the bar in progress -- and with
+     only one of them on the screen that reads as the panel
+     misreading the footprint. */
+  const B = d.bucket || {};
+  const both = B.read
+    ? '<span class="stamp" style="width:100%">'
+      + 'TWO WINDOWS, ONE FORMULA &mdash; the OFI here is the '
+      + '<b>net over ' + mins + ' minutes</b> '
+      + clockWord(C ? C.ofi_dir : 'flat')
+      + ' <span class="thin">' + num(C ? C.net_ofi : 0) + '</span>'
+      + ' &middot; the footprint candle is the <b>bar in progress</b> '
+      + clockWord(B.read)
+      + ' <span class="thin">' + num(B.imbalance) + ' of '
+      + num(B.target) + ' contracts, &plusmn;' + num(B.level)
+      + ' to count</span>'
+      + ((C && B.read && B.read !== 'flat' && C.ofi_dir !== 'flat'
+          && C.ofi_dir !== B.read)
+          ? ' &middot; <b>they point different ways right now, which '
+            + 'is the two windows disagreeing, not a misread</b>'
+          : '')
+      + '</span>'
+    : '';
+
+  el.innerHTML = head + both + stats
     + '<div style="margin-top:6px">' + table + '</div>'
     + '<span class="stamp" style="width:100%">'
     + esc(d.candle || '') + ' &middot; ' + esc(d.ofi || '')
