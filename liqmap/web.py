@@ -6473,7 +6473,7 @@ def create_app() -> FastAPI:
         # through a request and the fixture decides what the rule is
         # ever asked.
         side, blocked = jn_signal(
-            says, r, (read or {}).get("price_dir") or "",
+            says, r, (read or {}).get("delta_side") or "",
             bool((read or {}).get("flip_ok")))
         return side, says, blocked
 
@@ -9069,9 +9069,10 @@ has to be running before the gate stops refusing.">spike
         <div class="msg" style="margin-bottom:8px"><b>The OFI candle
           decides.</b> Up when the candle is green, down when it is
           red &mdash; the imbalance of the bar in progress.
-          <b>The OFI picks the side, price says whether it is worth
-          taking.</b> Green is a buy and red is a sell; price has to
-          be going the same way or there is no trade. It exits when
+          <b>The OFI candle has to match the CVD.</b> Green is a buy
+          and red is a sell, and the CVD &mdash; size that actually
+          traded &mdash; has to point the same way or there is no
+          trade. One trade per candle when they agree. It exits when
           price <b>diverges</b> from the lean &mdash; that is the take
           profit &mdash; or when the candle flips. A turn the
           <b>CVD has not followed</b> is a suspect turn and is not
@@ -14085,7 +14086,7 @@ function paintJournal(d) {
     : '<span class="thin">— no OFI bar forming</span>';
   const ag = $('jnlAgree');
   if (ag) {
-    ag.innerHTML = (J.blocked === 'price'
+    ag.innerHTML = (J.blocked === 'cvd-side'
       ? '<b class="short">NO TRADE</b> <span class="thin">the OFI is '
         + esc(J.would_be).toUpperCase() + ' but the delta is '
         + esc((R.delta_side || 'flat')).toUpperCase()
@@ -14127,6 +14128,15 @@ function paintJournal(d) {
       + (R.read && R.read !== 'flat' && !R.flip_ok
           ? ' <span class="short">· the turn is not confirmed</span>'
           : '')
+      + ' <span class="thin">· CVD </span>'
+      + (R.delta_side === 'up' ? '<b class="long">UP</b>'
+         : R.delta_side === 'down' ? '<b class="short">DOWN</b>'
+         : '<b>FLAT</b>')
+      + ' <span class="thin">' + Math.round(R.delta || 0).toLocaleString()
+      + '</span>'
+      + (R.read && R.read !== 'flat' && R.delta_side
+         && R.read !== R.delta_side
+          ? ' <span class="short">· they do not match</span>' : '')
       + ' <span class="thin">· price </span>'
       + (R.price_dir === 'up' ? '<b class="long">UP</b>'
          : R.price_dir === 'down' ? '<b class="short">DOWN</b>'

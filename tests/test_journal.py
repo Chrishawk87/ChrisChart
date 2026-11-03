@@ -735,8 +735,8 @@ class TestTheCandleDecidesAndTheStackVetoes:
 
         # The imbalance is passed as agreeing unless a test says
         # otherwise; its own rule is covered in its own class.
-        delta = read if read in ("up", "down") else ""
-        return signal({"15m": d15, "5m": d5, "1m": d1}, read, delta)
+        cvd = read if read in ("up", "down") else ""
+        return signal({"15m": d15, "5m": d5, "1m": d1}, read, cvd)
 
     def test_the_candle_alone_is_enough(self):
         assert self._side(None, None, None, "up") == ("up", "")
@@ -994,15 +994,18 @@ class TestWhetherItIsWorthTrusting:
         assert blk.index("NOT YET READABLE") < blk.index("round trip")
 
 
-class TestPriceConfirmsTheOfi:
-    """Chris: "you are going to see OFI but then check price to
-    verify that the move that OFI is making is one worth taking".
+class TestTheOfiMustMatchTheCvd:
+    """Chris: "OFI candle has to match the direction of CVD in order
+    for a trade to take place same 1 trade per OFI candle when they
+    agree".
 
-    The delta was the confirmation for a day and is not any more. The
-    OFI is the book leaning, which makes the candle green or red;
-    price is whether that lean is actually moving the market. A
-    candle leaning hard with price going nowhere is a lean nobody is
-    paying for.
+    The OFI is the book leaning -- what makes the candle green or
+    red. The CVD is size that actually traded and cannot be pulled
+    back. A candle leaning one way while the aggressive size goes the
+    other is a lean nobody is paying for.
+
+    Price was the confirmation for a day; it is still carried, still
+    drawn, and still ends a trade when it diverges.
 
     THE READ IS THE CANDLE'S COLOUR, not price against its open.
     That distinction cost a day: the read measured the price path
@@ -1011,10 +1014,10 @@ class TestPriceConfirmsTheOfi:
     """
 
     @staticmethod
-    def _s(read, price, says=None):
+    def _s(read, cvd, says=None):
         from liqmap.journal import signal
 
-        return signal(says or {}, read, price)
+        return signal(says or {}, read, cvd)
 
     def test_both_up_is_a_buy(self):
         assert self._s("up", "up") == ("up", "")
@@ -1022,17 +1025,26 @@ class TestPriceConfirmsTheOfi:
     def test_both_down_is_a_short(self):
         assert self._s("down", "down") == ("down", "")
 
-    def test_ofi_up_price_down_is_no_trade(self):
-        assert self._s("up", "down") == ("", "price")
+    def test_ofi_up_cvd_down_is_no_trade(self):
+        assert self._s("up", "down") == ("", "cvd-side")
 
-    def test_ofi_down_price_up_is_no_trade(self):
-        assert self._s("down", "up") == ("", "price")
+    def test_ofi_down_cvd_up_is_no_trade(self):
+        assert self._s("down", "up") == ("", "cvd-side")
 
-    def test_a_flat_price_is_not_confirmation(self):
-        """The lean has not moved anything yet, which is the case
-        this check exists for."""
-        assert self._s("up", "flat") == ("", "price")
-        assert self._s("up", "") == ("", "price")
+    def test_a_flat_cvd_is_not_a_match(self):
+        """It has not taken a side, so there is nothing to match."""
+        assert self._s("up", "flat") == ("", "cvd-side")
+        assert self._s("up", "") == ("", "cvd-side")
+
+    def test_the_two_cvd_checks_are_different(self):
+        """The bar's CVD DIRECTION, and whether anything printed
+        behind the OFI's last turn. A bar can be bought overall and
+        have nothing behind its most recent turn."""
+        from liqmap.journal import signal
+
+        assert signal({}, "up", "up", True) == ("up", "")
+        assert signal({}, "up", "up", False) == ("", "cvd")
+        assert signal({}, "up", "down", True) == ("", "cvd-side")
 
     def test_a_flat_candle_is_no_signal_either(self):
         assert self._s("flat", "up") == ("", "")
@@ -1334,10 +1346,10 @@ class TestCvdConfirmsTheFlip:
         assert self._sig("up", "up", False) == ("", "cvd")
         assert self._sig("down", "down", False) == ("", "cvd")
 
-    def test_price_is_still_checked_first(self):
-        """Order matters only for which reason is shown, and the
-        price one is the more basic failure."""
-        assert self._sig("up", "down", False) == ("", "price")
+    def test_the_direction_is_checked_first(self):
+        """Order matters only for which reason is shown, and a CVD
+        pointing the wrong way is the more basic failure."""
+        assert self._sig("up", "down", False) == ("", "cvd-side")
 
     def test_the_builder_measures_cvd_from_the_turn(self):
         from liqmap.ofibar import OfiBarBuilder

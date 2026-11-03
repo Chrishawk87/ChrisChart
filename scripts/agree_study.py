@@ -4,8 +4,9 @@
     ENTRY   The OFI bar read -- where price sits against the open of
             the bar in progress. That is the whole signal. The 15m,
             5m and 1m do not vote; they VETO, and only when all three
-            point the other way. The OFI picks the side and PRICE
-            has to confirm it; a candle is traded once.
+            point the other way. The OFI candle must match the CVD
+            direction, and the CVD must have followed the OFI's last
+            turn; a candle is traded once.
     EXIT    take profit, stop loss, or the agreement breaking --
             whichever comes first.
 
@@ -122,7 +123,7 @@ class Result:
         return out
 
 
-def _side(dirs: dict, read: str, price: str = "",
+def _side(dirs: dict, read: str, cvd: str = "",
           flip_ok: bool = True) -> str:
     """The direction to trade. "" for none.
 
@@ -134,7 +135,7 @@ def _side(dirs: dict, read: str, price: str = "",
     """
     from liqmap.journal import signal
 
-    side, _blocked = signal(dirs, read, price, flip_ok)
+    side, _blocked = signal(dirs, read, cvd, flip_ok)
     return side
 
 
@@ -223,7 +224,7 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
         dirs = _dirs(tape, ts, tape.book)
         br = ofi.bar_read or {}
         read = br.get("read") or ""
-        agree = _side(dirs, read, br.get("price_dir") or "",
+        agree = _side(dirs, read, br.get("delta_side") or "",
                       bool(br.get("flip_ok")))
         bar_ts = float(br.get("bar_ts") or 0.0)
 

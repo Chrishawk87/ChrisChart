@@ -612,7 +612,7 @@ def decide(t: Trade | None, s: Settings, px: float,
 STACK = ("15m", "5m", "1m")
 
 
-def signal(says: dict, read: str, price: str = "",
+def signal(says: dict, read: str, cvd: str = "",
            flip_ok: bool = True) -> tuple[str, str]:
     """The direction to trade, and what stopped it.
 
@@ -620,18 +620,25 @@ def signal(says: dict, read: str, price: str = "",
     otherwise "imbalance" or "stack", and the side it would have
     taken is recoverable from `read`.
 
-    THE OFI PICKS THE SIDE; PRICE SAYS WHETHER IT IS WORTH TAKING.
-    Chris: "if the OFI candle shows down then take a sell if it shows
-    a buy then take a buy ... you are going to see OFI but then check
-    price to verify that the move that OFI is making is one worth
-    taking".
+    THE OFI CANDLE AND THE CVD HAVE TO MATCH. Chris: "OFI candle has
+    to match the direction of CVD in order for a trade to take place
+    same 1 trade per OFI candle when they agree".
 
-    The delta was the confirmation for a while and is not any more --
-    he watched the candle read correctly on its own and wanted price,
-    not prints, as the check. The OFI is the book leaning, which is
-    what makes the candle green or red; price is whether that lean is
-    actually moving the market. A candle leaning hard with price
-    going nowhere is the lean not being paid for.
+    The OFI is the book leaning -- what makes the candle green or
+    red. The CVD is size that actually traded, by the side CME
+    stated, and cannot be pulled back. A candle leaning one way while
+    the aggressive size goes the other is a lean nobody is paying
+    for, and that is the trade this refuses.
+
+    Price was the confirmation for a while and is not any more; it is
+    still carried and still drawn, and it still ends a trade when it
+    diverges.
+
+    TWO CVD CHECKS, AND THEY ARE NOT THE SAME ONE. This is the
+    DIRECTION of the bar's CVD. `flip_ok` is narrower: whether
+    anything printed behind the OFI's last turn. A bar can be bought
+    overall and have nothing behind its most recent turn, and both
+    are worth refusing.
 
     `read` here is the OFI side, which is the candle's colour: green
     is up, red is down. It is NOT price against the bar's open --
@@ -647,10 +654,10 @@ def signal(says: dict, read: str, price: str = "",
     side = read if read in ("up", "down") else ""
     if not side:
         return "", ""
-    if price != side:
-        # A flat price is not confirmation: the lean has not moved
-        # anything yet, which is the case this check exists for.
-        return "", "price"
+    if cvd != side:
+        # A flat CVD has not taken a side, so there is nothing for
+        # the candle to match.
+        return "", "cvd-side"
     # CVD AT THE FLIP POINT. The OFI says book pressure has changed
     # direction; the CVD since that change says whether aggressive
     # size actually followed it. A turn with nothing printing behind
