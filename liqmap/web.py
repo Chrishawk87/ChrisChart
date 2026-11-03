@@ -145,6 +145,10 @@ class Runtime:
         # Every call the engine makes, written before its answer exists.
         from .callbook import CallBook as _CallBook
         self.callbook = _CallBook(self.db_path)
+        # Chris's own trades under the four-must-agree rule, in ticks
+        # and dollars. A RECORD, NOT A BROKER -- see liqmap/journal.py.
+        from .journal import Journal as _Journal
+        self.journal = _Journal(self.db_path)
         # The agent's own book, separate from yours on purpose: yours is
         # filtered by your judgement, which is the thing it is being
         # measured against.
@@ -5288,6 +5292,90 @@ def create_app() -> FastAPI:
     def api_delete_dataset(id: str) -> dict[str, Any]:
         return {"ok": rt.history.delete_dataset(id), "id": id}
 
+    @app.post("/api/journal/trade", dependencies=[Depends(require_token)])
+    def api_journal_trade(coin: str = "ES", action: str = "open",
+                          side: str = "", px: float = 0.0
+                          ) -> dict[str, Any]:
+        """Open or close a row in the trade journal.
+
+        THIS DOES NOT REACH A BROKER. It writes a row in a table so a
+        trade Chris placed himself can be scored in ticks and dollars.
+        There is no credential here and no order path, and a test
+        greps this module for the shapes one would take.
+
+        `px` is optional: left out, the live price is used, which is
+        the mid at this instant and not a price anyone is filled at.
+        """
+        act = (action or "open").lower()
+        price = float(px) if px and px > 0 else _live_px(rt, coin)
+        if not price:
+            return {"ok": False, "why":
+                    "no live price -- the tape has not printed yet"}
+        j = rt.journal
+        if act == "close":
+            t = j.close_trade(coin, price, why="manual")
+            if t is None:
+                return {"ok": False, "why": "nothing is open on "
+                                            f"{coin}"}
+            return {"ok": True, "closed": t.to_dict(),
+                    "stats": j.stats(coin).to_dict()}
+        if act != "open":
+            return {"ok": False, "why": f"unknown action {act!r}"}
+        want = (side or "").lower()
+        if want not in ("up", "down", "buy", "sell", "long", "short"):
+            return {"ok": False, "why":
+                    "side must be up or down -- a trade with no "
+                    "direction cannot be scored"}
+        s = j.settings(coin)
+        t = j.open_trade(coin, want, price, mode="manual",
+                         tp=(s.tp_ticks if s.tp_on else 0.0),
+                         sl=(s.sl_ticks if s.sl_on else 0.0))
+        if t is None:
+            return {"ok": False, "why":
+                    "a trade is already open on this market -- close "
+                    "it first. Two rows for one position is a total "
+                    "that is wrong in a way nobody spots."}
+        return {"ok": True, "open": t.to_dict(price)}
+
+    @app.post("/api/journal/settings",
+              dependencies=[Depends(require_token)])
+    def api_journal_settings(coin: str = "ES", auto: bool | None = None,
+                             tp_on: bool | None = None,
+                             sl_on: bool | None = None,
+                             tp_ticks: float | None = None,
+                             sl_ticks: float | None = None
+                             ) -> dict[str, Any]:
+        """The switches under the column. Only what is sent changes."""
+        from .journal import Settings as _JS
+
+        j = rt.journal
+        cur = j.settings(coin)
+        s = _JS(coin=coin,
+                auto=cur.auto if auto is None else bool(auto),
+                tp_on=cur.tp_on if tp_on is None else bool(tp_on),
+                sl_on=cur.sl_on if sl_on is None else bool(sl_on),
+                tp_ticks=(cur.tp_ticks if tp_ticks is None
+                          else max(0.0, float(tp_ticks))),
+                sl_ticks=(cur.sl_ticks if sl_ticks is None
+                          else max(0.0, float(sl_ticks))))
+        return {"ok": True, "settings": j.save_settings(s).to_dict()}
+
+    @app.post("/api/journal/clear",
+              dependencies=[Depends(require_token)])
+    def api_journal_clear(coin: str = "ES",
+                          confirm: str = "") -> dict[str, Any]:
+        """Wipe this market's trades. Needs `confirm=yes`.
+
+        Asked for explicitly or not at all: a journal is a record, and
+        a record that can be cleared by a stray click is not one.
+        """
+        if confirm.lower() not in ("yes", "y", "true"):
+            return {"ok": False, "why":
+                    "pass confirm=yes -- this deletes the trade "
+                    "history for this market and cannot be undone"}
+        n = rt.journal.clear(coin)
+        return {"ok": True, "deleted": n}
+
     @app.get("/api/read", dependencies=[Depends(require_token)])
     def api_read(coin: str = "BTC", interval: str = "15m",
                  higher: str = "4h", size: float = 0.0,
@@ -6107,6 +6195,21 @@ def create_app() -> FastAPI:
         except Exception as exc:
             out["pressure_error"] = f"{type(exc).__name__}: {exc}"
 
+        # ---- the journal, under the stack --------------------------
+        #
+        # FOUR MUST AGREE: the three rungs and the OFI bar read. The
+        # agreement is computed from the rows ALREADY on this payload,
+        # not recomputed, so the column and the stack above it cannot
+        # disagree about what was showing.
+        #
+        # NOTHING HERE PLACES AN ORDER. "auto" means the journal writes
+        # its own rows so a signal does not have to be clicked to be
+        # recorded. The order at Ironbeam stays Chris's to place.
+        try:
+            out["journal"] = _journal_step(rt, coin, out)
+        except Exception as exc:                        # noqa: BLE001
+            out["journal"] = {"error": f"{type(exc).__name__}: {exc}"}
+
         if book is not None and not book.empty:
             out["book"] = {
                 "bid": book.best_bid, "ask": book.best_ask, "mid": book.mid,
@@ -6274,6 +6377,93 @@ def create_app() -> FastAPI:
             return float(rt.client().INTERVALS.get(interval, 900))
         except Exception:                               # noqa: BLE001
             return 900.0
+
+    def _live_px(rt_, coin_: str) -> float:
+        """The last traded price, in the units a person reads.
+
+        TWO UNITS LIVE IN THIS ENGINE AND THEY LOOK ALIKE. The OFI
+        bars hold raw integers a billion to the point; `tape.last_px`
+        is already scaled, because the decoder does it on the way in.
+        Scaling it again here produced 0.0 after rounding, and the
+        column refused every trade with "the tape has not printed
+        yet" while the tape was printing fine. Measured before this
+        comment was written: the fixture's tape read 1712.0, and
+        multiplying by 1e-9 made it 0.0000017.
+
+        So this does not convert. It exists so that every caller
+        reads the price from one place, and so the next person
+        wondering about the units finds the answer here.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        px = float(getattr(tape, "last_px", 0.0) or 0.0)
+        return round(px, 4) if px > 0 else 0.0
+
+    def _agreement(out_: dict) -> tuple[str, dict]:
+        """Which way all four point, from the payload already built.
+
+        "" when they do not all agree. The rungs come from the cascade
+        that is going out on this same response, so the column can
+        never show a trade the stack above it does not justify.
+        """
+        casc = out_.get("cascade") or {}
+        rungs = {g.get("timeframe"): g for g in (casc.get("rungs") or [])
+                 if g.get("present")}
+        read = ((out_.get("read") or {}).get("read") or "")
+        want = ("15m", "5m", "1m")
+        says = {t: (rungs.get(t) or {}).get("qualified") for t in want}
+        says["read"] = read if read in ("up", "down") else None
+        vals = list(says.values())
+        side = vals[0] if vals and all(v == vals[0] and v for v in vals) \
+            else ""
+        return side, says
+
+    def _journal_step(rt_, coin_: str, out_: dict) -> dict:
+        """Close what should close, open what auto should open, report.
+
+        READ-ONLY WHEN AUTO IS OFF, with one exception: a stop or a
+        target that has been hit still closes the row, because those
+        are settings Chris turned on and a journal that ignored them
+        until he happened to refresh would be scoring trades he had
+        already said he was out of.
+        """
+        from . import journal as jn
+
+        j = rt_.journal
+        s = j.settings(coin_)
+        px = _live_px(rt_, coin_)
+        side, says = _agreement(out_)
+
+        t = j.open_trade_for(coin_)
+        closed = None
+        # THE POLICY IS `journal.decide`, not written out here. It
+        # lived in this closure, where the only way to reach it was an
+        # HTTP request through a fixture that never produced
+        # agreement -- so deleting the auto check broke nothing that
+        # any test could see.
+        act, arg = jn.decide(t, s, px, side)
+        if act == "close":
+            closed = j.close_trade(coin_, px, why=arg)
+            t = None
+            act, arg = jn.decide(None, s, px, side)
+        if act == "open":
+            t = j.open_trade(
+                coin_, arg, px, mode="auto",
+                tp=(s.tp_ticks if s.tp_on else 0.0),
+                sl=(s.sl_ticks if s.sl_on else 0.0))
+
+        st = j.stats(coin_)
+        return {
+            "settings": s.to_dict(),
+            "agree": side, "says": says, "price": px,
+            "open": t.to_dict(px) if t is not None else None,
+            "just_closed": closed.to_dict() if closed is not None else None,
+            "stats": st.to_dict(),
+            "recent": [x.to_dict() for x in j.closed(coin_, 20)],
+            # Said on every response so it cannot be forgotten: this
+            # records, it does not trade.
+            "places_orders": False,
+        }
 
     def _candle_rows(coin_: str, interval: str, n: int):
         """Candles for a panel that needs nothing else from the feed.
@@ -8762,6 +8952,46 @@ has to be running before the gate stops refusing.">spike
            these are the same strings that panel draws, and nothing in
            the stack above is computed from them or changed by them. -->
       <div id="stackStrip" style="margin-top:10px"></div>
+
+      <!-- THE TRADE COLUMN. Four must agree: 15m, 5m, 1m and the OFI
+           bar read. It RECORDS trades and scores them in ticks and
+           dollars; it does not reach a broker. AUTO means the rows
+           write themselves when the four line up, so a signal does
+           not have to be clicked to be logged -- the order is still
+           placed by hand. -->
+      <div id="jnlBox" style="margin-top:14px;padding-top:12px;
+        border-top:1px solid rgba(255,255,255,.12)">
+        <h3 style="margin:0 0 8px">Trades on this rule
+          <span class="stamp" id="jnlMode"></span></h3>
+        <div class="msg" style="margin-bottom:8px">Opens only when the
+          15m, 5m, 1m and the read all point the same way. A tick is
+          0.25 and <b>$12.50</b>. These are logged trades, not placed
+          ones &mdash; nothing here reaches Ironbeam.</div>
+        <div id="jnlAgree" class="say" style="margin-bottom:10px">—</div>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;
+          align-items:center;margin-bottom:10px">
+          <label><input type="checkbox" id="jnlAuto"
+            onchange="jnlSet()"> auto-record</label>
+          <label><input type="checkbox" id="jnlTpOn"
+            onchange="jnlSet()"> take profit
+            <input type="number" id="jnlTp" value="16" min="0" step="1"
+              style="width:64px" onchange="jnlSet()"> ticks</label>
+          <label><input type="checkbox" id="jnlSlOn"
+            onchange="jnlSet()"> stop loss
+            <input type="number" id="jnlSl" value="8" min="0" step="1"
+              style="width:64px" onchange="jnlSet()"> ticks</label>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;
+          margin-bottom:10px">
+          <button onclick="jnlTrade('open','up')">Log BUY</button>
+          <button onclick="jnlTrade('open','down')">Log SELL</button>
+          <button onclick="jnlTrade('close')">Close</button>
+          <span id="jnlMsg" class="thin"></span>
+        </div>
+        <div id="jnlOpen" style="margin-bottom:10px"></div>
+        <div id="jnlStats"></div>
+        <div id="jnlRecent" style="margin-top:10px"></div>
+      </div>
     </div>
 
     <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
@@ -13578,6 +13808,169 @@ function paintStackStrip() {
     + _ofiThisBar;
 }
 
+/* THE TRADE COLUMN, under the stack.
+
+   It draws what the server already decided. The agreement, the open
+   row and the totals all come off the same /api/read payload that
+   drew the rungs above, so the column cannot show a trade the stack
+   does not justify -- recomputing any of it here would be a second
+   opinion wearing the first one's clothes.
+
+   NOTHING IN THIS FUNCTION PLACES AN ORDER. The buttons write rows. */
+let _jnlBusy = false;
+
+function jnlFmt(t, d) {
+  const sign = t > 0 ? '+' : '';
+  const cls = t > 0 ? 'long' : t < 0 ? 'short' : '';
+  return '<b class="' + cls + '">' + sign + t.toFixed(2) + ' ticks</b>'
+       + ' <span class="thin">(' + sign + '$' + d.toFixed(2) + ')</span>';
+}
+
+async function jnlSet() {
+  const q = new URLSearchParams({
+    coin: coin(),
+    auto: $('jnlAuto').checked ? 'true' : 'false',
+    tp_on: $('jnlTpOn').checked ? 'true' : 'false',
+    sl_on: $('jnlSlOn').checked ? 'true' : 'false',
+    tp_ticks: $('jnlTp').value || 0,
+    sl_ticks: $('jnlSl').value || 0 });
+  try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
+  catch (e) { $('jnlMsg').textContent = String(e); }
+}
+
+async function jnlTrade(action, side) {
+  if (_jnlBusy) return;              /* one click, one row */
+  _jnlBusy = true;
+  $('jnlMsg').textContent = '…';
+  const q = new URLSearchParams({coin: coin(), action: action});
+  if (side) q.set('side', side);
+  try {
+    const d = await api('/api/journal/trade?' + q.toString(),
+                        {method: 'POST'});
+    $('jnlMsg').textContent = d.ok ? '' : (d.why || 'refused');
+  } catch (e) {
+    $('jnlMsg').textContent = String(e);
+  } finally {
+    _jnlBusy = false;
+  }
+  if (typeof loadRead === 'function') { try { await loadRead(); } catch (e) {} }
+}
+
+function paintJournal(d) {
+  const J = (d && d.journal) || null;
+  const box = $('jnlBox');
+  if (!box) return;
+  if (!J || J.error) {
+    const el = $('jnlAgree');
+    if (el) el.innerHTML = J && J.error
+      ? '<span class="err">' + esc(J.error) + '</span>'
+      : '<span class="thin">no reading yet</span>';
+    return;
+  }
+  const S = J.settings || {};
+  /* The inputs are only written when they are not being typed in,
+     so a value does not get yanked back mid-edit by a poll. */
+  const set = (id, v) => { const e = $(id);
+    if (e && document.activeElement !== e) e.value = v; };
+  const chk = (id, v) => { const e = $(id);
+    if (e && document.activeElement !== e) e.checked = !!v; };
+  chk('jnlAuto', S.auto); chk('jnlTpOn', S.tp_on); chk('jnlSlOn', S.sl_on);
+  set('jnlTp', S.tp_ticks); set('jnlSl', S.sl_ticks);
+  const mode = $('jnlMode');
+  if (mode) mode.textContent = S.auto ? 'AUTO — rows write themselves'
+                                      : 'MANUAL — you log the trades';
+
+  /* WHICH OF THE FOUR AGREE, named individually. "no signal" tells
+     you nothing about which one is holding it up. */
+  const says = J.says || {};
+  const word = v => v === 'up' ? '<b class="long">UP</b>'
+                  : v === 'down' ? '<b class="short">DOWN</b>'
+                  : '<span class="thin">—</span>';
+  const ag = $('jnlAgree');
+  if (ag) {
+    ag.innerHTML = J.agree
+      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">ALL FOUR '
+        + J.agree.toUpperCase() + '</b>'
+        + (S.auto ? '' : ' <span class="thin">— log it if you take it</span>')
+      : '<span class="thin">not all four: </span>'
+        + ['15m', '5m', '1m', 'read'].map(k =>
+            esc(k) + ' ' + word(says[k])).join(' <span class="thin">·</span> ');
+  }
+
+  const op = $('jnlOpen');
+  if (op) {
+    if (J.open) {
+      const t = J.open;
+      op.innerHTML = '<div class="say">'
+        + '<b class="' + (t.side === 'up' ? 'long' : 'short') + '">OPEN '
+        + t.side.toUpperCase() + '</b> from <b>' + t.open_px.toFixed(2)
+        + '</b> <span class="thin">(' + esc(t.mode) + ')</span> &middot; '
+        + jnlFmt(t.live_ticks || 0, t.live_dollars || 0)
+        + ' <span class="thin">unrealised — this is the last print, '
+        + 'not money</span>'
+        + (t.tp ? ' &middot; <span class="thin">tp ' + t.tp + '</span>' : '')
+        + (t.sl ? ' &middot; <span class="thin">sl ' + t.sl + '</span>' : '')
+        + '</div>';
+    } else {
+      op.innerHTML = '<div class="thin">nothing open</div>';
+    }
+  }
+
+  const st = J.stats || {};
+  const el = $('jnlStats');
+  if (el) {
+    el.innerHTML = st.trades
+      ? '<div style="display:flex;flex-wrap:wrap;gap:16px">'
+        + '<span><b>' + st.trades + '</b> <span class="thin">trades'
+        + '</span></span>'
+        + '<span><b class="long">' + st.wins + 'W</b> / '
+        + '<b class="short">' + st.losses + 'L</b>'
+        + (st.flat ? ' <span class="thin">/ ' + st.flat + ' flat</span>' : '')
+        + ' <span class="thin">(' + (100 * st.rate).toFixed(1)
+        + '%)</span></span>'
+        + '<span>' + jnlFmt(st.ticks, st.dollars) + '</span>'
+        + '<span class="thin">per trade '
+        + (st.per_trade_ticks >= 0 ? '+' : '')
+        + st.per_trade_ticks.toFixed(2) + ' ticks ($'
+        + st.per_trade_dollars.toFixed(2) + ')</span>'
+        + '</div>'
+        /* COSTS ARE NOT IN THE NUMBERS ABOVE and this is where that
+           gets said. A round trip across the spread is about a tick;
+           an average under that is a loss wearing a profit's clothes. */
+        + '<div class="thin" style="margin-top:6px">'
+        + (st.beats_costs
+            ? 'Averaging more than the ~1 tick a round trip costs. '
+            : '<b class="short">Averaging less than the ~1 tick a round '
+              + 'trip costs</b> — on these numbers the rule is not paying '
+              + 'for itself. ')
+        + 'Commission and spread are in none of these figures; the price '
+        + 'logged is the mid at the click, not a fill.</div>'
+      : '<div class="thin">no trades logged yet</div>';
+  }
+
+  const rec = $('jnlRecent');
+  if (rec) {
+    const rows = J.recent || [];
+    rec.innerHTML = rows.length
+      ? '<div class="thin" style="margin-bottom:4px">last '
+        + rows.length + '</div>'
+        + rows.map(t =>
+            '<div style="display:flex;gap:10px;padding:3px 0;'
+            + 'border-top:1px solid rgba(255,255,255,.06)">'
+            + '<b style="width:52px" class="'
+            + (t.side === 'up' ? 'long' : 'short') + '">'
+            + t.side.toUpperCase() + '</b>'
+            + '<span style="width:150px">' + jnlFmt(t.ticks, t.dollars)
+            + '</span>'
+            + '<span class="thin" style="width:70px">' + esc(t.why)
+            + '</span>'
+            + '<span class="thin">' + t.open_px.toFixed(2) + ' → '
+            + (t.close_px || 0).toFixed(2) + '</span>'
+            + '</div>').join('')
+      : '';
+  }
+}
+
 function paintCascade(d) {
   paintStackStrip();
   const el = $('cascRows'), head = $('cascSay');
@@ -14491,6 +14884,7 @@ function paintRead(d) {
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
   paintLadder(d);
   paintCascade(d);
+  paintJournal(d);
   loadScore();
   paintTrace(d);
   paintLayers(d);
