@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""THE ONLY STRATEGY. Four things agree, you are in; they stop, you are out.
+"""THE ONLY STRATEGY. Three of four agree, you are in; they stop, you are out.
 
-    ENTRY   15m, 5m and 1m all qualify the same way AND the OFI bar
-            read agrees with them. All four, or nothing.
+    ENTRY   THREE of these four pointing the same way: the 15m, the
+            5m, the 1m and the OFI bar read. A fourth pointing the
+            other way does not block it -- Chris's rule, and the
+            report names how often that happened.
     EXIT    take profit, stop loss, or the agreement breaking --
             whichever comes first.
 
@@ -52,6 +54,8 @@ from liqmap.ofibar import OfiBarBuilder                  # noqa: E402
 POINT = 1_000_000_000
 RAW_TICK = POINT // 4
 STACK = ("15m", "5m", "1m")
+# Three of the four. See `_side`.
+MIN_AGREE = 3
 SECS = {"15m": 900.0, "5m": 300.0, "1m": 60.0}
 
 
@@ -116,6 +120,25 @@ class Result:
             o["pts"] += t.points
             o["won"] += 1 if t.won else 0
         return out
+
+
+def _side(dirs: dict, read: str) -> str:
+    """Which way three of the four point, or "".
+
+    THREE, NOT FOUR, and a dissenting fourth does not block it. It was
+    all four until Chris changed it; three is three even with the odd
+    one out pointing the other way. Two against two is not three.
+
+    The same rule the panel runs, deliberately in one place in each --
+    a study measuring a slightly different rule from the one on the
+    screen is worse than no study.
+    """
+    votes = [dirs.get(t) for t in STACK]
+    votes.append(read if read in ("up", "down") else None)
+    for way in ("up", "down"):
+        if votes.count(way) >= MIN_AGREE:
+            return way
+    return ""
 
 
 def _dirs(tape, now_s: float, book) -> dict:
@@ -211,10 +234,7 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
 
         dirs = _dirs(tape, ts, tape.book)
         read = (ofi.bar_read or {}).get("read") or ""
-        agree = ""
-        if read in ("up", "down") and all(dirs.get(t) == read
-                                          for t in STACK):
-            agree = read
+        agree = _side(dirs, read)
 
         if open_t is not None and agree != open_t.side:
             open_t.ts_out, open_t.px_out = ts, mid
@@ -269,7 +289,7 @@ def from_files(paths, limit: int = 0):
 
 def report(res: Result, src: str, real: bool) -> None:
     print(f"\n{'=' * 78}")
-    print(f"FOUR MUST AGREE   15m + 5m + 1m + the OFI bar read")
+    print("THREE OF FOUR AGREE   15m + 5m + 1m + the OFI bar read")
     print(f"{src}")
     print(f"take profit {res.tp:g} pts   stop loss {res.sl:g} pts"
           f"   (0 means not used)")

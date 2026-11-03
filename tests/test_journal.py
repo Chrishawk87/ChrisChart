@@ -515,3 +515,205 @@ class TestTheColumnEndToEnd:
             assert want in blk, want
         # And it is actually called.
         assert "paintJournal(d);" in src
+
+
+class TestTheFourthSignalIsActuallyThere:
+    """Chris: "it doesn't show the read so that it can make the
+    decision to trade".
+
+    The column asked for the OFI bar read at `out["read"]` on the
+    /api/read payload. That route has never carried it -- it is a
+    property of the OFI builder and it is served by /api/ofibars. So
+    the fourth signal was None on every single poll, the four could
+    never agree, and auto had nothing to fire on. Invisible, because
+    "not all four" is also what a quiet market looks like.
+    """
+
+    AUTH = {"Authorization": "Bearer t0ken"}
+
+    def _read(self, client, **kw):
+        params = {"coin": "ES", "interval": "15m",
+                  "timeframes": "15m,5m,1m"}
+        params.update(kw)
+        r = client.get("/api/read", params=params, headers=self.AUTH)
+        assert r.status_code == 200, r.text
+        return r.json()
+
+    def _with_ofi(self, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        rt, tape = _cme(monkeypatch)
+        # The OFI builders are attached when the footprint is built.
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        rec = getattr(rt, "_candlerec", None)
+        if rec is not None:
+            rec.stop()
+        return rt, tape
+
+    def test_the_read_reaches_the_column(self, client, monkeypatch):
+        self._with_ofi(monkeypatch)
+        j = self._read(client)["journal"]
+        assert "read" in j, j.keys()
+        assert isinstance(j["read"], dict)
+
+    def test_it_is_the_ofi_bar_read_not_an_empty_dict(self, client,
+                                                      monkeypatch):
+        """The failure it replaces returned nothing and looked like a
+        quiet market."""
+        _rt, tape = self._with_ofi(monkeypatch)
+        # Drive one OFI bar so there is something to read.
+        b = tape.ofibars[max(tape.ofibars)]
+        px = 6800 * 1_000_000_000
+        t = 1000.0
+        for i in range(40):
+            b.on_book(t + i, px + i * 250_000_000, 500,
+                      px + (i + 1) * 250_000_000, 500)
+        r = self._read(client)["journal"]["read"]
+        assert r.get("forming") is True, r
+        assert r.get("read") in ("up", "down", "flat"), r
+        assert "ticks" in r
+
+    def test_a_flat_read_is_not_agreement(self, client, monkeypatch):
+        """Price sitting at the bar open is not a direction, and
+        counting it would open a trade on a bar that has not moved."""
+        from liqmap import journal as jn
+
+        assert jn.decide(None, jn.Settings(auto=True), 6700.0,
+                         "flat") == ("", "")
+
+    def test_the_page_draws_the_read(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function paintJournal(")
+        blk = src[i:i + 7000]
+        assert "J.read" in blk
+        assert "no OFI bar forming" in blk
+
+
+class TestAutoEntryAndExitFire:
+    """Chris: "it has auto record but it dont have auto entry and
+    auto exit based on the rules that i gave you".
+
+    With the read permanently absent they could not. These drive the
+    policy directly with all four agreeing, so the entry and every
+    exit are exercised rather than assumed.
+    """
+
+    def _s(self, **kw):
+        from liqmap.journal import Settings
+
+        base = dict(coin="ES", auto=True)
+        base.update(kw)
+        return Settings(**base)
+
+    def test_all_four_agreeing_opens(self):
+        from liqmap.journal import decide
+
+        assert decide(None, self._s(), 6700.0, "down") == ("open",
+                                                            "down")
+
+    def test_it_exits_when_they_stop_agreeing(self):
+        from liqmap.journal import Trade, decide
+
+        t = Trade(side="down", open_px=6700.0, mode="auto")
+        assert decide(t, self._s(), 6700.0, "up") == ("close",
+                                                       "disagree")
+        assert decide(t, self._s(), 6700.0, "") == ("close",
+                                                     "disagree")
+
+    def test_it_exits_on_the_target(self):
+        from liqmap.journal import Trade, decide
+
+        s = self._s(tp_on=True, tp_ticks=8.0)
+        t = Trade(side="down", open_px=6700.0, mode="auto")
+        assert decide(t, s, 6698.0, "down") == ("close", "tp")
+
+    def test_it_exits_on_the_stop(self):
+        from liqmap.journal import Trade, decide
+
+        s = self._s(sl_on=True, sl_ticks=4.0)
+        t = Trade(side="down", open_px=6700.0, mode="auto")
+        assert decide(t, s, 6701.0, "down") == ("close", "sl")
+
+    def test_it_holds_while_all_four_hold(self):
+        from liqmap.journal import Trade, decide
+
+        s = self._s(tp_on=True, tp_ticks=8.0, sl_on=True, sl_ticks=4.0)
+        t = Trade(side="down", open_px=6700.0, mode="auto")
+        assert decide(t, s, 6699.75, "down") == ("", "")
+
+    def test_the_route_applies_the_decision(self):
+        """The policy is called AND acted on. A decision nothing acts
+        on is the same bug in a different place."""
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step")
+        blk = src[i:i + 2500]
+        assert "jn.decide(" in blk
+        assert 'act == "close"' in blk
+        assert 'act == "open"' in blk
+        assert "j.close_trade(" in blk
+        assert "j.open_trade(" in blk
+
+
+class TestThreeOfFour:
+    """Chris: "not all 4 have to agree on a direction it can be if 3
+    agree", and a dissenting fourth does not block it.
+
+    The agreement is computed in a route closure, so these drive the
+    same rule through the study's copy of it -- which exists because a
+    backtest measuring a different rule from the panel is worse than
+    no backtest. If the two ever drift, this is where it shows.
+    """
+
+    @staticmethod
+    def _side(d15, d5, d1, read):
+        import importlib.util
+        import sys as _sys
+
+        spec = importlib.util.spec_from_file_location(
+            "agree_study", ROOT / "scripts" / "agree_study.py")
+        mod = _sys.modules.get("agree_study")
+        if mod is None:
+            mod = importlib.util.module_from_spec(spec)
+            _sys.modules["agree_study"] = mod
+            spec.loader.exec_module(mod)
+        return mod._side({"15m": d15, "5m": d5, "1m": d1}, read)
+
+    def test_all_four_still_fires(self):
+        assert self._side("up", "up", "up", "up") == "up"
+
+    def test_three_with_one_silent(self):
+        assert self._side("down", "down", "down", "") == "down"
+        assert self._side("down", "down", None, "down") == "down"
+
+    def test_three_with_one_opposed_still_fires(self):
+        """3 is 3 -- his call, and the column names the dissenter."""
+        assert self._side("up", "up", "up", "down") == "up"
+        assert self._side("down", "down", "up", "down") == "down"
+
+    def test_two_is_not_three(self):
+        assert self._side("up", "up", None, None) == ""
+        assert self._side("up", "up", "down", "down") == ""
+
+    def test_a_flat_read_is_not_a_vote(self):
+        assert self._side("up", "up", None, "flat") == ""
+
+    def test_nothing_agrees_on_nothing(self):
+        assert self._side(None, None, None, "") == ""
+
+    def test_the_route_uses_three(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert "MIN_AGREE = 3" in src
+        i = src.index("def _agreement(")
+        blk = src[i:i + 2000]
+        assert "votes.count(way) >= MIN_AGREE" in blk
+        # The old rule must be gone, not merely bypassed.
+        assert "all(v == vals[0]" not in blk
+
+    def test_the_column_reports_the_count_and_the_dissenter(self):
+        """"It agreed" cannot tell a clean signal from a contested
+        one once three is enough."""
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step")
+        blk = src[i:i + 3000]
+        assert '"votes"' in blk
+        assert '"against"' in blk

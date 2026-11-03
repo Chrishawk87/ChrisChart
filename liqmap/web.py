@@ -6399,23 +6399,77 @@ def create_app() -> FastAPI:
         px = float(getattr(tape, "last_px", 0.0) or 0.0)
         return round(px, 4) if px > 0 else 0.0
 
-    def _agreement(out_: dict) -> tuple[str, dict]:
-        """Which way all four point, from the payload already built.
+    # How many of the four have to point the same way. THREE, by
+    # Chris's rule: a fourth pointing the other way does not block it.
+    MIN_AGREE = 3
+
+    def _bar_read(rt_) -> dict:
+        """The OFI bar read -- the fourth of the four.
+
+        FETCHED, NOT READ OFF THE PAYLOAD. It is a property of the OFI
+        builder and it is served by /api/ofibars; this route never
+        carried it. The column therefore asked for `out["read"]`, got
+        nothing every single time, and the four could never agree --
+        so auto had nothing to fire on and the read column showed a
+        dash forever. The bug was invisible because "not all four" is
+        also what a quiet market looks like.
+
+        From the builder for the target the panel is showing, which
+        the OFI poll records on the tape. A read taken off a different
+        target would be a read of a candle Chris cannot see.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        bars = getattr(tape, "ofibars", None) if tape else None
+        if not bars:
+            return {}
+        tgt = getattr(tape, "read_target", 0)
+        b = bars.get(tgt) if tgt else None
+        if b is None:
+            try:
+                b = bars[max(bars)]
+            except Exception:                           # noqa: BLE001
+                return {}
+        try:
+            return dict(b.bar_read or {})
+        except Exception:                               # noqa: BLE001
+            return {}
+
+    def _agreement(out_: dict, read: dict) -> tuple[str, dict]:
+        """Which way all four point.
 
         "" when they do not all agree. The rungs come from the cascade
         that is going out on this same response, so the column can
         never show a trade the stack above it does not justify.
+
+        FLAT IS NOT A DIRECTION. The bar read says flat when price
+        sits at its candle's open, and counting that as agreement
+        would open a trade on a bar that has not moved.
         """
         casc = out_.get("cascade") or {}
         rungs = {g.get("timeframe"): g for g in (casc.get("rungs") or [])
                  if g.get("present")}
-        read = ((out_.get("read") or {}).get("read") or "")
+        r = (read or {}).get("read") or ""
         want = ("15m", "5m", "1m")
         says = {t: (rungs.get(t) or {}).get("qualified") for t in want}
-        says["read"] = read if read in ("up", "down") else None
-        vals = list(says.values())
-        side = vals[0] if vals and all(v == vals[0] and v for v in vals) \
-            else ""
+        says["read"] = r if r in ("up", "down") else None
+
+        # THREE OF THE FOUR, and a dissenting fourth does not block it.
+        #
+        # It was all four. Chris changed it: three is three, even when
+        # the odd one out points the other way. That means a signal can
+        # fire with something actively against it, which is his call and
+        # is visible on the panel -- the column names every one of the
+        # four and what it says, so a trade taken into a disagreeing
+        # row can be seen for what it is rather than discovered later.
+        #
+        # Two against two is not three and never fires.
+        votes = [v for v in says.values() if v in ("up", "down")]
+        side = ""
+        for way in ("up", "down"):
+            if votes.count(way) >= MIN_AGREE:
+                side = way
+                break
         return side, says
 
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
@@ -6432,7 +6486,8 @@ def create_app() -> FastAPI:
         j = rt_.journal
         s = j.settings(coin_)
         px = _live_px(rt_, coin_)
-        side, says = _agreement(out_)
+        read = _bar_read(rt_)
+        side, says = _agreement(out_, read)
 
         t = j.open_trade_for(coin_)
         closed = None
@@ -6456,6 +6511,19 @@ def create_app() -> FastAPI:
         return {
             "settings": s.to_dict(),
             "agree": side, "says": says, "price": px,
+            # HOW MANY, and WHICH ONE IS AGAINST IT. Three of four
+            # fires even with the fourth pointing the other way, so
+            # "it agreed" is not enough to tell a clean signal from a
+            # contested one.
+            "votes": (sum(1 for v in says.values() if v == side)
+                      if side else 0),
+            "against": (", ".join(k for k, v in says.items()
+                                  if v and v != side) if side else ""),
+            # THE READ ITSELF, not only its direction. The column
+            # could show which timeframe was holding a signal up and
+            # not what the read was doing, which is the one of the
+            # four that moves fastest.
+            "read": read,
             "open": t.to_dict(px) if t is not None else None,
             "just_closed": closed.to_dict() if closed is not None else None,
             "stats": st.to_dict(),
@@ -8963,10 +9031,14 @@ has to be running before the gate stops refusing.">spike
         border-top:1px solid rgba(255,255,255,.12)">
         <h3 style="margin:0 0 8px">Trades on this rule
           <span class="stamp" id="jnlMode"></span></h3>
-        <div class="msg" style="margin-bottom:8px">Opens only when the
-          15m, 5m, 1m and the read all point the same way. A tick is
-          0.25 and <b>$12.50</b>. These are logged trades, not placed
-          ones &mdash; nothing here reaches Ironbeam.</div>
+        <div class="msg" style="margin-bottom:8px">Opens when
+          <b>three of the four</b> &mdash; 15m, 5m, 1m and the read
+          &mdash; point the same way, and closes when they stop. A
+          fourth pointing the other way does not block it, so every
+          one of the four is named below and a trade taken into a
+          disagreeing row can be seen for what it is. A tick is 0.25
+          and <b>$12.50</b>. These are logged trades, not placed ones
+          &mdash; nothing here reaches Ironbeam.</div>
         <div id="jnlAgree" class="say" style="margin-bottom:10px">—</div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;
           align-items:center;margin-bottom:10px">
@@ -13886,15 +13958,32 @@ function paintJournal(d) {
   const word = v => v === 'up' ? '<b class="long">UP</b>'
                   : v === 'down' ? '<b class="short">DOWN</b>'
                   : '<span class="thin">—</span>';
+  /* THE READ, WITH ITS NUMBER. It is the fastest of the four and the
+     one most likely to be the reason a signal is not firing, and the
+     column could name it without ever saying what it was doing. */
+  const R = J.read || {};
+  const readBit = (R.read)
+    ? word(R.read === 'flat' ? null : R.read)
+      + (R.read === 'flat' ? ' <span class="thin">FLAT</span>' : '')
+      + ' <span class="thin">'
+      + ((R.ticks > 0 ? '+' : '') + (R.ticks || 0).toFixed(2))
+      + ' ticks from the open of this OFI bar</span>'
+    : '<span class="thin">— no OFI bar forming</span>';
   const ag = $('jnlAgree');
   if (ag) {
-    ag.innerHTML = J.agree
-      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">ALL FOUR '
-        + J.agree.toUpperCase() + '</b>'
-        + (S.auto ? '' : ' <span class="thin">— log it if you take it</span>')
-      : '<span class="thin">not all four: </span>'
-        + ['15m', '5m', '1m', 'read'].map(k =>
-            esc(k) + ' ' + word(says[k])).join(' <span class="thin">·</span> ');
+    ag.innerHTML = (J.agree
+      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">'
+        + (J.votes || 3) + ' OF 4 ' + J.agree.toUpperCase() + '</b>'
+        + (J.against ? ' <span class="short">(' + esc(J.against)
+            + ' says the other way)</span>' : '')
+        + (S.auto ? ' <span class="thin">— auto will take it</span>'
+                  : ' <span class="thin">— log it if you take it</span>')
+      : '<span class="thin">fewer than three agree: </span>'
+        + ['15m', '5m', '1m'].map(k =>
+            esc(k) + ' ' + word(says[k])).join(' <span class="thin">·</span> ')
+        + ' <span class="thin">·</span> read ' + word(says.read))
+      + '<div class="thin" style="margin-top:4px">read &mdash; '
+      + readBit + '</div>';
   }
 
   const op = $('jnlOpen');

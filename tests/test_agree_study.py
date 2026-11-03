@@ -162,24 +162,66 @@ class TestTakingProfitMeansSomething:
         assert tight.n <= none.n
 
 
-class TestTheRuleIsAllFourOrNothing:
-    def test_the_stack_alone_is_not_enough(self, monkeypatch, recs):
-        """With the read forced to nothing, no trade may open."""
+class TestTheRuleIsThreeOfFour:
+    """It was all four until Chris changed it. Three is three now,
+    and a dissenting fourth does not block it.
+
+    Two of these tests asserted the old rule and are rewritten rather
+    than satisfied -- "the stack alone is not enough" and "one
+    dissenting timeframe blocks it" are both false by design now, and
+    bending the rule back to keep them green would have been the
+    wrong fix.
+    """
+
+    def test_three_timeframes_fire_without_the_read(self, monkeypatch,
+                                                     recs):
+        """This asserted no trade may open with the read silent.
+        Under three-of-four the three timeframes ARE three."""
         monkeypatch.setattr(
             ag.OfiBarBuilder, "bar_read",
             property(lambda self: {"read": ""}))
+        monkeypatch.setattr(
+            ag, "_dirs", lambda *a, **k: {t: "up" for t in ag.STACK})
+        r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
+        assert r.n >= 1
+        assert all(t.side == "up" for t in r.trades)
+
+    def test_two_is_still_not_enough(self, monkeypatch, recs):
+        """Where the line actually sits now."""
+        monkeypatch.setattr(
+            ag.OfiBarBuilder, "bar_read",
+            property(lambda self: {"read": ""}))
+        monkeypatch.setattr(
+            ag, "_dirs",
+            lambda *a, **k: {"15m": "up", "5m": "up", "1m": None})
         r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
         assert r.n == 0
 
     def test_the_read_alone_is_not_enough(self, monkeypatch, recs):
-        """With every timeframe silent, no trade may open."""
+        """With every timeframe silent, one vote is not three."""
         monkeypatch.setattr(ag, "_dirs",
                             lambda *a, **k: {t: None for t in ag.STACK})
         r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
         assert r.n == 0
 
-    def test_one_dissenting_timeframe_blocks_it(self, monkeypatch,
-                                                recs):
+    def test_a_dissenting_fourth_does_not_block_it(self, monkeypatch,
+                                                    recs):
+        """This asserted the opposite. Chris's call: 3 is 3, even
+        with the odd one out pointing the other way."""
+        monkeypatch.setattr(
+            ag.OfiBarBuilder, "bar_read",
+            property(lambda self: {"read": "up"}))
+        monkeypatch.setattr(
+            ag, "_dirs",
+            lambda *a, **k: {"15m": "down", "5m": "down", "1m": "down"})
+        r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
+        assert r.n >= 1
+        assert all(t.side == "down" for t in r.trades)
+
+    def test_two_against_two_fires_nothing(self, monkeypatch, recs):
+        monkeypatch.setattr(
+            ag.OfiBarBuilder, "bar_read",
+            property(lambda self: {"read": "up"}))
         monkeypatch.setattr(
             ag, "_dirs",
             lambda *a, **k: {"15m": "down", "5m": "down", "1m": "up"})
