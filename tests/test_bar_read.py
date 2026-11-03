@@ -56,20 +56,22 @@ class TestItReadsTheBar:
         book(b, 0.0, PX)
         r = b.bar_read
         assert r["read"] == "flat"
+        assert r["price_dir"] == "flat"
         assert r["ticks"] == 0.0
         assert r["forming"] is True
 
-    def test_above_its_open_reads_up(self):
+    def test_above_its_open_shows_price_up(self):
+        """`read` is the OFI now; the price path is `price_dir`."""
         b = builder()
         book(b, 0.0, PX)
         book(b, 1.0, PX + TICK)
-        assert b.bar_read["read"] == "up"
+        assert b.bar_read["price_dir"] == "up"
 
-    def test_below_its_open_reads_down(self):
+    def test_below_its_open_shows_price_down(self):
         b = builder()
         book(b, 0.0, PX)
         book(b, 1.0, PX - TICK)
-        assert b.bar_read["read"] == "down"
+        assert b.bar_read["price_dir"] == "down"
 
     def test_back_at_the_open_reads_flat(self):
         """FLAT IS PRINTED, NOT SUPPRESSED. Showing the last direction
@@ -77,9 +79,9 @@ class TestItReadsTheBar:
         b = builder()
         book(b, 0.0, PX)
         book(b, 1.0, PX + 4 * TICK)
-        assert b.bar_read["read"] == "up"
+        assert b.bar_read["price_dir"] == "up"
         book(b, 2.0, PX)
-        assert b.bar_read["read"] == "flat"
+        assert b.bar_read["price_dir"] == "flat"
 
 
 class TestTheNumberIsTheEvidence:
@@ -141,7 +143,7 @@ class TestItResetsWithTheBarAndOnNothingElse:
         b = builder(target=250)
         book(b, 0.0, PX)
         book(b, 0.5, PX + 8 * TICK)
-        assert b.bar_read["read"] == "up"
+        assert b.bar_read["price_dir"] == "up"
         ts, closed = self._run_to_a_close(b, 0.5)
         assert closed >= 1, "fixture never closed a bar"
         # The new bar's read is measured from ITS open, so a bar that
@@ -171,7 +173,7 @@ class TestItResetsWithTheBarAndOnNothingElse:
         before = b.bar_read
         book(b, 601.0, PX + 4 * TICK)
         after = b.bar_read
-        assert after["read"] == before["read"] == "up"
+        assert after["price_dir"] == before["price_dir"] == "up"
         assert after["bar_ts"] == before["bar_ts"]
         assert after["into_s"] > 600
 
@@ -186,57 +188,34 @@ class TestItResetsWithTheBarAndOnNothingElse:
         assert r["into_s"] == pytest.approx(30.0, abs=0.01)
 
 
-class TestTheImbalanceDoesNotDecideTheDirection:
-    """It decides when the bar ENDS. That is a different question, and
-    the read answering the second one is the change Chris asked for."""
+class TestTheReadIsTheOfiNotThePricePath:
+    """This class asserted the opposite and is rewritten, not fixed.
 
-    def test_one_sided_selling_with_price_up_still_reads_up(self):
+    It existed to pin that the imbalance decides when the bar ENDS
+    and never which way it reads. Chris then told me what he was
+    actually looking at -- "the OFI candle read is up when the OFI
+    candle is green" -- and green means the imbalance crossed the
+    level. The read IS the imbalance now; the price path is carried
+    beside it as `price_dir`.
+    """
+
+    def test_one_sided_buying_reads_up_whatever_price_does(self):
         b = builder()
         book(b, 0.0, PX)
-        # Size stacked on the bid against a rising price: the
-        # imbalance and the price point opposite ways.
-        for i in range(20):
-            book(b, 0.1 * (i + 1), PX + TICK, bsz=10, asz=900)
+        # Size stacked on the bid while price sits still.
+        for i in range(30):
+            book(b, 0.1 * (i + 1), PX, bsz=100 + 60 * i, asz=100)
         r = b.bar_read
-        assert r["read"] == "up", r
-        assert r["ticks"] > 0
+        assert r["read"] == "up"
+        assert r["price_dir"] == "flat"
 
-    def test_the_imbalance_sits_beside_the_read_not_inside_it(self):
-        """This asserted the read carried NO imbalance at all, which
-        was right while the read was price and nothing else. Chris
-        then asked for the imbalance to gate the trade -- "if OFI and
-        imbalance dont agree no trade" -- so it is reported here, and
-        the claim that survives is the one that mattered: the
-        DIRECTION is still price against the open, and the imbalance
-        is a separate field rather than a term in it.
-        """
+    def test_the_price_path_is_still_carried(self):
         b = builder()
         book(b, 0.0, PX)
         book(b, 1.0, PX + TICK)
         r = b.bar_read
-        # Reported, in its own fields.
-        assert "imbalance" in r and "imb" in r
-        # And the direction is still price's alone: a bar above its
-        # open reads up whatever the accumulator says.
-        assert r["read"] == "up"
+        assert "price_dir" in r and "ticks" in r
         assert r["ticks"] > 0
-        for k in ("lead", "gross", "share"):
-            assert k not in r, f"{k} leaked into the read"
-
-    def test_the_direction_ignores_the_imbalance(self):
-        """The two can disagree, and when they do the read still
-        follows price. The rule refuses the trade elsewhere -- that
-        is a decision about trading, not about what the bar did."""
-        b = builder()
-        book(b, 0.0, PX)
-        # Price up while size stacks on the ask: direction up,
-        # accumulator pushed the other way.
-        for i in range(8):
-            book(b, 1.0 + i, PX + TICK, bsz=10, asz=900)
-        r = b.bar_read
-        assert r["read"] == "up"
-        if r["imb"] == "down":
-            assert r["agrees"] is False
 
 
 class TestHoldAndCrossings:
@@ -296,3 +275,75 @@ class TestHoldAndCrossings:
         # Asking again changes nothing.
         assert b.bar_read["flips"] == once
         assert b.bar_read["flips"] == once
+
+
+class TestTheDeadbandStopsTheFlipping:
+    """Chris: "the flips in the OFI candles are killing the trades".
+
+    The accumulator crosses zero constantly, so reading its bare sign
+    made the candle change direction about three times a bar --
+    measured on a synthetic tape, 10,178 sign changes over 3,213
+    bars -- and every one was a flip exit on a trade that had not
+    gone wrong. Requiring it past the call level before it counts as
+    a side took that to 1.0 a bar at 500 and 0.4 at 1,000.
+
+    THE BAND IS THE LEVEL ALREADY ON THE PANEL. A second threshold
+    of its own would be a number to keep in step with that one for
+    no reason.
+    """
+
+    @staticmethod
+    def _b(level):
+        return OfiBarBuilder(tick_size=0.25, threshold=2000,
+                             max_s=900.0, min_updates=2,
+                             call_level=level)
+
+    def _lean(self, b, steps, up=True):
+        px = PX
+        b.on_book(0.0, px, 100, px + TICK, 100)
+        for i in range(steps):
+            if up:
+                b.on_book(1.0 + i, px, 100 + 60 * i, px + TICK, 100)
+            else:
+                b.on_book(1.0 + i, px, 100, px + TICK, 100 + 60 * i)
+        return b.bar_read
+
+    def test_inside_the_band_reads_flat(self):
+        r = self._lean(self._b(500), 3)
+        assert 0 < r["imbalance"] < 500
+        assert r["read"] == "flat"
+
+    def test_past_the_band_reads_up(self):
+        r = self._lean(self._b(500), 30)
+        assert r["imbalance"] >= 500
+        assert r["read"] == "up"
+
+    def test_past_the_band_reads_down(self):
+        r = self._lean(self._b(500), 30, up=False)
+        assert r["imbalance"] <= -500
+        assert r["read"] == "down"
+
+    def test_a_bigger_band_holds_out_longer(self):
+        """The control Chris turns when the flips are killing him."""
+        small = self._lean(self._b(100), 6)
+        big = self._lean(self._b(1500), 6)
+        assert small["read"] == "up"
+        assert big["read"] == "flat"
+        assert big["raw_side"] == "up"
+
+    def test_the_lean_is_still_reported(self):
+        """So the panel says "leaning up but inside your level"
+        rather than showing a blank, which is how a working band
+        gets mistaken for a dead feed."""
+        r = self._lean(self._b(1500), 6)
+        assert r["read"] == "flat"
+        assert r["raw_side"] == "up"
+        assert r["level"] == 1500
+
+    def test_the_band_is_the_panels_level(self):
+        assert self._b(250).bar_read["level"] == 250
+        assert self._b(1000).bar_read["level"] == 1000
+
+    def test_a_zero_band_is_the_old_sign_test(self):
+        r = self._lean(self._b(0), 3)
+        assert r["read"] == r["raw_side"] == "up"

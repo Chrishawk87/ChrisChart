@@ -612,7 +612,8 @@ def decide(t: Trade | None, s: Settings, px: float,
 STACK = ("15m", "5m", "1m")
 
 
-def signal(says: dict, read: str, price: str = "") -> tuple[str, str]:
+def signal(says: dict, read: str, price: str = "",
+           flip_ok: bool = True) -> tuple[str, str]:
     """The direction to trade, and what stopped it.
 
     Returns (side, blocked). `blocked` is "" when nothing stopped it,
@@ -650,6 +651,12 @@ def signal(says: dict, read: str, price: str = "") -> tuple[str, str]:
         # A flat price is not confirmation: the lean has not moved
         # anything yet, which is the case this check exists for.
         return "", "price"
+    # CVD AT THE FLIP POINT. The OFI says book pressure has changed
+    # direction; the CVD since that change says whether aggressive
+    # size actually followed it. A turn with nothing printing behind
+    # it is a suspect turn, and this is where those are refused.
+    if not flip_ok:
+        return "", "cvd"
     other = "down" if side == "up" else "up"
     if all(says.get(t) == other for t in STACK):
         return "", "stack"

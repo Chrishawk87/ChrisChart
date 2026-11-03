@@ -6473,7 +6473,8 @@ def create_app() -> FastAPI:
         # through a request and the fixture decides what the rule is
         # ever asked.
         side, blocked = jn_signal(
-            says, r, (read or {}).get("price_dir") or "")
+            says, r, (read or {}).get("price_dir") or "",
+            bool((read or {}).get("flip_ok")))
         return side, says, blocked
 
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
@@ -6678,7 +6679,11 @@ def create_app() -> FastAPI:
         # observation so a change does not turn the table into a
         # mixture of two rules.
         if level:
-            want_level = max(100, min(int(level), 500))
+            # Up to 1,500: the deadband that quiets the
+            # candle's flips is this same level, and 500
+            # was a cap on a control that was only ever a
+            # call threshold before.
+            want_level = max(50, min(int(level), 1500))
             for _b in builders.values():
                 _b.set_call_level(want_level)
 
@@ -7186,7 +7191,12 @@ def create_app() -> FastAPI:
                 "at_live": off == 0,
                 "oldest": off >= max(0, total - n),
                 "call_level": b.call_level,
-                "call_levels": [100, 150, 200, 250, 300, 400, 500],
+                # The high end is new: this level is also the
+                # deadband that stops the candle flipping, and
+                # measured flips fall from 3.2 a bar at zero to
+                # 1.0 at 500 and 0.4 at 1,000.
+                "call_levels": [100, 150, 200, 250, 300, 400,
+                                500, 750, 1000, 1250, 1500],
                 "reachable": b.reachable(),
                 "pivot_n": pv, "confirm_n": cf,
                 "clear_n": cl,
@@ -9063,7 +9073,11 @@ has to be running before the gate stops refusing.">spike
           taking.</b> Green is a buy and red is a sell; price has to
           be going the same way or there is no trade. It exits when
           price <b>diverges</b> from the lean &mdash; that is the take
-          profit &mdash; or when the candle flips.
+          profit &mdash; or when the candle flips. A turn the
+          <b>CVD has not followed</b> is a suspect turn and is not
+          traded: the OFI says book pressure changed direction, the
+          CVD since that moment says whether aggressive size actually
+          went with it.
           It holds until the candle reads the <b>other</b> way &mdash;
           going flat is not an exit, because closing on that was
           giving back about a tick every time. <b>One trade per OFI
@@ -14076,6 +14090,12 @@ function paintJournal(d) {
         + esc(J.would_be).toUpperCase() + ' but the delta is '
         + esc((R.delta_side || 'flat')).toUpperCase()
         + ' — they have to agree</span>'
+      : J.blocked === 'cvd'
+      ? '<b class="short">SUSPECT FLIP</b> <span class="thin">the OFI '
+        + 'turned ' + esc(J.would_be).toUpperCase() + ' but the CVD '
+        + 'since it turned is '
+        + Math.round(R.cvd_since_flip || 0).toLocaleString()
+        + ' — nothing has followed it through</span>'
       : J.blocked === 'stack'
       ? '<b class="short">VETOED</b> <span class="thin">the candle '
         + 'reads ' + esc(J.would_be).toUpperCase() + ' and all three '
@@ -14093,6 +14113,20 @@ function paintJournal(d) {
         + ' <span class="thin">(veto only)</span>')
       + '<div class="thin" style="margin-top:4px">candle &mdash; '
       + readBit
+      + (R.read === 'flat' && R.raw_side && R.raw_side !== 'flat'
+          ? ' <span class="thin">· leaning ' + esc(R.raw_side)
+            + ' but inside ±' + (R.level || 0).toLocaleString()
+            + '</span>'
+          : '')
+      + ' <span class="thin">· CVD since the turn </span>'
+      + ((R.cvd_since_flip || 0) > 0
+          ? '<b class="long">+' + Math.round(R.cvd_since_flip).toLocaleString() + '</b>'
+          : (R.cvd_since_flip || 0) < 0
+          ? '<b class="short">' + Math.round(R.cvd_since_flip).toLocaleString() + '</b>'
+          : '<b>0</b>')
+      + (R.read && R.read !== 'flat' && !R.flip_ok
+          ? ' <span class="short">· the turn is not confirmed</span>'
+          : '')
       + ' <span class="thin">· price </span>'
       + (R.price_dir === 'up' ? '<b class="long">UP</b>'
          : R.price_dir === 'down' ? '<b class="short">DOWN</b>'

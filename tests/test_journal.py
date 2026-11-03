@@ -1048,13 +1048,14 @@ class TestPriceConfirmsTheOfi:
         from liqmap.ofibar import OfiBarBuilder
 
         b = OfiBarBuilder(tick_size=0.25, threshold=2000,
-                          max_s=900.0, min_updates=2)
+                          max_s=900.0, min_updates=2, call_level=100)
         P, T = 1_000_000_000, 250_000_000
         px = 6700 * P
         b.on_book(0.0, px, 100, px + T, 100)
-        # Bid grows at an unchanged price: OFI up, price flat.
-        for i in range(6):
-            b.on_book(1.0 + i, px, 100 + 40 * i, px + T, 100)
+        # Bid grows at an unchanged price: OFI up, price flat. Past
+        # the deadband, which the read now requires.
+        for i in range(12):
+            b.on_book(1.0 + i, px, 100 + 60 * i, px + T, 100)
         r = b.bar_read
         assert r["read"] == "up"
         assert r["imbalance"] > 0
@@ -1085,12 +1086,12 @@ class TestPriceConfirmsTheOfi:
         from liqmap.ofibar import OfiBarBuilder
 
         b = OfiBarBuilder(tick_size=0.25, threshold=2000,
-                          max_s=900.0, min_updates=2)
+                          max_s=900.0, min_updates=2, call_level=100)
         P, T = 1_000_000_000, 250_000_000
         px = 6700 * P
         b.on_book(0.0, px, 100, px + T, 100)
-        for i in range(6):
-            b.on_book(1.0 + i, px, 100 + 40 * i, px + T, 100)
+        for i in range(12):
+            b.on_book(1.0 + i, px, 100 + 60 * i, px + T, 100)
         r = b.bar_read
         for k in ("read", "price_dir", "ticks"):
             assert k in r, k
@@ -1308,3 +1309,91 @@ class TestItOpensADatabaseFromAnEarlierBuild:
         declared = {n for n, _ in _ADDED}
         assert declared <= cols, declared - cols
         assert "bar_ts" in declared
+
+
+class TestCvdConfirmsTheFlip:
+    """Chris: "OFI tells you book pressure has changed direction, CVD
+    tells you aggressive funds are actually following through. Only
+    when both align do you confirm the flip."
+
+    MEASURED FROM THE TURN, NOT FROM THE BAR'S OPEN. Measuring the
+    whole bar would let buying from before the turn vouch for a turn
+    against it, which is the opposite of the check.
+    """
+
+    @staticmethod
+    def _sig(read, price, flip_ok):
+        from liqmap.journal import signal
+
+        return signal({}, read, price, flip_ok)
+
+    def test_a_confirmed_turn_trades(self):
+        assert self._sig("up", "up", True) == ("up", "")
+
+    def test_an_unconfirmed_turn_does_not(self):
+        assert self._sig("up", "up", False) == ("", "cvd")
+        assert self._sig("down", "down", False) == ("", "cvd")
+
+    def test_price_is_still_checked_first(self):
+        """Order matters only for which reason is shown, and the
+        price one is the more basic failure."""
+        assert self._sig("up", "down", False) == ("", "price")
+
+    def test_the_builder_measures_cvd_from_the_turn(self):
+        from liqmap.ofibar import OfiBarBuilder
+
+        P, T = 1_000_000_000, 250_000_000
+        px = 6700 * P
+        b = OfiBarBuilder(tick_size=0.25, threshold=4000, max_s=900.0,
+                          min_updates=2, call_level=200)
+        b.on_book(0.0, px, 100, px + T, 100)
+        # Heavy selling BEFORE the turn. If the check measured the
+        # whole bar this would hold the flip down for a long time --
+        # and if it measured it the wrong way round, vouch for it.
+        b.on_trade(0.5, 500.0, "sell")
+        for i in range(10):
+            b.on_book(1.0 + i, px, 100 + 60 * i, px + T, 100)
+        r = b.bar_read
+        assert r["read"] == "up"
+        assert r["cvd_since_flip"] == 0.0
+        assert r["flip_ok"] is False
+
+        b.on_trade(20.0, 300.0, "buy")
+        r = b.bar_read
+        assert r["cvd_since_flip"] == 300.0
+        assert r["flip_ok"] is True
+
+    def test_selling_after_an_up_turn_keeps_it_unconfirmed(self):
+        from liqmap.ofibar import OfiBarBuilder
+
+        P, T = 1_000_000_000, 250_000_000
+        px = 6700 * P
+        b = OfiBarBuilder(tick_size=0.25, threshold=4000, max_s=900.0,
+                          min_updates=2, call_level=200)
+        b.on_book(0.0, px, 100, px + T, 100)
+        for i in range(10):
+            b.on_book(1.0 + i, px, 100 + 60 * i, px + T, 100)
+        b.on_trade(20.0, 400.0, "sell")
+        r = b.bar_read
+        assert r["read"] == "up"
+        assert r["cvd_since_flip"] < 0
+        assert r["flip_ok"] is False
+
+    def test_a_flat_cvd_is_not_confirmation(self):
+        """"negative or flat -> suspect flip". Nothing has followed
+        it through either way."""
+        from liqmap.ofibar import OfiBarBuilder
+
+        P, T = 1_000_000_000, 250_000_000
+        px = 6700 * P
+        b = OfiBarBuilder(tick_size=0.25, threshold=4000, max_s=900.0,
+                          min_updates=2, call_level=200)
+        b.on_book(0.0, px, 100, px + T, 100)
+        for i in range(10):
+            b.on_book(1.0 + i, px, 100 + 60 * i, px + T, 100)
+        assert b.bar_read["cvd_since_flip"] == 0.0
+        assert b.bar_read["flip_ok"] is False
+
+    def test_the_route_passes_it_through(self):
+        blk = py_func("_agreement")
+        assert 'flip_ok' in blk

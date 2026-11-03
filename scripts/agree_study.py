@@ -122,7 +122,8 @@ class Result:
         return out
 
 
-def _side(dirs: dict, read: str, price: str = "") -> str:
+def _side(dirs: dict, read: str, price: str = "",
+          flip_ok: bool = True) -> str:
     """The direction to trade. "" for none.
 
     THE OFI CANDLE DECIDES and the stack only vetoes -- the same rule
@@ -133,7 +134,7 @@ def _side(dirs: dict, read: str, price: str = "") -> str:
     """
     from liqmap.journal import signal
 
-    side, _blocked = signal(dirs, read, price)
+    side, _blocked = signal(dirs, read, price, flip_ok)
     return side
 
 
@@ -222,7 +223,8 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
         dirs = _dirs(tape, ts, tape.book)
         br = ofi.bar_read or {}
         read = br.get("read") or ""
-        agree = _side(dirs, read, br.get("price_dir") or "")
+        agree = _side(dirs, read, br.get("price_dir") or "",
+                      bool(br.get("flip_ok")))
         bar_ts = float(br.get("bar_ts") or 0.0)
 
         # LOSING AGREEMENT IS NOT AN EXIT; ONLY A FLIP IS.

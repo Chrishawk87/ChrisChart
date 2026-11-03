@@ -703,7 +703,8 @@ class OfiBarBuilder:
                  "_c_side", "_c_px", "_c_ts", "_min_acc", "_hold_acc",
                  "_level", "_obj", "_confirm", "_max_calls", "_widen",
                  "_ep", "_eps", "_meas", "_pu", "_pd",
-                 "_r_sign", "_r_flips", "_r_since")
+                 "_r_sign", "_r_flips", "_r_since",
+                 "_o_sign", "_o_delta", "_o_ts")
 
     def __init__(self, tick_size: float = 0.25, threshold: int = 250,
                  max_s: float = 30.0, min_updates: int = 1,
@@ -795,6 +796,12 @@ class OfiBarBuilder:
         self._r_sign = 0
         self._r_flips = 0
         self._r_since = 0.0
+        self._o_sign = 0
+        self._o_delta = 0.0
+        self._o_ts = 0.0
+        self._o_sign = 0
+        self._o_delta = 0.0
+        self._o_ts = 0.0
         self._ep: Episode | None = None
         self._eps: list = []
         # The observation still being MEASURED -- a list, but it holds
@@ -810,6 +817,9 @@ class OfiBarBuilder:
         self._r_sign = 0
         self._r_flips = 0
         self._r_since = 0.0
+        self._o_sign = 0
+        self._o_delta = 0.0
+        self._o_ts = 0.0
         self.bars.clear()
         self.dropped = 0
         self._buy_agg = 0.0
@@ -973,7 +983,11 @@ class OfiBarBuilder:
         bar = self._bar
         if bar is None:
             return {"read": "", "imbalance": 0, "imb": "",
+                    "level": max(0, int(self._level)),
+                    "raw_side": "",
                     "delta": 0.0, "delta_side": "",
+                    "cvd_since_flip": 0.0, "flip_ts": 0.0,
+                    "flip_ok": False,
                     "price_dir": "", "agrees": False,
                     "open_px": 0.0, "last_px": 0.0,
                     "ticks": 0.0, "points": 0.0, "into_s": 0.0,
@@ -999,11 +1013,31 @@ class OfiBarBuilder:
         # payload as evidence rather than as the signal.
         acc = int(self._acc)
         dlt = float(self._buy_vol - self._sell_vol)
-        ofi_side = "up" if acc > 0 else "down" if acc < 0 else "flat"
+        # A DEADBAND, NOT A SIGN TEST.
+        #
+        # The accumulator crosses zero constantly, and reading its
+        # bare sign made the candle flip direction three times a bar
+        # on measurement -- every one of those a flip exit on a trade
+        # that had not gone wrong. Requiring it to be past the call
+        # level before it counts as a side took that to one flip a
+        # bar at 500 and to 0.4 at 1,000.
+        #
+        # THE LEVEL IS THE ONE ON THE PANEL. Chris already tunes it;
+        # giving the read a second threshold of its own would be a
+        # number to keep in step with that one for no reason.
+        band = max(0, int(self._level))
+        ofi_side = ("up" if acc >= band else
+                    "down" if acc <= -band else "flat")
         dlt_side = "up" if dlt > 0 else "down" if dlt < 0 else "flat"
         return {
             "read": ofi_side,
             "imbalance": acc,
+            # What it has to clear to count as a side, so the panel
+            # can say "leaning, but not past your level" instead of
+            # showing a blank.
+            "level": band,
+            "raw_side": ("up" if acc > 0 else "down" if acc < 0
+                         else "flat"),
             "imb": ofi_side,
             # THE PAID-FOR COLUMN, and the other half of the pair.
             # The imbalance is the book leaning; the delta is size
@@ -1012,6 +1046,16 @@ class OfiBarBuilder:
             # makes agreeing with each other worth anything.
             "delta": dlt,
             "delta_side": dlt_side,
+            # THE CVD SINCE THE OFI LAST TURNED, and whether it backs
+            # the turn. Chris: "OFI tells you book pressure has
+            # changed direction, CVD tells you aggressive funds are
+            # actually following through. Only when both align do you
+            # confirm the flip."
+            "cvd_since_flip": round(dlt - self._o_delta, 2),
+            "flip_ts": float(self._o_ts),
+            "flip_ok": bool(
+                (ofi_side == "up" and dlt - self._o_delta > 0)
+                or (ofi_side == "down" and dlt - self._o_delta < 0)),
             "agrees": (ofi_side == dlt_side
                        and ofi_side in ("up", "down")),
             "price_dir": ("up" if d > 0 else "down" if d < 0
@@ -1188,6 +1232,21 @@ class OfiBarBuilder:
         # in a property at read time would count only the changes a
         # caller happened to look at, which on a polled panel is a
         # different number every time it is asked.
+        # ---- the OFI side, and when it last changed ------------
+        #
+        # CVD CONFIRMS A FLIP WITH WHAT PRINTED AFTER IT, not with
+        # the whole bar. Measuring from the bar's open would let
+        # buying from before the turn vouch for a turn against it,
+        # which is the opposite of the check. So the delta is marked
+        # here, at the instant the side changes.
+        band = max(0, int(self._level))
+        o = (1 if self._acc >= band else
+             -1 if self._acc <= -band else 0)
+        if o and o != self._o_sign:
+            self._o_sign = o
+            self._o_delta = float(self._buy_vol - self._sell_vol)
+            self._o_ts = ts
+
         sign = (1 if mid > bar.open else -1 if mid < bar.open else 0)
         if sign and self._r_sign and sign != self._r_sign:
             self._r_flips += 1
@@ -1272,6 +1331,12 @@ class OfiBarBuilder:
         self._r_sign = 0
         self._r_flips = 0
         self._r_since = ts
+        # The OFI side, and the CVD reading at the moment it last
+        # changed. A flip is only confirmed by what has printed
+        # SINCE it, so the mark has to be taken when it happens.
+        self._o_sign = 0
+        self._o_delta = 0.0
+        self._o_ts = ts
 
     # -- observations inside the bar -----------------------------------
 

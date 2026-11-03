@@ -1504,7 +1504,7 @@ class TestTheLevelIsSelectable:
     def test_the_route_takes_a_level(self):
         r = self._route()
         assert "level: int = 0" in r
-        assert "want_level = max(100, min(int(level), 500))" in r
+        assert "want_level = max(50, min(int(level), 1500))" in r
 
     def test_it_is_applied_to_every_builder(self):
         """Or the ladder stops being comparable."""
@@ -1597,7 +1597,7 @@ class TestNoDictLiteralHasADuplicateKey:
         assert not bad, bad
 
     def test_the_dropdown_reads_its_own_key(self):
-        assert '"call_levels": [100, 150, 200, 250, 300, 400, 500],' in WEB
+        assert '"call_levels": [100, 150, 200, 250, 300, 400,' in WEB
         assert "(d.call_levels || []).map" in WEB
 
     def test_the_swing_rails_still_read_theirs(self):
