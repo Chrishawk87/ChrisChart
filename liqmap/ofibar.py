@@ -972,7 +972,9 @@ class OfiBarBuilder:
         """
         bar = self._bar
         if bar is None:
-            return {"read": "", "open_px": 0.0, "last_px": 0.0,
+            return {"read": "", "imbalance": 0, "imb": "",
+                    "agrees": False,
+                    "open_px": 0.0, "last_px": 0.0,
                     "ticks": 0.0, "points": 0.0, "into_s": 0.0,
                     "held_s": 0.0, "flips": 0, "bar_ts": 0.0,
                     "target": int(self.threshold), "forming": False}
@@ -984,8 +986,24 @@ class OfiBarBuilder:
         # goes through RAW_TICK and so does this one.
         d = bar.close - bar.open
         ticks = d / RAW_TICK
+        # THE IMBALANCE OF THIS BAR, beside its price direction.
+        #
+        # They are two different questions and Chris watched them
+        # disagree and lose: the candle reading up while the
+        # imbalance was down. The accumulator is what ENDS the bar;
+        # whether buying or selling is ahead inside it is a separate
+        # fact, and the rule now needs both.
+        #
+        # Carried here so there is one place that answers "what is
+        # this bar doing" -- a caller reaching into the builder for
+        # the second half is how the two come to be read at
+        # different instants.
+        acc = int(self._acc)
         return {
             "read": ("up" if d > 0 else "down" if d < 0 else "flat"),
+            "imbalance": acc,
+            "imb": ("up" if acc > 0 else "down" if acc < 0 else "flat"),
+            "agrees": ((d > 0 and acc > 0) or (d < 0 and acc < 0)),
             "open_px": float(bar.open), "last_px": float(bar.close),
             "ticks": round(ticks, 2),
             "points": round(d / POINT, 4),

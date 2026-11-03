@@ -4,7 +4,9 @@
     ENTRY   The OFI bar read -- where price sits against the open of
             the bar in progress. That is the whole signal. The 15m,
             5m and 1m do not vote; they VETO, and only when all three
-            point the other way.
+            point the other way. The bar's IMBALANCE must agree with
+            its price direction or there is no trade, and a candle is
+            traded twice at most, never twice the same way.
     EXIT    take profit, stop loss, or the agreement breaking --
             whichever comes first.
 
@@ -54,6 +56,7 @@ from liqmap.ofibar import OfiBarBuilder                  # noqa: E402
 POINT = 1_000_000_000
 RAW_TICK = POINT // 4
 STACK = ("15m", "5m", "1m")
+from liqmap.journal import MAX_PER_BAR  # noqa: E402
 SECS = {"15m": 900.0, "5m": 300.0, "1m": 60.0}
 
 
@@ -120,7 +123,7 @@ class Result:
         return out
 
 
-def _side(dirs: dict, read: str) -> str:
+def _side(dirs: dict, read: str, imb: str = "") -> str:
     """The direction to trade. "" for none.
 
     THE OFI CANDLE DECIDES and the stack only vetoes -- the same rule
@@ -131,7 +134,7 @@ def _side(dirs: dict, read: str) -> str:
     """
     from liqmap.journal import signal
 
-    side, _vetoed = signal(dirs, read)
+    side, _blocked = signal(dirs, read, imb)
     return side
 
 
@@ -189,6 +192,7 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
     open_t: Trade | None = None
     tp_raw, sl_raw = tp_pts * POINT, sl_pts * POINT
     next_eval, last_ts, last_mid = 0.0, 0.0, 0.0
+    cur_bar, taken = None, []
     # NO RE-ENTRY GATE. There was one, and it existed because
     # without it the P&L telescopes -- 4/2, 2/2 and no levels at all
     # came out at +216.00 to the cent, with only the win rate moving.
@@ -217,8 +221,10 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
         next_eval = ts + eval_s
 
         dirs = _dirs(tape, ts, tape.book)
-        read = (ofi.bar_read or {}).get("read") or ""
-        agree = _side(dirs, read)
+        br = ofi.bar_read or {}
+        read = br.get("read") or ""
+        agree = _side(dirs, read, br.get("imb") or "")
+        bar_ts = float(br.get("bar_ts") or 0.0)
 
         # LOSING AGREEMENT IS NOT AN EXIT; ONLY A FLIP IS.
         #
@@ -240,8 +246,22 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
         # closed, and the pieces sum to the one move. The take profit
         # therefore moves the win RATE and not the total. The report
         # says so rather than leaving it to be noticed.
-        if open_t is None and agree:
+        # TWO TO A CANDLE, NEVER TWO THE SAME WAY -- the same cap
+        # the panel applies. Without it one candle is traded the same
+        # way over and over, each one the same read on the same bar
+        # and charged a round trip.
+        if bar_ts != cur_bar:
+            cur_bar, taken = bar_ts, []
+        # NO BAR IDENTITY, NO CAP -- the same rule the journal's
+        # `sides_in_bar` applies when it is handed a zero. Capping
+        # against an unknown candle would charge every trade in the
+        # run to one imaginary bar and stop after two.
+        capped = bool(bar_ts) and (agree in taken
+                                   or len(taken) >= MAX_PER_BAR)
+        if open_t is None and agree and not capped:
             open_t = Trade(side=agree, ts_in=ts, px_in=mid)
+            if bar_ts:
+                taken.append(agree)
 
     if open_t is not None:
         # STILL OPEN AT THE END. Recorded as what it is: dropping it

@@ -201,13 +201,42 @@ class TestTheImbalanceDoesNotDecideTheDirection:
         assert r["read"] == "up", r
         assert r["ticks"] > 0
 
-    def test_the_read_carries_no_imbalance_figure(self):
+    def test_the_imbalance_sits_beside_the_read_not_inside_it(self):
+        """This asserted the read carried NO imbalance at all, which
+        was right while the read was price and nothing else. Chris
+        then asked for the imbalance to gate the trade -- "if OFI and
+        imbalance dont agree no trade" -- so it is reported here, and
+        the claim that survives is the one that mattered: the
+        DIRECTION is still price against the open, and the imbalance
+        is a separate field rather than a term in it.
+        """
         b = builder()
         book(b, 0.0, PX)
         book(b, 1.0, PX + TICK)
         r = b.bar_read
-        for k in ("ofi", "lead", "gross", "share", "acc", "imbalance"):
+        # Reported, in its own fields.
+        assert "imbalance" in r and "imb" in r
+        # And the direction is still price's alone: a bar above its
+        # open reads up whatever the accumulator says.
+        assert r["read"] == "up"
+        assert r["ticks"] > 0
+        for k in ("lead", "gross", "share"):
             assert k not in r, f"{k} leaked into the read"
+
+    def test_the_direction_ignores_the_imbalance(self):
+        """The two can disagree, and when they do the read still
+        follows price. The rule refuses the trade elsewhere -- that
+        is a decision about trading, not about what the bar did."""
+        b = builder()
+        book(b, 0.0, PX)
+        # Price up while size stacks on the ask: direction up,
+        # accumulator pushed the other way.
+        for i in range(8):
+            book(b, 1.0 + i, PX + TICK, bsz=10, asz=900)
+        r = b.bar_read
+        assert r["read"] == "up"
+        if r["imb"] == "down":
+            assert r["agrees"] is False
 
 
 class TestHoldAndCrossings:

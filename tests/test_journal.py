@@ -35,6 +35,28 @@ from tests.test_cme_panels import client  # noqa: F401,E402
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def py_func(name: str, path: str = "liqmap/web.py") -> str:
+    """A python function's whole body, found by indentation.
+
+    SIX TESTS IN THIS SUITE HAVE BROKEN on a fixed-width slice --
+    `src[i:i + 3000]` is an assertion about how long a function is,
+    and every comment added to it is a chance to fail a test whose
+    claim is still true. This reads to the first line indented no
+    further than the `def`.
+    """
+    src = (ROOT / path).read_text()
+    i = src.index(f"def {name}(")
+    start = src.rfind("\n", 0, i) + 1
+    indent = i - start
+    lines = src[start:].split("\n")
+    out = [lines[0]]
+    for line in lines[1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
 @pytest.fixture()
 def jn(tmp_path) -> Journal:
     return Journal(tmp_path / "journal.db")
@@ -93,9 +115,7 @@ class TestItDoesNotTrade:
     def test_the_payload_says_so_on_every_response(self):
         """Stated in the data, not only in a comment, so a reader of
         the API cannot mistake what auto means."""
-        src = (ROOT / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step")
-        assert '"places_orders": False' in src[i:i + 3000]
+        assert '"places_orders": False' in py_func("_journal_step")
 
 
 class TestATickIsTwelveFifty:
@@ -713,7 +733,10 @@ class TestTheCandleDecidesAndTheStackVetoes:
         """
         from liqmap.journal import signal
 
-        return signal({"15m": d15, "5m": d5, "1m": d1}, read)
+        # The imbalance is passed as agreeing unless a test says
+        # otherwise; its own rule is covered in its own class.
+        imb = read if read in ("up", "down") else ""
+        return signal({"15m": d15, "5m": d5, "1m": d1}, read, imb)
 
     def test_the_candle_alone_is_enough(self):
         assert self._side(None, None, None, "up") == ("up", "")
@@ -725,7 +748,7 @@ class TestTheCandleDecidesAndTheStackVetoes:
         assert self._side("down", "down", None, "up") == ("up", "")
 
     def test_all_three_against_vetoes_it(self):
-        assert self._side("down", "down", "down", "up") == ("", "up")
+        assert self._side("down", "down", "down", "up") == ("", "stack")
 
     def test_all_three_with_it_is_fine(self):
         assert self._side("up", "up", "up", "up") == ("up", "")
@@ -741,22 +764,22 @@ class TestTheCandleDecidesAndTheStackVetoes:
         assert self._side("up", None, "up", "down") == ("down", "")
 
     def test_the_route_calls_it_rather_than_copying_it(self):
-        src = (ROOT / "liqmap" / "web.py").read_text()
-        i = src.index("def _agreement(")
-        blk = src[i:src.index("def _journal_step(")]
-        assert "jn_signal(says, r)" in blk
+        blk = py_func("_agreement")
+        assert "jn_signal(says, r," in blk
         # The vote count is gone, not merely unused.
         assert "votes.count(way) >= MIN_AGREE" not in blk
         # And the rule is not re-written alongside the call.
         assert "all(says[t] == other" not in blk
 
     def test_the_veto_is_reported(self):
-        """A veto that fires invisibly is worse than no veto."""
+        """A block that fires invisibly is worse than no block -- it
+        reads as a market with nothing in it."""
+        blk = py_func("_journal_step")
+        assert '"blocked"' in blk
+        assert '"would_be"' in blk
         src = (ROOT / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step")
-        assert '"vetoed"' in src[i:i + 3000]
         j = src.index("function paintJournal(")
-        assert "VETOED" in src[j:j + 9000]
+        assert "VETOED" in src[j:j + 12000]
 
 
 class TestResettingTheTest:
@@ -969,3 +992,172 @@ class TestWhetherItIsWorthTrusting:
         assert "WORTH A CLOSER LOOK" in blk
         # Above the cost caveat, not buried under it.
         assert blk.index("NOT YET READABLE") < blk.index("round trip")
+
+
+class TestTheImbalanceMustAgree:
+    """Chris: "i have seen this make consecutive trades trying to
+    trade OFI is up but imbalance is down and it losses the trade ...
+    if OFI and imbalance dont agree no trade".
+
+    Two different facts about one bar: where price sits against the
+    open, and which side is ahead in the flow that will end the bar.
+    A bar where they disagree is being pushed one way on price while
+    the book leans the other.
+    """
+
+    @staticmethod
+    def _s(read, imb, says=None):
+        from liqmap.journal import signal
+
+        return signal(says or {}, read, imb)
+
+    def test_both_up_is_a_buy(self):
+        assert self._s("up", "up") == ("up", "")
+
+    def test_both_down_is_a_short(self):
+        assert self._s("down", "down") == ("down", "")
+
+    def test_candle_up_imbalance_down_is_no_trade(self):
+        assert self._s("up", "down") == ("", "imbalance")
+
+    def test_candle_down_imbalance_up_is_no_trade(self):
+        assert self._s("down", "up") == ("", "imbalance")
+
+    def test_a_flat_imbalance_is_not_agreement(self):
+        """It has not taken a side, so there is nothing to agree
+        with."""
+        assert self._s("up", "flat") == ("", "imbalance")
+        assert self._s("up", "") == ("", "imbalance")
+
+    def test_a_flat_candle_is_no_signal_either(self):
+        assert self._s("flat", "up") == ("", "")
+
+    def test_the_stack_veto_still_applies_on_top(self):
+        both = {"15m": "down", "5m": "down", "1m": "down"}
+        assert self._s("up", "up", both) == ("", "stack")
+
+    def test_the_builder_reports_both_from_one_place(self):
+        """A caller reaching into the builder for the second half is
+        how the two come to be read at different instants."""
+        from liqmap.ofibar import OfiBarBuilder
+
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000,
+                          max_s=900.0, min_updates=2)
+        P, T = 1_000_000_000, 250_000_000
+        px = 6700 * P
+        b.on_book(0.0, px, 100, px + T, 100)
+        b.on_book(1.0, px + T, 400, px + 2 * T, 100)
+        r = b.bar_read
+        for k in ("read", "imb", "imbalance", "agrees"):
+            assert k in r, k
+        assert r["agrees"] is (r["read"] == r["imb"]
+                               and r["read"] in ("up", "down"))
+
+
+class TestTwoTradesToACandle:
+    """Chris: "its trading the same ofi candle over and over again it
+    gets out of the trade and immediately gets back in ... we trade
+    the OFI candle at maximum of 2 times a candle ... its one trade
+    per direction".
+
+    Holding to a flip stopped the EXIT churning. It did nothing about
+    the entry: with re-entry immediate, one candle could be traded
+    the same way again and again, each one the same read on the same
+    bar and charged a round trip.
+    """
+
+    def _s(self):
+        from liqmap.journal import Settings
+
+        return Settings(coin="ES", auto=True)
+
+    def test_the_first_trade_opens(self):
+        from liqmap.journal import decide
+
+        assert decide(None, self._s(), 6700.0, "up",
+                      taken=()) == ("open", "up")
+
+    def test_the_same_direction_again_is_refused(self):
+        from liqmap.journal import decide
+
+        assert decide(None, self._s(), 6700.0, "up",
+                      taken=("up",)) == ("", "")
+
+    def test_the_other_direction_is_allowed(self):
+        from liqmap.journal import decide
+
+        assert decide(None, self._s(), 6700.0, "down",
+                      taken=("up",)) == ("open", "down")
+
+    def test_a_third_trade_is_refused(self):
+        from liqmap.journal import decide
+
+        assert decide(None, self._s(), 6700.0, "up",
+                      taken=("down", "up")) == ("", "")
+
+    def test_the_cap_holds_on_its_own(self):
+        """THE TWO RULES COINCIDE AT TWO DIRECTIONS, which hid a gap:
+        deleting the `len(taken) >= MAX_PER_BAR` check broke no test,
+        because one-per-direction already caps it at two when up and
+        down are the only sides.
+
+        This reaches the cap directly with a candle that somehow took
+        the same side twice -- not a state the rule above can
+        produce, which is exactly why the guard is worth keeping and
+        worth testing separately."""
+        from liqmap.journal import decide
+
+        assert decide(None, self._s(), 6700.0, "up",
+                      taken=("down", "down")) == ("", "")
+
+    def test_the_cap_is_two(self):
+        from liqmap.journal import MAX_PER_BAR
+
+        assert MAX_PER_BAR == 2
+
+    def test_the_count_comes_from_the_table(self, jn):
+        """FROM THE TABLE, NOT FROM MEMORY. A cap counted in a
+        variable resets on every restart, which on a poll-driven
+        column is indistinguishable from having no cap."""
+        jn.open_trade("ES", "up", 6700.0, bar_ts=111.0)
+        jn.close_trade("ES", 6701.0)
+        assert jn.sides_in_bar("ES", 111.0) == ("up",)
+        jn.open_trade("ES", "down", 6701.0, bar_ts=111.0)
+        jn.close_trade("ES", 6700.0)
+        assert jn.sides_in_bar("ES", 111.0) == ("up", "down")
+
+    def test_it_survives_a_restart(self, jn, tmp_path):
+        from liqmap.journal import Journal
+
+        jn.open_trade("ES", "up", 6700.0, bar_ts=222.0)
+        jn.close_trade("ES", 6701.0)
+        again = Journal(tmp_path / "journal.db")
+        assert again.sides_in_bar("ES", 222.0) == ("up",)
+
+    def test_the_next_candle_starts_clean(self, jn):
+        jn.open_trade("ES", "up", 6700.0, bar_ts=111.0)
+        jn.close_trade("ES", 6701.0)
+        jn.open_trade("ES", "down", 6701.0, bar_ts=111.0)
+        jn.close_trade("ES", 6700.0)
+        assert jn.sides_in_bar("ES", 111.0) == ("up", "down")
+        assert jn.sides_in_bar("ES", 222.0) == ()
+
+    def test_no_bar_id_means_no_cap_lookup(self, jn):
+        """A read with no forming bar must not make every trade ever
+        taken look like it belongs to candle zero."""
+        jn.open_trade("ES", "up", 6700.0, bar_ts=0.0)
+        jn.close_trade("ES", 6701.0)
+        assert jn.sides_in_bar("ES", 0.0) == ()
+
+    def test_the_route_passes_the_candle_through(self):
+        blk = py_func("_journal_step")
+        assert "j.sides_in_bar(coin_, bar_ts)" in blk
+        assert "bar_ts=bar_ts" in blk
+        assert "jn.decide(t, s, px, side, taken)" in blk
+
+    def test_the_panel_shows_what_the_candle_has_had(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function paintJournal(")
+        blk = src[i:i + 9000]
+        assert "taken_this_candle" in blk
+        assert "no more until the next one" in blk

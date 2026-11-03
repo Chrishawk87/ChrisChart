@@ -58,7 +58,12 @@ CREATE TABLE IF NOT EXISTS journal_trades (
     why        TEXT    NOT NULL DEFAULT '',
     tp         REAL    NOT NULL DEFAULT 0,
     sl         REAL    NOT NULL DEFAULT 0,
-    note       TEXT    NOT NULL DEFAULT ''
+    note       TEXT    NOT NULL DEFAULT '',
+    -- WHICH OFI CANDLE THIS TRADE BELONGS TO. The cap is two per
+    -- candle and one per direction, and a cap held only in memory
+    -- resets on every restart -- which on a poll-driven column is
+    -- indistinguishable from no cap at all.
+    bar_ts     REAL    NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS journal_open
     ON journal_trades (coin, closed_ts);
@@ -104,6 +109,7 @@ class Trade:
     tp: float = 0.0
     sl: float = 0.0
     note: str = ""
+    bar_ts: float = 0.0
 
     @property
     def open(self) -> bool:
@@ -312,7 +318,8 @@ def _trade_of(r: sqlite3.Row) -> Trade:
                  close_px=(float(r["close_px"])
                            if r["close_px"] is not None else None),
                  why=r["why"] or "", tp=float(r["tp"]),
-                 sl=float(r["sl"]), note=r["note"] or "")
+                 sl=float(r["sl"]), note=r["note"] or "",
+                 bar_ts=float(r["bar_ts"] or 0.0))
 
 
 class Journal(ThreadedDB):
@@ -363,7 +370,8 @@ class Journal(ThreadedDB):
 
     def open_trade(self, coin: str, side: str, px: float,
                    mode: str = "manual", ts: float | None = None,
-                   tp: float = 0.0, sl: float = 0.0) -> Trade | None:
+                   tp: float = 0.0, sl: float = 0.0,
+                   bar_ts: float = 0.0) -> Trade | None:
         """Open one. Returns None when one is already open.
 
         ONE AT A TIME, enforced here rather than in the page. A double
@@ -382,11 +390,11 @@ class Journal(ThreadedDB):
             with self._tx() as conn:
                 cur = conn.execute(
                     "INSERT INTO journal_trades"
-                    " (coin, side, mode, opened_ts, open_px, tp, sl)"
-                    " VALUES (?,?,?,?,?,?,?)",
+                    " (coin, side, mode, opened_ts, open_px, tp, sl,"
+                    "  bar_ts) VALUES (?,?,?,?,?,?,?,?)",
                     (str(coin), side, str(mode),
                      float(ts if ts is not None else time.time()),
-                     float(px), float(tp), float(sl)))
+                     float(px), float(tp), float(sl), float(bar_ts)))
                 new_id = int(cur.lastrowid)
         return self.get(new_id)
 
@@ -417,6 +425,21 @@ class Journal(ThreadedDB):
             "SELECT * FROM journal_trades WHERE id=?",
             (int(trade_id),)).fetchone()
         return _trade_of(r) if r else None
+
+    def sides_in_bar(self, coin: str, bar_ts: float) -> tuple:
+        """Which directions have already been opened in this candle.
+
+        FROM THE TABLE, NOT FROM MEMORY. The column is driven by a
+        poll and the process restarts; a cap counted in a variable
+        would reset on both, which is indistinguishable from having
+        no cap.
+        """
+        if not bar_ts:
+            return ()
+        rows = self._conn.execute(
+            "SELECT side FROM journal_trades WHERE coin=? AND bar_ts=?"
+            " ORDER BY id", (str(coin), float(bar_ts))).fetchall()
+        return tuple(r["side"] for r in rows)
 
     def closed(self, coin: str, limit: int = 200) -> list:
         rows = self._conn.execute(
@@ -479,7 +502,7 @@ def should_close(t: Trade, s: Settings, px: float,
 
 
 def decide(t: Trade | None, s: Settings, px: float,
-           agree: str) -> tuple[str, str]:
+           agree: str, taken: tuple = ()) -> tuple[str, str]:
     """What the journal should do right now: ("", "") to do nothing.
 
     ("close", why) or ("open", side).
@@ -514,41 +537,68 @@ def decide(t: Trade | None, s: Settings, px: float,
         if why == "flip" and t.mode != "auto":
             why = ""
         return ("close", why) if why else ("", "")
-    if s.auto and agree in ("up", "down"):
-        return "open", agree
-    return "", ""
+    if not s.auto or agree not in ("up", "down"):
+        return "", ""
+    # ONE TRADE PER DIRECTION, TWO PER CANDLE AT MOST.
+    #
+    # Chris: "its trading the same ofi candle over and over again it
+    # gets out of the trade and immediately gets back in". Holding to
+    # a flip stopped the exit churning; it did not stop the entry.
+    # With re-entry immediate, one candle could be traded the same
+    # way again and again -- and each of those is the same read, the
+    # same bar and the same idea, charged a round trip every time.
+    #
+    # `taken` is the sides already opened in THIS candle.
+    if agree in taken:
+        return "", ""
+    # THE TWO RULES COINCIDE AT TWO DIRECTIONS, so this one never
+    # fires while the one above stands -- deleting it broke no test
+    # until one was written that reaches it directly. Kept because
+    # the cap is the stated rule and the per-direction rule is the
+    # one most likely to be relaxed later.
+    if len(taken) >= MAX_PER_BAR:
+        return "", ""
+    return "open", agree
 
 
 STACK = ("15m", "5m", "1m")
 
 
-def signal(says: dict, read: str) -> tuple[str, str]:
-    """The direction to trade, and the direction that was vetoed.
+def signal(says: dict, read: str, imb: str = "") -> tuple[str, str]:
+    """The direction to trade, and what stopped it.
 
-    THE OFI CANDLE DECIDES. `read` is where price sits against the
-    open of the bar in progress and it is the whole signal -- the
-    three timeframes stopped voting when Chris said the column is
-    "supposed to be tracking the OFI candle making trades based on
-    that and nothing more".
+    Returns (side, blocked). `blocked` is "" when nothing stopped it,
+    otherwise "imbalance" or "stack", and the side it would have
+    taken is recoverable from `read`.
 
-    THE STACK IS A VETO AND ONLY A VETO, and only when ALL THREE
-    point the other way. Two against is not a veto; a silent row is
-    not opposed. That is the stack saying as clearly as it can that
-    the candle is running against everything above it.
+    THE CANDLE AND ITS IMBALANCE MUST AGREE. Chris watched it take
+    the price direction while the imbalance pointed the other way and
+    lose the trade: "if OFI and imbalance dont agree no trade". They
+    are two different facts about one bar -- where price sits against
+    the open, and which side is ahead in the flow that will end the
+    bar -- and a bar where they disagree is a bar being pushed one
+    way on price while the book leans the other.
 
-    FLAT IS NOT A DIRECTION -- price at its candle's open would
-    otherwise open a trade on a bar that has not moved.
+    THE STACK IS STILL A VETO AND ONLY A VETO, and only when all
+    three point the other way. Two against is not a veto; a silent
+    row is not opposed.
 
-    This lives here, not in the route, for the reason the auto gate
-    did: a rule inside a closure can only be reached through an HTTP
-    request, and the fixture that request goes through decides what
-    the rule is ever asked. Deleting the veto broke no test while it
-    lived there.
+    FLAT IS NOT A DIRECTION, on either of them.
     """
     side = read if read in ("up", "down") else ""
     if not side:
         return "", ""
+    if imb != side:
+        # Includes a flat or missing imbalance: it has not taken a
+        # side, so there is nothing for the candle to agree WITH.
+        return "", "imbalance"
     other = "down" if side == "up" else "up"
     if all(says.get(t) == other for t in STACK):
-        return "", side
+        return "", "stack"
     return side, ""
+
+
+# At most this many trades in one OFI candle, and never two the same
+# way. Chris: "we trade the OFI candle at maximum of 2 times a
+# candle ... its one trade per direction".
+MAX_PER_BAR = 2

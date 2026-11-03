@@ -6472,8 +6472,9 @@ def create_app() -> FastAPI:
         # it broke no test, because a closure can only be reached
         # through a request and the fixture decides what the rule is
         # ever asked.
-        side, vetoed = jn_signal(says, r)
-        return side, says, vetoed
+        side, blocked = jn_signal(says, r,
+                                  (read or {}).get("imb") or "")
+        return side, says, blocked
 
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
         """Close what should close, open what auto should open, report.
@@ -6491,6 +6492,8 @@ def create_app() -> FastAPI:
         px = _live_px(rt_, coin_)
         read = _bar_read(rt_)
         side, says, vetoed = _agreement(out_, read)
+        bar_ts = float(read.get("bar_ts") or 0.0)
+        taken = j.sides_in_bar(coin_, bar_ts)
 
         t = j.open_trade_for(coin_)
         closed = None
@@ -6499,16 +6502,18 @@ def create_app() -> FastAPI:
         # HTTP request through a fixture that never produced
         # agreement -- so deleting the auto check broke nothing that
         # any test could see.
-        act, arg = jn.decide(t, s, px, side)
+        act, arg = jn.decide(t, s, px, side, taken)
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
             t = None
-            act, arg = jn.decide(None, s, px, side)
+            taken = j.sides_in_bar(coin_, bar_ts)
+            act, arg = jn.decide(None, s, px, side, taken)
         if act == "open":
             t = j.open_trade(
-                coin_, arg, px, mode="auto",
+                coin_, arg, px, mode="auto", bar_ts=bar_ts,
                 tp=(s.tp_ticks if s.tp_on else 0.0),
                 sl=(s.sl_ticks if s.sl_on else 0.0))
+            taken = j.sides_in_bar(coin_, bar_ts)
 
         st = j.stats(coin_)
         return {
@@ -6524,8 +6529,14 @@ def create_app() -> FastAPI:
             "against": (", ".join(k for k, v in says.items()
                                   if v and v != side)
                         if side else ""),
-            # A VETO THAT FIRES INVISIBLY IS WORSE THAN NO VETO.
-            "vetoed": vetoed,
+            # WHAT STOPPED IT, when something did: "imbalance"
+            # or "stack". A block that fires invisibly is worse than
+            # no block -- it reads as a market with nothing in it.
+            "blocked": vetoed,
+            "would_be": ((read or {}).get("read") or "") if vetoed
+                        else "",
+            "taken_this_candle": list(taken),
+            "max_per_candle": jn.MAX_PER_BAR,
             # THE READ ITSELF, not only its direction. The column
             # could show which timeframe was holding a signal up and
             # not what the read was doing, which is the one of the
@@ -9041,9 +9052,13 @@ has to be running before the gate stops refusing.">spike
         <div class="msg" style="margin-bottom:8px"><b>The OFI candle
           decides.</b> The direction is where price sits against the
           open of the bar in progress, and that is the whole signal.
+          <b>The imbalance has to agree with it</b> &mdash; candle up
+          and imbalance up is a buy, candle down and imbalance down is
+          a short, and if they point different ways there is no trade.
           It holds until the candle reads the <b>other</b> way &mdash;
           going flat is not an exit, because closing on that was
-          giving back about a tick every time.
+          giving back about a tick every time. <b>Two trades to a
+          candle at most, and never two the same way.</b>
           The 15m, 5m and 1m are shown below but do not vote: they
           only <b>veto</b>, and only when all three point the other
           way. A tick is 0.25 and <b>$12.50</b>. These are logged
@@ -14027,6 +14042,17 @@ function paintJournal(d) {
      one most likely to be the reason a signal is not firing, and the
      column could name it without ever saying what it was doing. */
   const R = J.read || {};
+  /* THE CAP, VISIBLE. Two trades to a candle and never two the
+     same way -- without this on the screen a quiet column looks like
+     a quiet market rather than a candle that has had its turns. */
+  const taken = J.taken_this_candle || [];
+  const capBit = taken.length
+    ? ' <span class="thin">· this candle has had '
+      + taken.map(x => esc(x).toUpperCase()).join(' and ')
+      + (taken.length >= (J.max_per_candle || 2)
+          ? ' — no more until the next one' : '')
+      + '</span>'
+    : '';
   const readBit = (R.read)
     ? word(R.read === 'flat' ? null : R.read)
       + (R.read === 'flat' ? ' <span class="thin">FLAT</span>' : '')
@@ -14036,9 +14062,14 @@ function paintJournal(d) {
     : '<span class="thin">— no OFI bar forming</span>';
   const ag = $('jnlAgree');
   if (ag) {
-    ag.innerHTML = (J.vetoed
+    ag.innerHTML = (J.blocked === 'imbalance'
+      ? '<b class="short">NO TRADE</b> <span class="thin">the candle '
+        + 'reads ' + esc(J.would_be).toUpperCase() + ' but the '
+        + 'imbalance is ' + esc((R.imb || 'flat')).toUpperCase()
+        + ' — they have to agree</span>'
+      : J.blocked === 'stack'
       ? '<b class="short">VETOED</b> <span class="thin">the candle '
-        + 'reads ' + esc(J.vetoed).toUpperCase() + ' and all three '
+        + 'reads ' + esc(J.would_be).toUpperCase() + ' and all three '
         + 'timeframes point the other way</span>'
       : J.agree
       ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">CANDLE '
@@ -14051,8 +14082,18 @@ function paintJournal(d) {
         + ['15m', '5m', '1m'].map(k =>
             esc(k) + ' ' + word(says[k])).join(' <span class="thin">·</span> ')
         + ' <span class="thin">(veto only)</span>')
-      + '<div class="thin" style="margin-top:4px">read &mdash; '
-      + readBit + '</div>';
+      + '<div class="thin" style="margin-top:4px">candle &mdash; '
+      + readBit
+      + ' <span class="thin">· imbalance </span>'
+      + (R.imb === 'up' ? '<b class="long">UP</b>'
+         : R.imb === 'down' ? '<b class="short">DOWN</b>'
+         : '<b>FLAT</b>')
+      + ' <span class="thin">' + (R.imbalance || 0).toLocaleString()
+      + '</span>'
+      + (R.read && R.imb && !R.agrees
+          ? ' <span class="short">· they disagree, so no trade</span>'
+          : '')
+      + capBit + '</div>';
   }
 
   const op = $('jnlOpen');
