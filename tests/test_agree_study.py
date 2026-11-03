@@ -167,14 +167,14 @@ class TestTheOfiCandleDecides:
     def test_a_flat_candle_opens_nothing(self, monkeypatch, recs):
         monkeypatch.setattr(
             ag.OfiBarBuilder, "bar_read",
-            property(lambda self: {"read": "flat", "delta_side": "up"}))
+            property(lambda self: {"read": "flat", "price_dir": "up"}))
         r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
         assert r.n == 0
 
     def test_all_three_against_vetoes_it(self, monkeypatch, recs):
         monkeypatch.setattr(
             ag.OfiBarBuilder, "bar_read",
-            property(lambda self: {"read": "up", "delta_side": "up"}))
+            property(lambda self: {"read": "up", "price_dir": "up"}))
         monkeypatch.setattr(
             ag, "_dirs", lambda *a, **k: {t: "down" for t in ag.STACK})
         r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
@@ -183,7 +183,7 @@ class TestTheOfiCandleDecides:
     def test_two_against_does_not(self, monkeypatch, recs):
         monkeypatch.setattr(
             ag.OfiBarBuilder, "bar_read",
-            property(lambda self: {"read": "up", "delta_side": "up"}))
+            property(lambda self: {"read": "up", "price_dir": "up"}))
         monkeypatch.setattr(
             ag, "_dirs",
             lambda *a, **k: {"15m": "down", "5m": "down", "1m": None})
@@ -196,7 +196,7 @@ class TestTheOfiCandleDecides:
         panel's rule once already."""
         src = (ROOT / "scripts" / "agree_study.py").read_text()
         assert "from liqmap.journal import signal" in src
-        assert "signal(dirs, read, delta)" in src
+        assert "signal(dirs, read, price)" in src
 
 
 class TestLosingDirectionIsNotAnExit:
@@ -235,7 +235,7 @@ class TestTheHonestAccounting:
             ag, "_dirs", lambda *a, **k: {t: "up" for t in ag.STACK})
         monkeypatch.setattr(
             ag.OfiBarBuilder, "bar_read",
-            property(lambda self: {"read": "up", "delta_side": "up"}))
+            property(lambda self: {"read": "up", "price_dir": "up"}))
         r = ag.run(recs, 0.0, 0.0, target=2000, eval_s=1.0)
         assert r.by_reason().get("end", {}).get("n", 0) == 1
 

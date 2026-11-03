@@ -6473,7 +6473,7 @@ def create_app() -> FastAPI:
         # through a request and the fixture decides what the rule is
         # ever asked.
         side, blocked = jn_signal(
-            says, r, (read or {}).get("delta_side") or "")
+            says, r, (read or {}).get("price_dir") or "")
         return side, says, blocked
 
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
@@ -6502,13 +6502,15 @@ def create_app() -> FastAPI:
         # HTTP request through a fixture that never produced
         # agreement -- so deleting the auto check broke nothing that
         # any test could see.
-        act, arg = jn.decide(t, s, px, side, taken)
+        act, arg = jn.decide(t, s, px, side, taken,
+                             (read or {}).get("price_dir") or "")
         idle_why = arg if act == "" else ""
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
             t = None
             taken = j.sides_in_bar(coin_, bar_ts)
-            act, arg = jn.decide(None, s, px, side, taken)
+            act, arg = jn.decide(None, s, px, side, taken,
+                                 (read or {}).get("price_dir") or "")
             idle_why = arg if act == "" else ""
         if act == "open":
             t = j.open_trade(
@@ -9057,10 +9059,11 @@ has to be running before the gate stops refusing.">spike
         <div class="msg" style="margin-bottom:8px"><b>The OFI candle
           decides.</b> Up when the candle is green, down when it is
           red &mdash; the imbalance of the bar in progress.
-          <b>The OFI and the delta have to agree</b> &mdash; the OFI
-          is the book leaning, which is what makes the candle green or
-          red; the delta is size that actually printed. Both up is a
-          buy, both down is a short, different ways is no trade.
+          <b>The OFI picks the side, price says whether it is worth
+          taking.</b> Green is a buy and red is a sell; price has to
+          be going the same way or there is no trade. It exits when
+          price <b>diverges</b> from the lean &mdash; that is the take
+          profit &mdash; or when the candle flips.
           It holds until the candle reads the <b>other</b> way &mdash;
           going flat is not an exit, because closing on that was
           giving back about a tick every time. <b>One trade per OFI
@@ -14068,7 +14071,7 @@ function paintJournal(d) {
     : '<span class="thin">— no OFI bar forming</span>';
   const ag = $('jnlAgree');
   if (ag) {
-    ag.innerHTML = (J.blocked === 'delta'
+    ag.innerHTML = (J.blocked === 'price'
       ? '<b class="short">NO TRADE</b> <span class="thin">the OFI is '
         + esc(J.would_be).toUpperCase() + ' but the delta is '
         + esc((R.delta_side || 'flat')).toUpperCase()
@@ -14090,13 +14093,13 @@ function paintJournal(d) {
         + ' <span class="thin">(veto only)</span>')
       + '<div class="thin" style="margin-top:4px">candle &mdash; '
       + readBit
-      + ' <span class="thin">· delta </span>'
-      + (R.delta_side === 'up' ? '<b class="long">UP</b>'
-         : R.delta_side === 'down' ? '<b class="short">DOWN</b>'
+      + ' <span class="thin">· price </span>'
+      + (R.price_dir === 'up' ? '<b class="long">UP</b>'
+         : R.price_dir === 'down' ? '<b class="short">DOWN</b>'
          : '<b>FLAT</b>')
-      + ' <span class="thin">' + Math.round(R.delta || 0).toLocaleString()
-      + '</span>'
-      + (R.read && R.delta_side && !R.agrees
+      + ' <span class="thin">' + ((R.ticks > 0 ? '+' : '')
+          + (R.ticks || 0).toFixed(2)) + ' ticks</span>'
+      + (R.read && R.price_dir && R.read !== R.price_dir
           ? ' <span class="short">· they disagree, so no trade</span>'
           : '')
       + capBit

@@ -496,7 +496,7 @@ class Journal(ThreadedDB):
 
 
 def should_close(t: Trade, s: Settings, px: float,
-                 agree: str) -> str:
+                 agree: str, diverged: str = "") -> str:
     """Why this open trade should end now, or "" to hold it.
 
     LOSING AGREEMENT IS NOT AN EXIT. ONLY A FLIP IS.
@@ -528,11 +528,23 @@ def should_close(t: Trade, s: Settings, px: float,
     other = "down" if t.side == "up" else "up"
     if agree == other:
         return "flip"
+    # DIVERGENCE IS THE TAKE PROFIT. Chris: "taking profit when you
+    # feel it should be taken based on the OFI and price divergence".
+    # The trade was opened because the OFI lean and price were going
+    # the same way; when price stops going that way the reason for
+    # being in it has gone, whether or not the lean has flipped.
+    #
+    # Only once price has gone the OTHER way -- flat is not
+    # divergence. Closing on flat is what gave back a tick at a time
+    # when the exit last fired on noise.
+    if diverged == other:
+        return "diverge"
     return ""
 
 
 def decide(t: Trade | None, s: Settings, px: float,
-           agree: str, taken: tuple = ()) -> tuple[str, str]:
+           agree: str, taken: tuple = (),
+           price: str = "") -> tuple[str, str]:
     """What the journal should do right now.
 
     ("open", side), ("close", why), or ("", reason) -- and the reason
@@ -567,8 +579,8 @@ def decide(t: Trade | None, s: Settings, px: float,
     if not px or px <= 0:
         return "", "no live price -- the tape has not printed"
     if t is not None and t.open:
-        why = should_close(t, s, px, agree)
-        if why == "flip" and t.mode != "auto":
+        why = should_close(t, s, px, agree, price)
+        if why in ("flip", "diverge") and t.mode != "auto":
             why = ""
         return ("close", why) if why else ("", "a trade is already open")
     if not s.auto:
@@ -600,20 +612,25 @@ def decide(t: Trade | None, s: Settings, px: float,
 STACK = ("15m", "5m", "1m")
 
 
-def signal(says: dict, read: str, delta: str = "") -> tuple[str, str]:
+def signal(says: dict, read: str, price: str = "") -> tuple[str, str]:
     """The direction to trade, and what stopped it.
 
     Returns (side, blocked). `blocked` is "" when nothing stopped it,
     otherwise "imbalance" or "stack", and the side it would have
     taken is recoverable from `read`.
 
-    THE OFI AND THE DELTA MUST AGREE. Chris: "take trades when the
-    delta and OFI agree". The OFI is the book leaning -- the
-    accumulator that decides whether this candle closes green or red.
-    The delta is size that actually printed, by the side CME stated,
-    and cannot be pulled back. They are genuinely different
-    measurements, which is the only reason agreeing with each other
-    is worth anything.
+    THE OFI PICKS THE SIDE; PRICE SAYS WHETHER IT IS WORTH TAKING.
+    Chris: "if the OFI candle shows down then take a sell if it shows
+    a buy then take a buy ... you are going to see OFI but then check
+    price to verify that the move that OFI is making is one worth
+    taking".
+
+    The delta was the confirmation for a while and is not any more --
+    he watched the candle read correctly on its own and wanted price,
+    not prints, as the check. The OFI is the book leaning, which is
+    what makes the candle green or red; price is whether that lean is
+    actually moving the market. A candle leaning hard with price
+    going nowhere is the lean not being paid for.
 
     `read` here is the OFI side, which is the candle's colour: green
     is up, red is down. It is NOT price against the bar's open --
@@ -629,10 +646,10 @@ def signal(says: dict, read: str, delta: str = "") -> tuple[str, str]:
     side = read if read in ("up", "down") else ""
     if not side:
         return "", ""
-    if delta != side:
-        # Includes a flat or missing delta: nothing has printed, so
-        # there is nothing for the candle to agree WITH.
-        return "", "delta"
+    if price != side:
+        # A flat price is not confirmation: the lean has not moved
+        # anything yet, which is the case this check exists for.
+        return "", "price"
     other = "down" if side == "up" else "up"
     if all(says.get(t) == other for t in STACK):
         return "", "stack"

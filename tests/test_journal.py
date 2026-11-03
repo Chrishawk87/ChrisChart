@@ -994,15 +994,15 @@ class TestWhetherItIsWorthTrusting:
         assert blk.index("NOT YET READABLE") < blk.index("round trip")
 
 
-class TestTheOfiAndDeltaMustAgree:
-    """Chris: "can you pair the OFI and take trades when the delta
-    and OFI agree".
+class TestPriceConfirmsTheOfi:
+    """Chris: "you are going to see OFI but then check price to
+    verify that the move that OFI is making is one worth taking".
 
-    The OFI is the book leaning -- the accumulator that decides
-    whether this candle closes green or red. The delta is size that
-    actually printed, by the side CME stated, and cannot be pulled
-    back. Genuinely different measurements, which is the only reason
-    agreeing is worth anything.
+    The delta was the confirmation for a day and is not any more. The
+    OFI is the book leaning, which makes the candle green or red;
+    price is whether that lean is actually moving the market. A
+    candle leaning hard with price going nowhere is a lean nobody is
+    paying for.
 
     THE READ IS THE CANDLE'S COLOUR, not price against its open.
     That distinction cost a day: the read measured the price path
@@ -1011,10 +1011,10 @@ class TestTheOfiAndDeltaMustAgree:
     """
 
     @staticmethod
-    def _s(read, delta, says=None):
+    def _s(read, price, says=None):
         from liqmap.journal import signal
 
-        return signal(says or {}, read, delta)
+        return signal(says or {}, read, price)
 
     def test_both_up_is_a_buy(self):
         assert self._s("up", "up") == ("up", "")
@@ -1022,16 +1022,17 @@ class TestTheOfiAndDeltaMustAgree:
     def test_both_down_is_a_short(self):
         assert self._s("down", "down") == ("down", "")
 
-    def test_ofi_up_delta_down_is_no_trade(self):
-        assert self._s("up", "down") == ("", "delta")
+    def test_ofi_up_price_down_is_no_trade(self):
+        assert self._s("up", "down") == ("", "price")
 
-    def test_ofi_down_delta_up_is_no_trade(self):
-        assert self._s("down", "up") == ("", "delta")
+    def test_ofi_down_price_up_is_no_trade(self):
+        assert self._s("down", "up") == ("", "price")
 
-    def test_a_flat_delta_is_not_agreement(self):
-        """Nothing printed, so there is nothing to agree with."""
-        assert self._s("up", "flat") == ("", "delta")
-        assert self._s("up", "") == ("", "delta")
+    def test_a_flat_price_is_not_confirmation(self):
+        """The lean has not moved anything yet, which is the case
+        this check exists for."""
+        assert self._s("up", "flat") == ("", "price")
+        assert self._s("up", "") == ("", "price")
 
     def test_a_flat_candle_is_no_signal_either(self):
         assert self._s("flat", "up") == ("", "")
@@ -1059,6 +1060,27 @@ class TestTheOfiAndDeltaMustAgree:
         assert r["imbalance"] > 0
         assert r["price_dir"] == "flat"      # carried, not the signal
 
+    def test_divergence_takes_the_profit(self):
+        """Chris: "taking profit when you feel it should be taken
+        based on the OFI and price divergence". The trade was opened
+        because the lean and price agreed; when price stops going
+        that way the reason for being in it has gone."""
+        from liqmap.journal import Settings, Trade, should_close
+
+        s = Settings(auto=True)
+        t = Trade(side="up", open_px=6700.0, mode="auto")
+        assert should_close(t, s, 6700.0, "up", "down") == "diverge"
+
+    def test_flat_price_is_not_divergence(self):
+        """Closing on flat is what gave back a tick at a time when
+        the exit last fired on noise."""
+        from liqmap.journal import Settings, Trade, should_close
+
+        s = Settings(auto=True)
+        t = Trade(side="up", open_px=6700.0, mode="auto")
+        assert should_close(t, s, 6700.0, "up", "flat") == ""
+        assert should_close(t, s, 6700.0, "up", "up") == ""
+
     def test_the_builder_reports_both_from_one_place(self):
         from liqmap.ofibar import OfiBarBuilder
 
@@ -1069,14 +1091,10 @@ class TestTheOfiAndDeltaMustAgree:
         b.on_book(0.0, px, 100, px + T, 100)
         for i in range(6):
             b.on_book(1.0 + i, px, 100 + 40 * i, px + T, 100)
-        b.on_trade(9.0, 50.0, "buy")
         r = b.bar_read
-        for k in ("read", "delta", "delta_side", "agrees"):
+        for k in ("read", "price_dir", "ticks"):
             assert k in r, k
-        assert r["read"] == "up" and r["delta_side"] == "up"
-        assert r["agrees"] is True
-        b.on_trade(10.0, 200.0, "sell")
-        assert b.bar_read["agrees"] is False
+        assert r["read"] == "up"
 
 
 class TestOneTradePerCandle:
@@ -1180,7 +1198,7 @@ class TestOneTradePerCandle:
         blk = py_func("_journal_step")
         assert "j.sides_in_bar(coin_, bar_ts)" in blk
         assert "bar_ts=bar_ts" in blk
-        assert "jn.decide(t, s, px, side, taken)" in blk
+        assert "jn.decide(t, s, px, side, taken," in blk
 
     def test_the_panel_shows_what_the_candle_has_had(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
