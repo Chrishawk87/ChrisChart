@@ -533,9 +533,13 @@ def should_close(t: Trade, s: Settings, px: float,
 
 def decide(t: Trade | None, s: Settings, px: float,
            agree: str, taken: tuple = ()) -> tuple[str, str]:
-    """What the journal should do right now: ("", "") to do nothing.
+    """What the journal should do right now.
 
-    ("close", why) or ("open", side).
+    ("open", side), ("close", why), or ("", reason) -- and the reason
+    is never blank when nothing happens. A column that goes quiet
+    without saying why is the failure that has cost the most time on
+    this panel: it reads as a market with nothing in it, and it has
+    meant a missing read, a stale cap and a switch left off.
 
     THE POLICY LIVES HERE, NOT IN THE ROUTE. It was in a route
     closure, where the only way to reach it was an HTTP request
@@ -561,14 +565,16 @@ def decide(t: Trade | None, s: Settings, px: float,
     re-entries so it can be seen happening rather than inferred.
     """
     if not px or px <= 0:
-        return "", ""
+        return "", "no live price -- the tape has not printed"
     if t is not None and t.open:
         why = should_close(t, s, px, agree)
         if why == "flip" and t.mode != "auto":
             why = ""
-        return ("close", why) if why else ("", "")
-    if not s.auto or agree not in ("up", "down"):
-        return "", ""
+        return ("close", why) if why else ("", "a trade is already open")
+    if not s.auto:
+        return "", "AUTO is off -- the button says MANUAL"
+    if agree not in ("up", "down"):
+        return "", "no signal"
     # ONE TRADE PER DIRECTION, TWO PER CANDLE AT MOST.
     #
     # Chris: "its trading the same ofi candle over and over again it
@@ -580,34 +586,39 @@ def decide(t: Trade | None, s: Settings, px: float,
     #
     # `taken` is the sides already opened in THIS candle.
     if agree in taken:
-        return "", ""
+        return "", f"this candle has already taken its {agree}"
     # THE TWO RULES COINCIDE AT TWO DIRECTIONS, so this one never
     # fires while the one above stands -- deleting it broke no test
     # until one was written that reaches it directly. Kept because
     # the cap is the stated rule and the per-direction rule is the
     # one most likely to be relaxed later.
     if len(taken) >= MAX_PER_BAR:
-        return "", ""
+        return "", "this candle has had its two trades"
     return "open", agree
 
 
 STACK = ("15m", "5m", "1m")
 
 
-def signal(says: dict, read: str, imb: str = "") -> tuple[str, str]:
+def signal(says: dict, read: str, delta: str = "") -> tuple[str, str]:
     """The direction to trade, and what stopped it.
 
     Returns (side, blocked). `blocked` is "" when nothing stopped it,
     otherwise "imbalance" or "stack", and the side it would have
     taken is recoverable from `read`.
 
-    THE CANDLE AND ITS IMBALANCE MUST AGREE. Chris watched it take
-    the price direction while the imbalance pointed the other way and
-    lose the trade: "if OFI and imbalance dont agree no trade". They
-    are two different facts about one bar -- where price sits against
-    the open, and which side is ahead in the flow that will end the
-    bar -- and a bar where they disagree is a bar being pushed one
-    way on price while the book leans the other.
+    THE OFI AND THE DELTA MUST AGREE. Chris: "take trades when the
+    delta and OFI agree". The OFI is the book leaning -- the
+    accumulator that decides whether this candle closes green or red.
+    The delta is size that actually printed, by the side CME stated,
+    and cannot be pulled back. They are genuinely different
+    measurements, which is the only reason agreeing with each other
+    is worth anything.
+
+    `read` here is the OFI side, which is the candle's colour: green
+    is up, red is down. It is NOT price against the bar's open --
+    that was measured and called the read for a while, and it is a
+    different fact that disagrees often.
 
     THE STACK IS STILL A VETO AND ONLY A VETO, and only when all
     three point the other way. Two against is not a veto; a silent
@@ -618,17 +629,17 @@ def signal(says: dict, read: str, imb: str = "") -> tuple[str, str]:
     side = read if read in ("up", "down") else ""
     if not side:
         return "", ""
-    if imb != side:
-        # Includes a flat or missing imbalance: it has not taken a
-        # side, so there is nothing for the candle to agree WITH.
-        return "", "imbalance"
+    if delta != side:
+        # Includes a flat or missing delta: nothing has printed, so
+        # there is nothing for the candle to agree WITH.
+        return "", "delta"
     other = "down" if side == "up" else "up"
     if all(says.get(t) == other for t in STACK):
         return "", "stack"
     return side, ""
 
 
-# At most this many trades in one OFI candle, and never two the same
-# way. Chris: "we trade the OFI candle at maximum of 2 times a
-# candle ... its one trade per direction".
-MAX_PER_BAR = 2
+# ONE TRADE PER OFI CANDLE. Chris: "we only ever use the current
+# candle and thats all taking one trade per OFI candle". It was two;
+# one is what he asked for after watching it run.
+MAX_PER_BAR = 1

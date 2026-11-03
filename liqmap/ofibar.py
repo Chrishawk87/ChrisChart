@@ -973,37 +973,49 @@ class OfiBarBuilder:
         bar = self._bar
         if bar is None:
             return {"read": "", "imbalance": 0, "imb": "",
-                    "agrees": False,
+                    "delta": 0.0, "delta_side": "",
+                    "price_dir": "", "agrees": False,
                     "open_px": 0.0, "last_px": 0.0,
                     "ticks": 0.0, "points": 0.0, "into_s": 0.0,
                     "held_s": 0.0, "flips": 0, "bar_ts": 0.0,
                     "target": int(self.threshold), "forming": False}
-        # RAW UNITS IN, TICKS OUT. The bar's prices are raw -- a point
-        # is 1_000_000_000 of them -- and `self.tick` is 0.25, a price
-        # tick. Dividing one by the other gives a number four billion
-        # times too big, which on the panel reads as a one-tick move
-        # being a thousand points. Every other converter on this class
-        # goes through RAW_TICK and so does this one.
+        # RAW UNITS IN, TICKS OUT. The bar's prices are raw -- a
+        # point is 1_000_000_000 of them -- and `self.tick` is 0.25.
         d = bar.close - bar.open
         ticks = d / RAW_TICK
-        # THE IMBALANCE OF THIS BAR, beside its price direction.
+
+        # THE READ IS THE OFI, NOT THE PRICE PATH.
         #
-        # They are two different questions and Chris watched them
-        # disagree and lose: the candle reading up while the
-        # imbalance was down. The accumulator is what ENDS the bar;
-        # whether buying or selling is ahead inside it is a separate
-        # fact, and the rule now needs both.
+        # This measured price against the bar's open and called that
+        # the read. That is not what Chris is looking at: the chart
+        # colours a candle GREEN when its imbalance crossed +target
+        # and RED when it crossed -target, and he reads the candle by
+        # its colour. Price against the open is a different fact
+        # about the same bar, and the two disagree often -- which is
+        # why pairing them refused nearly every trade.
         #
-        # Carried here so there is one place that answers "what is
-        # this bar doing" -- a caller reaching into the builder for
-        # the second half is how the two come to be read at
-        # different instants.
+        # So the direction is the accumulator's sign, which is what
+        # the colour will be, and the price distance stays in the
+        # payload as evidence rather than as the signal.
         acc = int(self._acc)
+        dlt = float(self._buy_vol - self._sell_vol)
+        ofi_side = "up" if acc > 0 else "down" if acc < 0 else "flat"
+        dlt_side = "up" if dlt > 0 else "down" if dlt < 0 else "flat"
         return {
-            "read": ("up" if d > 0 else "down" if d < 0 else "flat"),
+            "read": ofi_side,
             "imbalance": acc,
-            "imb": ("up" if acc > 0 else "down" if acc < 0 else "flat"),
-            "agrees": ((d > 0 and acc > 0) or (d < 0 and acc < 0)),
+            "imb": ofi_side,
+            # THE PAID-FOR COLUMN, and the other half of the pair.
+            # The imbalance is the book leaning; the delta is size
+            # that actually printed and cannot be pulled back. They
+            # are genuinely different measurements, which is what
+            # makes agreeing with each other worth anything.
+            "delta": dlt,
+            "delta_side": dlt_side,
+            "agrees": (ofi_side == dlt_side
+                       and ofi_side in ("up", "down")),
+            "price_dir": ("up" if d > 0 else "down" if d < 0
+                          else "flat"),
             "open_px": float(bar.open), "last_px": float(bar.close),
             "ticks": round(ticks, 2),
             "points": round(d / POINT, 4),

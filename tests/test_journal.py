@@ -297,18 +297,18 @@ class TestTheAutoSwitch:
     OFF = Settings(auto=False)
 
     def test_auto_off_opens_nothing(self):
-        assert decide(None, self.OFF, 6700.0, "up") == ("", "")
-        assert decide(None, self.OFF, 6700.0, "down") == ("", "")
+        assert decide(None, self.OFF, 6700.0, "up")[0] == ""
+        assert decide(None, self.OFF, 6700.0, "down")[0] == ""
 
     def test_auto_on_opens_on_agreement(self):
         assert decide(None, self.OPEN, 6700.0, "up") == ("open", "up")
         assert decide(None, self.OPEN, 6700.0, "down") == ("open", "down")
 
     def test_auto_on_opens_nothing_without_agreement(self):
-        assert decide(None, self.OPEN, 6700.0, "") == ("", "")
+        assert decide(None, self.OPEN, 6700.0, "")[0] == ""
 
     def test_no_price_does_nothing(self):
-        assert decide(None, self.OPEN, 0.0, "up") == ("", "")
+        assert decide(None, self.OPEN, 0.0, "up")[0] == ""
 
     def test_an_auto_row_closes_on_a_flip(self):
         t = Trade(side="up", open_px=6700.0, mode="auto")
@@ -317,12 +317,12 @@ class TestTheAutoSwitch:
 
     def test_an_auto_row_holds_through_neutral(self):
         t = Trade(side="up", open_px=6700.0, mode="auto")
-        assert decide(t, self.OPEN, 6700.0, "") == ("", "")
+        assert decide(t, self.OPEN, 6700.0, "")[0] == ""
 
     def test_a_manual_row_is_not_flipped_out_of(self):
         """Chris took it by hand; it is his to end."""
         t = Trade(side="up", open_px=6700.0, mode="manual")
-        assert decide(t, self.OPEN, 6700.0, "down") == ("", "")
+        assert decide(t, self.OPEN, 6700.0, "down")[0] == ""
 
     def test_a_manual_row_still_respects_his_stop(self):
         """The levels are settings he turned on. Ignoring them until
@@ -629,7 +629,7 @@ class TestTheFourthSignalIsActuallyThere:
         from liqmap import journal as jn
 
         assert jn.decide(None, jn.Settings(auto=True), 6700.0,
-                         "flat") == ("", "")
+                         "flat")[0] == ""
 
     def test_the_page_draws_the_read(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
@@ -673,7 +673,7 @@ class TestAutoEntryAndExitFire:
         from liqmap.journal import Trade, decide
 
         t = Trade(side="down", open_px=6700.0, mode="auto")
-        assert decide(t, self._s(), 6700.0, "") == ("", "")
+        assert decide(t, self._s(), 6700.0, "")[0] == ""
 
     def test_it_exits_on_the_target(self):
         from liqmap.journal import Trade, decide
@@ -694,7 +694,7 @@ class TestAutoEntryAndExitFire:
 
         s = self._s(tp_on=True, tp_ticks=8.0, sl_on=True, sl_ticks=4.0)
         t = Trade(side="down", open_px=6700.0, mode="auto")
-        assert decide(t, s, 6699.75, "down") == ("", "")
+        assert decide(t, s, 6699.75, "down")[0] == ""
 
     def test_the_route_applies_the_decision(self):
         """The policy is called AND acted on. A decision nothing acts
@@ -735,8 +735,8 @@ class TestTheCandleDecidesAndTheStackVetoes:
 
         # The imbalance is passed as agreeing unless a test says
         # otherwise; its own rule is covered in its own class.
-        imb = read if read in ("up", "down") else ""
-        return signal({"15m": d15, "5m": d5, "1m": d1}, read, imb)
+        delta = read if read in ("up", "down") else ""
+        return signal({"15m": d15, "5m": d5, "1m": d1}, read, delta)
 
     def test_the_candle_alone_is_enough(self):
         assert self._side(None, None, None, "up") == ("up", "")
@@ -765,7 +765,7 @@ class TestTheCandleDecidesAndTheStackVetoes:
 
     def test_the_route_calls_it_rather_than_copying_it(self):
         blk = py_func("_agreement")
-        assert "jn_signal(says, r," in blk
+        assert "jn_signal(" in blk
         # The vote count is gone, not merely unused.
         assert "votes.count(way) >= MIN_AGREE" not in blk
         # And the rule is not re-written alongside the call.
@@ -994,22 +994,27 @@ class TestWhetherItIsWorthTrusting:
         assert blk.index("NOT YET READABLE") < blk.index("round trip")
 
 
-class TestTheImbalanceMustAgree:
-    """Chris: "i have seen this make consecutive trades trying to
-    trade OFI is up but imbalance is down and it losses the trade ...
-    if OFI and imbalance dont agree no trade".
+class TestTheOfiAndDeltaMustAgree:
+    """Chris: "can you pair the OFI and take trades when the delta
+    and OFI agree".
 
-    Two different facts about one bar: where price sits against the
-    open, and which side is ahead in the flow that will end the bar.
-    A bar where they disagree is being pushed one way on price while
-    the book leans the other.
+    The OFI is the book leaning -- the accumulator that decides
+    whether this candle closes green or red. The delta is size that
+    actually printed, by the side CME stated, and cannot be pulled
+    back. Genuinely different measurements, which is the only reason
+    agreeing is worth anything.
+
+    THE READ IS THE CANDLE'S COLOUR, not price against its open.
+    That distinction cost a day: the read measured the price path
+    while Chris was reading the chart's green and red, the two
+    disagree often, and the pair refused nearly every trade.
     """
 
     @staticmethod
-    def _s(read, imb, says=None):
+    def _s(read, delta, says=None):
         from liqmap.journal import signal
 
-        return signal(says or {}, read, imb)
+        return signal(says or {}, read, delta)
 
     def test_both_up_is_a_buy(self):
         assert self._s("up", "up") == ("up", "")
@@ -1017,17 +1022,16 @@ class TestTheImbalanceMustAgree:
     def test_both_down_is_a_short(self):
         assert self._s("down", "down") == ("down", "")
 
-    def test_candle_up_imbalance_down_is_no_trade(self):
-        assert self._s("up", "down") == ("", "imbalance")
+    def test_ofi_up_delta_down_is_no_trade(self):
+        assert self._s("up", "down") == ("", "delta")
 
-    def test_candle_down_imbalance_up_is_no_trade(self):
-        assert self._s("down", "up") == ("", "imbalance")
+    def test_ofi_down_delta_up_is_no_trade(self):
+        assert self._s("down", "up") == ("", "delta")
 
-    def test_a_flat_imbalance_is_not_agreement(self):
-        """It has not taken a side, so there is nothing to agree
-        with."""
-        assert self._s("up", "flat") == ("", "imbalance")
-        assert self._s("up", "") == ("", "imbalance")
+    def test_a_flat_delta_is_not_agreement(self):
+        """Nothing printed, so there is nothing to agree with."""
+        assert self._s("up", "flat") == ("", "delta")
+        assert self._s("up", "") == ("", "delta")
 
     def test_a_flat_candle_is_no_signal_either(self):
         assert self._s("flat", "up") == ("", "")
@@ -1036,9 +1040,10 @@ class TestTheImbalanceMustAgree:
         both = {"15m": "down", "5m": "down", "1m": "down"}
         assert self._s("up", "up", both) == ("", "stack")
 
-    def test_the_builder_reports_both_from_one_place(self):
-        """A caller reaching into the builder for the second half is
-        how the two come to be read at different instants."""
+    def test_the_read_is_the_ofi_not_the_price_path(self):
+        """THE BUG THIS REPLACES. The chart colours a candle green
+        when its imbalance crossed +target; the read measured price
+        against the bar open instead, and the two disagree often."""
         from liqmap.ofibar import OfiBarBuilder
 
         b = OfiBarBuilder(tick_size=0.25, threshold=2000,
@@ -1046,15 +1051,35 @@ class TestTheImbalanceMustAgree:
         P, T = 1_000_000_000, 250_000_000
         px = 6700 * P
         b.on_book(0.0, px, 100, px + T, 100)
-        b.on_book(1.0, px + T, 400, px + 2 * T, 100)
+        # Bid grows at an unchanged price: OFI up, price flat.
+        for i in range(6):
+            b.on_book(1.0 + i, px, 100 + 40 * i, px + T, 100)
         r = b.bar_read
-        for k in ("read", "imb", "imbalance", "agrees"):
+        assert r["read"] == "up"
+        assert r["imbalance"] > 0
+        assert r["price_dir"] == "flat"      # carried, not the signal
+
+    def test_the_builder_reports_both_from_one_place(self):
+        from liqmap.ofibar import OfiBarBuilder
+
+        b = OfiBarBuilder(tick_size=0.25, threshold=2000,
+                          max_s=900.0, min_updates=2)
+        P, T = 1_000_000_000, 250_000_000
+        px = 6700 * P
+        b.on_book(0.0, px, 100, px + T, 100)
+        for i in range(6):
+            b.on_book(1.0 + i, px, 100 + 40 * i, px + T, 100)
+        b.on_trade(9.0, 50.0, "buy")
+        r = b.bar_read
+        for k in ("read", "delta", "delta_side", "agrees"):
             assert k in r, k
-        assert r["agrees"] is (r["read"] == r["imb"]
-                               and r["read"] in ("up", "down"))
+        assert r["read"] == "up" and r["delta_side"] == "up"
+        assert r["agrees"] is True
+        b.on_trade(10.0, 200.0, "sell")
+        assert b.bar_read["agrees"] is False
 
 
-class TestTwoTradesToACandle:
+class TestOneTradePerCandle:
     """Chris: "its trading the same ofi candle over and over again it
     gets out of the trade and immediately gets back in ... we trade
     the OFI candle at maximum of 2 times a candle ... its one trade
@@ -1081,19 +1106,21 @@ class TestTwoTradesToACandle:
         from liqmap.journal import decide
 
         assert decide(None, self._s(), 6700.0, "up",
-                      taken=("up",)) == ("", "")
+                      taken=("up",))[0] == ""
 
-    def test_the_other_direction_is_allowed(self):
+    def test_the_other_direction_is_also_refused_now(self):
+        """It was two per candle. Chris: "taking one trade per OFI
+        candle"."""
         from liqmap.journal import decide
 
         assert decide(None, self._s(), 6700.0, "down",
-                      taken=("up",)) == ("open", "down")
+                      taken=("up",))[0] == ""
 
     def test_a_third_trade_is_refused(self):
         from liqmap.journal import decide
 
         assert decide(None, self._s(), 6700.0, "up",
-                      taken=("down", "up")) == ("", "")
+                      taken=("down", "up"))[0] == ""
 
     def test_the_cap_holds_on_its_own(self):
         """THE TWO RULES COINCIDE AT TWO DIRECTIONS, which hid a gap:
@@ -1108,12 +1135,12 @@ class TestTwoTradesToACandle:
         from liqmap.journal import decide
 
         assert decide(None, self._s(), 6700.0, "up",
-                      taken=("down", "down")) == ("", "")
+                      taken=("down", "down"))[0] == ""
 
-    def test_the_cap_is_two(self):
+    def test_the_cap_is_one(self):
         from liqmap.journal import MAX_PER_BAR
 
-        assert MAX_PER_BAR == 2
+        assert MAX_PER_BAR == 1
 
     def test_the_count_comes_from_the_table(self, jn):
         """FROM THE TABLE, NOT FROM MEMORY. A cap counted in a

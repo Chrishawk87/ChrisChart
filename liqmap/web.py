@@ -6472,8 +6472,8 @@ def create_app() -> FastAPI:
         # it broke no test, because a closure can only be reached
         # through a request and the fixture decides what the rule is
         # ever asked.
-        side, blocked = jn_signal(says, r,
-                                  (read or {}).get("imb") or "")
+        side, blocked = jn_signal(
+            says, r, (read or {}).get("delta_side") or "")
         return side, says, blocked
 
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
@@ -6503,11 +6503,13 @@ def create_app() -> FastAPI:
         # agreement -- so deleting the auto check broke nothing that
         # any test could see.
         act, arg = jn.decide(t, s, px, side, taken)
+        idle_why = arg if act == "" else ""
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
             t = None
             taken = j.sides_in_bar(coin_, bar_ts)
             act, arg = jn.decide(None, s, px, side, taken)
+            idle_why = arg if act == "" else ""
         if act == "open":
             t = j.open_trade(
                 coin_, arg, px, mode="auto", bar_ts=bar_ts,
@@ -6535,6 +6537,9 @@ def create_app() -> FastAPI:
             "blocked": vetoed,
             "would_be": ((read or {}).get("read") or "") if vetoed
                         else "",
+            # WHY NOTHING HAPPENED, on every poll that does
+            # nothing. Blank only when a trade was opened or closed.
+            "idle": idle_why,
             "taken_this_candle": list(taken),
             "max_per_candle": jn.MAX_PER_BAR,
             # THE READ ITSELF, not only its direction. The column
@@ -9050,15 +9055,16 @@ has to be running before the gate stops refusing.">spike
         <h3 style="margin:0 0 8px">Trades on this rule
           <span class="stamp" id="jnlMode"></span></h3>
         <div class="msg" style="margin-bottom:8px"><b>The OFI candle
-          decides.</b> The direction is where price sits against the
-          open of the bar in progress, and that is the whole signal.
-          <b>The imbalance has to agree with it</b> &mdash; candle up
-          and imbalance up is a buy, candle down and imbalance down is
-          a short, and if they point different ways there is no trade.
+          decides.</b> Up when the candle is green, down when it is
+          red &mdash; the imbalance of the bar in progress.
+          <b>The OFI and the delta have to agree</b> &mdash; the OFI
+          is the book leaning, which is what makes the candle green or
+          red; the delta is size that actually printed. Both up is a
+          buy, both down is a short, different ways is no trade.
           It holds until the candle reads the <b>other</b> way &mdash;
           going flat is not an exit, because closing on that was
-          giving back about a tick every time. <b>Two trades to a
-          candle at most, and never two the same way.</b>
+          giving back about a tick every time. <b>One trade per OFI
+          candle.</b>
           The 15m, 5m and 1m are shown below but do not vote: they
           only <b>veto</b>, and only when all three point the other
           way. A tick is 0.25 and <b>$12.50</b>. These are logged
@@ -14062,10 +14068,10 @@ function paintJournal(d) {
     : '<span class="thin">— no OFI bar forming</span>';
   const ag = $('jnlAgree');
   if (ag) {
-    ag.innerHTML = (J.blocked === 'imbalance'
-      ? '<b class="short">NO TRADE</b> <span class="thin">the candle '
-        + 'reads ' + esc(J.would_be).toUpperCase() + ' but the '
-        + 'imbalance is ' + esc((R.imb || 'flat')).toUpperCase()
+    ag.innerHTML = (J.blocked === 'delta'
+      ? '<b class="short">NO TRADE</b> <span class="thin">the OFI is '
+        + esc(J.would_be).toUpperCase() + ' but the delta is '
+        + esc((R.delta_side || 'flat')).toUpperCase()
         + ' — they have to agree</span>'
       : J.blocked === 'stack'
       ? '<b class="short">VETOED</b> <span class="thin">the candle '
@@ -14084,16 +14090,19 @@ function paintJournal(d) {
         + ' <span class="thin">(veto only)</span>')
       + '<div class="thin" style="margin-top:4px">candle &mdash; '
       + readBit
-      + ' <span class="thin">· imbalance </span>'
-      + (R.imb === 'up' ? '<b class="long">UP</b>'
-         : R.imb === 'down' ? '<b class="short">DOWN</b>'
+      + ' <span class="thin">· delta </span>'
+      + (R.delta_side === 'up' ? '<b class="long">UP</b>'
+         : R.delta_side === 'down' ? '<b class="short">DOWN</b>'
          : '<b>FLAT</b>')
-      + ' <span class="thin">' + (R.imbalance || 0).toLocaleString()
+      + ' <span class="thin">' + Math.round(R.delta || 0).toLocaleString()
       + '</span>'
-      + (R.read && R.imb && !R.agrees
+      + (R.read && R.delta_side && !R.agrees
           ? ' <span class="short">· they disagree, so no trade</span>'
           : '')
-      + capBit + '</div>';
+      + capBit
+      + (J.idle ? '<div class="thin" style="margin-top:4px">'
+          + '<b>no trade</b> &mdash; ' + esc(J.idle) + '</div>' : '')
+      + '</div>';
   }
 
   const op = $('jnlOpen');

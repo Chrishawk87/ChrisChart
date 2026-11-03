@@ -248,13 +248,17 @@ class TestHoldAndCrossings:
         assert b.bar_read["held_s"] == pytest.approx(4.0, abs=0.01)
 
     def test_a_crossing_restarts_the_hold(self):
+        """`read` is the OFI now, so the price-path fields are
+        checked on their own names. The crossing count and the hold
+        still describe price against the bar open -- they are
+        evidence carried beside the signal, not the signal."""
         b = builder()
         book(b, 0.0, PX)
         book(b, 1.0, PX + TICK)
         book(b, 5.0, PX + TICK)
         book(b, 6.0, PX - TICK)
         r = b.bar_read
-        assert r["read"] == "down"
+        assert r["price_dir"] == "down"
         assert r["held_s"] == pytest.approx(0.0, abs=0.01)
         assert r["flips"] == 1
 

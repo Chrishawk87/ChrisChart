@@ -4,9 +4,9 @@
     ENTRY   The OFI bar read -- where price sits against the open of
             the bar in progress. That is the whole signal. The 15m,
             5m and 1m do not vote; they VETO, and only when all three
-            point the other way. The bar's IMBALANCE must agree with
-            its price direction or there is no trade, and a candle is
-            traded twice at most, never twice the same way.
+            point the other way. The OFI and the DELTA must agree --
+            the book leaning and the size that actually printed -- and
+            a candle is traded once.
     EXIT    take profit, stop loss, or the agreement breaking --
             whichever comes first.
 
@@ -123,7 +123,7 @@ class Result:
         return out
 
 
-def _side(dirs: dict, read: str, imb: str = "") -> str:
+def _side(dirs: dict, read: str, delta: str = "") -> str:
     """The direction to trade. "" for none.
 
     THE OFI CANDLE DECIDES and the stack only vetoes -- the same rule
@@ -134,7 +134,7 @@ def _side(dirs: dict, read: str, imb: str = "") -> str:
     """
     from liqmap.journal import signal
 
-    side, _blocked = signal(dirs, read, imb)
+    side, _blocked = signal(dirs, read, delta)
     return side
 
 
@@ -223,7 +223,7 @@ def run(records, tp_pts: float, sl_pts: float, target: int = 2000,
         dirs = _dirs(tape, ts, tape.book)
         br = ofi.bar_read or {}
         read = br.get("read") or ""
-        agree = _side(dirs, read, br.get("imb") or "")
+        agree = _side(dirs, read, br.get("delta_side") or "")
         bar_ts = float(br.get("bar_ts") or 0.0)
 
         # LOSING AGREEMENT IS NOT AN EXIT; ONLY A FLIP IS.
