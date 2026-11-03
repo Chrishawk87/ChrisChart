@@ -22,6 +22,7 @@ from liqmap.clockwin import PERIOD_S, ClockWindows, Window, window_start
 
 # The CME attach path needs a configured engine and a database.
 from tests.test_cme_panels import client  # noqa: F401,E402
+from tests.test_stack_strip import page_js  # noqa: F401,E402
 
 ROOT = Path(__file__).resolve().parent.parent
 P = 1_000_000_000
@@ -366,3 +367,148 @@ class TestItIsWiredIntoTheLiveTape:
         assert "from liqmap.clockwin import PERIOD_S, ClockWindows" in src
         assert "resample" not in src.replace(
             "There is no resample here", "")
+
+
+class TestThePanelDrawsIt:
+    """A panel that throws on a forming window is the failure that
+    matters here -- the forming one is the whole reason this is event
+    driven. Run in node against the served page, because a source
+    scan cannot tell that a function raises when it is called.
+    """
+
+    @staticmethod
+    def _run(payload):
+        import json
+        import subprocess
+        import tempfile
+
+        import pytest as _pt
+
+        from tests.test_stack_strip import HARNESS, NODE, run_js
+
+        if NODE is None:
+            _pt.skip("node is not installed")
+        return payload
+
+    def test_it_renders_a_forming_window(self, page_js):
+        from tests.test_stack_strip import run_js
+
+        out = run_js(page_js, "clock", {
+            "ok": True, "period_s": 900,
+            "candle": "mid-price from the book",
+            "ofi": "level-level at the touch (MBP-10)",
+            "current": {"start_ts": 0, "ts_last": 300, "mid_dir": "up",
+                        "ticks": 4.0, "ofi_dir": "up", "net_ofi": 1200,
+                        "cvd_dir": "up", "net_cvd": 300.0,
+                        "agree": True, "books": 900, "trades": 40,
+                        "unknown": 0, "closed": False},
+            "windows": [], "summary": {"windows": 0, "decided": 0,
+                                       "agreed": 0, "agree_pct": 0.0,
+                                       "ofi_flips": 0,
+                                       "flips_cvd_confirmed": 0,
+                                       "flips_unconfirmed": 0,
+                                       "flips_per_window": 0.0,
+                                       "unknown_side_trades": 0,
+                                       "trades": 40}})
+        assert "15-MINUTE WINDOW" in out
+        assert "all three agree" in out
+        assert "no window has closed yet" in out
+
+    def test_it_renders_closed_windows(self, page_js):
+        from tests.test_stack_strip import run_js
+
+        w = {"start_ts": 0, "mid_dir": "down", "ticks": -6.0,
+             "ofi_dir": "down", "net_ofi": -900, "cvd_dir": "up",
+             "net_cvd": 50.0, "agree": False}
+        out = run_js(page_js, "clock", {
+            "ok": True, "period_s": 900, "candle": "", "ofi": "",
+            "current": None, "windows": [w],
+            "summary": {"windows": 1, "decided": 1, "agreed": 0,
+                        "agree_pct": 0.0, "ofi_flips": 3,
+                        "flips_cvd_confirmed": 1,
+                        "flips_unconfirmed": 2,
+                        "flips_per_window": 3.0,
+                        "unknown_side_trades": 0, "trades": 10}})
+        assert "flagged" in out
+        assert "3 OFI flips" in out
+        assert "1 CVD-confirmed" in out
+
+    def test_it_says_when_prints_state_no_side(self, page_js):
+        """The thing most likely to be silently wrong, and it is
+        wrong everywhere else in this app."""
+        from tests.test_stack_strip import run_js
+
+        out = run_js(page_js, "clock", {
+            "ok": True, "period_s": 900, "candle": "", "ofi": "",
+            "current": None, "windows": [],
+            "summary": {"windows": 2, "decided": 2, "agreed": 1,
+                        "agree_pct": 0.5, "ofi_flips": 1,
+                        "flips_cvd_confirmed": 1,
+                        "flips_unconfirmed": 0,
+                        "flips_per_window": 0.5,
+                        "unknown_side_trades": 77, "trades": 400}})
+        assert "77" in out
+        assert "no side" in out
+        assert "dropped everywhere else" in out
+
+    def test_a_refusal_is_shown_not_thrown(self, page_js):
+        from tests.test_stack_strip import run_js
+
+        out = run_js(page_js, "clock",
+                     {"ok": False, "why": "the CME engine is not "
+                                          "configured"})
+        assert "not configured" in out
+
+    def test_it_states_what_it_is_built_from(self, page_js):
+        from tests.test_stack_strip import run_js
+
+        out = run_js(page_js, "clock", {
+            "ok": True, "period_s": 900,
+            "candle": "mid-price from the book",
+            "ofi": "level-level at the touch (MBP-10)",
+            "current": None, "windows": [], "summary": {}})
+        assert "mid-price from the book" in out
+        assert "MBP-10" in out
+        assert "never resampled" in out
+
+
+class TestThePanelIsActuallyPolled:
+    """A renderer nothing calls draws nothing.
+
+    Found by mutation: deleting the fetch from `ofiTick` left every
+    other test in this file green, because they all call the painter
+    directly.
+    """
+
+    @staticmethod
+    def _js_func(name: str) -> str:
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function " + name + "(")
+        depth, j = 0, src.index("{", i)
+        for k in range(j, len(src)):
+            if src[k] == "{":
+                depth += 1
+            elif src[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return src[i:k + 1]
+        raise AssertionError(name + " has no closing brace")
+
+    def test_the_ofi_poll_fetches_it(self):
+        blk = self._js_func("ofiTick")
+        assert "/api/clockwindows" in blk
+        assert "paintClockWindows(" in blk
+
+    def test_it_goes_through_the_url_encoder(self):
+        """A symbol with a '#' turns the rest of the query into a
+        fragment and the token never arrives."""
+        blk = self._js_func("ofiTick")
+        i = blk.index("/api/clockwindows")
+        assert "q({coin:" in blk[i:i + 200]
+
+    def test_a_failure_there_does_not_stop_the_ofi_panel(self):
+        """This rides the OFI poll. If it threw, the panel it is
+        riding on would go blank with it."""
+        blk = self._js_func("ofiTick")
+        i = blk.index("paintClockWindows(")
+        assert "catch" in blk[i:i + 300]

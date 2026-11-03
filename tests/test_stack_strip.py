@@ -108,6 +108,10 @@ globalThis.__probe = {
     return document.getElementById('stackStrip').innerHTML;
   },
   readLine(r, pr, id) { return ofiReadLine(r, pr, id); },
+  clock(payload) {
+    paintClockWindows(payload);
+    return document.getElementById('clockWin').innerHTML;
+  },
   cascade(d, last, thisBar, stripCoin, selected) {
     document.getElementById('coin').value = selected;
     _ofiLast = last; _ofiThisBar = thisBar; _ofiStripCoin = stripCoin;

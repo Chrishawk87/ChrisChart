@@ -8760,6 +8760,13 @@ DASHBOARD = """<!doctype html>
       <div id="fpStats" class="fpstat"></div>
       <div id="ofiBars" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
+      <!-- THE SAME THREE MEASUREMENTS ON A CLOCK. Fifteen-minute
+           windows of mid-price OHLC, net OFI and net CVD, every one
+           rebuilt from the raw events as they arrive. Here so the
+           contract-bucket candles above and the time version can be
+           read against each other on one screen. -->
+      <div id="clockWin" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
       <div id="fpVerdict" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
       <div id="fpBook" class="fpstat" style="border-top:1px solid
@@ -12333,6 +12340,12 @@ async function ofiTick(fromTimer) {
       + '&rev=' + _ofiRev);
     if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; _ofiLast = d; }
     ofiBindChart();
+    /* THE CLOCK WINDOWS RIDE THE SAME POLL. A timer of their own
+       would be a second clock to keep in step with this one, and the
+       two panels are read together. */
+    try { paintClockWindows(await api('/api/clockwindows?'
+      + q({coin: coin(), limit: 40}))); }
+    catch (e) { /* the OFI panel below is the louder failure */ }
     if (!d.ok) {
       /* "ES is not a CME symbol" is true and useless. The reason this
          panel is blank is almost always that a crypto market is
@@ -14054,6 +14067,110 @@ async function jnlTrade(action, side) {
     _jnlBusy = false;
   }
   if (typeof loadRead === 'function') { try { await loadRead(); } catch (e) {} }
+}
+
+/* The clock windows, under the OFI candles.
+
+   THE COMPARISON IS THE POINT. The bars above end on a quantity of
+   flow and flip often; these end on a clock. Both are drawn from the
+   same raw events and the same OFI formula, so the difference on the
+   screen is the difference between the two ways of cutting the tape
+   and nothing else. */
+function clockWord(v) {
+  return v === 'up' ? '<b class="long">UP</b>'
+       : v === 'down' ? '<b class="short">DOWN</b>'
+       : '<b>FLAT</b>';
+}
+
+function paintClockWindows(d) {
+  const el = $('clockWin');
+  if (!el) return;
+  if (!d || !d.ok) {
+    el.innerHTML = '<span class="stamp" style="width:100%">'
+      + 'clock windows &mdash; ' + esc((d && d.why) || 'unavailable')
+      + '</span>';
+    return;
+  }
+  const C = d.current, S = d.summary || {}, mins = (d.period_s || 900) / 60;
+  const num = x => Math.round(x || 0).toLocaleString();
+
+  /* THE FORMING WINDOW FIRST, because it is the one that is not in
+     any resampled table -- it is the whole reason this is event
+     driven rather than a query. */
+  let head;
+  if (!C) {
+    head = '<span class="stamp" style="width:100%">'
+      + mins + '-MINUTE WINDOW &mdash; nothing has arrived yet</span>';
+  } else {
+    const into = Math.max(0, (C.ts_last || 0) - (C.start_ts || 0));
+    const left = Math.max(0, (d.period_s || 900) - into);
+    head = '<span class="stamp" style="width:100%">'
+      + mins + '-MINUTE WINDOW &mdash; candle ' + clockWord(C.mid_dir)
+      + ' <span class="thin">' + (C.ticks > 0 ? '+' : '')
+      + (C.ticks || 0).toFixed(2) + ' ticks</span>'
+      + ' &middot; OFI ' + clockWord(C.ofi_dir)
+      + ' <span class="thin">' + num(C.net_ofi) + '</span>'
+      + ' &middot; CVD ' + clockWord(C.cvd_dir)
+      + ' <span class="thin">' + num(C.net_cvd) + '</span>'
+      + ' &middot; ' + (C.agree
+          ? '<b class="long">all three agree</b>'
+          : '<span class="thin">not all three</span>')
+      + ' &middot; <span class="thin">' + Math.round(left / 60)
+      + ' min left, ' + num(C.books) + ' book updates, '
+      + num(C.trades) + ' prints</span>'
+      + (C.unknown
+          ? ' &middot; <span class="short">' + num(C.unknown)
+            + ' with no side stated</span>' : '')
+      + '</span>';
+  }
+
+  /* HOW THE TWO WAYS OF CUTTING THE TAPE COMPARE. Flips and signal
+     count together: either one alone can be made to look good. */
+  const stats = '<span class="stamp" style="width:100%">'
+    + 'OVER ' + num(S.windows) + ' CLOSED WINDOWS &mdash; all three '
+    + 'agreed on <b>' + num(S.agreed) + '</b> of ' + num(S.decided)
+    + ' that had a direction ('
+    + (100 * (S.agree_pct || 0)).toFixed(1) + '%)'
+    + ' &middot; ' + num(S.ofi_flips) + ' OFI flips between windows ('
+    + (S.flips_per_window || 0).toFixed(2) + ' each)'
+    + ' &middot; <b class="long">' + num(S.flips_cvd_confirmed)
+    + ' CVD-confirmed</b>, ' + num(S.flips_unconfirmed) + ' not'
+    + (S.unknown_side_trades
+        ? ' &middot; <span class="short">' + num(S.unknown_side_trades)
+          + ' of ' + num(S.trades) + ' prints stated no side &mdash; '
+          + 'those are dropped everywhere else in this app</span>'
+        : '')
+    + ' &middot; <span class="thin">fewer flips is only better if '
+    + 'there are still enough signals to trade</span></span>';
+
+  const rows = (d.windows || []).slice(-12).reverse();
+  const table = rows.length
+    ? rows.map(w => {
+        const t = new Date((w.start_ts || 0) * 1000)
+          .toISOString().slice(11, 16);
+        return '<div style="display:flex;gap:10px;padding:3px 0;'
+          + 'border-top:1px solid rgba(255,255,255,.06)">'
+          + '<span class="thin" style="width:52px">' + t + '</span>'
+          + '<span style="width:92px">' + clockWord(w.mid_dir)
+          + ' <span class="thin">' + (w.ticks > 0 ? '+' : '')
+          + (w.ticks || 0).toFixed(1) + '</span></span>'
+          + '<span style="width:120px">OFI ' + clockWord(w.ofi_dir)
+          + ' <span class="thin">' + num(w.net_ofi) + '</span></span>'
+          + '<span style="width:120px">CVD ' + clockWord(w.cvd_dir)
+          + ' <span class="thin">' + num(w.net_cvd) + '</span></span>'
+          + '<span>' + (w.agree
+              ? '<b class="long">confirmed</b>'
+              : '<span class="thin">flagged</span>') + '</span>'
+          + '</div>';
+      }).join('')
+    : '<div class="thin">no window has closed yet</div>';
+
+  el.innerHTML = head + stats
+    + '<div style="margin-top:6px">' + table + '</div>'
+    + '<span class="stamp" style="width:100%">'
+    + esc(d.candle || '') + ' &middot; ' + esc(d.ofi || '')
+    + ' &middot; rebuilt from raw events, never resampled; the window '
+    + 'above grows on every event and locks at the boundary</span>';
 }
 
 function paintJournal(d) {
