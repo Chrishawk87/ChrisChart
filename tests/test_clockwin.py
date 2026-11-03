@@ -512,3 +512,51 @@ class TestThePanelIsActuallyPolled:
         blk = self._js_func("ofiTick")
         i = blk.index("paintClockWindows(")
         assert "catch" in blk[i:i + 300]
+
+
+class TestThePanelCanBeFound:
+    """The first version of this was a div inside the footprint
+    panel, because it was anchored to `ofiBars` and `ofiBars` lives
+    there. It rendered correctly and Chris could not find it -- a
+    measurement nobody can locate is one nobody reads.
+    """
+
+    @staticmethod
+    def _page() -> str:
+        return (ROOT / "liqmap" / "web.py").read_text()
+
+    def test_it_is_a_panel_of_its_own(self):
+        src = self._page()
+        i = src.index('id="clockWin"')
+        pan = src.rfind('class="panel', 0, i)
+        assert 'id="clockPanel"' in src[pan:pan + 120], \
+            "clockWin is nested inside someone else's panel"
+
+    def test_it_has_a_heading(self):
+        src = self._page()
+        i = src.index('id="clockPanel"')
+        blk = src[i:i + 400]
+        assert "<h2>" in blk
+        assert "Fifteen-minute" in blk
+
+    def test_it_is_on_the_dashboard_tab(self):
+        src = self._page()
+        i = src.index('id="clockWin"')
+        tab = src.rfind('id="tab-', 0, i)
+        assert src[tab:tab + 20].startswith('id="tab-dash"')
+
+    def test_it_says_something_before_the_first_poll(self):
+        """An empty div under a heading reads as broken."""
+        src = self._page()
+        i = src.index('id="clockWin"')
+        assert "waiting for the first events" in src[i:i + 260]
+
+    def test_it_is_not_inside_the_footprint_panel(self):
+        src = self._page()
+        fp = src.index('id="fpPanel"')
+        cw = src.index('id="clockWin"')
+        # The footprint panel closes before this one opens.
+        assert cw > fp
+        assert src.index('id="clockPanel"') > fp
+        nested = src.count('id="fpPanel"', fp, cw)
+        assert nested == 1

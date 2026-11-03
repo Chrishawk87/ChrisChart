@@ -8760,13 +8760,6 @@ DASHBOARD = """<!doctype html>
       <div id="fpStats" class="fpstat"></div>
       <div id="ofiBars" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
-      <!-- THE SAME THREE MEASUREMENTS ON A CLOCK. Fifteen-minute
-           windows of mid-price OHLC, net OFI and net CVD, every one
-           rebuilt from the raw events as they arrive. Here so the
-           contract-bucket candles above and the time version can be
-           read against each other on one screen. -->
-      <div id="clockWin" class="fpstat" style="border-top:1px solid
-           var(--line);padding-top:8px"></div>
       <div id="fpVerdict" class="fpstat" style="border-top:1px solid
            var(--line);padding-top:8px"></div>
       <div id="fpBook" class="fpstat" style="border-top:1px solid
@@ -9166,6 +9159,24 @@ has to be running before the gate stops refusing.">spike
         <div id="jnlStats"></div>
         <div id="jnlRecent" style="margin-top:10px"></div>
       </div>
+    </div>
+
+    <!-- THE SAME THREE MEASUREMENTS ON A CLOCK. ITS OWN PANEL,
+         because the first version of this was a div inside the
+         footprint panel and could not be found -- a measurement
+         nobody can locate is one nobody reads. -->
+    <div class="panel full" id="clockPanel"><h2>Fifteen-minute windows
+      &mdash; the same tape, cut by the clock</h2>
+      <div class="msg" style="margin-bottom:8px">The OFI candles end
+        on a quantity of flow and flip often. These end on a clock.
+        Both are built from the <b>same raw events</b> and the
+        <b>same OFI formula</b>, so what differs below is the way the
+        tape is cut and nothing else. Every figure is accumulated as
+        the events arrive &mdash; the window at the top grows tick by
+        tick and locks at the boundary.</div>
+      <div id="clockWin"><span class="stamp"
+        style="width:100%">waiting for the first events &mdash; this fills as the
+        tape runs</span></div>
     </div>
 
     <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
