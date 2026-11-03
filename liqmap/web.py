@@ -6403,6 +6403,8 @@ def create_app() -> FastAPI:
     # Chris's rule: a fourth pointing the other way does not block it.
     MIN_AGREE = 3
 
+    from .journal import signal as jn_signal
+
     def _bar_read(rt_) -> dict:
         """The OFI bar read -- the fourth of the four.
 
@@ -6435,16 +6437,27 @@ def create_app() -> FastAPI:
         except Exception:                               # noqa: BLE001
             return {}
 
-    def _agreement(out_: dict, read: dict) -> tuple[str, dict]:
-        """Which way all four point.
+    def _agreement(out_: dict,
+                   read: dict) -> tuple[str, dict, str]:
+        """The direction to trade, and what each reading says.
 
-        "" when they do not all agree. The rungs come from the cascade
-        that is going out on this same response, so the column can
-        never show a trade the stack above it does not justify.
+        THE OFI CANDLE DECIDES. The three timeframes do not vote any
+        more -- Chris: "its supposed to be tracking the OFI candle
+        making trades based on that and nothing more". The direction
+        is where price sits against the open of the bar in progress,
+        and that is the whole signal.
 
-        FLAT IS NOT A DIRECTION. The bar read says flat when price
-        sits at its candle's open, and counting that as agreement
-        would open a trade on a bar that has not moved.
+        THE STACK IS A VETO AND ONLY A VETO. A trade is skipped when
+        all three timeframes point the OTHER way. Not two of them, not
+        a quiet one -- all three, which is the stack saying as
+        clearly as it can that the candle is running against
+        everything above it.
+
+        FLAT IS NOT A DIRECTION. Price at its candle's open would
+        otherwise open a trade on a bar that has not moved.
+
+        The rows are still reported, because the panel shows them and
+        a veto that fires invisibly is worse than no veto.
         """
         casc = out_.get("cascade") or {}
         rungs = {g.get("timeframe"): g for g in (casc.get("rungs") or [])
@@ -6454,23 +6467,13 @@ def create_app() -> FastAPI:
         says = {t: (rungs.get(t) or {}).get("qualified") for t in want}
         says["read"] = r if r in ("up", "down") else None
 
-        # THREE OF THE FOUR, and a dissenting fourth does not block it.
-        #
-        # It was all four. Chris changed it: three is three, even when
-        # the odd one out points the other way. That means a signal can
-        # fire with something actively against it, which is his call and
-        # is visible on the panel -- the column names every one of the
-        # four and what it says, so a trade taken into a disagreeing
-        # row can be seen for what it is rather than discovered later.
-        #
-        # Two against two is not three and never fires.
-        votes = [v for v in says.values() if v in ("up", "down")]
-        side = ""
-        for way in ("up", "down"):
-            if votes.count(way) >= MIN_AGREE:
-                side = way
-                break
-        return side, says
+        # THE RULE ITSELF IS `journal.signal`, not written out here.
+        # The auto gate lived in a closure like this one and deleting
+        # it broke no test, because a closure can only be reached
+        # through a request and the fixture decides what the rule is
+        # ever asked.
+        side, vetoed = jn_signal(says, r)
+        return side, says, vetoed
 
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
         """Close what should close, open what auto should open, report.
@@ -6487,7 +6490,7 @@ def create_app() -> FastAPI:
         s = j.settings(coin_)
         px = _live_px(rt_, coin_)
         read = _bar_read(rt_)
-        side, says = _agreement(out_, read)
+        side, says, vetoed = _agreement(out_, read)
 
         t = j.open_trade_for(coin_)
         closed = None
@@ -6515,10 +6518,14 @@ def create_app() -> FastAPI:
             # fires even with the fourth pointing the other way, so
             # "it agreed" is not enough to tell a clean signal from a
             # contested one.
-            "votes": (sum(1 for v in says.values() if v == side)
-                      if side else 0),
+            # WHICH ROWS DISAGREE WITH THE CANDLE. They no longer
+            # stop it unless all three do, so the count is shown to
+            # be read rather than acted on.
             "against": (", ".join(k for k, v in says.items()
-                                  if v and v != side) if side else ""),
+                                  if v and v != side)
+                        if side else ""),
+            # A VETO THAT FIRES INVISIBLY IS WORSE THAN NO VETO.
+            "vetoed": vetoed,
             # THE READ ITSELF, not only its direction. The column
             # could show which timeframe was holding a signal up and
             # not what the read was doing, which is the one of the
@@ -9031,20 +9038,19 @@ has to be running before the gate stops refusing.">spike
         border-top:1px solid rgba(255,255,255,.12)">
         <h3 style="margin:0 0 8px">Trades on this rule
           <span class="stamp" id="jnlMode"></span></h3>
-        <div class="msg" style="margin-bottom:8px">Opens when
-          <b>three of the four</b> &mdash; 15m, 5m, 1m and the read
-          &mdash; point the same way, and holds until three point the
-          <b>other</b> way. Losing agreement is not an exit: the read
-          crosses its bar open constantly, and closing on that was
-          giving back about a tick every time. A
-          fourth pointing the other way does not block it, so every
-          one of the four is named below and a trade taken into a
-          disagreeing row can be seen for what it is. A tick is 0.25
-          and <b>$12.50</b>. These are logged trades, not placed ones
-          &mdash; <b>nothing here reaches Ironbeam</b>. On AUTO the
-          journal opens and closes its own rows on the rule, with your
-          take profit and stop loss; the order at the broker is still
-          yours to place.</div>
+        <div class="msg" style="margin-bottom:8px"><b>The OFI candle
+          decides.</b> The direction is where price sits against the
+          open of the bar in progress, and that is the whole signal.
+          It holds until the candle reads the <b>other</b> way &mdash;
+          going flat is not an exit, because closing on that was
+          giving back about a tick every time.
+          The 15m, 5m and 1m are shown below but do not vote: they
+          only <b>veto</b>, and only when all three point the other
+          way. A tick is 0.25 and <b>$12.50</b>. These are logged
+          trades, not placed ones &mdash; <b>nothing here reaches
+          Ironbeam</b>. On AUTO the journal opens and closes its own
+          rows on the rule, with your take profit and stop loss; the
+          order at the broker is still yours to place.</div>
         <div id="jnlAgree" class="say" style="margin-bottom:10px">—</div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;
           align-items:center;margin-bottom:10px">
@@ -9067,6 +9073,9 @@ has to be running before the gate stops refusing.">spike
           <button onclick="jnlTrade('open','up')">Log BUY</button>
           <button onclick="jnlTrade('open','down')">Log SELL</button>
           <button onclick="jnlTrade('close')">Close</button>
+          <button onclick="jnlReset()" title="Deletes every logged
+            trade for this market and starts the test over."
+            >Reset test</button>
           <span id="jnlMsg" class="thin"></span>
         </div>
         <div id="jnlOpen" style="margin-bottom:10px"></div>
@@ -13899,6 +13908,7 @@ function paintStackStrip() {
 
    NOTHING IN THIS FUNCTION PLACES AN ORDER. The buttons write rows. */
 let _jnlBusy = false;
+let _jnlLast = null;
 
 function jnlFmt(t, d) {
   const sign = t > 0 ? '+' : '';
@@ -13931,6 +13941,26 @@ async function jnlSet() {
   catch (e) { $('jnlMsg').textContent = String(e); }
 }
 
+/* RESET THE TEST. Two steps on purpose: a record is the whole point
+   of the column, and one that a stray click can empty is not one.
+   The count is named in the prompt so it is clear what is going. */
+async function jnlReset() {
+  const n = (_jnlLast && _jnlLast.stats && _jnlLast.stats.trades) || 0;
+  const mkt = coin();
+  if (!confirm('Delete ' + n + ' logged trade' + (n === 1 ? '' : 's')
+      + ' for ' + mkt + ' and start the test over? '
+      + 'This cannot be undone.')) return;
+  $('jnlMsg').textContent = '…';
+  try {
+    const d = await api('/api/journal/clear?'
+      + q({coin: mkt, confirm: 'yes'}), {method: 'POST'});
+    $('jnlMsg').textContent = d.ok
+      ? 'cleared ' + d.deleted + ' — the test starts again from here'
+      : (d.why || 'refused');
+  } catch (e) { $('jnlMsg').textContent = String(e); }
+  if (typeof loadRead === 'function') { try { await loadRead(); } catch (e) {} }
+}
+
 async function jnlTrade(action, side) {
   if (_jnlBusy) return;              /* one click, one row */
   _jnlBusy = true;
@@ -13951,6 +13981,7 @@ async function jnlTrade(action, side) {
 
 function paintJournal(d) {
   const J = (d && d.journal) || null;
+  _jnlLast = J;
   const box = $('jnlBox');
   if (!box) return;
   if (!J || J.error) {
@@ -14005,17 +14036,21 @@ function paintJournal(d) {
     : '<span class="thin">— no OFI bar forming</span>';
   const ag = $('jnlAgree');
   if (ag) {
-    ag.innerHTML = (J.agree
-      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">'
-        + (J.votes || 3) + ' OF 4 ' + J.agree.toUpperCase() + '</b>'
-        + (J.against ? ' <span class="short">(' + esc(J.against)
-            + ' says the other way)</span>' : '')
+    ag.innerHTML = (J.vetoed
+      ? '<b class="short">VETOED</b> <span class="thin">the candle '
+        + 'reads ' + esc(J.vetoed).toUpperCase() + ' and all three '
+        + 'timeframes point the other way</span>'
+      : J.agree
+      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">CANDLE '
+        + J.agree.toUpperCase() + '</b>'
+        + (J.against ? ' <span class="thin">(' + esc(J.against)
+            + ' disagrees — shown, not blocking)</span>' : '')
         + (S.auto ? ' <span class="thin">— auto will take it</span>'
                   : ' <span class="thin">— log it if you take it</span>')
-      : '<span class="thin">fewer than three agree: </span>'
+      : '<span class="thin">no direction on this candle. </span>'
         + ['15m', '5m', '1m'].map(k =>
             esc(k) + ' ' + word(says[k])).join(' <span class="thin">·</span> ')
-        + ' <span class="thin">·</span> read ' + word(says.read))
+        + ' <span class="thin">(veto only)</span>')
       + '<div class="thin" style="margin-top:4px">read &mdash; '
       + readBit + '</div>';
   }

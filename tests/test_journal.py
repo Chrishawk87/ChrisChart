@@ -689,69 +689,120 @@ class TestAutoEntryAndExitFire:
         assert "j.open_trade(" in blk
 
 
-class TestThreeOfFour:
-    """Chris: "not all 4 have to agree on a direction it can be if 3
-    agree", and a dissenting fourth does not block it.
+class TestTheCandleDecidesAndTheStackVetoes:
+    """Chris: "its supposed to be tracking the OFI candle making
+    trades based on that and nothing more".
 
-    The agreement is computed in a route closure, so these drive the
-    same rule through the study's copy of it -- which exists because a
-    backtest measuring a different rule from the panel is worse than
-    no backtest. If the two ever drift, this is where it shows.
+    So the three timeframes stopped voting. The direction is the OFI
+    bar read and nothing else; the stack can only VETO, and only when
+    all three point the other way.
+
+    The three-of-four tests that stood here are gone rather than
+    fixed -- the rule they described is not the rule any more, and
+    keeping them green would have meant keeping it.
     """
 
     @staticmethod
     def _side(d15, d5, d1, read):
-        import importlib.util
-        import sys as _sys
+        """THE REAL RULE, called directly.
 
-        spec = importlib.util.spec_from_file_location(
-            "agree_study", ROOT / "scripts" / "agree_study.py")
-        mod = _sys.modules.get("agree_study")
-        if mod is None:
-            mod = importlib.util.module_from_spec(spec)
-            _sys.modules["agree_study"] = mod
-            spec.loader.exec_module(mod)
-        return mod._side({"15m": d15, "5m": d5, "1m": d1}, read)
+        This used to re-implement it, because the rule lived in a
+        route closure. That is not a test of anything: deleting the
+        veto from the route left all of these green. It is
+        `journal.signal` now.
+        """
+        from liqmap.journal import signal
 
-    def test_all_four_still_fires(self):
-        assert self._side("up", "up", "up", "up") == "up"
+        return signal({"15m": d15, "5m": d5, "1m": d1}, read)
 
-    def test_three_with_one_silent(self):
-        assert self._side("down", "down", "down", "") == "down"
-        assert self._side("down", "down", None, "down") == "down"
+    def test_the_candle_alone_is_enough(self):
+        assert self._side(None, None, None, "up") == ("up", "")
 
-    def test_three_with_one_opposed_still_fires(self):
-        """3 is 3 -- his call, and the column names the dissenter."""
-        assert self._side("up", "up", "up", "down") == "up"
-        assert self._side("down", "down", "up", "down") == "down"
+    def test_one_timeframe_against_does_not_stop_it(self):
+        assert self._side("down", None, None, "up") == ("up", "")
 
-    def test_two_is_not_three(self):
-        assert self._side("up", "up", None, None) == ""
-        assert self._side("up", "up", "down", "down") == ""
+    def test_two_against_does_not_stop_it(self):
+        assert self._side("down", "down", None, "up") == ("up", "")
 
-    def test_a_flat_read_is_not_a_vote(self):
-        assert self._side("up", "up", None, "flat") == ""
+    def test_all_three_against_vetoes_it(self):
+        assert self._side("down", "down", "down", "up") == ("", "up")
 
-    def test_nothing_agrees_on_nothing(self):
-        assert self._side(None, None, None, "") == ""
+    def test_all_three_with_it_is_fine(self):
+        assert self._side("up", "up", "up", "up") == ("up", "")
 
-    def test_the_route_uses_three(self):
+    def test_a_flat_candle_is_no_signal(self):
+        assert self._side("up", "up", "up", "flat") == ("", "")
+        assert self._side("up", "up", "up", "") == ("", "")
+
+    def test_a_silent_stack_cannot_veto(self):
+        """All three must POINT the other way. Absent is not
+        opposed."""
+        assert self._side(None, None, None, "down") == ("down", "")
+        assert self._side("up", None, "up", "down") == ("down", "")
+
+    def test_the_route_calls_it_rather_than_copying_it(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
-        assert "MIN_AGREE = 3" in src
         i = src.index("def _agreement(")
-        blk = src[i:i + 2000]
-        assert "votes.count(way) >= MIN_AGREE" in blk
-        # The old rule must be gone, not merely bypassed.
-        assert "all(v == vals[0]" not in blk
+        blk = src[i:src.index("def _journal_step(")]
+        assert "jn_signal(says, r)" in blk
+        # The vote count is gone, not merely unused.
+        assert "votes.count(way) >= MIN_AGREE" not in blk
+        # And the rule is not re-written alongside the call.
+        assert "all(says[t] == other" not in blk
 
-    def test_the_column_reports_the_count_and_the_dissenter(self):
-        """"It agreed" cannot tell a clean signal from a contested
-        one once three is enough."""
+    def test_the_veto_is_reported(self):
+        """A veto that fires invisibly is worse than no veto."""
         src = (ROOT / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step")
-        blk = src[i:i + 3000]
-        assert '"votes"' in blk
-        assert '"against"' in blk
+        assert '"vetoed"' in src[i:i + 3000]
+        j = src.index("function paintJournal(")
+        assert "VETOED" in src[j:j + 9000]
+
+
+class TestResettingTheTest:
+    """Chris: "i need to be able to reset the test if i choose"."""
+
+    def test_the_button_exists(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert "function jnlReset(" in src
+        assert "Reset test" in src
+
+    def test_it_asks_first(self):
+        """A record a stray click can empty is not a record."""
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function jnlReset(")
+        blk = src[i:i + 900]
+        assert "confirm(" in blk
+        assert "cannot be undone" in blk
+        # Through the URL encoder, not concatenated: a symbol with a
+        # '#' in it turns the rest of the query into a fragment and
+        # the request arrives without its token.
+        assert "confirm: 'yes'" in blk
+        assert "q({coin:" in blk
+
+    def test_it_names_the_count_being_deleted(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function jnlReset(")
+        assert "stats.trades" in src[i:i + 500]
+
+    def test_it_clears_only_this_market(self, jn):
+        jn.open_trade("ES", "up", 6700.0)
+        jn.close_trade("ES", 6701.0)
+        jn.open_trade("NQ", "up", 24000.0)
+        jn.close_trade("NQ", 24001.0)
+        assert jn.clear("ES") == 1
+        assert jn.stats("ES").n == 0
+        assert jn.stats("NQ").n == 1
+
+    def test_the_test_starts_clean_after_a_reset(self, jn):
+        for _ in range(5):
+            jn.open_trade("ES", "up", 6700.0)
+            jn.close_trade("ES", 6701.0)
+        assert jn.stats("ES").verdict()["need"] == 25
+        jn.clear("ES")
+        v = jn.stats("ES").verdict()
+        assert v["need"] == 30
+        assert v["enough"] is False
 
 
 class TestTheAutoButton:
@@ -800,10 +851,21 @@ class TestTheAutoButton:
             assert act2 in ("", "close")
 
     def test_the_panel_says_where_auto_stops(self):
+        """The whole jnlBox, found by its closing div rather than by
+        a character count -- this sliced 2,500 and broke when the
+        reset button was added, with its claim still true. Fifth test
+        today to fail that way."""
+        import re
+
         src = (ROOT / "liqmap" / "web.py").read_text()
         i = src.index('id="jnlBox"')
-        blk = src[i:i + 2500]
-        assert "nothing here reaches Ironbeam" in blk
+        j = src.index('id="jnlRecent"', i)
+        # WHITESPACE-FLATTENED. The sentence wraps across a line in
+        # the markup, so a raw substring search misses it and reports
+        # the panel as silent about the one thing it must say.
+        blk = re.sub(r"\s+", " ", src[i:j])
+        assert "nothing here reaches <b>Ironbeam" in blk or \
+               "nothing here reaches Ironbeam" in blk, blk[:400]
         assert "yours to place" in blk
 
     def test_the_switch_still_persists(self, jn):

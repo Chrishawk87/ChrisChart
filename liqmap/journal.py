@@ -517,3 +517,38 @@ def decide(t: Trade | None, s: Settings, px: float,
     if s.auto and agree in ("up", "down"):
         return "open", agree
     return "", ""
+
+
+STACK = ("15m", "5m", "1m")
+
+
+def signal(says: dict, read: str) -> tuple[str, str]:
+    """The direction to trade, and the direction that was vetoed.
+
+    THE OFI CANDLE DECIDES. `read` is where price sits against the
+    open of the bar in progress and it is the whole signal -- the
+    three timeframes stopped voting when Chris said the column is
+    "supposed to be tracking the OFI candle making trades based on
+    that and nothing more".
+
+    THE STACK IS A VETO AND ONLY A VETO, and only when ALL THREE
+    point the other way. Two against is not a veto; a silent row is
+    not opposed. That is the stack saying as clearly as it can that
+    the candle is running against everything above it.
+
+    FLAT IS NOT A DIRECTION -- price at its candle's open would
+    otherwise open a trade on a bar that has not moved.
+
+    This lives here, not in the route, for the reason the auto gate
+    did: a rule inside a closure can only be reached through an HTTP
+    request, and the fixture that request goes through decides what
+    the rule is ever asked. Deleting the veto broke no test while it
+    lived there.
+    """
+    side = read if read in ("up", "down") else ""
+    if not side:
+        return "", ""
+    other = "down" if side == "up" else "up"
+    if all(says.get(t) == other for t in STACK):
+        return "", side
+    return side, ""

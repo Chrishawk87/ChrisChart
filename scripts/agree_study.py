@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""THE ONLY STRATEGY. Three of four agree, you are in; they stop, you are out.
+"""THE ONLY STRATEGY. The OFI candle decides; the stack can only veto.
 
-    ENTRY   THREE of these four pointing the same way: the 15m, the
-            5m, the 1m and the OFI bar read. A fourth pointing the
-            other way does not block it -- Chris's rule, and the
-            report names how often that happened.
+    ENTRY   The OFI bar read -- where price sits against the open of
+            the bar in progress. That is the whole signal. The 15m,
+            5m and 1m do not vote; they VETO, and only when all three
+            point the other way.
     EXIT    take profit, stop loss, or the agreement breaking --
             whichever comes first.
 
@@ -54,8 +54,6 @@ from liqmap.ofibar import OfiBarBuilder                  # noqa: E402
 POINT = 1_000_000_000
 RAW_TICK = POINT // 4
 STACK = ("15m", "5m", "1m")
-# Three of the four. See `_side`.
-MIN_AGREE = 3
 SECS = {"15m": 900.0, "5m": 300.0, "1m": 60.0}
 
 
@@ -123,22 +121,18 @@ class Result:
 
 
 def _side(dirs: dict, read: str) -> str:
-    """Which way three of the four point, or "".
+    """The direction to trade. "" for none.
 
-    THREE, NOT FOUR, and a dissenting fourth does not block it. It was
-    all four until Chris changed it; three is three even with the odd
-    one out pointing the other way. Two against two is not three.
-
-    The same rule the panel runs, deliberately in one place in each --
-    a study measuring a slightly different rule from the one on the
-    screen is worse than no study.
+    THE OFI CANDLE DECIDES and the stack only vetoes -- the same rule
+    the panel runs, imported from the same place rather than written
+    out twice. A study measuring a slightly different rule from the
+    one on the screen is worse than no study, and this file has
+    already drifted from it once.
     """
-    votes = [dirs.get(t) for t in STACK]
-    votes.append(read if read in ("up", "down") else None)
-    for way in ("up", "down"):
-        if votes.count(way) >= MIN_AGREE:
-            return way
-    return ""
+    from liqmap.journal import signal
+
+    side, _vetoed = signal(dirs, read)
+    return side
 
 
 def _dirs(tape, now_s: float, book) -> dict:
@@ -291,7 +285,7 @@ def from_files(paths, limit: int = 0):
 
 def report(res: Result, src: str, real: bool) -> None:
     print(f"\n{'=' * 78}")
-    print("THREE OF FOUR AGREE   15m + 5m + 1m + the OFI bar read")
+    print("THE OFI CANDLE DECIDES   15m/5m/1m veto only")
     print(f"{src}")
     print(f"take profit {res.tp:g} pts   stop loss {res.sl:g} pts"
           f"   (0 means not used)")
