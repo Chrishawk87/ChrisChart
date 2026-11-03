@@ -6465,6 +6465,23 @@ def create_app() -> FastAPI:
 
     from .journal import signal as jn_signal
 
+    def _window_now(rt_) -> dict:
+        """The forming 15-minute window, as the panel draws it.
+
+        FROM THE SAME OBJECT THE PANEL READS. A second accumulation
+        for the trade rule would be a second thing to keep in step
+        with the one on the screen, and the first time they drifted
+        the column would be trading a window nobody could see.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        cw = getattr(tape, "clockwin", None) if tape else None
+        cur = getattr(cw, "current", None) if cw else None
+        try:
+            return cur.to_dict() if cur is not None else {}
+        except Exception:                               # noqa: BLE001
+            return {}
+
     def _bar_read(rt_) -> dict:
         """The OFI bar read -- the fourth of the four.
 
@@ -6552,8 +6569,19 @@ def create_app() -> FastAPI:
         s = j.settings(coin_)
         px = _live_px(rt_, coin_)
         read = _bar_read(rt_)
-        side, says, vetoed = _agreement(out_, read)
-        bar_ts = float(read.get("bar_ts") or 0.0)
+        # THE SIGNAL IS THE 15-MINUTE WINDOW NOW, not the bucket
+        # candle. They were separate systems and nothing said so --
+        # the column traded the 2,000-contract bar while the window
+        # was only ever a comparison panel, so an agreement there
+        # drove nothing and looked broken.
+        win = _window_now(rt_)
+        side, blocked_why = jn.window_signal(win)
+        says = {"candle": win.get("mid_dir") or None,
+                "ofi": win.get("ofi_dir") or None,
+                "cvd": win.get("cvd_dir") or None}
+        vetoed = blocked_why
+        # The window is the candle the cap counts against.
+        bar_ts = float(win.get("start_ts") or 0.0)
         taken = j.sides_in_bar(coin_, bar_ts)
 
         t = j.open_trade_for(coin_)
@@ -6564,14 +6592,14 @@ def create_app() -> FastAPI:
         # agreement -- so deleting the auto check broke nothing that
         # any test could see.
         act, arg = jn.decide(t, s, px, side, taken,
-                             (read or {}).get("price_dir") or "")
+                             (win.get("mid_dir") or ""))
         idle_why = arg if act == "" else ""
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
             t = None
             taken = j.sides_in_bar(coin_, bar_ts)
             act, arg = jn.decide(None, s, px, side, taken,
-                                 (read or {}).get("price_dir") or "")
+                                 (win.get("mid_dir") or ""))
             idle_why = arg if act == "" else ""
         if act == "open":
             t = j.open_trade(
@@ -6598,8 +6626,8 @@ def create_app() -> FastAPI:
             # or "stack". A block that fires invisibly is worse than
             # no block -- it reads as a market with nothing in it.
             "blocked": vetoed,
-            "would_be": ((read or {}).get("read") or "") if vetoed
-                        else "",
+            "window": win,
+            "would_be": (win.get("mid_dir") or "") if vetoed else "",
             # WHY NOTHING HAPPENED, on every poll that does
             # nothing. Blank only when a trade was opened or closed.
             "idle": idle_why,
@@ -9129,10 +9157,12 @@ has to be running before the gate stops refusing.">spike
         <div class="msg" style="margin-bottom:8px"><b>The OFI candle
           decides.</b> Up when the candle is green, down when it is
           red &mdash; the imbalance of the bar in progress.
-          <b>The OFI candle has to match the CVD.</b> Green is a buy
-          and red is a sell, and the CVD &mdash; size that actually
-          traded &mdash; has to point the same way or there is no
-          trade. One trade per candle when they agree. It exits when
+          <b>The 15-minute window decides.</b> A trade opens when all
+          three of that window agree &mdash; its mid-price candle, its
+          net OFI and its net CVD, every one rebuilt from the raw
+          events. One trade per direction per window. The bucket
+          candle no longer drives this; it is the comparison in the
+          panel below. It exits when
           price <b>diverges</b> from the lean &mdash; that is the take
           profit &mdash; or when the candle flips. A turn the
           <b>CVD has not followed</b> is a suspect turn and is not
@@ -14298,70 +14328,34 @@ function paintJournal(d) {
       + ' ticks from the open of this OFI bar</span>'
     : '<span class="thin">— no OFI bar forming</span>';
   const ag = $('jnlAgree');
+  const W = J.window || {};
   if (ag) {
-    ag.innerHTML = (J.blocked === 'cvd-side'
-      ? '<b class="short">NO TRADE</b> <span class="thin">the OFI is '
-        + esc(J.would_be).toUpperCase() + ' but the delta is '
-        + esc((R.delta_side || 'flat')).toUpperCase()
-        + ' — they have to agree</span>'
-      : J.blocked === 'cvd'
-      ? '<b class="short">SUSPECT FLIP</b> <span class="thin">the OFI '
-        + 'turned ' + esc(J.would_be).toUpperCase() + ' but the CVD '
-        + 'since it turned is '
-        + Math.round(R.cvd_since_flip || 0).toLocaleString()
-        + ' — nothing has followed it through</span>'
-      : J.blocked === 'stack'
-      ? '<b class="short">VETOED</b> <span class="thin">the candle '
-        + 'reads ' + esc(J.would_be).toUpperCase() + ' and all three '
-        + 'timeframes point the other way</span>'
-      : J.agree
-      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">CANDLE '
-        + J.agree.toUpperCase() + '</b>'
-        + (J.against ? ' <span class="thin">(' + esc(J.against)
-            + ' disagrees — shown, not blocking)</span>' : '')
-        + (S.auto ? ' <span class="thin">— auto will take it</span>'
-                  : ' <span class="thin">— log it if you take it</span>')
-      : '<span class="thin">no direction on this candle. </span>'
-        + ['15m', '5m', '1m'].map(k =>
-            esc(k) + ' ' + word(says[k])).join(' <span class="thin">·</span> ')
-        + ' <span class="thin">(veto only)</span>')
-      + '<div class="thin" style="margin-top:4px">candle &mdash; '
-      + readBit
-      + (R.read === 'flat' && R.raw_side && R.raw_side !== 'flat'
-          ? ' <span class="thin">· leaning ' + esc(R.raw_side)
-            + ' but inside ±' + (R.level || 0).toLocaleString()
-            + '</span>'
-          : '')
-      + ' <span class="thin">· CVD since the turn </span>'
-      + ((R.cvd_since_flip || 0) > 0
-          ? '<b class="long">+' + Math.round(R.cvd_since_flip).toLocaleString() + '</b>'
-          : (R.cvd_since_flip || 0) < 0
-          ? '<b class="short">' + Math.round(R.cvd_since_flip).toLocaleString() + '</b>'
-          : '<b>0</b>')
-      + (R.read && R.read !== 'flat' && !R.flip_ok
-          ? ' <span class="short">· the turn is not confirmed</span>'
-          : '')
-      + ' <span class="thin">· CVD </span>'
-      + (R.delta_side === 'up' ? '<b class="long">UP</b>'
-         : R.delta_side === 'down' ? '<b class="short">DOWN</b>'
-         : '<b>FLAT</b>')
-      + ' <span class="thin">' + Math.round(R.delta || 0).toLocaleString()
-      + '</span>'
-      + (R.read && R.read !== 'flat' && R.delta_side
-         && R.read !== R.delta_side
-          ? ' <span class="short">· they do not match</span>' : '')
-      + ' <span class="thin">· price </span>'
-      + (R.price_dir === 'up' ? '<b class="long">UP</b>'
-         : R.price_dir === 'down' ? '<b class="short">DOWN</b>'
-         : '<b>FLAT</b>')
-      + ' <span class="thin">' + ((R.ticks > 0 ? '+' : '')
-          + (R.ticks || 0).toFixed(2)) + ' ticks</span>'
-      + (R.read && R.price_dir && R.read !== R.price_dir
-          ? ' <span class="short">· they disagree, so no trade</span>'
-          : '')
+    /* THE WINDOW IS THE SIGNAL. All three the same way opens a
+       trade; anything else says which one is off, by name, because
+       "no signal" was what this column said for days while the
+       reason sat one function away. */
+    ag.innerHTML = (J.agree
+      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">'
+        + 'WINDOW ' + J.agree.toUpperCase() + '</b>'
+        + ' <span class="thin">candle, OFI and CVD all the same way</span>'
+      : '<b class="short">NO TRADE</b> <span class="thin">'
+        + esc(J.blocked || 'no window yet') + '</span>')
+      + '<div class="thin" style="margin-top:4px">15-minute window'
+      + ' &mdash; candle ' + word(W.mid_dir === 'flat' ? null : W.mid_dir)
+      + (W.mid_dir === 'flat' ? ' <b>FLAT</b>' : '')
+      + ' <span class="thin">' + ((W.ticks > 0 ? '+' : '')
+          + (W.ticks || 0).toFixed(2)) + ' ticks</span>'
+      + ' &middot; OFI ' + word(W.ofi_dir === 'flat' ? null : W.ofi_dir)
+      + (W.ofi_dir === 'flat' ? ' <b>FLAT</b>' : '')
+      + ' <span class="thin">'
+      + Math.round(W.net_ofi || 0).toLocaleString() + '</span>'
+      + ' &middot; CVD ' + word(W.cvd_dir === 'flat' ? null : W.cvd_dir)
+      + (W.cvd_dir === 'flat' ? ' <b>FLAT</b>' : '')
+      + ' <span class="thin">'
+      + Math.round(W.net_cvd || 0).toLocaleString() + '</span>'
       + capBit
-      + (J.idle ? '<div class="thin" style="margin-top:4px">'
-          + '<b>no trade</b> &mdash; ' + esc(J.idle) + '</div>' : '')
+      + (J.idle ? ' &middot; <b>no trade</b> &mdash; ' + esc(J.idle)
+                : '')
       + '</div>';
   }
 

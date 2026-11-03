@@ -676,3 +676,43 @@ def signal(says: dict, read: str, cvd: str = "",
 # the per-direction rule is the one he keeps restating and the cap
 # follows from it.
 MAX_PER_BAR = 2
+
+
+def window_signal(win: dict) -> tuple[str, str]:
+    """The direction a 15-minute window is trading, and what stopped it.
+
+    ALL THREE THE SAME WAY: the mid-price candle, the net OFI and the
+    net CVD, every one of them rebuilt from the raw events over the
+    same fifteen minutes. Chris: "this is not taking trades when the
+    15 minute window shows that all 3 are the same directions".
+
+    THIS REPLACES THE BUCKET CANDLE AS THE SIGNAL. The two were
+    separate systems -- the column traded the 2,000-contract bar
+    while the window was only ever a comparison panel -- and nothing
+    on the screen said so, which is how he came to expect a trade
+    from an agreement that drove nothing.
+
+    FLAT IS NOT A DIRECTION, on any of the three. Three zeros are not
+    three signals pointing together, and a window with nothing in it
+    would otherwise read as the strongest kind there is.
+
+    No flip confirmation here. That check asked whether anything
+    printed behind the OFI's last turn INSIDE a bucket bar; over a
+    fifteen-minute window the CVD agreeing is that question already
+    answered.
+    """
+    if not win:
+        return "", "no window yet"
+    candle = win.get("mid_dir") or ""
+    ofi = win.get("ofi_dir") or ""
+    cvd = win.get("cvd_dir") or ""
+    if candle not in ("up", "down"):
+        return "", "the window candle is flat"
+    off = []
+    if ofi != candle:
+        off.append(f"OFI is {ofi or 'flat'}")
+    if cvd != candle:
+        off.append(f"CVD is {cvd or 'flat'}")
+    if off:
+        return "", (f"the candle is {candle} but " + " and ".join(off))
+    return candle, ""

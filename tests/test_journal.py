@@ -435,15 +435,19 @@ class TestTheColumnEndToEnd:
         assert j["places_orders"] is False
         assert "stats" in j and "settings" in j
 
-    def test_it_names_which_of_the_four_disagree(self, client,
-                                                 monkeypatch):
-        """"no signal" says nothing about which one is holding it
-        up, which is the whole reason this column exists."""
+    def test_it_names_which_of_the_three_disagree(self, client,
+                                                  monkeypatch):
+        """"no signal" says nothing about which one is holding it up.
+
+        The three are the 15-minute window's own: its mid candle, its
+        net OFI and its net CVD. They were the stack's timeframes
+        plus the bucket read until Chris moved the signal to the
+        window."""
         from tests.test_cme_panels import _cme
 
         _cme(monkeypatch)
         says = self._read(client)["journal"]["says"]
-        assert set(says) == {"15m", "5m", "1m", "read"}
+        assert set(says) == {"candle", "ofi", "cvd"}
 
     def test_a_manual_trade_opens_and_closes(self, client, monkeypatch):
         from tests.test_cme_panels import _cme
@@ -771,15 +775,29 @@ class TestTheCandleDecidesAndTheStackVetoes:
         # And the rule is not re-written alongside the call.
         assert "all(says[t] == other" not in blk
 
-    def test_the_veto_is_reported(self):
+    def test_the_block_is_reported(self):
         """A block that fires invisibly is worse than no block -- it
-        reads as a market with nothing in it."""
+        reads as a market with nothing in it. It names which of the
+        window's three is off now, not which timeframe."""
         blk = py_func("_journal_step")
         assert '"blocked"' in blk
         assert '"would_be"' in blk
-        src = (ROOT / "liqmap" / "web.py").read_text()
-        j = src.index("function paintJournal(")
-        assert "VETOED" in src[j:j + 12000]
+        assert '"window"' in blk
+        assert "jn.window_signal(win)" in blk
+
+    def test_the_stack_veto_no_longer_gates_the_trade(self):
+        """IT WAS DROPPED, NOT FORGOTTEN. The veto belonged to the
+        bucket rule -- the trade was refused when all three
+        timeframes opposed the bucket candle. The signal is the
+        15-minute window now and that window has its own three; the
+        stack is not among them.
+
+        Pinned so the removal is a decision on the record rather
+        than something that quietly stopped firing.
+        """
+        blk = py_func("_journal_step")
+        assert "jn_signal(" not in blk
+        assert "_agreement(" not in blk
 
 
 class TestResettingTheTest:
@@ -1413,3 +1431,99 @@ class TestCvdConfirmsTheFlip:
     def test_the_route_passes_it_through(self):
         blk = py_func("_agreement")
         assert 'flip_ok' in blk
+
+
+class TestTheWindowOpensTheTrade:
+    """Chris: "this is not taking trades when the 15 minute window
+    shows that all 3 are the same directions".
+
+    It could not. The column traded the 2,000-contract bucket candle
+    and the window was only ever a comparison panel -- two separate
+    systems, with nothing on the screen saying so. An agreement in
+    the window drove nothing.
+
+    These drive the real route with a real window, because the bug
+    was precisely that the two were never connected: a test of the
+    rule alone would have passed throughout.
+    """
+
+    AUTH = {"Authorization": "Bearer t0ken"}
+
+    def _set_up(self, monkeypatch, bid_growth=60, buys=True):
+        from tests.test_cme_panels import _cme
+
+        rt, tape = _cme(monkeypatch)
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        rec = getattr(rt, "_candlerec", None)
+        if rec is not None:
+            rec.stop()
+        cw = tape.clockwin
+        P, T = 1_000_000_000, 250_000_000
+        px = 6700 * P
+        # Price up, book leaning up, buyers printing: all three up.
+        for i in range(30):
+            cw.on_book(i * 10.0, int(px + i * T), 500 + i * bid_growth,
+                       int(px + i * T + T), 500)
+            cw.on_trade_px(i * 10.0 + 1.0, 6700.0 + i * 0.25, 5.0,
+                           "B" if buys else "A")
+        tape.last_px = 6707.0
+        return rt, tape, cw
+
+    def _read(self, client):
+        r = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=self.AUTH)
+        assert r.status_code == 200, r.text
+        return r.json()["journal"]
+
+    def _auto_on(self, client):
+        client.post("/api/journal/settings",
+                    params={"coin": "ES", "auto": True},
+                    headers=self.AUTH)
+
+    def test_all_three_agreeing_is_reported(self, client, monkeypatch):
+        self._set_up(monkeypatch)
+        j = self._read(client)
+        assert j["window"]["mid_dir"] == "up"
+        assert j["window"]["ofi_dir"] == "up"
+        assert j["window"]["cvd_dir"] == "up"
+        assert j["agree"] == "up", j.get("blocked")
+
+    def test_all_three_agreeing_opens_a_trade(self, client,
+                                              monkeypatch):
+        """THE BUG, END TO END."""
+        self._set_up(monkeypatch)
+        self._auto_on(client)
+        j = self._read(client)
+        assert j["open"] is not None, j.get("idle") or j.get("blocked")
+        assert j["open"]["side"] == "up"
+        assert j["open"]["mode"] == "auto"
+
+    def test_a_disagreeing_window_says_which_one(self, client,
+                                                  monkeypatch):
+        """Selling prints against a rising candle: the CVD is the
+        one holding it up, and the column says so by name."""
+        self._set_up(monkeypatch, buys=False)
+        self._auto_on(client)
+        j = self._read(client)
+        assert j["open"] is None
+        assert "CVD" in (j["blocked"] or ""), j["blocked"]
+
+    def test_the_window_is_the_candle_the_cap_counts(self, client,
+                                                      monkeypatch):
+        """One per direction per WINDOW now, not per bucket bar."""
+        _rt, _tape, cw = self._set_up(monkeypatch)
+        self._auto_on(client)
+        self._read(client)
+        blk = py_func("_journal_step")
+        assert 'win.get("start_ts")' in blk
+
+    def test_the_signal_comes_from_the_panels_own_object(self):
+        """A second accumulation for the trade rule would be a second
+        thing to keep in step with the one on the screen, and the
+        first time they drifted the column would be trading a window
+        nobody could see."""
+        blk = py_func("_window_now")
+        assert "clockwin" in blk
+        assert "current" in blk
