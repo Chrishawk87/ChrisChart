@@ -1076,6 +1076,11 @@ class Runtime:
                     # disk that will not take it is a slow start, not a
                     # dead feed.
                     self._candlerec = None
+            if svc.tape.clockwin is None:
+                # The clock version of the same three measurements,
+                # for comparing against the contract-bucket candles.
+                from .clockwin import ClockWindows
+                svc.tape.clockwin = ClockWindows()
             if svc.tape.flowread is None:
                 from .flowread import FlowRead
                 svc.tape.flowread = FlowRead()
@@ -5375,6 +5380,39 @@ def create_app() -> FastAPI:
                     "history for this market and cannot be undone"}
         n = rt.journal.clear(coin)
         return {"ok": True, "deleted": n}
+
+    @app.get("/api/clockwindows", dependencies=[Depends(require_token)])
+    def api_clockwindows(coin: str = "ES", limit: int = 40
+                         ) -> dict[str, Any]:
+        """Fifteen-minute windows: mid OHLC, net OFI, net CVD.
+
+        ALL REBUILT FROM RAW EVENTS as they arrive, never resampled.
+        The forming window updates on every book update and every
+        print and locks at the boundary; a batch resample produces
+        the same closed values and cannot produce the forming one.
+
+        The OFI uses the same `level_ofi` the contract-bucket candles
+        use, because the comparison is worthless if the two versions
+        are computed differently. MBP-10 means level-level at the
+        touch -- per-order reconstruction needs MBO.
+
+        Nothing here places, sizes or times an order.
+        """
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc else None
+        cw = getattr(tape, "clockwin", None) if tape else None
+        if cw is None:
+            rt.footprint(rule="1m", volume=0, min_volume=0,
+                         multiplier=4.0)
+            cw = getattr(tape, "clockwin", None) if tape else None
+        if cw is None:
+            return {"ok": False, "why": "the CME engine is not "
+                                        "configured"}
+        out = cw.snapshot(limit=max(1, min(int(limit), 200)))
+        return {"ok": True, "coin": coin, "source": "cme",
+                "candle": "mid-price from the book",
+                "ofi": "level-level at the touch (MBP-10)",
+                "places_orders": False, **out}
 
     @app.get("/api/read", dependencies=[Depends(require_token)])
     def api_read(coin: str = "BTC", interval: str = "15m",

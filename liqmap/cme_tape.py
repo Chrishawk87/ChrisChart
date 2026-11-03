@@ -144,6 +144,12 @@ class Tape:
     # actually looking at. Set by the poll, read by the frame; zero
     # until the first poll says.
     read_target: int = 0
+    # THE SAME THREE MEASUREMENTS ON A CLOCK. Fifteen-minute windows
+    # of mid-price OHLC, net OFI and net CVD, all rebuilt from the
+    # raw events as they arrive -- never resampled -- so the
+    # contract-bucket candles above can be compared against a time
+    # version on equal terms.
+    clockwin: object = None
     # WHICH SIDE IS WINNING, continuously, independent of the bars.
     # One instance, not one per target: the five builders are five
     # slicings of one tape, and the flow underneath them is one thing.
@@ -356,6 +362,25 @@ class Tape:
                     _fn()
                 except Exception:                       # noqa: BLE001
                     pass
+        # ---- the clock windows see the RAW print -------------------
+        #
+        # `trade_from` returns None when the side is 'N', so every
+        # reader downstream of it omits those trades silently. Chris
+        # asked for them counted, not dropped, so this reads the
+        # record itself: a tape full of unknown-side prints must not
+        # be able to look like a balanced one.
+        if self.clockwin is not None:
+            try:
+                if dbn._action(rec) in (dbn.ACTION_TRADE,
+                                        dbn.ACTION_FILL):
+                    _ts = float(dbn.seconds(
+                        dbn._get(rec, "ts_event")) or 0.0)
+                    _rsz = float(dbn._get(rec, "size", 0) or 0)
+                    _rpx = dbn.price(dbn._get(rec, "price"))
+                    self.clockwin.on_trade_px(
+                        _ts, _rpx, _rsz, dbn._side(rec))
+            except Exception:                           # noqa: BLE001
+                pass            # a measurement must not stop the tape
         t = dbn.trade_from(rec)
         if self.ofibars:
             # Fed from the RAW integer levels, not from the decoded
@@ -399,6 +424,11 @@ class Tape:
                     asz = int(dbn._get(l0, "ask_sz", 0) or 0)
                     for _b in self.ofibars.values():
                         _b.on_book(bts, bpx, bsz, apx, asz)
+                    if self.clockwin is not None:
+                        # Same book update, same OFI formula. The
+                        # comparison is worthless if the two versions
+                        # of OFI are computed differently.
+                        self.clockwin.on_book(bts, bpx, bsz, apx, asz)
                     if self.flowread is not None:
                         # The same book update, through the same OFI
                         # formula. The reading and the candles cannot
