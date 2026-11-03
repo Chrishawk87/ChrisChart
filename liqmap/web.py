@@ -5623,6 +5623,9 @@ def create_app() -> FastAPI:
             # disagrees with you, and the two call for opposite reactions.
             ages: dict[str, float] = {}
             srcs: dict[str, str] = {}
+            # Why a timeframe did not produce a measured row. Empty
+            # for every row that did.
+            tf_why: dict[str, str] = {}
             # Kept per timeframe so the volume read below has the same bars
             # the direction read was built from, rather than fetching them
             # a second time and possibly getting a different slice.
@@ -5667,14 +5670,33 @@ def create_app() -> FastAPI:
                 # what it is so the row's age says the reading is of a
                 # finished bar rather than of this one.
                 closed_fallback = False
+                # WHY THIS ROW ENDED UP WHERE IT DID, recorded as it
+                # happens. "the stack is incomplete" names the
+                # timeframes and not the cause, and three separate
+                # faults have now produced that identical sentence --
+                # each one costing a round trip to find, because the
+                # panel could say what was missing and never why.
+                why_tf = ""
+                if feed is None:
+                    why_tf = "no CME feed for this market"
+                elif bar is None:
+                    why_tf = "no bar in progress"
+                elif not bar.seeded:
+                    why_tf = ("the bar in progress is unseeded -- its "
+                              "open was never observed")
                 if (bar is None or not bar.seeded) and feed is not None:
                     try:
                         last = feed.last_closed(tf)
                     except Exception:                   # noqa: BLE001
                         last = None
-                    if last is not None and getattr(
-                            last, "flow_measured", False):
+                    if last is None:
+                        why_tf += "; and no closed bar to fall back on"
+                    elif not getattr(last, "flow_measured", False):
+                        why_tf += ("; the last closed bar carries no "
+                                   "aggressor, so it has no direction")
+                    else:
                         bar, closed_fallback = last, True
+                        why_tf = ""
                 if bar is not None and (bar.seeded or closed_fallback):
                     cov = (min(1.0, (now_s - feed.started_at) / iv)
                            if feed.started_at else 0.0)
@@ -5689,9 +5711,17 @@ def create_app() -> FastAPI:
                     # and a prior that is too wide reports an ordinary down
                     # minute as flat -- which inverts it into an absorption
                     # read pointing the other way.
-                    readings.append(pr.from_live(
+                    _r = pr.from_live(
                         tf, iv, bar, book, coverage=max(cov, 0.05),
-                        history=feed.history(tf)))
+                        history=feed.history(tf))
+                    if not _r.measured:
+                        # A LIVE BAR THAT STILL DOES NOT COUNT. Rare,
+                        # and it used to disappear into the same blank
+                        # row as everything else.
+                        tf_why[tf] = ("read from the live bar, but it "
+                                      "measured nothing -- no fills "
+                                      "have been counted in it")
+                    readings.append(_r)
                     tf_hist[tf] = feed.history(tf)
                     # THE AGE TELLS THE TWO APART. A reading of the bar
                     # in progress is as old as the last print; a
@@ -5723,7 +5753,13 @@ def create_app() -> FastAPI:
                     tf_bars, _tfwhy, _tfsrc = _candle_rows(
                         coin, tf, pr.TYPICAL_BARS + 6)
                 if not tf_bars:
+                    tf_why[tf] = (why_tf or "no bars at all") + \
+                        "; and no stored candles either"
                     continue
+                tf_why[tf] = ((why_tf + "; " if why_tf else "")
+                              + "read from stored candles, which carry "
+                                "no aggressor -- the stack only counts "
+                                "bars built from fills")
                 # A polled bar is as old as the moment it was last written,
                 # which for a closed bar is however long ago it closed.
                 last_ts = float(getattr(tf_bars[-1], "ts", 0.0) or 0.0)
@@ -5988,6 +6024,24 @@ def create_app() -> FastAPI:
                                 previous=rt.last_aligned(coin, interval))
                 rt.remember_aligned(coin, interval, csc.aligned_way(casc))
                 out["cascade"] = casc.to_dict()
+                # THE CAUSE, ON THE PANEL, NEXT TO THE SYMPTOM.
+                #
+                # "no read on 15m, 5m, 1m -- the stack is incomplete"
+                # is what three different faults have produced, and
+                # each took a round trip to tell apart because the
+                # screen could say what was missing and never why. The
+                # route knows; it just was not saying.
+                missing = [g["timeframe"] for g in
+                           (out["cascade"].get("rungs") or [])
+                           if not g.get("present")]
+                if missing:
+                    out["cascade"]["blocked"] = [
+                        {"timeframe": t,
+                         "why": tf_why.get(t) or (
+                             "the row never reached the stack and left "
+                             "no reason -- that is a bug, not a market "
+                             "state")}
+                        for t in missing]
 
                 # ---- and how the read GOT here ---------------------
                 #
@@ -13577,6 +13631,18 @@ function paintCascade(d) {
                                               : 'building it') + '</span>'
          + '</div>';
   }).join('') || '<div class="msg">no rows</div>';
+  /* WHY, NOT JUST WHAT. The line above names the timeframes that did
+     not read; three separate faults have produced that same sentence
+     and none of them could be told apart from the screen. The route
+     records the reason per row now, so it goes here. */
+  if (C.blocked && C.blocked.length) {
+    el.innerHTML += '<div class="msg" style="margin-top:8px">'
+      + '<b>why these rows did not read</b>'
+      + C.blocked.map(b => '<div class="thin" style="margin-top:4px">'
+          + '<b>' + esc(b.timeframe) + '</b> &mdash; ' + esc(b.why)
+          + '</div>').join('')
+      + '</div>';
+  }
   const st = $('cascStamp');
   if (st) st.textContent = C.trading ? 'trading ' + C.trading : '';
 }

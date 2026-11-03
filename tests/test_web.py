@@ -2369,9 +2369,18 @@ def test_a_live_row_is_given_its_own_timeframes_history(client):
 
     from liqmap import web as w
     src = inspect.getsource(w.create_app)
-    call = src[src.index("readings.append(pr.from_live("):]
-    call = call[:call.index("ages[tf]")]
-    assert "history=feed.history(tf)" in call
+    # THE CALL, NOT ITS FORMATTING. This used to key on the exact text
+    # `readings.append(pr.from_live(` and broke the moment the result
+    # was assigned to a variable first -- a change that does not touch
+    # what is passed. Find the call and read its arguments.
+    import re
+
+    # One balanced level of nesting is enough here: the call's own
+    # arguments contain calls, and a naive scan to the first ')' stops
+    # inside `feed.history(tf)`.
+    calls = re.findall(r"pr\.from_live\((?:[^()]|\([^()]*\))*\)", src)
+    assert calls, "the ladder no longer builds a live reading at all"
+    assert any("history=feed.history(tf)" in c for c in calls), calls
 
 
 def test_the_row_carries_the_evidence_behind_its_call(client):

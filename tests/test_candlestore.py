@@ -456,6 +456,88 @@ class TestTheStackReadsImmediatelyAfterARestart:
         assert row is None or row["measured"] is False
 
 
+class TestThePanelSaysWhyNotJustWhat:
+    """Three separate faults have produced the identical sentence
+    "no read on 15m, 5m, 1m -- the stack is incomplete": a venue
+    mix-up that emptied the ladder, an empty candle history, and a
+    missing bar in progress after a restart. Each cost a round trip to
+    tell apart, because the screen could say what was missing and
+    never why. The route knew every time.
+    """
+
+    def _read(self, client):
+        r = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers={"Authorization": "Bearer t0ken"})
+        return r.json()
+
+    def _blocked(self, client):
+        casc = self._read(client).get("cascade") or {}
+        return {b["timeframe"]: b["why"]
+                for b in (casc.get("blocked") or [])}
+
+    def test_a_healthy_stack_blocks_nothing(self, client, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        _cme(monkeypatch)
+        assert self._blocked(client) == {}
+
+    def test_an_unseeded_bar_with_no_usable_history_says_both(
+            self, client, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        _rt, tape = _cme(monkeypatch)
+        for b in tape.builders.values():
+            if b.current is not None:
+                b.current.seeded = False
+            for c in b.closed:
+                c.flow_measured = False
+        got = self._blocked(client)
+        assert set(got) >= {"15m", "5m", "1m"}, got
+        assert "unseeded" in got["15m"], got["15m"]
+        assert "no aggressor" in got["15m"], got["15m"]
+
+    def test_history_without_flow_says_so(self, client, monkeypatch):
+        """The failure mode of a candle store that saved prices and
+        dropped the buy/sell split -- it clears the bar-count gate and
+        reads nothing, and used to look identical to a dead feed."""
+        from tests.test_cme_panels import _cme
+
+        _rt, tape = _cme(monkeypatch)
+        for b in tape.builders.values():
+            b.current = None
+            for c in b.closed:
+                c.flow_measured = False
+        got = self._blocked(client)
+        assert "no bar in progress" in got["15m"], got["15m"]
+        assert "no aggressor" in got["15m"], got["15m"]
+
+    def test_a_blocked_row_never_goes_unexplained(self, client,
+                                                  monkeypatch):
+        """A missing row with no reason attached is a bug in this
+        reporting, and it says so rather than printing a blank."""
+        from tests.test_cme_panels import _cme
+
+        _rt, tape = _cme(monkeypatch)
+        for b in tape.builders.values():
+            b.current = None
+            for c in b.closed:
+                c.flow_measured = False
+        for why in self._blocked(client).values():
+            assert why.strip()
+            assert "that is a bug" not in why, why
+
+    def test_the_page_draws_them(self):
+        """The reasons reach the screen, not just the payload."""
+        web_src = (Path(__file__).resolve().parent.parent / "liqmap"
+                   / "web.py").read_text()
+        i = web_src.index("function paintCascade(")
+        blk = web_src[i:i + 4000]
+        assert "C.blocked" in blk
+        assert "why these rows did not read" in blk
+
+
 class TestTheThread:
     def test_it_starts_and_stops(self, store):
         t = Tape()
