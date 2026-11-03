@@ -1161,3 +1161,105 @@ class TestTwoTradesToACandle:
         blk = src[i:i + 9000]
         assert "taken_this_candle" in blk
         assert "no more until the next one" in blk
+
+
+class TestItOpensADatabaseFromAnEarlierBuild:
+    """Chris, on deploying: OperationalError, table journal_trades
+    has no column named bar_ts. The trade button stopped working
+    entirely and nothing could be logged.
+
+    CREATE TABLE IF NOT EXISTS DOES NOT ALTER AN EXISTING TABLE. The
+    schema gained `bar_ts`, his database was written before it, and
+    every insert failed. The store next door (ofistore) has carried a
+    migration for exactly this since it shipped; this one did not,
+    because I added a column and only ever ran it against a database
+    this build had created.
+    """
+
+    OLD = """CREATE TABLE journal_trades (
+        id INTEGER PRIMARY KEY, coin TEXT NOT NULL, side TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'manual', opened_ts REAL NOT NULL,
+        open_px REAL NOT NULL, closed_ts REAL, close_px REAL,
+        why TEXT NOT NULL DEFAULT '', tp REAL NOT NULL DEFAULT 0,
+        sl REAL NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '')"""
+
+    def _old_db(self, tmp_path, rows=()):
+        import sqlite3
+
+        path = tmp_path / "old.db"
+        c = sqlite3.connect(path)
+        c.execute(self.OLD)
+        for coin, side, op, cl in rows:
+            c.execute("INSERT INTO journal_trades (coin, side,"
+                      " opened_ts, open_px, closed_ts, close_px, why)"
+                      " VALUES (?,?,1.0,?,2.0,?,'manual')",
+                      (coin, side, op, cl))
+        c.commit()
+        c.close()
+        return path
+
+    def test_it_opens_without_raising(self, tmp_path):
+        from liqmap.journal import Journal
+
+        Journal(self._old_db(tmp_path))
+
+    def test_a_trade_can_be_logged_again(self, tmp_path):
+        """The symptom: every insert failed."""
+        from liqmap.journal import Journal
+
+        j = Journal(self._old_db(tmp_path))
+        assert j.open_trade("ES.Z26", "down", 6700.0,
+                            bar_ts=99.0) is not None
+
+    def test_the_old_trades_are_kept(self, tmp_path):
+        """A migration that drops the record it was migrating is
+        worse than the error it replaced."""
+        from liqmap.journal import Journal
+
+        j = Journal(self._old_db(
+            tmp_path, [("ES.Z26", "up", 6700.0, 6701.0)]))
+        assert j.stats("ES.Z26").n == 1
+        assert j.stats("ES.Z26").ticks == 4.0
+
+    def test_a_pre_migration_trade_belongs_to_no_candle(self, tmp_path):
+        """It reads back with the default, zero, and zero means "no
+        candle recorded" -- which is what those trades honestly are.
+        Inventing an id would put them under a cap they were never
+        subject to."""
+        from liqmap.journal import Journal
+
+        j = Journal(self._old_db(
+            tmp_path, [("ES.Z26", "up", 6700.0, 6701.0)]))
+        assert j.closed("ES.Z26")[0].bar_ts == 0.0
+        assert j.sides_in_bar("ES.Z26", 0.0) == ()
+
+    def test_the_cap_works_on_the_migrated_table(self, tmp_path):
+        from liqmap.journal import Journal
+
+        j = Journal(self._old_db(tmp_path))
+        j.open_trade("ES.Z26", "up", 6700.0, bar_ts=99.0)
+        j.close_trade("ES.Z26", 6701.0)
+        assert j.sides_in_bar("ES.Z26", 99.0) == ("up",)
+
+    def test_migrating_twice_is_harmless(self, tmp_path):
+        from liqmap.journal import Journal
+
+        path = self._old_db(tmp_path)
+        Journal(path)
+        j = Journal(path)
+        assert j.open_trade("ES.Z26", "up", 6700.0,
+                            bar_ts=1.0) is not None
+
+    def test_every_added_column_is_declared(self):
+        """The list is what the migration walks. A column added to
+        SCHEMA and not to `_ADDED` is this bug again."""
+        import re
+
+        from liqmap.journal import SCHEMA, _ADDED
+
+        body = SCHEMA[SCHEMA.index("journal_trades"):]
+        body = body[:body.index(");")]
+        cols = set(re.findall(r"^\s{4}(\w+)\s", body, re.M))
+        declared = {n for n, _ in _ADDED}
+        assert declared <= cols, declared - cols
+        assert "bar_ts" in declared

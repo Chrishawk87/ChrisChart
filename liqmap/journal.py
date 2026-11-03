@@ -322,12 +322,42 @@ def _trade_of(r: sqlite3.Row) -> Trade:
                  bar_ts=float(r["bar_ts"] or 0.0))
 
 
+# Columns added after the table first shipped. CREATE TABLE IF NOT
+# EXISTS does NOT alter a table that already exists, so a database
+# written by an earlier build keeps its old shape and every insert
+# fails with "no column named ...". Chris hit exactly that on a
+# deploy: the trade button returned OperationalError and nothing
+# could be logged at all.
+_ADDED = (
+    ("bar_ts", "REAL NOT NULL DEFAULT 0"),
+)
+
+
 class Journal(ThreadedDB):
     """Trades and their settings. One row open per market at a time."""
 
     def __init__(self, path: str | Path = "liqmap.db"):
         super().__init__(path, SCHEMA)
         self._lock = threading.Lock()
+
+    def _bootstrap(self, conn: sqlite3.Connection) -> None:
+        """Create the tables, then add any column a later build grew.
+
+        Rows written before a column existed keep their rows and read
+        back with its default, which for `bar_ts` is zero -- and zero
+        means "no candle recorded", which is what those trades
+        honestly are. Nothing is rewritten: a logged trade is a fact,
+        and inventing a candle id for one that never had one would
+        put it into a cap it was never subject to.
+        """
+        super()._bootstrap(conn)
+        have = {r[1] for r in
+                conn.execute("PRAGMA table_info(journal_trades)")}
+        for name, decl in _ADDED:
+            if name not in have:
+                conn.execute(
+                    f"ALTER TABLE journal_trades ADD COLUMN {name} {decl}")
+        conn.commit()
 
     @contextmanager
     def _tx(self) -> Iterator[sqlite3.Connection]:
