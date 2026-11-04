@@ -1086,6 +1086,25 @@ class Runtime:
                     300.0: ClockWindows(period_s=300.0),
                     900.0: ClockWindows(period_s=900.0)}
                 svc.tape.clockwin = svc.tape.clockwins[900.0]
+            if not svc.tape.tickbars:
+                # N-PRINT BARS. One builder per size for the same
+                # reason the OFI bars have one per target: the sizes
+                # are five cuts of one tape, they cost a handful of
+                # adds per print, and a selector that empties the
+                # chart is a selector nobody uses twice.
+                #
+                # These are NOT persisted across a restart, unlike
+                # the OFI bars and the time candles. A tick bar is
+                # defined by a count of prints, so a half-built bar
+                # cannot be resumed from a disk row without the
+                # prints that built it -- it would come back as a
+                # bar of the wrong length wearing the right label.
+                # They refill from the live tape instead, which at
+                # ES print rates is minutes rather than hours.
+                from .tickbar import PER_BAR_CHOICES, TickBars
+                svc.tape.tickbars = {
+                    int(n): TickBars(per_bar=int(n))
+                    for n in PER_BAR_CHOICES}
             if svc.tape.flowread is None:
                 from .flowread import FlowRead
                 svc.tape.flowread = FlowRead()
@@ -4923,6 +4942,83 @@ def create_app() -> FastAPI:
         n = max(20, min(bars, 500))
         out: dict[str, Any] = {"coin": coin, "interval": interval}
 
+        # ---- TICK BARS TRAVEL THROUGH THE EXISTING INTERVAL BOX -----
+        #
+        # '1000t' means a thousand PRINTS to a bar. Everything that is
+        # not a tick size parses to None here and falls straight
+        # through to the time-bar path below, unchanged -- which is
+        # the point of doing it this way rather than adding a second
+        # chart route. One route, one payload shape, one painter; the
+        # bars underneath are cut differently and nothing downstream
+        # has to know.
+        from . import tickbar as _tb
+        _per = _tb.parse_interval(interval)
+        if _per is not None:
+            tape = getattr(rt.ofi, "tape", None) if rt.ofi is not None \
+                else None
+            books = getattr(tape, "tickbars", None) if tape is not None \
+                else None
+            if not books:
+                return {**out, "source": "tick",
+                        "error": ("tick bars are built from the ES tape "
+                                  "and that engine is not running here. "
+                                  "Start the CME feed and they fill from "
+                                  "live prints.")}
+            # Nearest offered size rather than a refusal. A builder is
+            # a running count of prints: one created now for an
+            # arbitrary number would start empty and stay useless for
+            # as long as it took to fill, so the selector is limited
+            # to the sizes that have been counting all along.
+            bld = books.get(_per)
+            if bld is None:
+                near = min(books, key=lambda k: abs(int(k) - _per))
+                bld, _per = books[near], int(near)
+            rows = bld.rows(limit=n, include_live=True)
+            if not rows:
+                return {**out, "interval": _tb.label(_per), "source": "tick",
+                        "error": (f"no prints counted yet -- a {_per}-tick "
+                                  "bar needs that many trades before it "
+                                  "closes one, and the count starts when "
+                                  "the engine does")}
+            try:
+                tick = ppo_mod.tick_ppo(
+                    rows, smooth=max(1, ppo_smooth),
+                    signal=max(1, ppo_signal),
+                    ad_weight=ppo_ad, mom_weight=ppo_mom)
+            except Exception as exc:                    # noqa: BLE001
+                tick = {"ppo": [], "signal": [], "hist": [],
+                        "ready": False, "error": str(exc)}
+            last = 0.0
+            try:
+                last = float(getattr(tape, "last_px", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0
+            return {
+                **out, "interval": _tb.label(_per), "source": "tick",
+                "bars": rows,
+                # Empty, and empty on purpose. The agent's own trades
+                # are recorded against a TIME bar's timestamp, so
+                # drawing them here would put each one on whichever
+                # tick bar happened to span that second -- a marker
+                # that looks placed and is not. Honest blank beats
+                # plausible wrong.
+                "marks": [],
+                "marks_note": ("trade markers are recorded against time "
+                               "bars and are not drawn on a tick series"),
+                "profile": None,
+                "tick_ppo": tick,
+                "tick_bps": (round(0.25 / last * 10_000.0, 5)
+                             if last > 0 else None),
+                # A tick bar has no fixed duration. Saying it does is
+                # what would let the panel draw an evenly spaced
+                # x-axis and quietly lie about when things happened.
+                "interval_s": None,
+                "per_bar": _per,
+                "sizes": list(_tb.PER_BAR_CHOICES),
+                "pace": bld.pace(),
+                "summary": bld.summary(),
+            }
+
         # CME (ES) bars come from the Databento tape, not from Hyperliquid.
         # `feed_for` is deliberately HL-only, so CME is asked for by name.
         # THE SAME ACCESSOR THE PROFILE AND THE STACK USE. Two routes
@@ -7843,8 +7939,26 @@ def create_app() -> FastAPI:
     # -- dashboard -------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard() -> str:
-        return DASHBOARD
+    def dashboard() -> HTMLResponse:
+        """The page, and never a cached copy of an older one.
+
+        THIS IS NOT A PERFORMANCE SETTING. The whole dashboard is one
+        HTML string with the JS inside it, so a browser or an edge
+        cache holding yesterday's copy serves yesterday's PANEL while
+        every API call underneath it returns today's data. That
+        failure is almost impossible to read from the outside: the
+        deploy went green, the numbers move, and a control that was
+        added in the new build is simply absent -- which looks
+        exactly like the build not having landed.
+
+        It cost an afternoon once. The page is small and it is
+        rebuilt on every deploy, so there is nothing to gain by
+        letting it be stored.
+        """
+        return HTMLResponse(
+            DASHBOARD,
+            headers={"Cache-Control": "no-store, max-age=0",
+                     "Pragma": "no-cache"})
 
     return app
 
@@ -8946,8 +9060,17 @@ DASHBOARD = """<!doctype html>
 
       <div class="conbar">
         <label>candle <select id="sInt" onchange="chartTfChanged()">
+          <optgroup label="by the clock">
           <option>1m</option><option>5m</option><option selected>15m</option>
-          <option>30m</option><option>1h</option></select></label>
+          <option>30m</option><option>1h</option></optgroup>
+          <optgroup label="by prints (ES tape only)">
+          <option value="233t">233 ticks</option>
+          <option value="500t">500 ticks</option>
+          <option value="1000t">1,000 ticks</option>
+          <option value="1597t">1,597 ticks</option>
+          <option value="2000t">2,000 ticks</option>
+          <option value="4000t">4,000 ticks</option></optgroup>
+        </select></label>
         <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
         <label><b>stop loss</b> <input id="apSl" value="10" size="3"></label>
         <label>in <select id="apUnit">
@@ -15405,9 +15528,19 @@ function flowNum(n) {
    the read's own selector by hand breaks the link rather than being
    silently undone on the next chart change -- an override that gets
    reverted is worse than no override. */
+// '1000t' is a thousand prints to a bar, not a duration.
+function isTickTf(v) { return /^[0-9]+t$/.test(String(v || '')); }
+
 function followChartTf() {
   const box = $('rFollow'), chart = $('sInt'), read = $('rInt');
   if (!box || !chart || !read) return false;
+  // THE READ NEVER FOLLOWS THE CHART ONTO A TICK SERIES. The stack
+  // is built on clock intervals -- it asks for ten closed bars of
+  // one and compares three of them -- so handing it '1000t' would
+  // not switch it to tick bars, it would make every row unreadable
+  // and the panel would blame the data. The chart can show prints
+  // while the read stays on the clock; they are different questions.
+  if (isTickTf(chart.value)) return false;
   if (!box.checked || read.value === chart.value) return false;
   read.value = chart.value;
   return true;
@@ -16828,26 +16961,63 @@ function drawMTF(g, s, xOf, step, y, hi, lo, plotW, up, down, panel) {
 }
 
 function markIndex(m, s) {
-  const iv = chartData.interval_s || 900;
-  return Math.round(((m.entry_ts || m.ts) - s.bars[0].ts) / iv);
+  return Math.round(barPos(m.entry_ts || m.ts, s));
 }
 
 function exitIndex(m, s) {
   if (!m.exit_ts) return null;
-  const iv = chartData.interval_s || 900;
-  return Math.round((m.exit_ts - s.bars[0].ts) / iv);
+  return Math.round(barPos(m.exit_ts, s));
+}
+
+/* A TIMESTAMP IN BAR UNITS. On a clock chart this is a division --
+   every bar is the same width in seconds, so (ts - first) / interval
+   IS the bar number. On a tick chart it is not: a bar can take two
+   seconds or four minutes, and dividing by any fixed number puts a
+   drawn level on the wrong bar and keeps it there.
+
+   So when there is no interval, this walks the bars. The fractional
+   part interpolates inside whichever bar contains the timestamp, and
+   beyond either end it extrapolates on that end bar's own duration,
+   which is the only rate there is any evidence for. */
+function barPos(ts, s) {
+  const iv = chartData.interval_s;
+  const b = s.bars;
+  if (iv) return (ts - b[0].ts) / iv;
+  if (!b || !b.length) return 0;
+  const span = (r) => Math.max(0.001, (r.ts_last || r.ts) - r.ts);
+  if (ts <= b[0].ts) return (ts - b[0].ts) / span(b[0]);
+  for (let i = 0; i < b.length; i++) {
+    const end = (i + 1 < b.length) ? b[i + 1].ts : b[i].ts + span(b[i]);
+    if (ts < end) return i + (ts - b[i].ts) / Math.max(0.001, end - b[i].ts);
+  }
+  const last = b[b.length - 1];
+  return (b.length - 1) + (ts - last.ts) / span(last);
+}
+
+function posTs(pos, s) {
+  const iv = chartData.interval_s;
+  const b = s.bars;
+  if (iv) return b[0].ts + pos * iv;
+  if (!b || !b.length) return 0;
+  const span = (r) => Math.max(0.001, (r.ts_last || r.ts) - r.ts);
+  const i = Math.floor(pos), f = pos - i;
+  if (i < 0) return b[0].ts + pos * span(b[0]);
+  if (i >= b.length) {
+    const last = b[b.length - 1];
+    return last.ts + (pos - (b.length - 1)) * span(last);
+  }
+  const end = (i + 1 < b.length) ? b[i + 1].ts : b[i].ts + span(b[i]);
+  return b[i].ts + f * (end - b[i].ts);
 }
 
 /* A timestamp's x, even when it is off the visible slice — a trendline
    anchored to a bar you have scrolled past still has to point somewhere. */
 function tsX(ts, s, xOf, step) {
-  const iv = chartData.interval_s || 900;
-  return xOf(0) + ((ts - s.bars[0].ts) / iv) * step;
+  return xOf(0) + barPos(ts, s) * step;
 }
 
 function xTs(x, s, step) {
-  const iv = chartData.interval_s || 900;
-  return s.bars[0].ts + ((x - (CH_PAD.l + step / 2)) / step) * iv;
+  return posTs((x - (CH_PAD.l + step / 2)) / step, s);
 }
 
 /* ---- interaction ------------------------------------------------------ */
@@ -17082,7 +17252,16 @@ async function loadChart() {
     d = await api('/api/chart?' + q({
       coin: coin(), interval: $('sInt').value, bars: 400}));
   } catch (e) { return; }
-  if (d && d.error) return;
+  if (d && d.error) {
+    // SAY IT RATHER THAN DRAWING THE LAST GOOD CHART IN SILENCE.
+    // A tick series that has not filled yet, or a tape that is not
+    // running, returns an error and used to leave the previous
+    // candles on screen wearing the new label -- which is how you
+    // end up reading 15-minute bars believing they are prints.
+    const note = $('chartNote');
+    if (note) note.textContent = d.error;
+    return;
+  }
 
   // Hold position when new bars arrive. Scrolled back through history and
   // having the view yanked forward every time a candle closes is the
@@ -17097,7 +17276,10 @@ async function loadChart() {
   if (fresh) { loadShapes(); loadPPOPref(); loadPanes(); resetChartView(); }
 
   // The projection rides along with the chart: same poll, same bar.
-  if (chartProjOn) {
+  // Not on a tick series: the projection is a distance over a
+  // REMAINING DURATION, and a tick bar has no scheduled end to have
+  // a remainder of.
+  if (chartProjOn && !isTickTf($('sInt').value)) {
     try {
       const pr = await api('/api/projection?' + q({
         coin: coin(), interval: $('sInt').value}));
@@ -17110,8 +17292,16 @@ async function loadChart() {
   wireChart();
   drawChart();
   const n = (chartData.marks || []).length;
-  $('chartNote').innerHTML =
-      `${esc(chartData.source || '')} · ${n} trade${n === 1 ? '' : 's'} · `
+  // On a tick series the bar COUNT is not the interesting number --
+  // the rate is. How long a bar is taking against its own recent
+  // median is the one thing a clock chart cannot show you, so it
+  // goes where the trade count would be.
+  const head = chartData.source === 'tick'
+    ? `${chartData.per_bar} prints a bar · `
+      + esc((chartData.pace || {}).say || '')
+      + (chartData.marks_note ? ' · ' + esc(chartData.marks_note) : '')
+    : `${esc(chartData.source || '')} · ${n} trade${n === 1 ? '' : 's'}`;
+  $('chartNote').innerHTML = head + ' · '
     + 'scroll to zoom · drag to pan · drag the price scale to stretch · '
     + 'drag a pane divider to resize it · drag the bottom-right corner for '
     + 'a taller chart · double-click to reset';

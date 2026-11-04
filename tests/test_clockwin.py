@@ -186,7 +186,11 @@ class TestUnknownSideIsCountedNotDropped:
     def test_the_live_tape_reads_the_raw_side(self):
         """Not through `trade_from`, which would drop them."""
         src = (ROOT / "liqmap" / "cme_tape.py").read_text()
-        i = src.index("if self.clockwin is not None:")
+        # Found by what the guard STARTS with, not by the whole line.
+        # The condition has had a term added to it once already (the
+        # tick bars share this decode), and an exact-line anchor
+        # fails on that with its claim still true.
+        i = src.index("if self.clockwin is not None")
         # To the end of that block, not a character count: a fixed
         # slice runs on into the next statement, which is the
         # `trade_from` call this is asserting the block avoids.

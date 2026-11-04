@@ -154,6 +154,15 @@ class Tape:
     # them; both are always running, so switching does not start an
     # empty window.
     clockwins: dict | None = None
+    # N-PRINT BARS, one builder per size, keyed by prints-per-bar.
+    # Same arrangement and same reason as `ofibars`: several run on
+    # the one stream so switching the chart's bar size is instant
+    # rather than starting an empty chart. Fed from the RAW record
+    # like the clock windows, so side 'N' prints advance the count
+    # instead of vanishing -- a bar that silently needed 1,000
+    # ATTRIBUTABLE prints would close at a different rate than the
+    # one the panel says it is drawing.
+    tickbars: dict | None = None
     # WHICH SIDE IS WINNING, continuously, independent of the bars.
     # One instance, not one per target: the five builders are five
     # slicings of one tape, and the flow underneath them is one thing.
@@ -373,7 +382,7 @@ class Tape:
         # asked for them counted, not dropped, so this reads the
         # record itself: a tape full of unknown-side prints must not
         # be able to look like a balanced one.
-        if self.clockwin is not None:
+        if self.clockwin is not None or self.tickbars:
             try:
                 if dbn._action(rec) in (dbn.ACTION_TRADE,
                                         dbn.ACTION_FILL):
@@ -381,12 +390,20 @@ class Tape:
                         dbn._get(rec, "ts_event")) or 0.0)
                     _rsz = float(dbn._get(rec, "size", 0) or 0)
                     _rpx = dbn.price(dbn._get(rec, "price"))
-                    self.clockwin.on_trade_px(
-                        _ts, _rpx, _rsz, dbn._side(rec))
-                    for _cw in (self.clockwins or {}).values():
-                        if _cw is not self.clockwin:
-                            _cw.on_trade_px(_ts, _rpx, _rsz,
-                                            dbn._side(rec))
+                    _sd = dbn._side(rec)
+                    if self.clockwin is not None:
+                        self.clockwin.on_trade_px(_ts, _rpx, _rsz, _sd)
+                        for _cw in (self.clockwins or {}).values():
+                            if _cw is not self.clockwin:
+                                _cw.on_trade_px(_ts, _rpx, _rsz, _sd)
+                    # The tick bars share this decode rather than
+                    # doing their own. One record, one read of it:
+                    # a second decode is a second place for the
+                    # price scale to be got wrong, and the two
+                    # series would then disagree about a print
+                    # they both saw.
+                    for _tb in (self.tickbars or {}).values():
+                        _tb.on_trade(_ts, _rpx, _rsz, _sd)
             except Exception:                           # noqa: BLE001
                 pass            # a measurement must not stop the tape
         t = dbn.trade_from(rec)
