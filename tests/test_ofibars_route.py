@@ -89,7 +89,11 @@ class TestTheTapeFeedsRawIntegers:
     def test_the_tape_reads_bid_px_not_the_decoded_book(self):
         """A float that round-tripped through a division breaks the
         equality branch the formula depends on."""
-        i = TAPE.index("if self.ofibars:")
+        # Matched on what the guard STARTS with. The condition has
+        # gained a term (the fused bars take their OFI leg from
+        # this same block), and an exact-line anchor fails on that
+        # with the claim below still true.
+        i = TAPE.index("if self.ofibars")
         j = TAPE.index("if self.cvdcross is not None:", i)
         block = TAPE[i:j]
         assert 'dbn._get(l0, "bid_px"' in block
@@ -97,7 +101,11 @@ class TestTheTapeFeedsRawIntegers:
         assert "bk.bids" not in block, "that is the decoded float book"
 
     def test_the_tape_cannot_be_stopped_by_the_display(self):
-        i = TAPE.index("if self.ofibars:")
+        # Matched on what the guard STARTS with. The condition has
+        # gained a term (the fused bars take their OFI leg from
+        # this same block), and an exact-line anchor fails on that
+        # with the claim below still true.
+        i = TAPE.index("if self.ofibars")
         j = TAPE.index("if self.cvdcross is not None:", i)
         assert "except Exception" in TAPE[i:j]
 

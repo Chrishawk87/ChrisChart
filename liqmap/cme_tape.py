@@ -163,6 +163,14 @@ class Tape:
     # ATTRIBUTABLE prints would close at a different rate than the
     # one the panel says it is drawing.
     tickbars: dict | None = None
+    # DUAL-TRIGGER BARS, keyed by (prints, contracts). These need
+    # BOTH feeds -- the raw side character for the tick leg, because
+    # `trade_from` drops side 'N', and the raw integer levels for the
+    # OFI leg, because the formula compares prices for exact
+    # equality. They are fed in the two places below that already
+    # decode each of those, in the order trade-then-book that the
+    # OFI bars use and for the same reason.
+    fusedbars: dict | None = None
     # WHICH SIDE IS WINNING, continuously, independent of the bars.
     # One instance, not one per target: the five builders are five
     # slicings of one tape, and the flow underneath them is one thing.
@@ -382,7 +390,7 @@ class Tape:
         # asked for them counted, not dropped, so this reads the
         # record itself: a tape full of unknown-side prints must not
         # be able to look like a balanced one.
-        if self.clockwin is not None or self.tickbars:
+        if self.clockwin is not None or self.tickbars or self.fusedbars:
             try:
                 if dbn._action(rec) in (dbn.ACTION_TRADE,
                                         dbn.ACTION_FILL):
@@ -404,10 +412,23 @@ class Tape:
                     # they both saw.
                     for _tb in (self.tickbars or {}).values():
                         _tb.on_trade(_ts, _rpx, _rsz, _sd)
+                    # THE TICK LEG of the fused bars, from the same
+                    # decode. Their OFI leg is fed from the book
+                    # below -- trade first, then the book off the
+                    # same record, so a print is never credited to a
+                    # bar that had not started when it happened.
+                    for _fb in (self.fusedbars or {}).values():
+                        _fb.on_trade(_ts, _rpx, _rsz, _sd)
             except Exception:                           # noqa: BLE001
                 pass            # a measurement must not stop the tape
         t = dbn.trade_from(rec)
-        if self.ofibars:
+        # The fused bars take their OFI leg from this block's decode
+        # of the raw levels, so it has to run for them even on a tape
+        # with no OFI bars attached. Guarding it on `ofibars` alone
+        # meant a fused builder could be fed prints forever and never
+        # a single book update -- a bar whose second leg could not
+        # move, waiting on a threshold it had no way to reach.
+        if self.ofibars or self.fusedbars:
             # Fed from the RAW integer levels, not from the decoded
             # float book above. The OFI formula compares prices for
             # exact equality -- "the bid did not move" is a different
@@ -431,7 +452,7 @@ class Tape:
                     # two would put a level three zeros away from the
                     # candle it belongs to.
                     _px = float(dbn._get(rec, "price", 0) or 0)
-                    for _b in self.ofibars.values():
+                    for _b in (self.ofibars or {}).values():
                         _b.on_trade(float(t.ts), _sz, _ag, _px)
                     if self.pricedir is not None:
                         # The RAW price off the record, same as the
@@ -447,8 +468,15 @@ class Tape:
                     apx = int(dbn._get(l0, "ask_px", 0) or 0)
                     bsz = int(dbn._get(l0, "bid_sz", 0) or 0)
                     asz = int(dbn._get(l0, "ask_sz", 0) or 0)
-                    for _b in self.ofibars.values():
+                    for _b in (self.ofibars or {}).values():
                         _b.on_book(bts, bpx, bsz, apx, asz)
+                    # THE OFI LEG of the fused bars. Same raw levels
+                    # and the same formula the bars above use: two
+                    # versions of OFI computed differently would make
+                    # the fused candle disagree with the OFI candle
+                    # beside it about the same book update.
+                    for _fb in (self.fusedbars or {}).values():
+                        _fb.on_book(bts, bpx, bsz, apx, asz)
                     if self.clockwins:
                         for _cw in self.clockwins.values():
                             _cw.on_book(bts, bpx, bsz, apx, asz)

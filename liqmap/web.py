@@ -1105,6 +1105,19 @@ class Runtime:
                 svc.tape.tickbars = {
                     int(n): TickBars(per_bar=int(n))
                     for n in PER_BAR_CHOICES}
+            if not svc.tape.fusedbars:
+                # DUAL-TRIGGER BARS. Not persisted either, and for a
+                # stronger reason than the tick bars: a half-built
+                # fused bar is a print count AND a running OFI
+                # accumulator, and the accumulator cannot be resumed
+                # from a disk row without the book updates that built
+                # it. Restoring one would produce a bar wearing the
+                # right label with a leg that never happened.
+                from .fusedbar import PAIRS as _FPAIRS, FusedBars
+                svc.tape.fusedbars = {
+                    (int(a), int(b)): FusedBars(tick_target=int(a),
+                                                ofi_target=int(b))
+                    for a, b in _FPAIRS}
             if svc.tape.flowread is None:
                 from .flowread import FlowRead
                 svc.tape.flowread = FlowRead()
@@ -4951,6 +4964,76 @@ def create_app() -> FastAPI:
         # chart route. One route, one payload shape, one painter; the
         # bars underneath are cut differently and nothing downstream
         # has to know.
+        # ---- FUSED BARS: '5000x2000' ---------------------------------
+        #
+        # Checked before the tick form and before the clock path, and
+        # like both of them it returns None for anything that is not
+        # its own shape, so nothing else changes by adding it.
+        from . import fusedbar as _fb
+        _pair = _fb.parse_interval(interval)
+        if _pair is not None:
+            tape = getattr(rt.ofi, "tape", None) if rt.ofi is not None \
+                else None
+            books = getattr(tape, "fusedbars", None) if tape is not None \
+                else None
+            if not books:
+                return {**out, "source": "fused",
+                        "error": ("fused bars are built from the ES tape "
+                                  "and that engine is not running here. "
+                                  "Start the CME feed and they fill from "
+                                  "live prints and book updates.")}
+            bld = books.get(_pair)
+            if bld is None:
+                # Nearest offered pair rather than a refusal, for the
+                # same reason the tick sizes snap: a builder is a
+                # running count and a running accumulator, so one
+                # created now would start empty and stay useless for
+                # as long as it took to fill.
+                near = min(books, key=lambda k: (abs(int(k[0]) - _pair[0])
+                                                 + abs(int(k[1]) - _pair[1])))
+                bld, _pair = books[near], (int(near[0]), int(near[1]))
+            rows = bld.rows(limit=n, include_live=True)
+            if not rows:
+                return {**out, "interval": _fb.label(*_pair),
+                        "source": "fused",
+                        "error": (f"nothing built yet -- a {_pair[0]:,}"
+                                  f"x{_pair[1]:,} bar needs that many "
+                                  "prints AND that much imbalance before "
+                                  "it closes one")}
+            try:
+                tick = ppo_mod.tick_ppo(
+                    rows, smooth=max(1, ppo_smooth),
+                    signal=max(1, ppo_signal),
+                    ad_weight=ppo_ad, mom_weight=ppo_mom)
+            except Exception as exc:                    # noqa: BLE001
+                tick = {"ppo": [], "signal": [], "hist": [],
+                        "ready": False, "error": str(exc)}
+            last = 0.0
+            try:
+                last = float(getattr(tape, "last_px", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0
+            return {
+                **out, "interval": _fb.label(*_pair), "source": "fused",
+                "bars": rows,
+                # Blank for the same reason the tick series is: the
+                # agent's trades are stamped against a TIME bar, so
+                # drawing them here would place each on whichever
+                # fused bar spanned that second.
+                "marks": [],
+                "marks_note": ("trade markers are recorded against time "
+                               "bars and are not drawn on a fused series"),
+                "profile": None,
+                "tick_ppo": tick,
+                "tick_bps": (round(0.25 / last * 10_000.0, 5)
+                             if last > 0 else None),
+                "interval_s": None,
+                "tick_target": _pair[0], "ofi_target": _pair[1],
+                "pairs": [list(p) for p in _fb.PAIRS],
+                "progress": bld.progress(),
+                "summary": bld.summary(),
+            }
+
         from . import tickbar as _tb
         _per = _tb.parse_interval(interval)
         if _per is not None:
@@ -9070,6 +9153,12 @@ DASHBOARD = """<!doctype html>
           <option value="1597t">1,597 ticks</option>
           <option value="2000t">2,000 ticks</option>
           <option value="4000t">4,000 ticks</option></optgroup>
+          <optgroup label="fused: prints AND imbalance (ES only)">
+          <option value="1000x500">1,000 ticks &times; 500 OFI</option>
+          <option value="2500x1000">2,500 ticks &times; 1,000 OFI</option>
+          <option value="5000x2000">5,000 ticks &times; 2,000 OFI</option>
+          <option value="10000x4000">10,000 ticks &times; 4,000 OFI</option>
+          </optgroup>
         </select></label>
         <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
         <label><b>stop loss</b> <input id="apSl" value="10" size="3"></label>
@@ -15530,6 +15619,12 @@ function flowNum(n) {
    reverted is worse than no override. */
 // '1000t' is a thousand prints to a bar, not a duration.
 function isTickTf(v) { return /^[0-9]+t$/.test(String(v || '')); }
+// '5000x2000' is prints AND contracts of imbalance. Also not a duration.
+function isFusedTf(v) { return /^[0-9]+x[0-9]+$/.test(String(v || '')); }
+/* EITHER OF THE COUNT-CLOSED FORMS. Everything that has to ask "is
+   this a clock interval?" asks this one, so a form added later is
+   added in one place instead of being half-handled in four. */
+function isCountTf(v) { return isTickTf(v) || isFusedTf(v); }
 
 function followChartTf() {
   const box = $('rFollow'), chart = $('sInt'), read = $('rInt');
@@ -15540,7 +15635,7 @@ function followChartTf() {
   // not switch it to tick bars, it would make every row unreadable
   // and the panel would blame the data. The chart can show prints
   // while the read stays on the clock; they are different questions.
-  if (isTickTf(chart.value)) return false;
+  if (isCountTf(chart.value)) return false;
   if (!box.checked || read.value === chart.value) return false;
   read.value = chart.value;
   return true;
@@ -16447,9 +16542,27 @@ function drawChart() {
   /* ---- candles ------------------------------------------------------ */
 
   bars.forEach((b, i) => {
-    const x = xOf(i), rising = b.c >= b.o;
-    const c = rising ? up : down;
+    const x = xOf(i);
+    /* A FUSED BAR IS COLOURED BY THE BOOK, NOT BY PRICE.
+       Its `dir` is the sign of the OFI accumulator at close, which
+       is how the OFI candles on this chart already read: green when
+       the book committed up, red when down. Using close-vs-open here
+       would make these bars say something different from the ones
+       beside them while looking identical.
+
+       AND THE ONES THAT DISAGREE GO GRAY. `tradeable` is the
+       stricter test -- enough prints AND price agreeing with the
+       book. A bar that fails it still prints, because it happened
+       and it is data, but it is washed out so it cannot be read as
+       a signal at a glance. That is the bar most likely to look
+       like one and not be. */
+    const fused = (b.dir !== undefined && b.tradeable !== undefined);
+    const grayed = fused && !b.tradeable;
+    const c = grayed ? dim
+            : fused ? (b.dir === 'up' ? up : b.dir === 'down' ? down : dim)
+            : (b.c >= b.o ? up : down);
     g.strokeStyle = c; g.fillStyle = c;
+    if (grayed) g.globalAlpha = 0.45;
     // Wick as a hairline, body as a filled rect with a one pixel floor so
     // a doji is still a mark rather than nothing.
     g.beginPath();
@@ -16464,6 +16577,16 @@ function drawChart() {
       g.strokeRect(Math.round(x - bw / 2) - 2.5, Math.round(top) - 2.5,
                    Math.round(bw) + 5, Math.max(1, Math.round(bot - top)) + 5);
       g.setLineDash([]); g.globalAlpha = 1;
+    }
+    if (grayed) {
+      // The overlay itself: a flat gray box over the bar's whole
+      // span. The wash above makes it recede; this says it was
+      // ruled out on purpose rather than merely drawn faintly.
+      g.globalAlpha = 0.14; g.fillStyle = dim;
+      g.fillRect(Math.round(x - bw / 2) - 1, Math.round(y(b.h)),
+                 Math.max(1, Math.round(bw)) + 2,
+                 Math.max(1, Math.round(y(b.l) - y(b.h))));
+      g.globalAlpha = 1;
     }
   });
 
@@ -17279,7 +17402,7 @@ async function loadChart() {
   // Not on a tick series: the projection is a distance over a
   // REMAINING DURATION, and a tick bar has no scheduled end to have
   // a remainder of.
-  if (chartProjOn && !isTickTf($('sInt').value)) {
+  if (chartProjOn && !isCountTf($('sInt').value)) {
     try {
       const pr = await api('/api/projection?' + q({
         coin: coin(), interval: $('sInt').value}));
@@ -17296,7 +17419,16 @@ async function loadChart() {
   // the rate is. How long a bar is taking against its own recent
   // median is the one thing a clock chart cannot show you, so it
   // goes where the trade count would be.
-  const head = chartData.source === 'tick'
+  /* On a counted series the bar TALLY is not the interesting number
+     -- what it is waiting on is. A fused bar can sit at 98% on one
+     leg and 4% on the other, and that is the whole point of fusing
+     them, so both are said rather than rolled into one figure. */
+  const head = chartData.source === 'fused'
+    ? `${chartData.tick_target.toLocaleString()} prints &times; `
+      + `${chartData.ofi_target.toLocaleString()} OFI · `
+      + esc((chartData.progress || {}).say || '')
+      + ' · ' + esc((chartData.summary || {}).say || '')
+    : chartData.source === 'tick'
     ? `${chartData.per_bar} prints a bar · `
       + esc((chartData.pace || {}).say || '')
       + (chartData.marks_note ? ' · ' + esc(chartData.marks_note) : '')
@@ -17375,7 +17507,7 @@ setInterval(async () => {
   if (!chartVisible() || _chartBusy) return;
   const iv = $('sInt') && $('sInt').value;
   if (!iv) return;
-  const every = isTickTf(iv) ? 2 : 5;        // seconds
+  const every = isCountTf(iv) ? 2 : 5;        // seconds
   if ((++_chartPoll % every) !== 0) return;
   _chartBusy = true;
   try { await loadChart(); } catch (e) {} finally { _chartBusy = false; }

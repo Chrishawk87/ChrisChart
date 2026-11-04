@@ -415,7 +415,8 @@ class TestTheTapeFeedsIt:
         never have been fed a single print.
         """
         src = (ROOT / "liqmap" / "cme_tape.py").read_text()
-        assert "if self.clockwin is not None or self.tickbars:" in src
+        # The guard has since gained the fused bars as a third term.
+        assert "if self.clockwin is not None or self.tickbars" in src
 
     def test_one_builder_per_offered_size_is_created(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
@@ -668,7 +669,10 @@ class TestThePanel:
         every row unreadable and the panel blames the data.
         """
         blk = js_func("followChartTf")
-        assert "isTickTf(chart.value)" in blk
+        # Routed through isCountTf once the fused form was added; the
+        # claim -- the read never follows onto a counted series -- is
+        # unchanged, and pinning the old name failed on a rename.
+        assert "isCountTf(chart.value)" in blk
         assert "return false" in blk
 
     def test_there_is_a_tick_interval_test_in_the_page(self):
@@ -678,7 +682,7 @@ class TestThePanel:
 
     def test_the_projection_is_skipped_on_a_tick_series(self):
         blk = js_func("loadChart")
-        assert "chartProjOn && !isTickTf($('sInt').value)" in blk
+        assert "chartProjOn && !isCountTf($('sInt').value)" in blk
 
     def test_an_error_is_shown_rather_than_the_stale_chart(self):
         blk = js_func("loadChart")
@@ -742,7 +746,7 @@ class TestTheChartKeepsMoving:
         src = (ROOT / "liqmap" / "web.py").read_text()
         i = src.index("let _chartBusy")
         blk = src[i:i + 700]
-        assert "isTickTf(iv) ? 2 : 5" in blk
+        assert "isCountTf(iv) ? 2 : 5" in blk
 
     def test_both_loops_share_one_visibility_test(self):
         """Two loops disagreeing about visibility is how a hidden
