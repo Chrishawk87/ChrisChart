@@ -5572,6 +5572,34 @@ def create_app() -> FastAPI:
         n = rt.journal.clear(coin)
         return {"ok": True, "deleted": n}
 
+    @app.get("/api/fusion", dependencies=[Depends(require_token)])
+    def api_fusion(coin: str = "ES", per_bar: int = 0) -> dict[str, Any]:
+        """The tick bar and the OFI bar, read separately, compared.
+
+        THE SAME CALL THE RULE MAKES. The panel and the strategy read
+        one function, so the screen cannot show an agreement the rule
+        did not see, or miss one it acted on. Two implementations of
+        "which way is this pointing" is two things to keep correct
+        and one of them is always wrong first.
+
+        Both readings are of the bar BEING BUILT on each series --
+        this is an intrabar comparison, not a comparison of closed
+        bars, which would be late by a bar on each side.
+        """
+        from .tickbar import PER_BAR_CHOICES, STRATEGY_PER_BAR
+
+        rt_ = RT
+        if rt_ is None:
+            return {"error": "the service is still starting"}
+        st = _fusion_now(rt_, int(per_bar or 0))
+        if not st.get("tick") or not (st["tick"].get("per_bar")):
+            return {**st, "error": ("the tick bars are built from the ES "
+                                    "tape and that engine is not running "
+                                    "here")}
+        return {**st, "coin": rt_.resolve_symbol(coin)[0] or coin,
+                "sizes": list(PER_BAR_CHOICES),
+                "default_per_bar": STRATEGY_PER_BAR}
+
     @app.get("/api/clockwindows", dependencies=[Depends(require_token)])
     def api_clockwindows(coin: str = "ES", limit: int = 40,
                          period: float = 0.0) -> dict[str, Any]:
@@ -6669,6 +6697,47 @@ def create_app() -> FastAPI:
             return wins.get(float(period_s)) or wins.get(900.0)
         return getattr(tape, "clockwin", None) if tape else None
 
+    def _tick_now(rt_, per_bar: int = 0) -> dict:
+        """The tick bar BEING BUILT, and which way it points.
+
+        Its direction is its own traded price, close against open.
+        Nothing about the book enters here, and that is the whole
+        reason pairing it with the OFI says anything: two readings
+        of the same events agree by construction.
+        """
+        from .tickbar import STRATEGY_PER_BAR
+
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        bars = getattr(tape, "tickbars", None) if tape else None
+        if not bars:
+            return {}
+        want = int(per_bar or STRATEGY_PER_BAR)
+        bld = bars.get(want)
+        if bld is None:
+            bld = bars[min(bars, key=lambda k: abs(int(k) - want))]
+        cur = bld.current
+        if cur is None:
+            return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
+                    "why": "between bars -- the last print closed one"}
+        return {"per_bar": bld.per_bar, "dir": cur.direction,
+                "prints": cur.trades, "open": cur.open,
+                "close": cur.close, "seconds": round(cur.seconds, 1),
+                "ticks": round((cur.close - cur.open) / 0.25, 1)
+                if cur.open else 0.0}
+
+    def _fusion_now(rt_, per_bar: int = 0) -> dict:
+        """The two series side by side, and whether they agree.
+
+        THE SAME READINGS THE PANEL DRAWS AND THE RULE TRADES. One
+        source for both, because the first time a screen and a rule
+        compute the same number separately they start telling
+        different stories about one tape.
+        """
+        from . import fusion as _fu
+
+        return _fu.state(_tick_now(rt_, per_bar), _bar_read(rt_))
+
     def _fused_now(rt_, pair: tuple[int, int] | None = None) -> dict:
         """The fused bar BEING BUILT, and its intrabar read.
 
@@ -6853,7 +6922,11 @@ def create_app() -> FastAPI:
         win = _window_now(rt_, float(s.window_s or 900.0))
         strat = s.strategy if s.strategy in jn.STRATEGIES else "ofi"
         fpi = _footprint_imbalance(rt_)
-        fus = _fused_now(rt_)
+        # THE TWO INDEPENDENT SERIES, not the dual-trigger candle.
+        # The tick bar and the OFI bar are built by different
+        # builders from different events and neither influences the
+        # other; this only asks each which way it points.
+        fus = _fusion_now(rt_)
         side, blocked_why = jn.window_signal(
             win, strat, fpi.get("side") or "", fus)
         says = {"candle": win.get("mid_dir") or None,
@@ -6864,18 +6937,22 @@ def create_app() -> FastAPI:
             # the signal actually read. Leaving the window's three
             # here would put a clock reading next to an intrabar
             # decision and explain nothing about why it fired.
-            says = {"OFI": fus.get("ofi_dir") or None,
-                    "tick": fus.get("tick_dir") or None}
+            says = {"tick": (fus.get("tick") or {}).get("dir") or None,
+                    "OFI": (fus.get("ofi") or {}).get("dir") or None}
         vetoed = blocked_why
-        # The window is the candle the cap counts against -- except
-        # for the fused rule, where the FORMING fused bar is the
-        # candle. Counting its trades against the clock window would
-        # let one fused bar be traded repeatedly inside a 15-minute
-        # window, or starve several of them of their one trade.
+        # The window is the candle the cap counts against.
         bar_ts = float(win.get("start_ts") or 0.0)
-        if strat == "fused":
-            bar_ts = float(fus.get("start_ts") or 0.0)
         taken = j.sides_in_bar(coin_, bar_ts, strat)
+        # THE FUSION RULE HAS NO PER-CANDLE CAP, and that is asked
+        # for rather than overlooked. Chris: "exiting when they
+        # disagree reenter when they agree again exit when they
+        # disagree". A one-per-direction cap would allow the first
+        # re-entry and refuse every one after it, which is not a
+        # rule, it is the rule plus an arbitrary stop. The cost is
+        # that this strategy can churn, so the column counts its
+        # trades and the churn is there to be looked at.
+        if strat == "fused":
+            taken = ()
 
         t = j.open_trade_for(coin_)
         closed = None
@@ -6886,7 +6963,12 @@ def create_app() -> FastAPI:
         # any test could see.
         act, arg = jn.decide(t, s, px, side, taken,
                              (win.get("mid_dir") or ""),
-                             window_rule=True)
+                             window_rule=True,
+                             # Symmetric in and out, for this
+                             # strategy only: losing the agreement
+                             # IS the exit, including one series
+                             # merely going flat.
+                             exit_on_disagree=(strat == "fused"))
         idle_why = arg if act == "" else ""
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
@@ -9208,9 +9290,9 @@ DASHBOARD = """<!doctype html>
           <option value="233t">233 ticks</option>
           <option value="500t">500 ticks</option>
           <option value="1000t">1,000 ticks</option>
-          <option value="1597t">1,597 ticks</option>
           <option value="2000t">2,000 ticks</option>
-          <option value="4000t">4,000 ticks</option></optgroup>
+          <option value="5000t">5,000 ticks</option>
+          <option value="10000t">10,000 ticks</option></optgroup>
           <optgroup label="fused: prints AND imbalance (ES only)">
           <option value="1000x500">1,000 ticks &times; 500 OFI</option>
           <option value="2500x1000">2,500 ticks &times; 1,000 OFI</option>
@@ -9565,6 +9647,30 @@ has to be running before the gate stops refusing.">spike
          because the first version of this was a div inside the
          footprint panel and could not be found -- a measurement
          nobody can locate is one nobody reads. -->
+    <!-- THE FUSION READ. Its own top-level panel, titled, because the
+         last reading that went inside another section rendered
+         correctly and could not be found. -->
+    <div class="panel full" id="fusionPanel"><h2>Fusion &mdash; the tick
+      bar and the OFI, read separately<span class="stamp"
+      id="fusionStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Two series, built by
+        <b>different builders from different events</b>. The tick bar
+        closes every N prints and knows nothing about the book; the OFI
+        bar closes on a quantity of imbalance and knows nothing about
+        how many prints it took. Neither influences the other &mdash;
+        that independence is the only reason their agreement says
+        anything. <b>Agree &rarr; a side. Disagree &rarr; no side, and
+        an open trade ends.</b> Flat is not a side on either.</div>
+      <div class="conbar" style="margin-top:-2px">
+        <label>tick series <select id="fusTick" onchange="fusLoad()"
+          style="margin:0 4px"></select></label>
+        <span class="thin" id="fusNote"></span>
+      </div>
+      <div id="fusionBox"><span class="stamp" style="width:100%">waiting
+        for the first prints and book updates &mdash; this fills as the
+        tape runs</span></div>
+    </div>
+
     <div class="panel full" id="clockPanel"><h2>Fifteen-minute windows
       &mdash; the same tape, cut by the clock</h2>
       <div class="msg" style="margin-bottom:8px">The OFI candles end
@@ -12758,6 +12864,11 @@ async function ofiTick(fromTimer) {
       + q({coin: coin(), limit: 40,
            period: ($('jnlWin') ? $('jnlWin').value : 900)}))); }
     catch (e) { /* the OFI panel below is the louder failure */ }
+
+    /* THE FUSION READ RIDES IT TOO. Same reason: a timer of its own
+       would be a second clock to keep in step, and this panel is
+       read beside the journal that trades off it. */
+    try { fusLoad(); } catch (e) {}
     if (!d.ok) {
       /* "ES is not a CME symbol" is true and useless. The reason this
          panel is blank is almost always that a crypto market is
@@ -14494,6 +14605,98 @@ function clockWord(v) {
   return v === 'up' ? '<b class="long">UP</b>'
        : v === 'down' ? '<b class="short">DOWN</b>'
        : '<b>FLAT</b>';
+}
+
+/* ---- the fusion read ------------------------------------------------- */
+
+let _fusSized = false;
+
+async function fusLoad() {
+  const sel = $('fusTick');
+  let d;
+  try {
+    d = await api('/api/fusion?' + q({
+      coin: coin(), per_bar: (sel && sel.value) || 0}));
+  } catch (e) { return; }
+  if (!_fusSized && d && d.sizes) {
+    // Filled once from the server's own list. Hard-coding the sizes
+    // in the markup is how a panel ends up offering a series that
+    // has no builder behind it.
+    sel.innerHTML = d.sizes.map(n =>
+      `<option value="${n}"${n === d.default_per_bar ? ' selected' : ''}>`
+      + `${n.toLocaleString()} ticks</option>`).join('');
+    _fusSized = true;
+  }
+  paintFusion(d);
+}
+
+function fusArrow(dir) {
+  if (dir === 'up') return '<b style="color:var(--up)">UP &uarr;</b>';
+  if (dir === 'down') return '<b style="color:var(--down)">DOWN &darr;</b>';
+  return '<b style="color:var(--dim)">FLAT</b>';
+}
+
+function paintFusion(d) {
+  const box = $('fusionBox');
+  if (!box) return;
+  if (!d || d.error) {
+    box.innerHTML = `<span class="stamp" style="width:100%">`
+      + esc((d && d.error) || 'no reading') + '</span>';
+    return;
+  }
+  const t = d.tick || {}, o = d.ofi || {};
+  /* THE VERDICT IS THE BIG THING ON THE PANEL, because it is the
+     only part that decides anything. The two readings under it are
+     the evidence for it, in the units each series actually uses. */
+  const verdict = d.agree
+    ? `<div style="font-size:22px;font-weight:700;color:var(--`
+      + (d.side === 'up' ? 'up' : 'down') + `)">AGREE &mdash; `
+      + esc(String(d.side).toUpperCase()) + `</div>`
+    : `<div style="font-size:22px;font-weight:700;color:var(--dim)">`
+      + `DISAGREE</div>`;
+  const why = d.agree
+    ? 'both series point the same way &mdash; this is the entry'
+    : esc(d.why || '') + ' &mdash; no entry, and an open trade ends here';
+
+  const cell = (title, dir, lines) =>
+    `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
+    + `border-radius:6px;padding:10px">`
+    + `<div class="thin" style="margin-bottom:4px">${title}</div>`
+    + `<div style="font-size:16px;margin-bottom:6px">${fusArrow(dir)}</div>`
+    + lines.map(l => `<div class="thin">${l}</div>`).join('')
+    + `</div>`;
+
+  const tickLines = [];
+  if (t.prints != null)
+    tickLines.push(`${Number(t.prints).toLocaleString()} of `
+      + `${Number(t.per_bar || 0).toLocaleString()} prints in`);
+  if (t.ticks != null)
+    tickLines.push(`${t.ticks > 0 ? '+' : ''}${t.ticks} ticks from its open`);
+  if (t.seconds != null) tickLines.push(`${t.seconds}s old`);
+  if (t.why) tickLines.push(esc(t.why));
+
+  const ofiLines = [];
+  if (o.imbalance != null)
+    ofiLines.push(`imbalance ${Number(o.imbalance).toLocaleString()}`
+      + (o.level != null ? ` against a &plusmn;${o.level} band` : ''));
+  if (o.delta != null) ofiLines.push(`delta ${o.delta}`);
+
+  box.innerHTML =
+      `<div style="margin-bottom:10px">${verdict}`
+    + `<div class="thin">${why}</div></div>`
+    + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
+    + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)
+    + cell('OFI BAR &mdash; the resting book only', o.dir, ofiLines)
+    + `</div>`;
+
+  const note = $('fusNote');
+  if (note) {
+    note.innerHTML = 'the Fused strategy in the trade column trades '
+      + 'exactly this: in on agreement, out the moment it breaks, '
+      + 'in again when it returns';
+  }
+  const st = $('fusionStamp');
+  if (st) st.textContent = d.agree ? d.side : 'no side';
 }
 
 function paintClockWindows(d) {

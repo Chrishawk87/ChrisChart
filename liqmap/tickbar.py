@@ -74,8 +74,12 @@ from dataclasses import dataclass, field
 # under a few hundred is noise at the chart scale, and anything over a
 # few thousand stops being faster than the clock bars it is meant to
 # beat. The Fibonacci-ish middle is the conventional futures set.
-PER_BAR_CHOICES: tuple[int, ...] = (233, 500, 1000, 1597, 2000, 4000)
+PER_BAR_CHOICES: tuple[int, ...] = (233, 500, 1000, 2000, 5000, 10000)
 DEFAULT_PER_BAR = 1000
+
+# The series the fusion rule reads unless told otherwise. Chris named
+# the 5,000-tick bar specifically.
+STRATEGY_PER_BAR = 5000
 
 # Floor and ceiling on anything arriving from a query string. A bar of
 # one print is a trade list, and a bar of a million never closes.

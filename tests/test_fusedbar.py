@@ -802,70 +802,35 @@ class TestTheIntrabarSignal:
         assert p["ofi_dir"] == "up" and p["tick_dir"] == "up"
 
 
-class TestTheJournalTradesIt:
-    def test_fused_is_a_strategy(self):
+class TestTheStrategyMovedOut:
+    """The fused STRATEGY is no longer this module's dual-trigger bar.
+
+    It was, for about an hour. Chris: "when i said fused i want the
+    5000 tick bar to read independent of the OFI ... they should read
+    independent but have the same directional interest for a trade to
+    happen" -- which is two separate series compared on direction,
+    not one bar closing on two conditions.
+
+    So the rule lives in `liqmap.fusion` and is tested in
+    test_fusion.py. The dual-trigger CANDLE below stays as a chart
+    type, because it is a real way to cut the tape and it is already
+    built; it simply is not what the strategy reads.
+    """
+
+    def test_the_strategy_reads_the_two_series_module(self):
         from liqmap.journal import STRATEGIES
         assert "fused" in STRATEGIES
-        assert "INTRABAR" in STRATEGIES["fused"]
+        assert "separately" in STRATEGIES["fused"]
 
-    def test_it_reads_the_fused_bar_not_the_window(self):
-        from liqmap.journal import window_signal
-        fused = {"live_side": "up", "live_why": ""}
-        assert window_signal({}, "fused", "", fused) == ("up", "")
-
-    def test_an_empty_window_does_not_refuse_it(self):
-        """The guard that would have broken it.
-
-        Every other strategy returns "no window yet" on an empty
-        window. The fused rule is not looking at the window, so that
-        check runs after its branch.
-        """
-        from liqmap.journal import window_signal
-        side, _ = window_signal({}, "fused", "",
-                                {"live_side": "down", "live_why": ""})
-        assert side == "down"
-        assert window_signal({}, "ofi")[1] == "no window yet"
-
-    def test_it_passes_the_reason_through(self):
-        from liqmap.journal import window_signal
-        fused = {"live_side": "",
-                 "live_why": "the book is up but price is down"}
-        side, why = window_signal({}, "fused", "", fused)
-        assert side == ""
-        assert why == "the book is up but price is down"
-
-    def test_a_missing_bar_is_a_reason_not_a_crash(self):
-        from liqmap.journal import window_signal
-        assert window_signal({}, "fused", "", None) == (
-            "", "no fused bar open yet")
-
-    def test_the_other_strategies_are_unchanged(self):
-        from liqmap.journal import window_signal
-        win = {"ts_last": 1000.0, "start_ts": 0.0, "mid_dir": "up",
-               "ofi_dir": "up", "cvd_dir": "up"}
-        assert window_signal(win, "ofi")[0] == "up"
-        assert window_signal(win, "candle")[0] == "up"
-        assert window_signal(win, "footprint", "up")[0] == "up"
-
-    def test_the_route_counts_trades_against_the_fused_bar(self):
-        """Not against the clock window.
-
-        Counting a fused bar's trades against a 15-minute window
-        would let one bar be traded repeatedly, or starve several of
-        their one trade.
-        """
-        blk = py_func("_journal_step")
-        assert 'if strat == "fused":' in blk
-        assert 'bar_ts = float(fus.get("start_ts") or 0.0)' in blk
-
-    def test_the_route_reads_the_forming_bar(self):
+    def test_this_module_no_longer_feeds_the_strategy(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
-        blk = py_func("_fused_now")
-        assert "bld.current" in blk
-        assert "last_closed" not in blk, "the rule is intrabar"
+        step = py_func("_journal_step")
+        assert "_fusion_now(rt_)" in step
+        assert "_fused_now(" not in step
 
-    def test_the_panel_offers_the_strategy(self):
-        src = (ROOT / "liqmap" / "web.py").read_text()
-        i = src.index('id="jnlStrat"')
-        box = src[i:src.index("</select>", i)]
-        assert 'value="fused"' in box
+    def test_the_dual_trigger_chart_type_still_works(self):
+        b = FusedBars(tick_target=4, ofi_target=100, max_s=1e9)
+        push_prints(b, 4)
+        push_ofi(b, 40)
+        assert b.last_closed is not None
+        assert b.last_closed.close_reason == "both"

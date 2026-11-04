@@ -606,7 +606,8 @@ class Journal(ThreadedDB):
 
 def should_close(t: Trade, s: Settings, px: float,
                  agree: str, diverged: str = "",
-                 window_rule: bool = False) -> str:
+                 window_rule: bool = False,
+                 exit_on_disagree: bool = False) -> str:
     """Why this open trade should end now, or "" to hold it.
 
     LOSING AGREEMENT IS NOT AN EXIT. ONLY A FLIP IS.
@@ -638,6 +639,28 @@ def should_close(t: Trade, s: Settings, px: float,
     other = "down" if t.side == "up" else "up"
     if agree == other:
         return "flip"
+    # THE FUSION RULE IS SYMMETRIC, AND ONLY THAT RULE.
+    #
+    # Chris, on the two independent series: "exiting when they
+    # disagree reenter when they agree again exit when they
+    # disagree". So for this strategy losing agreement IS the exit,
+    # including the merely-neutral case the flip test above lets
+    # through -- one series going flat is a disagreement, because
+    # the reason for the trade was that both pointed the same way
+    # and now they do not.
+    #
+    # IT IS OFF EVERYWHERE ELSE, ON PURPOSE. The same construction
+    # on the window signal closed for -1 tick over and over: the
+    # read crossed its own reference constantly, agreement broke for
+    # an instant, the trade closed and the next look re-opened it.
+    # Measured then: 1,582 trades became 72 when the exit was
+    # removed. These two series are not that read -- a tick bar and
+    # an OFI bar turn far less often than price against a bar open
+    # -- but the risk is the same shape, so the column counts the
+    # re-entries and the churn is meant to be looked at rather than
+    # assumed away.
+    if exit_on_disagree and agree != t.side:
+        return "disagree"
     # THE DIVERGENCE EXIT IS OFF FOR A WINDOW SIGNAL.
     #
     # It was written when the signal was the OFI lean and price was
@@ -661,7 +684,8 @@ def should_close(t: Trade, s: Settings, px: float,
 def decide(t: Trade | None, s: Settings, px: float,
            agree: str, taken: tuple = (),
            price: str = "",
-           window_rule: bool = False) -> tuple[str, str]:
+           window_rule: bool = False,
+           exit_on_disagree: bool = False) -> tuple[str, str]:
     """What the journal should do right now.
 
     ("open", side), ("close", why), or ("", reason) -- and the reason
@@ -697,8 +721,8 @@ def decide(t: Trade | None, s: Settings, px: float,
         return "", "no live price -- the tape has not printed"
     if t is not None and t.open:
         why = should_close(t, s, px, agree, price,
-                           window_rule)
-        if why in ("flip", "diverge") and t.mode != "auto":
+                           window_rule, exit_on_disagree)
+        if why in ("flip", "diverge", "disagree") and t.mode != "auto":
             why = ""
         return ("close", why) if why else ("", "a trade is already open")
     if not s.auto:
@@ -812,7 +836,7 @@ STRATEGIES = {
     "ofi": "OFI -- candle, OFI and CVD must agree",
     "candle": "Candle -- the window candle alone",
     "footprint": "Footprint -- candle and footprint imbalance agree",
-    "fused": "Fused -- OFI and tick direction agree, INTRABAR",
+    "fused": "Fused -- the tick bar and the OFI, read separately, agree",
 }
 
 
@@ -842,24 +866,29 @@ def window_signal(win: dict, strategy: str = "ofi",
     """
     # THE FUSED STRATEGY DOES NOT READ THE WINDOW AT ALL.
     #
-    # Its signal is the bar being BUILT -- the moment the OFI sign
-    # and the traded-price direction agree inside it. Chris: "this is
-    # a intrabar strategy not at close". Reading the closed bar would
-    # put every entry one bar late, which is the lateness this series
-    # was built to fix, and reading the window would put it back on
-    # the clock it was meant to get off.
+    # It reads TWO INDEPENDENT SERIES -- the tick bar, which knows
+    # nothing about the book, and the OFI bar, which knows nothing
+    # about how many prints it took -- and asks each the same
+    # question: which way are you pointing right now. Chris: "they
+    # should read independent but have the same directional interest
+    # for a trade to happen".
+    #
+    # Both readings are of the bar being BUILT, not the last closed
+    # one: "this is a intrabar strategy not at close". Reading closed
+    # bars would be late by a bar on each series, and reading the
+    # window would put it back on the clock it was built to escape.
     #
     # Checked BEFORE the window guards below, because a fused signal
     # must not be refused for "no window yet" when the window is not
     # what it is looking at.
     if strategy == "fused":
         if not fused:
-            return "", "no fused bar open yet"
-        side = str(fused.get("live_side") or "")
+            return "", "no reading from the tick bar or the OFI yet"
+        side = str(fused.get("side") or "")
         if side in ("up", "down"):
             return side, ""
-        return "", (str(fused.get("live_why") or "")
-                    or "the fused legs do not agree")
+        return "", (str(fused.get("why") or "")
+                    or "the tick bar and the OFI do not agree")
 
     if not win:
         return "", "no window yet"
