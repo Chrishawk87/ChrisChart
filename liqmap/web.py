@@ -6981,18 +6981,27 @@ def create_app() -> FastAPI:
         # The window is the candle the cap counts against.
         bar_ts = float(win.get("start_ts") or 0.0)
         taken = j.sides_in_bar(coin_, bar_ts, strat)
-        # THE FUSION RULE HAS NO PER-CANDLE CAP. It is counted
-        # against the 15-minute window, and this rule has nothing to
-        # do with that clock -- a cap from it would refuse a perfectly
-        # good entry because of a trade taken twelve minutes earlier
-        # under a different 5m bar.
+        # THE FUSION RULE IS CAPPED AT ONE TRADE PER 5-MINUTE BAR,
+        # and the 5m bar -- not the 15-minute window -- is the candle
+        # it counts against.
         #
-        # The churn this used to permit is gone by other means: with
-        # only the 5m closing a position, re-entry cannot happen
-        # until the 5m has turned, which is a slow event by
-        # construction.
+        # Chris watched it take a profit and step straight back into
+        # the same move: "it immediately jumps in for another trade
+        # without making sure the parameters still hold true". A
+        # per-direction cap does not stop that, because the trade
+        # after a long is usually another long. One trade per 5m
+        # bar, either way, does.
+        #
+        # This is also what makes the symmetric exit safe to use
+        # again. The exit can fire as often as the tape makes it
+        # fire; nothing re-enters until a new 5m bar opens, so the
+        # fourteen-trades-in-minutes shape is arithmetically
+        # impossible -- the ceiling is twelve an hour.
+        cap = 0
         if strat == "fused":
-            taken = ()
+            cap = 1
+            bar_ts = float((fus.get("m5") or {}).get("start_ts") or 0.0)
+            taken = j.sides_in_bar(coin_, bar_ts, strat)
 
         t = j.open_trade_for(coin_)
         closed = None
@@ -7001,20 +7010,25 @@ def create_app() -> FastAPI:
         # HTTP request through a fixture that never produced
         # agreement -- so deleting the auto check broke nothing that
         # any test could see.
-        # THE ONLY THING THAT CLOSES A FUSION TRADE IS THE 5m
-        # TURNING AGAINST IT. Computed here rather than inside the
-        # journal because it is a reading, and readings come from
-        # the one place that takes them.
-        m5_against = ""
+        # ANY ONE OF THE THREE TURNING ENDS A FUSION TRADE. The exit
+        # test is the entry test run again -- `holds_three` is
+        # defined in terms of `entry_side` -- so the two cannot drift
+        # apart. Computed here because it is a reading, and readings
+        # are taken in one place.
+        disagreed = ""
         if strat == "fused" and t is not None and t.open:
-            ok, m5_why = jn_fusion.hold_against_m5(
-                t.side, (fus.get("m5") or {}).get("dir") or "")
+            ok, why_out = jn_fusion.holds_three(
+                t.side,
+                (fus.get("tick") or {}).get("dir") or "",
+                (fus.get("ofi") or {}).get("dir") or "",
+                (fus.get("m5") or {}).get("dir") or "")
             if not ok:
-                m5_against = m5_why
+                disagreed = why_out
         act, arg = jn.decide(t, s, px, side, taken,
                              (win.get("mid_dir") or ""),
                              window_rule=True,
-                             m5_against=m5_against)
+                             disagreed=disagreed,
+                             max_per_bar=cap)
         idle_why = arg if act == "" else ""
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
@@ -9706,12 +9720,13 @@ has to be running before the gate stops refusing.">spike
         about how many prints it took; the 5-minute bar is the ordinary
         time candle. None of them influences the others &mdash; that
         independence is the only reason their agreement says anything.
-        <b>Entry: all three point the same way. Exit: only when the
-        5-minute bar turns against the trade.</b> A flat or
-        still-settling 5m holds the position; the tick bar and the OFI
-        breaking step does not close anything, which is what took 14
-        trades in a few minutes. The 5m is not read for its first
-        90&nbsp;seconds, so nothing opens in that part of the bar.</div>
+        <b>Entry: all three point the same way. Exit: any one of them
+        turning.</b> The same test both ways. The 5m is read
+        immediately &mdash; close against open, exactly what colours
+        that candle on the chart. What stops this churning is not a
+        softer exit but a hard limit on entries: <b>one trade per
+        5-minute bar</b>, either direction, so after a take profit
+        nothing re-enters until a new 5m bar opens.</div>
       <div class="conbar" style="margin-top:-2px">
         <label>tick series <select id="fusTick" onchange="fusLoad()"
           style="margin:0 4px"></select></label>
@@ -14712,11 +14727,11 @@ function paintFusion(d) {
   const why = d.agree
     ? 'all three point the same way &mdash; this is the entry'
     : esc(d.why || '') + ' &mdash; no new entry';
-  const holdLine = m.dir
-    ? `an open trade is held until the <b>5m</b> turns against it &mdash; `
-      + `it is ${fusArrow(m.dir)} now`
-    : 'an open trade is held &mdash; the 5m has not turned against '
-      + 'anything (' + esc(m.why || 'flat') + ')';
+  const holdLine = d.agree
+    ? 'an open trade is held while all three stay this way &mdash; '
+      + 'any one turning closes it'
+    : 'any one of the three turning closes an open trade &mdash; '
+      + esc(d.why || '');
 
   const cell = (title, dir, lines) =>
     `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
@@ -14742,11 +14757,9 @@ function paintFusion(d) {
   if (o.delta != null) ofiLines.push(`delta ${o.delta}`);
 
   const m5Lines = [];
-  if (m.seconds != null)
-    m5Lines.push(`${m.seconds}s into the bar`
-      + (m.dir ? '' : ` &mdash; read at ${m.settle_s}s`));
-  if (m.raw_dir && !m.dir)
-    m5Lines.push(`pointing ${esc(m.raw_dir)}, not counted yet`);
+  if (m.ticks != null)
+    m5Lines.push(`${m.ticks > 0 ? '+' : ''}${m.ticks} ticks from its open`);
+  if (m.seconds != null) m5Lines.push(`${m.seconds}s into the bar`);
   if (m.why) m5Lines.push(esc(m.why));
 
   box.innerHTML =
@@ -14756,16 +14769,16 @@ function paintFusion(d) {
     + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
     + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)
     + cell('OFI BAR &mdash; the resting book only', o.dir, ofiLines)
-    + cell('5 MINUTE BAR &mdash; the hold', m.dir, m5Lines)
+    + cell('5 MINUTE BAR &mdash; the slow one', m.dir, m5Lines)
     + `</div>`;
 
   const note = $('fusNote');
   if (note) {
     note.innerHTML = 'the Fused strategy trades exactly this: in '
-      + 'when all three agree, held until the <b>5 minute bar</b> '
-      + 'turns against it. The tick bar and the OFI breaking step '
-      + 'no longer closes anything &mdash; that is what took 14 '
-      + 'trades in a few minutes.';
+      + 'when all three agree, out when any one of them turns, and '
+      + '<b>at most one trade per 5-minute bar</b> &mdash; that cap '
+      + 'is what stops it stepping straight back in after a take '
+      + 'profit.';
   }
   const st = $('fusionStamp');
   if (st) st.textContent = d.agree ? d.side : 'no side';

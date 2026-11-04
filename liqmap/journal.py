@@ -607,7 +607,7 @@ class Journal(ThreadedDB):
 def should_close(t: Trade, s: Settings, px: float,
                  agree: str, diverged: str = "",
                  window_rule: bool = False,
-                 m5_against: str = "") -> str:
+                 disagreed: str = "") -> str:
     """Why this open trade should end now, or "" to hold it.
 
     LOSING AGREEMENT IS NOT AN EXIT. ONLY A FLIP IS.
@@ -639,26 +639,25 @@ def should_close(t: Trade, s: Settings, px: float,
     other = "down" if t.side == "up" else "up"
     if agree == other:
         return "flip"
-    # THE FIVE-MINUTE BAR IS THE ONLY THING THAT ENDS A FUSION TRADE.
+    # ANY ONE OF THE THREE DISAGREEING ENDS A FUSION TRADE.
     #
-    # It was the fast pair disagreeing. Chris ran it: "it literally
-    # took 14 trades in a matter of a few minutes that closed due to
-    # disagreement that cant happen in real trading". The tick bar
-    # and the OFI break step constantly inside a move, so every one
-    # of those exits was noise charged a round trip -- the same
-    # failure the window rule had, where 1,582 trades became 72 once
-    # the disagreement exit came out.
+    # Chris: "all 3 must agree for a entry if one disagrees it exits
+    # that simple". Symmetric with the entry, which is the only way
+    # it can be stated in one sentence and stay stated.
     #
-    # So the fast pair no longer closes anything. The caller passes
-    # the 5m direction only when it is AGAINST the open side, and
-    # that is the exit. A flat or still-settling 5m holds: "flat is
-    # not a reason to exit".
+    # THIS IS THE CONSTRUCTION THAT CHURNED, and it is allowed back
+    # for a specific reason: what stops the churn now is not a
+    # softer exit but a hard limit on ENTRIES. One trade per
+    # 5-minute bar. The exit may fire as often as the tape makes it
+    # fire; nothing can re-enter until a new 5m bar opens, so
+    # fourteen trades in a few minutes is arithmetically impossible
+    # -- the ceiling is twelve an hour.
     #
-    # The consequence is deliberate and worth knowing: a full
-    # reversal of both fast series no longer closes a position
-    # either, so the stop is the only fast protection left on it.
-    if m5_against:
-        return "m5"
+    # The caller passes the reason only when one of the three has
+    # actually turned, so an empty string here means they still
+    # agree.
+    if disagreed:
+        return "disagree"
     # THE DIVERGENCE EXIT IS OFF FOR A WINDOW SIGNAL.
     #
     # It was written when the signal was the OFI lean and price was
@@ -683,7 +682,8 @@ def decide(t: Trade | None, s: Settings, px: float,
            agree: str, taken: tuple = (),
            price: str = "",
            window_rule: bool = False,
-           m5_against: str = "") -> tuple[str, str]:
+           disagreed: str = "",
+           max_per_bar: int = 0) -> tuple[str, str]:
     """What the journal should do right now.
 
     ("open", side), ("close", why), or ("", reason) -- and the reason
@@ -719,8 +719,8 @@ def decide(t: Trade | None, s: Settings, px: float,
         return "", "no live price -- the tape has not printed"
     if t is not None and t.open:
         why = should_close(t, s, px, agree, price,
-                           window_rule, m5_against)
-        if why in ("flip", "diverge", "m5") and t.mode != "auto":
+                           window_rule, disagreed)
+        if why in ("flip", "diverge", "disagree") and t.mode != "auto":
             why = ""
         return ("close", why) if why else ("", "a trade is already open")
     if not s.auto:
@@ -744,8 +744,20 @@ def decide(t: Trade | None, s: Settings, px: float,
     # until one was written that reaches it directly. Kept because
     # the cap is the stated rule and the per-direction rule is the
     # one most likely to be relaxed later.
-    if len(taken) >= MAX_PER_BAR:
-        return "", "this candle has had its two trades"
+    # THE CAP IS THE CALLER'S TO SET. The fusion rule passes 1 -- one
+    # trade per 5-minute bar, whichever way it went -- because Chris
+    # watched it take a profit and step straight back into the same
+    # move: "it immediately jumps in for another trade without making
+    # sure the parameters still hold true". A per-DIRECTION cap does
+    # not stop that; the trade after a long is usually another long.
+    # 0 means "the module default". MAX_PER_BAR is defined below
+    # this function, so it cannot be the literal default -- a
+    # default argument is evaluated when the def runs, and that is
+    # before the constant exists.
+    cap = max(1, int(max_per_bar or MAX_PER_BAR))
+    if len(taken) >= cap:
+        return "", (f"this candle has had its {cap} "
+                    f"trade{'' if cap == 1 else 's'}")
     return "open", agree
 
 

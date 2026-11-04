@@ -51,21 +51,21 @@ from __future__ import annotations
 
 SIDES = ("up", "down")
 
-# How long a 5-minute bar must have been running before its direction
-# is believed. Under this it is reported flat, whatever its close is
-# doing.
+# THE 5-MINUTE BAR IS READ IMMEDIATELY. Chris: "the 5 minute is the
+# only one that dont need to be settled".
 #
-# WITHOUT IT THE FILTER IS NOT A FILTER. Thirty seconds into a
-# five-minute bar, its direction is a handful of prints against its
-# open and it flips about as freely as the tick bar this is meant to
-# steady -- so the churn would survive the fix, wearing a slower
-# label. It is Chris's own rule about not trading the unstable open,
-# applied to the confirmation rather than to the entry.
+# It was held flat for its first 90 seconds, on the reasoning that a
+# young bar's direction is a handful of prints against its open. The
+# cost of that was worse than the noise it removed: the 5m is the
+# SLOW reading in this rule, the one whose job is to be behind the
+# other two, and delaying it further made it turn visibly later than
+# the same candle on the chart -- a confirmation that disagreed with
+# what Chris could see.
 #
-# The cost is stated rather than hidden: because a settled 5m
-# direction is required to ENTER, nothing opens in the first 90
-# seconds of each 5-minute bar. That is 30% of the clock, deliberately.
-M5_SETTLE_S = 90.0
+# Close against open, exactly what colours the 5m candle on the
+# chart. Kept as a parameter rather than deleted so a settle can be
+# put back by passing one, but the default is none.
+M5_SETTLE_S = 0.0
 
 
 def agreement(tick_dir: str, ofi_dir: str) -> tuple[str, str]:
@@ -107,10 +107,13 @@ def m5_direction(m5: dict | None,
                  settle_s: float = M5_SETTLE_S) -> tuple[str, str]:
     """The forming 5-minute bar's direction, or "" and why not.
 
-    Flat until the bar has been running `settle_s`. An unsettled bar
-    is not a bar with no opinion -- it is a bar whose opinion is not
-    worth having yet, and the two are reported the same way on
-    purpose, because the rule treats both as "no confirmation".
+    Close against open -- the same thing that colours this candle on
+    the chart, so the rule and the screen cannot disagree about which
+    way the 5m is pointing.
+
+    No settle by default. A bar that is genuinely flat still has no
+    direction, and that is reported the same way, because the rule
+    treats "flat" and "no confirmation" identically.
     """
     if not m5:
         return "", "no 5-minute bar yet"
@@ -118,10 +121,9 @@ def m5_direction(m5: dict | None,
         age = float(m5.get("seconds") or 0.0)
     except (TypeError, ValueError):
         age = 0.0
-    if age < settle_s:
+    if settle_s > 0 and age < settle_s:
         return "", (f"the 5m bar is {int(age)}s old -- it is not read "
-                    f"until {int(settle_s)}s, that is when it is least "
-                    "settled")
+                    f"until {int(settle_s)}s")
     d = str(m5.get("dir") or "").strip().lower()
     if d not in SIDES:
         return "", "the 5m bar is flat"
@@ -148,22 +150,13 @@ def entry_side(tick_dir: str, ofi_dir: str, m5_dir: str) -> tuple[str, str]:
 
 
 def hold_against_m5(side: str, m5_dir: str) -> tuple[bool, str]:
-    """Does an open `side` survive? Only the 5m can end it.
+    """Kept for callers that want the 5m test on its own.
 
-    CHRIS'S ANSWER, AND THE WHOLE REASON THIS EXISTS. The fused rule
-    took fourteen trades in a few minutes, every one closed because
-    the tick bar and the OFI stopped agreeing for a moment. So they
-    no longer end a trade at all: once in, the position is held until
-    the FIVE-MINUTE bar points the other way.
-
-    A flat or unsettled 5m holds. "flat is not a reason to exit" --
-    only a 5m pointing AGAINST the trade closes it.
-
-    THE CONSEQUENCE, SAID OUT LOUD: a full reversal of both fast
-    series no longer closes anything either. You can be long while
-    the tick bar and the OFI both say down, for as long as the 5m
-    stays up. That is what was asked for and it is what makes the
-    stop loss the only fast protection left on the position.
+    NO LONGER THE EXIT. Chris: "all 3 must agree for a entry if one
+    disagrees it exits that simple" -- so the exit is symmetric with
+    the entry again and lives in `holds_three` below. This remains
+    because asking "has the 5m turned against this position" is a
+    real question worth being able to ask by itself.
     """
     if side not in SIDES:
         return False, "no side"
@@ -171,6 +164,38 @@ def hold_against_m5(side: str, m5_dir: str) -> tuple[bool, str]:
     if m in SIDES and m != side:
         return False, f"the 5m turned {m} against a {side}"
     return True, ""
+
+
+def holds_three(side: str, tick_dir: str, ofi_dir: str,
+                m5_dir: str) -> tuple[bool, str]:
+    """Do all three still stand behind an open `side`?
+
+    THE EXIT, AND IT IS THE ENTRY TEST RUN AGAIN. Chris: "all 3 must
+    agree for a entry if one disagrees it exits that simple". One of
+    them going flat is a disagreement, because the reason for the
+    trade was that all three pointed the same way and now they do
+    not.
+
+    Defined in terms of `entry_side` rather than reimplemented. A
+    rule that enters on one definition and exits on another is a bug
+    that hides until a live position is sitting in it, and this pair
+    has already been rewritten twice.
+
+    THE CHURN THIS CAN CAUSE IS REAL AND IS CAPPED ELSEWHERE. The
+    same construction took fourteen trades in a few minutes when the
+    pair alone drove it. What stops it now is not a softer exit but
+    a hard limit on entries: one trade per 5-minute bar, enforced by
+    the caller. The exit can fire as often as it likes; nothing can
+    re-enter until a new 5m bar opens.
+    """
+    if side not in SIDES:
+        return False, "no side"
+    now, why = entry_side(tick_dir, ofi_dir, m5_dir)
+    if now == side:
+        return True, ""
+    if now:
+        return False, f"all three turned {now} against a {side}"
+    return False, why or "the three no longer agree"
 
 
 def state(tick: dict | None, ofi: dict | None,
@@ -212,14 +237,16 @@ def state(tick: dict | None, ofi: dict | None,
         },
         "m5": {
             "dir": m_dir,
-            "raw_dir": str((m5 or {}).get("dir") or ""),
             "seconds": (m5 or {}).get("seconds"),
+            # The bar this reading belongs to. The caller caps
+            # entries at one per 5m bar and needs to know WHICH bar,
+            # not just how far into it we are.
+            "start_ts": (m5 or {}).get("start_ts"),
             "settle_s": M5_SETTLE_S,
-            "settled": bool(m_dir) or not m_why.startswith("the 5m bar is")
-            or "flat" in m_why,
             "why": m_why,
             "open": (m5 or {}).get("open"),
             "close": (m5 or {}).get("close"),
+            "ticks": (m5 or {}).get("ticks"),
         },
         # The fast pair alone. NOT the entry -- it was, and that is
         # what took fourteen trades in a few minutes.

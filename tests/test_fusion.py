@@ -257,11 +257,11 @@ class TestTheRouteReadsBothSeries:
         blk = py_func("_tick_now")
         assert "STRATEGY_PER_BAR" in blk
 
-    def test_only_fused_trades_are_closed_by_the_5m(self):
+    def test_only_fused_trades_use_the_three_way_exit(self):
         """The exit reading is taken for this strategy and no other."""
         blk = py_func("_journal_step")
         assert 'if strat == "fused" and t is not None and t.open:' in blk
-        assert "m5_against = \"\"" in blk
+        assert 'disagreed = ""' in blk
 
 
 class TestThePanel:
@@ -286,11 +286,10 @@ class TestThePanel:
         assert "ALL THREE" in blk and "NO ENTRY" in blk
 
     def test_it_says_what_actually_ends_a_trade(self):
-        """Reading "no entry" as "get out" is the mistake that
-        produced fourteen trades in a few minutes."""
+        """The entry and the exit are the same test now, and the
+        panel has to say the one that is true today."""
         blk = js_func("paintFusion")
-        assert "held until the" in blk
-        assert "5m" in blk
+        assert "turning closes" in blk
 
     def test_the_sizes_come_from_the_server(self):
         """Hard-coded sizes are how a panel offers a series that has
@@ -309,17 +308,19 @@ class TestThePanel:
         assert "Depends(require_token)" in src[i:i + 120]
 
 
-class TestTheFiveMinuteHold:
-    """Chris, after running it:
+class TestTheFiveMinuteLeg:
+    """Chris, after running the hold version:
 
-        "it literally took 14 trades in a matter of a few minutes
-        that closed due to disagreement that cant happen in real
-        trading we need a way to verify the hold so we will use the 5
-        minute timeframe bar to keep this from bouncing all over the
-        place"
+        "the 5 minute minute we use for this is highly inaccurate
+        compared to the 5 minute on chris charts it turns extremely
+        late also on auto trad after one trade hit the take profit it
+        immediately jumps in for another trade without making sure
+        the parameters still hold true remember all 3 must agree for
+        a entry if one disagrees it exits that simple"
 
-    So the fast pair no longer closes anything. Entry needs all
-    three; only the 5m turning against an open trade ends it.
+    Three consequences: the 5m is read immediately, the exit is
+    symmetric with the entry again, and entries are capped at one per
+    5-minute bar.
     """
 
     @staticmethod
@@ -332,176 +333,162 @@ class TestTheFiveMinuteHold:
         return Settings(coin="ES", auto=True, tp_on=False, sl_on=False,
                         strategy="fused")
 
-    # -- the settle window ------------------------------------------------
+    # -- read immediately -------------------------------------------------
 
-    def test_an_unsettled_bar_has_no_direction(self):
-        side, why = fu.m5_direction({"dir": "up", "seconds": 30})
-        assert side == ""
-        assert "30s old" in why and "90s" in why
+    def test_the_5m_is_not_held_back(self):
+        """"the 5 minute is the only one that dont need to be settled"."""
+        assert fu.M5_SETTLE_S == 0.0
+        assert fu.m5_direction({"dir": "up", "seconds": 1}) == ("up", "")
 
-    def test_a_settled_bar_does(self):
-        assert fu.m5_direction({"dir": "up", "seconds": 120}) == ("up", "")
+    def test_a_brand_new_bar_still_reads(self):
+        assert fu.m5_direction({"dir": "down", "seconds": 0})[0] == "down"
 
-    def test_the_boundary(self):
-        assert fu.m5_direction({"dir": "up",
-                                "seconds": fu.M5_SETTLE_S})[0] == "up"
-        assert fu.m5_direction({"dir": "up",
-                                "seconds": fu.M5_SETTLE_S - 0.1})[0] == ""
-
-    def test_settling_is_what_makes_it_a_filter(self):
-        """Thirty seconds in, a 5m bar flips about as freely as the
-        tick bar it is meant to steady."""
-        assert fu.M5_SETTLE_S >= 60.0
-
-    def test_a_flat_settled_bar_has_no_direction_either(self):
+    def test_a_flat_bar_has_no_direction(self):
+        """Flat is still not a side -- that never changed."""
         assert fu.m5_direction({"dir": "flat", "seconds": 300})[0] == ""
 
-    def test_no_bar_is_a_reason(self):
-        side, why = fu.m5_direction(None)
-        assert side == "" and why.strip()
+    def test_a_settle_can_still_be_asked_for(self):
+        """Kept as a parameter so it can be put back."""
+        assert fu.m5_direction({"dir": "up", "seconds": 10},
+                               settle_s=90.0)[0] == ""
 
-    # -- entry ------------------------------------------------------------
+    def test_it_matches_what_colours_the_candle(self):
+        """Close against open, the same as the chart.
 
-    def test_entry_needs_all_three(self):
-        assert fu.entry_side("up", "up", "up") == ("up", "")
-        assert fu.entry_side("down", "down", "down") == ("down", "")
+        A confirmation that disagrees with what Chris can see on his
+        own screen is worse than no confirmation.
+        """
+        blk = py_func("_m5_now")
+        assert '"up" if cl > o else "down" if cl < o else "flat"' in blk
+        assert 'tape.candle("5m")' in blk
 
-    def test_the_fast_pair_alone_is_not_an_entry(self):
-        """The change. This used to open a trade."""
-        side, why = fu.entry_side("up", "up", "")
-        assert side == ""
-        assert "the 5m is flat" in why
+    # -- the exit is the entry, run again ---------------------------------
 
-    def test_a_5m_against_blocks_entry(self):
-        side, why = fu.entry_side("up", "up", "down")
-        assert side == ""
-        assert "the 5m is down" in why
+    def test_all_three_holds(self):
+        assert fu.holds_three("up", "up", "up", "up") == (True, "")
 
-    def test_the_pair_failing_is_reported_before_the_5m(self):
-        """A trader wants to know which reading failed, and "the 5m
-        is flat" is unhelpful when the pair never agreed."""
-        side, why = fu.entry_side("up", "down", "up")
-        assert side == ""
-        assert why == "the tick bar is up and the OFI is down"
-
-    def test_nothing_opens_in_the_unsettled_part_of_the_bar(self):
-        st = fu.state({"dir": "up"}, {"read": "up"},
-                      {"dir": "up", "seconds": 10})
-        assert st["side"] == ""
-        assert st["pair"] == "up", "the fast pair did agree"
-        assert window_signal({}, "fused", "", st)[0] == ""
-
-    # -- the hold ---------------------------------------------------------
-
-    def test_a_flat_5m_holds(self):
-        ok, why = fu.hold_against_m5("up", "")
-        assert ok is True and why == ""
-
-    def test_an_agreeing_5m_holds(self):
-        assert fu.hold_against_m5("up", "up")[0] is True
-
-    def test_only_a_5m_against_ends_it(self):
-        ok, why = fu.hold_against_m5("up", "down")
+    @pytest.mark.parametrize("t,o,m", [("down", "up", "up"),
+                                       ("up", "down", "up"),
+                                       ("up", "up", "down")])
+    def test_any_one_turning_ends_it(self, t, o, m):
+        ok, why = fu.holds_three("up", t, o, m)
         assert ok is False
-        assert why == "the 5m turned down against a up"
+        assert why.strip()
 
-    def test_the_fast_pair_no_longer_closes_anything(self):
-        """The whole fix, in one assertion.
+    @pytest.mark.parametrize("t,o,m", [("", "up", "up"),
+                                       ("up", "", "up"),
+                                       ("up", "up", "")])
+    def test_any_one_going_flat_ends_it(self, t, o, m):
+        """One of them going flat is a disagreement: the reason for
+        the trade was that all three pointed the same way."""
+        assert fu.holds_three("up", t, o, m)[0] is False
 
-        Tick and OFI in full disagreement, trade still open.
+    def test_the_exit_cannot_drift_from_the_entry(self):
+        """`holds_three` is defined in terms of `entry_side`.
+
+        This pair has been rewritten twice; entering on one
+        definition and exiting on another is the bug that hides
+        until a live position is sitting in it.
         """
-        assert should_close(self._open(), self._s(), 6800.25, "") == ""
+        for t in ("up", "down", "flat"):
+            for o in ("up", "down", "flat"):
+                for m in ("up", "down", "flat"):
+                    side = fu.entry_side(t, o, m)[0]
+                    for guess in ("up", "down"):
+                        assert fu.holds_three(guess, t, o, m)[0] == (
+                            side == guess), (t, o, m, guess)
 
-    def test_even_a_full_fast_reversal_is_held(self):
-        """Stated out loud because it is a real exposure: you can be
-        long while both fast series say down, until the 5m turns.
-        The stop is the only fast protection left.
-
-        The signal reaching `should_close` is the ENTRY side, which
-        requires all three -- so the pair reversing under a 5m that
-        is still up arrives as no signal at all, not as "down".
-        """
-        pair_reversed = fu.entry_side("down", "down", "up")[0]
-        assert pair_reversed == "", "the 5m is still up"
-        assert should_close(self._open(), self._s(), 6800.25,
-                            pair_reversed) == ""
-
-    def test_a_three_way_reversal_does_close_it(self):
-        """And then it is a flip, which is a real turn: the 5m is
-        part of that agreement, so this is not the fast noise the
-        hold was added to ignore."""
-        both = fu.entry_side("down", "down", "down")[0]
-        assert both == "down"
-        assert should_close(self._open(), self._s(), 6800.25,
-                            both) == "flip"
-
-    def test_the_5m_turning_closes_it(self):
+    def test_the_journal_closes_on_a_disagreement(self):
         why = should_close(self._open(), self._s(), 6800.25, "",
-                           m5_against="the 5m turned down against a up")
-        assert why == "m5"
+                           disagreed="the 5m is flat")
+        assert why == "disagree"
+
+    def test_it_holds_when_nothing_disagreed(self):
+        assert should_close(self._open(), self._s(), 6800.25, "up") == ""
 
     def test_the_stop_still_wins(self):
         s = Settings(coin="ES", auto=True, sl_on=True, sl_ticks=2)
-        why = should_close(self._open(), s, 6799.0, "",
-                           m5_against="the 5m turned")
-        assert why == "sl"
+        assert should_close(self._open(), s, 6799.0, "",
+                            disagreed="x") == "sl"
 
-    def test_the_target_still_wins(self):
-        s = Settings(coin="ES", auto=True, tp_on=True, tp_ticks=2)
-        why = should_close(self._open(), s, 6800.75, "",
-                           m5_against="the 5m turned")
-        assert why == "tp"
-
-    def test_a_manual_trade_is_not_closed_by_the_5m(self):
+    def test_a_manual_trade_is_not_closed_by_it(self):
         t = self._open()
         t.mode = "manual"
-        act, _ = decide(t, self._s(), 6800.25, "",
-                        m5_against="the 5m turned")
-        assert act == ""
+        assert decide(t, self._s(), 6800.25, "", disagreed="x")[0] == ""
 
     def test_an_auto_trade_is(self):
-        act, why = decide(self._open(), self._s(), 6800.25, "",
-                          m5_against="the 5m turned")
-        assert (act, why) == ("close", "m5")
+        assert decide(self._open(), self._s(), 6800.25, "",
+                      disagreed="x") == ("close", "disagree")
 
-    # -- the wiring -------------------------------------------------------
+    # -- one trade per 5m bar ---------------------------------------------
 
-    def test_the_route_reads_the_ordinary_5m_candle(self):
-        """Not a mid-price window and not a counted bar -- the bar
-        Chris can see on his own chart."""
-        blk = py_func("_m5_now")
-        assert 'tape.candle("5m")' in blk
+    def test_a_second_entry_in_the_same_bar_is_refused(self):
+        """The take-profit bug: it banked a long and stepped straight
+        back into the same move."""
+        act, why = decide(None, self._s(), 6800.0, "up",
+                          taken=("up",), max_per_bar=1)
+        assert act == ""
 
-    def test_the_route_only_closes_fused_trades_on_the_5m(self):
+    def test_even_the_other_direction_is_refused(self):
+        """A per-direction cap does not fix it -- the trade after a
+        long is usually another long, but the other way must be
+        capped too or the bar can still take two."""
+        act, why = decide(None, self._s(), 6800.0, "down",
+                          taken=("up",), max_per_bar=1)
+        assert act == ""
+        assert "1 trade" in why
+
+    def test_an_empty_bar_opens(self):
+        assert decide(None, self._s(), 6800.0, "up", taken=(),
+                      max_per_bar=1) == ("open", "up")
+
+    def test_the_other_strategies_keep_their_cap(self):
+        act, _ = decide(None, Settings(coin="ES", auto=True),
+                        6800.0, "down", taken=("up",))
+        assert act == "open", "two per candle, one per direction"
+
+    def test_the_route_counts_against_the_5m_bar(self):
+        """Not the 15-minute window: a cap from that clock would
+        refuse a good entry because of a trade twelve minutes old."""
         blk = py_func("_journal_step")
-        assert "hold_against_m5(" in blk
-        assert 'if strat == "fused" and t is not None and t.open:' in blk
-        assert "m5_against=m5_against" in blk
+        assert 'bar_ts = float((fus.get("m5") or {}).get("start_ts") or 0.0)' \
+            in blk
+        assert "cap = 1" in blk
+        assert "max_per_bar=cap" in blk
 
-    def test_the_state_carries_all_three(self):
-        st = fu.state({"dir": "up"}, {"read": "up"},
-                      {"dir": "up", "seconds": 200})
-        assert st["tick"]["dir"] == "up"
-        assert st["ofi"]["dir"] == "up"
-        assert st["m5"]["dir"] == "up"
-        assert st["side"] == "up"
-        assert "all three" in st["say"]
+    def test_the_route_passes_all_three_to_the_exit(self):
+        blk = py_func("_journal_step")
+        assert "holds_three(" in blk
+        assert "disagreed=disagreed" in blk
 
-    def test_the_state_separates_the_pair_from_the_verdict(self):
-        """Pair agreeing without the 5m, and the pair disagreeing,
-        used to look identical on the panel."""
-        st = fu.state({"dir": "up"}, {"read": "up"},
-                      {"dir": "down", "seconds": 200})
-        assert st["pair"] == "up"
-        assert st["side"] == ""
+    def test_the_cap_makes_the_churn_arithmetically_impossible(self):
+        """Fourteen trades in a few minutes cannot recur.
 
-    def test_the_panel_shows_the_5m_box(self):
+        One per 5-minute bar is twelve an hour, whatever the exit
+        does. That is the reason the symmetric exit is safe to use
+        again rather than a hope that it behaves.
+        """
+        taken = ()
+        opens = 0
+        for _ in range(50):                 # fifty polls, one 5m bar
+            act, _why = decide(None, self._s(), 6800.0, "up",
+                               taken=taken, max_per_bar=1)
+            if act == "open":
+                opens += 1
+                taken = ("up",)             # the journal records it
+        assert opens == 1
+
+    # -- the panel --------------------------------------------------------
+
+    def test_the_panel_says_any_one_turning_closes_it(self):
         blk = js_func("paintFusion")
-        assert "5 MINUTE BAR" in blk
-        assert "the hold" in blk
+        assert "any one of the three turning closes" in blk \
+            or "any one turning closes it" in blk
 
-    def test_the_panel_does_not_say_disagreement_exits(self):
-        """It did, and that reading is now wrong."""
+    def test_the_panel_states_the_cap(self):
         blk = js_func("paintFusion")
-        assert "an open trade ends here" not in blk
-        assert "held until the" in blk
+        assert "one trade per 5-minute bar" in blk
+
+    def test_the_panel_no_longer_claims_a_hold(self):
+        blk = js_func("paintFusion")
+        assert "held until the <b>5m</b> turns" not in blk
