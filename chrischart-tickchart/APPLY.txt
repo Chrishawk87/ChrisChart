@@ -1,0 +1,96 @@
+TICK CHART — what to copy and what to run
+=========================================
+
+Copy these over ~/Downloads/chrischart, keeping the paths:
+
+    liqmap/tickbar.py       NEW   the N-print bar builder
+    liqmap/cme_tape.py            feeds the builders from the raw tape
+    liqmap/web.py                 the route, the selector, the x-axis maths
+    tests/test_tickbar.py   NEW   84 tests
+    tests/test_clockwin.py        one test's source anchor, see below
+
+Then:
+
+    cd ~/Downloads/chrischart
+    source .venv/bin/activate
+    python -m pytest tests/ -q          # 5,377 passed here
+    git add -A
+    git commit -m "tick bars: N-print candles on the chart"
+    git push origin main
+
+WHY test_clockwin.py IS IN HERE
+-------------------------------
+One test located a block in cme_tape.py by the exact text of its `if`
+line. The tick bars share that block's decode of the raw record, so the
+condition gained a term and the anchor stopped matching -- with the
+test's actual claim still true. The fix is to the anchor only; nothing
+that test asserts has changed.
+
+
+HOW TO USE IT
+-------------
+The chart's candle selector now has a second group: "by prints (ES tape
+only)". Pick a size and the same chart draws N-print bars instead of
+time bars. 233 / 500 / 1,000 / 1,597 / 2,000 / 4,000 are all counting
+from the moment the engine starts, so switching between them is instant
+rather than starting an empty chart.
+
+Under the chart you now get the pace instead of the trade count:
+
+    1000 prints a bar · on pace for 41s against a 96s median --
+    the tape is roughly twice as busy
+
+That line is the thing a clock chart cannot show you. It compares the
+bar being built -- PROJECTED to a full bar, not its raw elapsed time --
+against the median of the last 30 closed bars.
+
+
+WHAT THIS DOES NOT DO, SAID PLAINLY
+-----------------------------------
+IT DOES NOT CHANGE WHEN THE RULE FIRES.
+
+All three strategies still read the 15-minute (or 5-minute) window.
+Swapping the chart underneath them changes what you are looking at and
+nothing about what the auto trader is doing. If the entries were late
+yesterday they will be late today.
+
+The reason to put the tick series in first is that it is the thing a
+faster rule would have to read, and it has to exist and be counting
+before anything can be measured on it. Wiring it into the entry is a
+separate change and a deliberate one -- say the word and it becomes a
+fourth strategy.
+
+Two honest notes on the "tick charts lead" idea:
+
+  * A tick bar holds no information a time bar lacks. It is the same
+    prints, cut differently. What it changes is the CLOSING SCHEDULE --
+    a rule reading tick bars can act at the Nth print, while the same
+    rule on a 15m candle cannot act until :15. That is where any lead
+    comes from, and it is real, but it is not magic.
+
+  * Faster bars means more bars means more entries means more round
+    trips. ES costs about a tick a round trip. A rule that fires six
+    times as often needs to be more than six times as right to come
+    out ahead, and nothing has measured that yet.
+
+
+WHAT IS DELIBERATELY BLANK
+--------------------------
+  * No trade markers on a tick chart. Your trades are recorded against
+    a TIME bar's timestamp, so drawing them here would put each one on
+    whichever tick bar happened to span that second -- a marker that
+    looks placed and is not.
+  * No volume profile and no projection on a tick series. The
+    projection is a distance over a remaining duration, and a tick bar
+    has no scheduled end to have a remainder of.
+  * No countdown on the forming bar, for the same reason.
+  * The read/stack selector will NOT follow the chart onto a tick size,
+    even with "follow" ticked. The stack needs ten closed bars of a
+    clock interval; handing it "1000t" would not switch it to tick
+    bars, it would make every row unreadable.
+
+
+ONE THING THAT IS STILL OUTSTANDING
+-----------------------------------
+LIQMAP_TOKEN. You pasted it into the chat a while back. Rotate it in
+Railway -> Variables. Nothing here depends on its value.
