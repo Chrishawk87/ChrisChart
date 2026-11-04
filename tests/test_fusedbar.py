@@ -712,3 +712,160 @@ class TestTheGrayOverlay:
         """Nothing about the clock charts changes."""
         blk = self._painter()
         assert "(b.c >= b.o ? up : down)" in blk
+
+
+class TestTheIntrabarSignal:
+    """Chris: "this is a intrabar strategy not at close".
+
+    `tradeable` is the CLOSE-time flag and it greys a finished candle
+    on the chart. `live_signal` is the ENTRY test and it reads the
+    bar being built. Using the first as the second would put every
+    entry one bar late, which is the lateness this series exists to
+    fix.
+    """
+
+    def _agreeing(self, ticks=100, ofi=100):
+        b = FusedBars(tick_target=ticks, ofi_target=ofi, max_s=1e9)
+        push_ofi(b, 40, t0=1000.0)
+        push_prints(b, 30, px=6800.0, step=0.25, t0=1001.0)
+        return b
+
+    def test_it_fires_long_before_the_bar_closes(self):
+        b = self._agreeing()
+        assert b.last_closed is None, "the bar is still open"
+        side, why = fb.live_signal(b.current)
+        assert side == "up" and why == ""
+        assert b.current.prints < b.current.tick_target
+
+    def test_the_close_flag_would_still_refuse_it(self):
+        """The two tests disagree on purpose, and this pins it.
+
+        If `tradeable` ever becomes the entry test, this fails.
+        """
+        b = self._agreeing()
+        assert b.current.tradeable is False
+        assert "short of" in b.current.why_not
+        assert fb.live_signal(b.current)[0] == "up"
+
+    def test_disagreement_gives_no_side(self):
+        b = FusedBars(tick_target=100, ofi_target=100, max_s=1e9)
+        push_ofi(b, 40, t0=1000.0)                      # book up
+        push_prints(b, 30, px=6900.0, step=-0.25, t0=1001.0)  # price down
+        side, why = fb.live_signal(b.current)
+        assert side == ""
+        assert why == "the book is up but price is down"
+
+    def test_too_few_prints_is_refused_and_said(self):
+        b = FusedBars(tick_target=100, ofi_target=100, max_s=1e9)
+        push_ofi(b, 40)
+        push_prints(b, 3, px=6800.0, step=0.25, t0=1001.0)
+        side, why = fb.live_signal(b.current)
+        assert side == ""
+        assert "only 3 prints" in why and "10%" in why
+
+    def test_too_little_book_is_refused_and_said(self):
+        b = FusedBars(tick_target=10, ofi_target=100_000, max_s=1e9)
+        push_prints(b, 30, px=6800.0, step=0.25)
+        side, why = fb.live_signal(b.current)
+        assert side == ""
+        assert "the book has only moved" in why
+
+    def test_the_floor_is_a_fraction_not_the_whole_leg(self):
+        """Requiring the full target is requiring the close."""
+        b = self._agreeing()
+        assert fb.MIN_FRACTION < 0.5
+        assert fb.live_signal(b.current, min_fraction=1.0)[0] == ""
+        assert fb.live_signal(b.current, min_fraction=0.1)[0] == "up"
+
+    def test_no_bar_is_a_reason_not_a_crash(self):
+        side, why = fb.live_signal(None)
+        assert side == "" and why.strip()
+
+    @pytest.mark.parametrize("flat", ["book", "price"])
+    def test_flat_is_not_agreement(self, flat):
+        b = FusedBars(tick_target=10, ofi_target=10, max_s=1e9)
+        if flat == "book":
+            push_prints(b, 30, px=6800.0, step=0.25)
+            for i in range(30):            # book up then back down
+                b.on_book(1000 + i * 0.01, BID, 100 + (i % 2) * 50,
+                          ASK, 100)
+        else:
+            push_ofi(b, 40)
+            push_prints(b, 30, px=6800.0, step=0.0)
+        side, why = fb.live_signal(b.current)
+        assert side == ""
+        assert why.strip()
+
+    def test_progress_carries_the_live_read(self):
+        p = self._agreeing().progress()
+        assert p["live_side"] == "up"
+        assert p["ofi_dir"] == "up" and p["tick_dir"] == "up"
+
+
+class TestTheJournalTradesIt:
+    def test_fused_is_a_strategy(self):
+        from liqmap.journal import STRATEGIES
+        assert "fused" in STRATEGIES
+        assert "INTRABAR" in STRATEGIES["fused"]
+
+    def test_it_reads_the_fused_bar_not_the_window(self):
+        from liqmap.journal import window_signal
+        fused = {"live_side": "up", "live_why": ""}
+        assert window_signal({}, "fused", "", fused) == ("up", "")
+
+    def test_an_empty_window_does_not_refuse_it(self):
+        """The guard that would have broken it.
+
+        Every other strategy returns "no window yet" on an empty
+        window. The fused rule is not looking at the window, so that
+        check runs after its branch.
+        """
+        from liqmap.journal import window_signal
+        side, _ = window_signal({}, "fused", "",
+                                {"live_side": "down", "live_why": ""})
+        assert side == "down"
+        assert window_signal({}, "ofi")[1] == "no window yet"
+
+    def test_it_passes_the_reason_through(self):
+        from liqmap.journal import window_signal
+        fused = {"live_side": "",
+                 "live_why": "the book is up but price is down"}
+        side, why = window_signal({}, "fused", "", fused)
+        assert side == ""
+        assert why == "the book is up but price is down"
+
+    def test_a_missing_bar_is_a_reason_not_a_crash(self):
+        from liqmap.journal import window_signal
+        assert window_signal({}, "fused", "", None) == (
+            "", "no fused bar open yet")
+
+    def test_the_other_strategies_are_unchanged(self):
+        from liqmap.journal import window_signal
+        win = {"ts_last": 1000.0, "start_ts": 0.0, "mid_dir": "up",
+               "ofi_dir": "up", "cvd_dir": "up"}
+        assert window_signal(win, "ofi")[0] == "up"
+        assert window_signal(win, "candle")[0] == "up"
+        assert window_signal(win, "footprint", "up")[0] == "up"
+
+    def test_the_route_counts_trades_against_the_fused_bar(self):
+        """Not against the clock window.
+
+        Counting a fused bar's trades against a 15-minute window
+        would let one bar be traded repeatedly, or starve several of
+        their one trade.
+        """
+        blk = py_func("_journal_step")
+        assert 'if strat == "fused":' in blk
+        assert 'bar_ts = float(fus.get("start_ts") or 0.0)' in blk
+
+    def test_the_route_reads_the_forming_bar(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        blk = py_func("_fused_now")
+        assert "bld.current" in blk
+        assert "last_closed" not in blk, "the rule is intrabar"
+
+    def test_the_panel_offers_the_strategy(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index('id="jnlStrat"')
+        box = src[i:src.index("</select>", i)]
+        assert 'value="fused"' in box

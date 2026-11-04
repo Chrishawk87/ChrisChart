@@ -101,6 +101,10 @@ PAIRS: tuple[tuple[int, int], ...] = (
     (10_000, 4_000),
 )
 
+# The pair the fused STRATEGY reads when nothing says otherwise. The
+# one Chris named.
+DEFAULT_PAIR: tuple[int, int] = (TICK_TARGET, OFI_TARGET)
+
 
 @dataclass
 class FusedBar:
@@ -435,6 +439,12 @@ class FusedBars:
             "waiting_on": waiting,
             "say": _progress_words(b, self.tick_target, self.ofi_target,
                                    self.max_s, waiting),
+            # THE INTRABAR READ, on the bar being built. This is what
+            # the fused strategy trades off -- not the closed bar.
+            "live_side": live_signal(b)[0],
+            "live_why": live_signal(b)[1],
+            "ofi_dir": b.ofi_dir,
+            "tick_dir": b.tick_dir,
         }
 
     def summary(self) -> dict:
@@ -490,6 +500,60 @@ def _summary_words(built: int, cap_pct: float, tr_pct: float) -> str:
                 "missing often enough to be worth lowering it")
     return (f"{cap_pct:.0f}% capped, {tr_pct:.0f}% tradeable -- the pair "
             "is closing on both legs as intended")
+
+
+# How much of each leg has to be in before an intrabar agreement is
+# believed. NOT the full target -- waiting for that is waiting for the
+# close, which is the lateness this whole series exists to fix. But
+# not zero either: two prints and one book update agreeing is not
+# agreement, it is noise with a direction, and Chris's own rule from
+# the window work was that nothing is taken at the very opening of a
+# candle because that is when it is least settled.
+MIN_FRACTION = 0.10
+
+
+def live_signal(bar: FusedBar | None,
+                min_fraction: float = MIN_FRACTION) -> tuple[str, str]:
+    """INTRABAR. The direction the two legs agree on right now.
+
+    Returns (side, why_not) and the reason is never blank when the
+    side is: a rule that goes quiet without saying why reads as a
+    market with nothing in it, and on this panel that has meant a
+    missing read, a stale cap and a switch left off.
+
+    THIS DOES NOT WAIT FOR THE BAR TO CLOSE, and that is the whole
+    point of it. `FusedBar.tradeable` is the close-time flag -- it
+    requires the full print count and it is what greys a finished
+    candle on the chart. Using it as the entry test would mean
+    entering one bar late every time, which is the complaint that
+    started this.
+
+    So the test here is only: enough has arrived to be worth
+    believing, the book has a direction, and the traded price agrees
+    with it. The moment those hold, the trade is on.
+    """
+    if bar is None:
+        return "", "no bar open -- the last event closed one"
+
+    need_t = max(1, int(bar.tick_target * min_fraction))
+    need_o = max(1, int(bar.ofi_target * min_fraction))
+    pct = int(round(min_fraction * 100))
+
+    if bar.prints < need_t:
+        return "", (f"only {bar.prints:,} prints in -- {need_t:,} "
+                    f"({pct}% of the bar) before an agreement counts")
+    if abs(bar.net_ofi) < need_o:
+        return "", (f"the book has only moved {abs(bar.net_ofi):,} "
+                    f"-- {need_o:,} ({pct}% of the bar) before an "
+                    "agreement counts")
+    if bar.ofi_dir == "flat":
+        return "", "the book is exactly flat"
+    if bar.tick_dir == "flat":
+        return "", "price is where the bar opened"
+    if bar.tick_dir != bar.ofi_dir:
+        return "", (f"the book is {bar.ofi_dir} but price is "
+                    f"{bar.tick_dir}")
+    return bar.ofi_dir, ""
 
 
 _FUSED = re.compile(r"^(\d+)x(\d+)$")

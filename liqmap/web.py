@@ -6669,6 +6669,50 @@ def create_app() -> FastAPI:
             return wins.get(float(period_s)) or wins.get(900.0)
         return getattr(tape, "clockwin", None) if tape else None
 
+    def _fused_now(rt_, pair: tuple[int, int] | None = None) -> dict:
+        """The fused bar BEING BUILT, and its intrabar read.
+
+        The forming bar, deliberately -- the fused rule is intrabar.
+        `live_side` is set the moment the OFI sign and the traded
+        price agree, long before the bar has its full print count,
+        and `live_why` says what is missing until then.
+
+        FROM THE SAME BUILDER THE CHART DRAWS, so what the rule reads
+        and what is on the screen cannot differ. Every other way of
+        getting this number would be a second implementation of the
+        same two legs.
+        """
+        from .fusedbar import DEFAULT_PAIR
+
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        books = getattr(tape, "fusedbars", None) if tape else None
+        if not books:
+            return {}
+        key = tuple(pair or DEFAULT_PAIR)
+        bld = books.get(key)
+        if bld is None:
+            bld = books[min(books,
+                            key=lambda k: (abs(int(k[0]) - key[0])
+                                           + abs(int(k[1]) - key[1])))]
+        cur = bld.current
+        if cur is None:
+            # Between bars. Real and momentary: the last event closed
+            # one and the next has not opened one. Not an error, and
+            # not a signal either.
+            return {"start_ts": 0.0, "live_side": "", "ofi_dir": "",
+                    "tick_dir": "",
+                    "live_why": "between bars -- the last event closed one"}
+        prog = bld.progress()
+        return {"start_ts": float(cur.start_ts),
+                "live_side": prog.get("live_side") or "",
+                "live_why": prog.get("live_why") or "",
+                "ofi_dir": cur.ofi_dir, "tick_dir": cur.tick_dir,
+                "prints": cur.prints, "net_ofi": int(cur.net_ofi),
+                "tick_target": bld.tick_target,
+                "ofi_target": bld.ofi_target,
+                "say": prog.get("say") or ""}
+
     def _footprint_imbalance(rt_) -> dict:
         """Which way the forming footprint bar is imbalanced.
 
@@ -6809,14 +6853,28 @@ def create_app() -> FastAPI:
         win = _window_now(rt_, float(s.window_s or 900.0))
         strat = s.strategy if s.strategy in jn.STRATEGIES else "ofi"
         fpi = _footprint_imbalance(rt_)
+        fus = _fused_now(rt_)
         side, blocked_why = jn.window_signal(
-            win, strat, fpi.get("side") or "")
+            win, strat, fpi.get("side") or "", fus)
         says = {"candle": win.get("mid_dir") or None,
                 "ofi": win.get("ofi_dir") or None,
                 "cvd": win.get("cvd_dir") or None}
+        if strat == "fused":
+            # What the panel shows beside the signal has to be what
+            # the signal actually read. Leaving the window's three
+            # here would put a clock reading next to an intrabar
+            # decision and explain nothing about why it fired.
+            says = {"OFI": fus.get("ofi_dir") or None,
+                    "tick": fus.get("tick_dir") or None}
         vetoed = blocked_why
-        # The window is the candle the cap counts against.
+        # The window is the candle the cap counts against -- except
+        # for the fused rule, where the FORMING fused bar is the
+        # candle. Counting its trades against the clock window would
+        # let one fused bar be traded repeatedly inside a 15-minute
+        # window, or starve several of them of their one trade.
         bar_ts = float(win.get("start_ts") or 0.0)
+        if strat == "fused":
+            bar_ts = float(fus.get("start_ts") or 0.0)
         taken = j.sides_in_bar(coin_, bar_ts, strat)
 
         t = j.open_trade_for(coin_)
@@ -9470,6 +9528,7 @@ has to be running before the gate stops refusing.">spike
               <option value="ofi">OFI</option>
               <option value="candle">Candle</option>
               <option value="footprint">Footprint</option>
+              <option value="fused">Fused (intrabar)</option>
             </select></label>
           <label>window
             <select id="jnlWin" onchange="jnlSet()"

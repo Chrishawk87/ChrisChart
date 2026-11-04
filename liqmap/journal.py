@@ -812,11 +812,12 @@ STRATEGIES = {
     "ofi": "OFI -- candle, OFI and CVD must agree",
     "candle": "Candle -- the window candle alone",
     "footprint": "Footprint -- candle and footprint imbalance agree",
+    "fused": "Fused -- OFI and tick direction agree, INTRABAR",
 }
 
 
 def window_signal(win: dict, strategy: str = "ofi",
-                  fp: str = "") -> tuple[str, str]:
+                  fp: str = "", fused: dict | None = None) -> tuple[str, str]:
     """The direction a 15-minute window is trading, and what stopped it.
 
     ALL THREE THE SAME WAY: the mid-price candle, the net OFI and the
@@ -839,6 +840,27 @@ def window_signal(win: dict, strategy: str = "ofi",
     fifteen-minute window the CVD agreeing is that question already
     answered.
     """
+    # THE FUSED STRATEGY DOES NOT READ THE WINDOW AT ALL.
+    #
+    # Its signal is the bar being BUILT -- the moment the OFI sign
+    # and the traded-price direction agree inside it. Chris: "this is
+    # a intrabar strategy not at close". Reading the closed bar would
+    # put every entry one bar late, which is the lateness this series
+    # was built to fix, and reading the window would put it back on
+    # the clock it was meant to get off.
+    #
+    # Checked BEFORE the window guards below, because a fused signal
+    # must not be refused for "no window yet" when the window is not
+    # what it is looking at.
+    if strategy == "fused":
+        if not fused:
+            return "", "no fused bar open yet"
+        side = str(fused.get("live_side") or "")
+        if side in ("up", "down"):
+            return side, ""
+        return "", (str(fused.get("live_why") or "")
+                    or "the fused legs do not agree")
+
     if not win:
         return "", "no window yet"
     into = float(win.get("ts_last") or 0.0) - float(
