@@ -280,6 +280,59 @@ class Stats:
                 "se": round(se, 3), "need": max(0, 30 - self.n),
                 "say": say}
 
+    def stopped_then_ran(self, trades=None) -> dict:
+        """How often a stop was hit and the trade was RIGHT anyway.
+
+        Chris: "the ones that we lose actually end up going the way
+        of the loss just the SL was hit before it continued in the
+        direction of the trade".
+
+        That is a measurable claim and this is the measurement -- of
+        the trades that ended on a stop, it reports how much room
+        they had against how much they were given. It cannot see
+        what price did AFTER the stop, because nothing in this
+        journal records that; what it can say is how tight the stop
+        was relative to the winners' own excursions, which is the
+        same question from the other end.
+
+        A stop wider than the winners typically travel is not a stop
+        at all; one tighter than the losers' normal wobble is a
+        donation.
+        """
+        rows = self.trades if trades is None else trades
+        stops = [t for t in rows if t.why == "sl"]
+        wins = [t for t in rows if t.ticks > 0]
+        if not rows:
+            return {"stops": 0, "say": "no trades yet"}
+        avg_win = (sum(t.ticks for t in wins) / len(wins)
+                   if wins else 0.0)
+        sl_set = [abs(t.sl) for t in rows if t.sl]
+        stop_ticks = (sum(sl_set) / len(sl_set)) if sl_set else 0.0
+        out = {"stops": len(stops),
+               "stop_share": round(len(stops) / len(rows), 3),
+               "avg_win_ticks": round(avg_win, 2),
+               "stop_ticks": round(stop_ticks, 2)}
+        if not stop_ticks:
+            out["say"] = ("no stop is set, so nothing here was "
+                          "stopped out")
+        elif not wins:
+            out["say"] = "no winners yet to measure the stop against"
+        elif stop_ticks < avg_win / 2:
+            out["say"] = (
+                f"the stop is {stop_ticks:.0f} ticks and the average "
+                f"winner runs {avg_win:.0f}. A stop under half the "
+                "winners' travel is inside the noise those winners "
+                "went through -- widening it is the first thing to "
+                "try, and it costs more per loss.")
+        else:
+            out["say"] = (
+                f"the stop is {stop_ticks:.0f} ticks against an "
+                f"average winner of {avg_win:.0f}, which is not "
+                "obviously too tight. If losers are still running "
+                "your way afterwards, the entry is early rather than "
+                "the stop narrow.")
+        return out
+
     def streaks(self) -> dict:
         """Longest run of wins and of losses, oldest first.
 
@@ -321,6 +374,7 @@ class Stats:
             "spread_ticks": round(self.spread_ticks, 2),
             "verdict": self.verdict(),
             "streaks": self.streaks(),
+            "stops": self.stopped_then_ran(),
         }
 
 
@@ -757,11 +811,12 @@ WARMUP_S = 30.0
 STRATEGIES = {
     "ofi": "OFI -- candle, OFI and CVD must agree",
     "candle": "Candle -- the window candle alone",
+    "footprint": "Footprint -- candle and footprint imbalance agree",
 }
 
 
-def window_signal(win: dict,
-                  strategy: str = "ofi") -> tuple[str, str]:
+def window_signal(win: dict, strategy: str = "ofi",
+                  fp: str = "") -> tuple[str, str]:
     """The direction a 15-minute window is trading, and what stopped it.
 
     ALL THREE THE SAME WAY: the mid-price candle, the net OFI and the
@@ -797,6 +852,19 @@ def window_signal(win: dict,
     cvd = win.get("cvd_dir") or ""
     if candle not in ("up", "down"):
         return "", "the window candle is flat"
+    if strategy == "footprint":
+        # THE DIAGONAL IMBALANCE, not the delta and not the book.
+        # It counts price levels where one side's aggression beat the
+        # diagonal it was measured against -- which is a different
+        # question from "who traded more" and from "which way is the
+        # book leaning", and Chris wants it as the confirmation
+        # because it is the one he reads off the footprint by eye.
+        if fp not in ("up", "down"):
+            return "", "the footprint shows no imbalance either way"
+        if fp != candle:
+            return "", (f"the candle is {candle} but the footprint "
+                        f"imbalance is {fp}")
+        return candle, ""
     if strategy == "candle":
         # THE CANDLE STRATEGY. The window's own candle and nothing
         # else -- one trade per direction per window, so a candle

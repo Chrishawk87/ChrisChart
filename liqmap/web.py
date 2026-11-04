@@ -6490,6 +6490,36 @@ def create_app() -> FastAPI:
             return wins.get(float(period_s)) or wins.get(900.0)
         return getattr(tape, "clockwin", None) if tape else None
 
+    def _footprint_imbalance(rt_) -> dict:
+        """Which way the forming footprint bar is imbalanced.
+
+        A diagonal imbalance is a price level where one side's
+        aggression beat the OPPOSITE side one tick away -- a
+        different question from who traded more, and from which way
+        the book is leaning. Counting the levels on each side gives
+        the bar a direction.
+
+        FROM THE SAME STREAM THE FOOTPRINT PANEL DRAWS, so what the
+        rule reads and what Chris reads off the screen cannot differ.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        fp = getattr(tape, "footprint", None) if tape else None
+        eng = getattr(fp, "_engine", None) if fp else None
+        cur = getattr(eng, "current", None) if eng else None
+        if cur is None:
+            return {"side": "", "buy": 0, "sell": 0}
+        try:
+            flags = cur.imbalances(fp.cfg)
+        except Exception:                               # noqa: BLE001
+            return {"side": "", "buy": 0, "sell": 0}
+        buy = sum(1 for f in flags if f.side == "buy")
+        sell = sum(1 for f in flags if f.side == "sell")
+        return {"side": ("up" if buy > sell
+                         else "down" if sell > buy else ""),
+                "buy": buy, "sell": sell,
+                "levels": len(flags)}
+
     def _window_now(rt_, period_s: float = 900.0) -> dict:
         """The forming 15-minute window, as the panel draws it.
 
@@ -6599,7 +6629,9 @@ def create_app() -> FastAPI:
         # drove nothing and looked broken.
         win = _window_now(rt_, float(s.window_s or 900.0))
         strat = s.strategy if s.strategy in jn.STRATEGIES else "ofi"
-        side, blocked_why = jn.window_signal(win, strat)
+        fpi = _footprint_imbalance(rt_)
+        side, blocked_why = jn.window_signal(
+            win, strat, fpi.get("side") or "")
         says = {"candle": win.get("mid_dir") or None,
                 "ofi": win.get("ofi_dir") or None,
                 "cvd": win.get("cvd_dir") or None}
@@ -6654,6 +6686,7 @@ def create_app() -> FastAPI:
             # no block -- it reads as a market with nothing in it.
             "blocked": vetoed,
             "window": win,
+            "footprint": fpi,
             "would_be": (win.get("mid_dir") or "") if vetoed else "",
             # WHY NOTHING HAPPENED, on every poll that does
             # nothing. Blank only when a trade was opened or closed.
@@ -9224,6 +9257,7 @@ has to be running before the gate stops refusing.">spike
               style="margin:0 4px">
               <option value="ofi">OFI</option>
               <option value="candle">Candle</option>
+              <option value="footprint">Footprint</option>
             </select></label>
           <label>window
             <select id="jnlWin" onchange="jnlSet()"
@@ -14332,7 +14366,7 @@ function paintJournal(d) {
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =
-    (S.strategy === 'candle' ? 'CANDLE' : 'OFI') + ' · '
+    (S.strategy || 'ofi').toUpperCase() + ' · '
     + (S.auto ? 'AUTO — rows write themselves'
               : 'MANUAL — you log the trades');
   /* ONE BUTTON, TWO STATES, and the label says which one is live
@@ -14404,6 +14438,12 @@ function paintJournal(d) {
       + (W.cvd_dir === 'flat' ? ' <b>FLAT</b>' : '')
       + ' <span class="thin">'
       + Math.round(W.net_cvd || 0).toLocaleString() + '</span>'
+      + ((J.footprint && J.footprint.levels)
+          ? ' &middot; footprint '
+            + word(J.footprint.side || null)
+            + ' <span class="thin">' + J.footprint.buy + ' buy / '
+            + J.footprint.sell + ' sell levels</span>'
+          : '')
       + capBit
       + (J.idle ? ' &middot; <b>no trade</b> &mdash; ' + esc(J.idle)
                 : '')
@@ -14461,6 +14501,13 @@ function paintJournal(d) {
         + (V.need ? ' <span class="thin">(' + V.need + ' more to reach '
             + 'thirty)</span>' : '')
         + '</div>'
+        + (st.stops && st.stops.stop_ticks
+            ? '<div class="thin" style="margin-top:4px">'
+              + '<b>stops</b> — ' + st.stops.stops + ' of '
+              + st.trades + ' ended on one ('
+              + (100 * (st.stops.stop_share || 0)).toFixed(0) + '%) · '
+              + esc(st.stops.say || '') + '</div>'
+            : '')
         + (st.streaks
             ? '<div class="thin" style="margin-top:4px">longest run — '
               + '<b class="long">' + st.streaks.win + ' wins</b>, '

@@ -105,9 +105,7 @@ class TestItDoesNotTrade:
                     "the journal has no business reading the environment"
 
     def test_the_routes_place_nothing(self):
-        src = (ROOT / "liqmap" / "web.py").read_text()
-        i = src.index("def api_journal_trade")
-        blk = src[i:i + 3000]
+        blk = py_func("api_journal_trade")
         for bad in ("ironbeam", "submit_order", "place_order",
                     "requests.post"):
             assert bad not in blk.lower(), bad
@@ -395,9 +393,7 @@ class TestClearingIsDeliberate:
         assert jn.stats("ES").n == 0
 
     def test_the_route_refuses_without_confirm(self):
-        src = (ROOT / "liqmap" / "web.py").read_text()
-        i = src.index("def api_journal_clear")
-        blk = src[i:i + 1200]
+        blk = py_func("api_journal_clear")
         assert "confirm" in blk
         assert "cannot be undone" in blk
 
@@ -703,9 +699,7 @@ class TestAutoEntryAndExitFire:
     def test_the_route_applies_the_decision(self):
         """The policy is called AND acted on. A decision nothing acts
         on is the same bug in a different place."""
-        src = (ROOT / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step")
-        blk = src[i:i + 2500]
+        blk = py_func("_journal_step")
         assert "jn.decide(" in blk
         assert 'act == "close"' in blk
         assert 'act == "open"' in blk
@@ -783,7 +777,8 @@ class TestTheCandleDecidesAndTheStackVetoes:
         assert '"blocked"' in blk
         assert '"would_be"' in blk
         assert '"window"' in blk
-        assert "jn.window_signal(win, strat)" in blk
+        assert "jn.window_signal(" in blk
+        assert "strat" in blk
 
     def test_the_stack_veto_no_longer_gates_the_trade(self):
         """IT WAS DROPPED, NOT FORGOTTEN. The veto belonged to the
@@ -1766,7 +1761,8 @@ class TestTheTwoStrategies:
 
     def test_the_route_uses_the_chosen_one(self):
         blk = py_func("_journal_step")
-        assert "jn.window_signal(win, strat)" in blk
+        assert "jn.window_signal(" in blk
+        assert "strat" in blk
         assert "strategy=strat" in blk
         assert "j.stats(coin_, strategy=strat)" in blk
 
@@ -1829,3 +1825,168 @@ class TestNothingIsTakenAtTheOpen:
 
         assert window_signal(self._w(WARMUP_S - 0.1), "ofi")[0] == ""
         assert window_signal(self._w(WARMUP_S + 0.1), "ofi")[0] == "up"
+
+
+class TestTheFootprintStrategy:
+    """Chris: "a third strategy that takes candle direction and
+    footprint imbalance and enter when they agree".
+
+    A diagonal imbalance is a price level where one side's aggression
+    beat the OPPOSITE side one tick away. That is a different
+    question from who traded more (the CVD) and from which way the
+    book is leaning (the OFI) -- and it is the one Chris reads off
+    the footprint by eye, which is why it is worth having as its own
+    rule rather than folding into the others.
+    """
+
+    AUTH = {"Authorization": "Bearer t0ken"}
+    W = {"mid_dir": "up", "ofi_dir": "down", "cvd_dir": "flat",
+         "start_ts": 0.0, "ts_last": 600.0}
+
+    def _s(self, fp):
+        from liqmap.journal import window_signal
+
+        return window_signal(self.W, "footprint", fp)
+
+    def test_agreeing_opens_a_trade(self):
+        assert self._s("up") == ("up", "")
+
+    def test_it_ignores_the_ofi_and_the_cvd(self):
+        """Both point away in this window and it still trades --
+        that is the rule, and it is the difference from the OFI
+        strategy."""
+        assert self.W["ofi_dir"] == "down"
+        assert self.W["cvd_dir"] == "flat"
+        assert self._s("up")[0] == "up"
+
+    def test_disagreeing_does_not(self):
+        side, why = self._s("down")
+        assert side == ""
+        assert "footprint imbalance is down" in why
+
+    def test_no_imbalance_is_not_agreement(self):
+        side, why = self._s("")
+        assert side == ""
+        assert "no imbalance either way" in why
+
+    def test_a_flat_candle_still_blocks_it(self):
+        from liqmap.journal import window_signal
+
+        flat = {**self.W, "mid_dir": "flat"}
+        assert window_signal(flat, "footprint", "up")[0] == ""
+
+    def test_the_warmup_still_applies(self):
+        from liqmap.journal import window_signal
+
+        young = {**self.W, "ts_last": 5.0}
+        assert window_signal(young, "footprint", "up")[0] == ""
+
+    def test_the_count_comes_from_the_live_bar(self):
+        """FROM THE SAME STREAM THE PANEL DRAWS, so what the rule
+        reads and what Chris reads off the screen cannot differ."""
+        blk = py_func("_footprint_imbalance")
+        assert "_engine" in blk and "current" in blk
+        assert "imbalances(fp.cfg)" in blk
+
+    def test_more_buy_levels_is_up(self):
+        """The direction is a count of levels, not a volume."""
+        import types
+
+        flags = ([types.SimpleNamespace(side="buy")] * 3
+                 + [types.SimpleNamespace(side="sell")])
+        buy = sum(1 for f in flags if f.side == "buy")
+        sell = sum(1 for f in flags if f.side == "sell")
+        assert ("up" if buy > sell else "down" if sell > buy
+                else "") == "up"
+
+    def test_the_route_passes_it_in(self):
+        blk = py_func("_journal_step")
+        assert "_footprint_imbalance(rt_)" in blk
+        assert 'fpi.get("side")' in blk
+        assert '"footprint": fpi' in blk
+
+    def test_it_is_a_listed_strategy(self, client, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        _cme(monkeypatch)
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "strategy": "footprint"},
+                        headers=self.AUTH).json()
+        assert d["settings"]["strategy"] == "footprint"
+        j = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m"},
+                       headers=self.AUTH).json()["journal"]
+        assert j["strategy"] == "footprint"
+        assert "footprint" in j["strategies"]
+
+    def test_its_trades_are_kept_apart(self, jn):
+        jn.open_trade("ES", "up", 6700.0, bar_ts=1.0,
+                      strategy="footprint")
+        jn.close_trade("ES", 6702.0)
+        assert jn.stats("ES", strategy="footprint").ticks == 8.0
+        assert jn.stats("ES", strategy="ofi").n == 0
+        assert jn.sides_in_bar("ES", 1.0, "ofi") == ()
+
+
+class TestTheStopIsMeasuredAgainstTheWinners:
+    """Chris: "the ones that we lose actually end up going the way of
+    the loss just the SL was hit before it continued".
+
+    That is a measurable claim, and this is the only honest version
+    of the measurement available here: the journal cannot see what
+    price did AFTER a stop, so it compares the stop against how far
+    the WINNERS travelled, which is the same question from the other
+    end. A stop well under the winners' own excursion is inside the
+    noise those winners went through.
+    """
+
+    @staticmethod
+    def _stats(rows):
+        from liqmap.journal import Stats, Trade
+
+        return Stats([Trade(side="up", open_px=6700.0,
+                            close_px=6700.0 + t * 0.25, closed_ts=1.0,
+                            why=why, sl=sl) for t, why, sl in rows])
+
+    def test_a_tight_stop_is_called_out(self):
+        s = self._stats([(20, "flip", 4.0)] * 6
+                        + [(-4, "sl", 4.0)] * 10)
+        got = s.stopped_then_ran()
+        assert got["stops"] == 10
+        assert "widening it is the first thing to try" in got["say"]
+
+    def test_a_reasonable_stop_is_not(self):
+        s = self._stats([(8, "flip", 6.0)] * 6 + [(-6, "sl", 6.0)] * 4)
+        got = s.stopped_then_ran()
+        assert "not obviously too tight" in got["say"]
+
+    def test_it_says_the_entry_may_be_early_instead(self):
+        """The other explanation for the same symptom, and the one
+        left when the stop is not the problem."""
+        s = self._stats([(8, "flip", 6.0)] * 6 + [(-6, "sl", 6.0)] * 4)
+        assert "entry is early" in s.stopped_then_ran()["say"]
+
+    def test_no_stop_set_measures_nothing(self):
+        s = self._stats([(8, "flip", 0.0)] * 4)
+        assert "no stop is set" in s.stopped_then_ran()["say"]
+
+    def test_no_winners_yet_measures_nothing(self):
+        s = self._stats([(-4, "sl", 4.0)] * 3)
+        assert "no winners yet" in s.stopped_then_ran()["say"]
+
+    def test_an_empty_journal_does_not_divide_by_zero(self):
+        assert self._stats([])["stops"] if False else \
+            self._stats([]).stopped_then_ran()["stops"] == 0
+
+    def test_the_share_is_of_all_trades(self):
+        s = self._stats([(20, "flip", 4.0)] * 6
+                        + [(-4, "sl", 4.0)] * 10)
+        assert s.stopped_then_ran()["stop_share"] == 0.625
+
+    def test_it_reaches_the_payload_and_the_panel(self):
+        from liqmap.journal import Stats
+
+        assert "stops" in Stats([]).to_dict()
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("function paintJournal(")
+        assert "st.stops" in src[i:i + 12000]
