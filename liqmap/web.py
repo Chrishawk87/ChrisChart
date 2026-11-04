@@ -17333,16 +17333,52 @@ window.addEventListener('resize', () => { if (chartData) drawChart(); });
    between polls. One redraw a second, and only while the chart is on
    screen — a hidden canvas has nothing to say and a background tab should
    not be burning frames. */
-setInterval(() => {
-  if (!chartData || !chartData.interval_s) return;
-  if (document.hidden) return;
+/* Is the chart on screen and worth spending work on? Both loops below
+   ask the same question, and they MUST ask it the same way -- a
+   repaint loop and a refetch loop that disagree about visibility is
+   how you get a chart that fetches forever on a hidden tab. */
+function chartVisible() {
+  if (document.hidden) return false;
   const pane = $('tab-dash');
-  if (pane && pane.hidden) return;
+  if (pane && pane.hidden) return false;
   const wrap = $('chartWrap');
-  if (!wrap || wrap.style.display === 'none') return;
+  if (!wrap || wrap.style.display === 'none') return false;
+  return true;
+}
+
+/* REPAINT. Was gated on `chartData.interval_s`, which a tick series
+   deliberately does not have -- a tick bar has no fixed duration, so
+   the route reports null. That guard froze the tick chart solid:
+   every print arriving, the forming bar growing on the server, and
+   the canvas never redrawn. The live-bar check below is the real
+   condition and it was always doing the work. */
+setInterval(() => {
+  if (!chartData || !chartVisible()) return;
   const bars = chartData.bars || [];
   if (!bars.length || !bars[bars.length - 1].live) return;
   drawChart();
+}, 1000);
+
+/* REFETCH. A repaint only redraws bars already in hand, so without
+   this the chart is only as live as whatever last called loadChart
+   -- which was the suggestion poll, and nothing at all when auto is
+   off. That is the "sits stationary" and the "lagged behind
+   severely": not the tape, the page never asking again.
+
+   Tick bars are asked for more often because they close on
+   ACTIVITY: a busy minute can close several, and a chart that is
+   meant to be the timely one cannot be on a lazy poll. In flight is
+   tracked so a slow answer cannot stack requests on a fast timer. */
+let _chartBusy = false;
+let _chartPoll = 0;
+setInterval(async () => {
+  if (!chartVisible() || _chartBusy) return;
+  const iv = $('sInt') && $('sInt').value;
+  if (!iv) return;
+  const every = isTickTf(iv) ? 2 : 5;        // seconds
+  if ((++_chartPoll % every) !== 0) return;
+  _chartBusy = true;
+  try { await loadChart(); } catch (e) {} finally { _chartBusy = false; }
 }, 1000);
 
 /* ---- book vs price: the table ---------------------------------------- */

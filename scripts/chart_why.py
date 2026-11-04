@@ -26,6 +26,32 @@ import urllib.parse
 import urllib.request
 
 
+# Quote characters a token can arrive wrapped in. The straight pair
+# survives bash and never reaches here; the curly pair does, because
+# a shell does not treat it as quoting -- it becomes part of the
+# value, and an HTTP header must be latin-1, so the request dies with
+# a UnicodeEncodeError naming a codec instead of saying "your token
+# has a smart quote in it".
+_QUOTES = "'\"‘’“”«»‹›`"
+
+
+def clean(value: str) -> str:
+    """Strip whitespace and any wrapping quotes, curly ones included."""
+    s = (value or "").strip()
+    while len(s) >= 2 and s[0] in _QUOTES and s[-1] in _QUOTES:
+        s = s[1:-1].strip()
+    return s.strip(_QUOTES + " \t\r\n")
+
+
+def header_safe(value: str) -> str:
+    """'' if the value cannot go in an HTTP header, else the value."""
+    try:
+        value.encode("latin-1")
+    except (UnicodeEncodeError, AttributeError):
+        return ""
+    return value
+
+
 def fetch(base: str, token: str, path: str, **params):
     """Returns (payload, headers). Payload is a dict or raw text."""
     url = base.rstrip("/") + path
@@ -69,9 +95,29 @@ def age(seconds) -> str:
 
 
 def main() -> int:
-    base = os.environ.get("BASE", "http://127.0.0.1:8000")
-    token = os.environ.get("TOKEN", os.environ.get("LIQMAP_TOKEN", ""))
-    coin = sys.argv[1] if len(sys.argv) > 1 else "ES"
+    base = clean(os.environ.get("BASE", "http://127.0.0.1:8000"))
+    token = clean(os.environ.get("TOKEN",
+                                 os.environ.get("LIQMAP_TOKEN", "")))
+    coin = clean(sys.argv[1] if len(sys.argv) > 1 else "ES") or "ES"
+
+    # SAY WHAT IS WRONG WITH THE TOKEN BEFORE USING IT.
+    #
+    # A token with a character that cannot go in an HTTP header used
+    # to surface as "UnicodeEncodeError: 'latin-1' codec can't encode
+    # character '‘' in position 7" against the PAGE fetch, which
+    # reads as the site being unreachable. It is not: it is a smart
+    # quote in the token, and position 7 is just the length of
+    # "Bearer ".
+    if token and not header_safe(token):
+        bad = [(i, c) for i, c in enumerate(token) if ord(c) > 255]
+        print("\n  THE TOKEN HAS CHARACTERS THAT CANNOT GO IN A HEADER.\n")
+        for i, c in bad[:4]:
+            print(f"    position {i}: {c!r}  (U+{ord(c):04X})")
+        print("\n  This is nearly always a curly quote picked up when the"
+              "\n  command was copied from somewhere that styles text."
+              "\n  Retype the quotes as plain ' or leave them off:\n")
+        print("      TOKEN=abc123 python scripts/chart_why.py ES\n")
+        return 2
 
     print(f"\n{'=' * 72}")
     print(f"CHART WHY   {coin}   {base}")
@@ -104,6 +150,32 @@ def main() -> int:
     # code behind it is new; if this answers, the build landed and
     # anything missing on screen is the browser's copy.
     ch, _ = fetch(base, token, "/api/chart", coin=coin, interval="1000t")
+
+    # AN AUTH FAILURE IS NOT A VERDICT ABOUT THE BUILD.
+    #
+    # This script once printed "the route does not know '1000t'" when
+    # every authenticated call was coming back 401 -- it had not got
+    # far enough to find out, and the line sent the reader looking at
+    # a deploy that was in fact fine. A diagnostic that invents a
+    # cause is worse than one that stops.
+    if isinstance(ch, dict) and ch.get("_http") in (401, 403):
+        print(f"  {'the CODE knows tick bars':<34}????  "
+              f"could not ask -- the service returned "
+              f"{ch['_http']} on every call needing the token")
+        print(f"\n  {'-' * 68}")
+        print("  THE TOKEN WAS REFUSED, so nothing below could be read.")
+        print("  Everything above this line is still true: the page")
+        print("  itself needs no token and it IS the new build.")
+        print()
+        print("  TOKEN is currently " + (f"{len(token)} characters"
+                                         if token else "EMPTY"))
+        print("  Set it to the LIQMAP_TOKEN in Railway -> Variables:")
+        print("      TOKEN='...' python scripts/chart_why.py ES")
+        print("  If you rotated that token, the value here is the old")
+        print("  one. Nothing about the feed can be read until it")
+        print("  matches.\n")
+        return 2
+
     served = isinstance(ch, dict) and ch.get("source") == "tick"
     known = isinstance(ch, dict) and "_http" not in ch and "_err" not in ch
     print(f"  {'the CODE knows tick bars':<34}{tick(known and (served or bool(ch.get('error'))))}  "

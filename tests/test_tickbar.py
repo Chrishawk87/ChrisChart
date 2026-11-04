@@ -691,6 +691,67 @@ class TestThePanel:
         assert "pace" in blk
 
 
+class TestTheChartKeepsMoving:
+    """The bug that made the tick chart look like a dead feed.
+
+    The 1-second repaint was gated on `chartData.interval_s`, which a
+    tick series deliberately reports as null -- a tick bar has no
+    fixed duration. So the canvas was never redrawn: prints arriving,
+    the forming bar growing on the server, and nothing moving on
+    screen. It read as a frozen tape, and the tape was fine.
+    """
+
+    def test_the_repaint_is_not_gated_on_an_interval(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("setInterval(() => {\n  if (!chartData")
+        blk = src[i:i + 400]
+        assert "interval_s" not in blk, \
+            "the repaint loop must not require a fixed bar duration"
+
+    def test_the_repaint_still_requires_a_forming_bar(self):
+        """The guard that was always doing the real work.
+
+        Without it a settled chart repaints once a second forever.
+        """
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("setInterval(() => {\n  if (!chartData")
+        blk = src[i:i + 400]
+        assert "bars[bars.length - 1].live" in blk
+
+    def test_there_is_a_refetch_loop(self):
+        """A repaint redraws what is already in hand.
+
+        New bars only arrive from loadChart, which used to be called
+        by the suggestion poll and by nothing else -- so with auto
+        off the chart never updated at all.
+        """
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert "_chartBusy" in src
+        i = src.index("let _chartBusy")
+        blk = src[i:i + 700]
+        assert "await loadChart()" in blk
+
+    def test_the_refetch_does_not_stack_requests(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("let _chartBusy")
+        blk = src[i:i + 700]
+        assert "if (!chartVisible() || _chartBusy) return" in blk
+        assert "finally { _chartBusy = false; }" in blk
+
+    def test_a_tick_chart_refetches_more_often_than_a_time_chart(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("let _chartBusy")
+        blk = src[i:i + 700]
+        assert "isTickTf(iv) ? 2 : 5" in blk
+
+    def test_both_loops_share_one_visibility_test(self):
+        """Two loops disagreeing about visibility is how a hidden
+        tab keeps fetching forever."""
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert "function chartVisible()" in src
+        assert src.count("chartVisible()") >= 3
+
+
 class TestDrawingOnATickChart:
     """The x-axis maths that a fixed interval would get wrong."""
 
