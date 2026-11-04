@@ -1524,6 +1524,166 @@ class TestTheWindowOpensTheTrade:
         thing to keep in step with the one on the screen, and the
         first time they drifted the column would be trading a window
         nobody could see."""
-        blk = py_func("_window_now")
+        blk = py_func("_window_now") + py_func("_windows_for")
         assert "clockwin" in blk
         assert "current" in blk
+
+
+class TestTheWindowIsSelectable:
+    """Chris: "make this a multi timframe window as well so that i
+    can pick between a 5 and 15 minute if i choose to".
+
+    BOTH RUN ALL THE TIME. A selector that starts an empty window
+    costs you up to fifteen minutes of history the moment you touch
+    it, which is a selector nobody touches twice.
+    """
+
+    AUTH = {"Authorization": "Bearer t0ken"}
+
+    def test_both_periods_are_built(self, client, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        rt, tape = _cme(monkeypatch)
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        if getattr(rt, "_candlerec", None):
+            rt._candlerec.stop()
+        assert set(tape.clockwins) == {300.0, 900.0}
+
+    def test_both_are_fed_the_same_events(self, client, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        rt, tape = _cme(monkeypatch)
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        if getattr(rt, "_candlerec", None):
+            rt._candlerec.stop()
+        src = (ROOT / "liqmap" / "cme_tape.py").read_text()
+        i = src.index("if self.clockwins:")
+        assert "for _cw in self.clockwins.values()" in src[i:i + 300]
+
+    def test_the_setting_persists(self, client, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        _cme(monkeypatch)
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "window_s": 300},
+                        headers=self.AUTH).json()
+        assert d["settings"]["window_s"] == 300.0
+        assert d["settings"]["window_label"] == "5m"
+        got = client.get("/api/read",
+                         params={"coin": "ES", "interval": "15m"},
+                         headers=self.AUTH).json()["journal"]
+        assert got["settings"]["window_label"] == "5m"
+
+    def test_only_the_two_periods_are_accepted(self, jn):
+        from liqmap.journal import Settings
+
+        assert jn.save_settings(
+            Settings(coin="ES", window_s=61.0)).window_s == 300.0
+        assert jn.save_settings(
+            Settings(coin="ES", window_s=7200.0)).window_s == 900.0
+
+    def test_the_signal_reads_the_chosen_one(self, client,
+                                             monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        rt, tape = _cme(monkeypatch)
+        rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+        if getattr(rt, "_candlerec", None):
+            rt._candlerec.stop()
+        client.post("/api/journal/settings",
+                    params={"coin": "ES", "window_s": 300},
+                    headers=self.AUTH)
+        P, T = 1_000_000_000, 250_000_000
+        px = 6700 * P
+        # Only the 5-minute machine is driven.
+        cw5 = tape.clockwins[300.0]
+        for i in range(20):
+            cw5.on_book(i * 5.0, int(px + i * T), 500 + i * 40,
+                        int(px + i * T + T), 500)
+            cw5.on_trade_px(i * 5.0 + 1, 6700.0 + i * 0.25, 5.0, "B")
+        j = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m"},
+                       headers=self.AUTH).json()["journal"]
+        assert j["window"]["period_s"] == 300.0
+        assert j["window"]["books"] == 20
+
+    def test_the_settings_table_migrates(self, tmp_path):
+        """Same fault as bar_ts: a settings row written before this
+        column existed must not break every save."""
+        import sqlite3
+
+        from liqmap.journal import Journal
+
+        path = tmp_path / "old.db"
+        c = sqlite3.connect(path)
+        c.execute("""CREATE TABLE journal_settings (
+            coin TEXT PRIMARY KEY, auto INTEGER NOT NULL DEFAULT 0,
+            tp_on INTEGER NOT NULL DEFAULT 0,
+            sl_on INTEGER NOT NULL DEFAULT 0,
+            tp_ticks REAL NOT NULL DEFAULT 16,
+            sl_ticks REAL NOT NULL DEFAULT 8)""")
+        c.execute("INSERT INTO journal_settings (coin, auto)"
+                  " VALUES ('ES', 1)")
+        c.commit()
+        c.close()
+        j = Journal(path)
+        s = j.settings("ES")
+        assert s.auto is True
+        assert s.window_s == 900.0
+
+
+class TestTheDivergeExitIsOffForTheWindow:
+    """Chris: "there are trades that exit the market on its own a say
+    diverge but then the price continues to go in that intended
+    direction".
+
+    The diverge exit was written when the signal was the OFI lean and
+    price was the SEPARATE confirmation -- price turning meant the
+    reason for the trade had gone. Once the window became the signal
+    its mid candle is one of the three that FORM the agreement, so
+    the exit fired the instant that candle ticked the other way while
+    the OFI and the CVD still agreed.
+    """
+
+    def _t(self):
+        from liqmap.journal import Trade
+
+        return Trade(side="up", open_px=6700.0, mode="auto")
+
+    def _s(self):
+        from liqmap.journal import Settings
+
+        return Settings(auto=True)
+
+    def test_the_candle_ticking_over_does_not_close_it(self):
+        from liqmap.journal import should_close
+
+        assert should_close(self._t(), self._s(), 6700.0, "up",
+                            "down", window_rule=True) == ""
+
+    def test_the_window_agreeing_the_other_way_does(self):
+        from liqmap.journal import should_close
+
+        assert should_close(self._t(), self._s(), 6700.0, "down",
+                            "down", window_rule=True) == "flip"
+
+    def test_the_target_and_stop_still_work(self):
+        from liqmap.journal import Settings, should_close
+
+        s = Settings(auto=True, tp_on=True, tp_ticks=4.0,
+                     sl_on=True, sl_ticks=2.0)
+        assert should_close(self._t(), s, 6701.0, "up", "down",
+                            window_rule=True) == "tp"
+        assert should_close(self._t(), s, 6699.5, "up", "up",
+                            window_rule=True) == "sl"
+
+    def test_the_bucket_rule_keeps_its_diverge(self):
+        """A caller still using the old rule is unchanged."""
+        from liqmap.journal import should_close
+
+        assert should_close(self._t(), self._s(), 6700.0, "up",
+                            "down", window_rule=False) == "diverge"
+
+    def test_the_route_asks_for_the_window_rule(self):
+        blk = py_func("_journal_step")
+        assert "window_rule=True" in blk

@@ -74,7 +74,9 @@ CREATE TABLE IF NOT EXISTS journal_settings (
     tp_on      INTEGER NOT NULL DEFAULT 0,
     sl_on      INTEGER NOT NULL DEFAULT 0,
     tp_ticks   REAL    NOT NULL DEFAULT 16,
-    sl_ticks   REAL    NOT NULL DEFAULT 8
+    sl_ticks   REAL    NOT NULL DEFAULT 8,
+    -- Which clock the signal reads. 300 or 900 seconds.
+    window_s   REAL    NOT NULL DEFAULT 900
 );
 """
 
@@ -87,11 +89,15 @@ class Settings:
     sl_on: bool = False
     tp_ticks: float = 16.0
     sl_ticks: float = 8.0
+    window_s: float = 900.0
 
     def to_dict(self) -> dict:
         return {"coin": self.coin, "auto": self.auto,
                 "tp_on": self.tp_on, "sl_on": self.sl_on,
                 "tp_ticks": self.tp_ticks, "sl_ticks": self.sl_ticks,
+                "window_s": self.window_s,
+                "window_label": ("5m" if self.window_s <= 300
+                                 else "15m"),
                 "tick_value": TICK_VALUE, "tick": TICK}
 
 
@@ -331,6 +337,11 @@ def _trade_of(r: sqlite3.Row) -> Trade:
 _ADDED = (
     ("bar_ts", "REAL NOT NULL DEFAULT 0"),
 )
+# Columns the SETTINGS table grew. Same rule, same reason: CREATE
+# TABLE IF NOT EXISTS does not alter one that already exists.
+_ADDED_SETTINGS = (
+    ("window_s", "REAL NOT NULL DEFAULT 900"),
+)
 
 
 class Journal(ThreadedDB):
@@ -357,6 +368,13 @@ class Journal(ThreadedDB):
             if name not in have:
                 conn.execute(
                     f"ALTER TABLE journal_trades ADD COLUMN {name} {decl}")
+        have_s = {r[1] for r in
+                  conn.execute("PRAGMA table_info(journal_settings)")}
+        for name, decl in _ADDED_SETTINGS:
+            if name not in have_s:
+                conn.execute(
+                    "ALTER TABLE journal_settings ADD COLUMN "
+                    f"{name} {decl}")
         conn.commit()
 
     @contextmanager
@@ -379,21 +397,24 @@ class Journal(ThreadedDB):
         return Settings(coin=r["coin"], auto=bool(r["auto"]),
                         tp_on=bool(r["tp_on"]), sl_on=bool(r["sl_on"]),
                         tp_ticks=float(r["tp_ticks"]),
-                        sl_ticks=float(r["sl_ticks"]))
+                        sl_ticks=float(r["sl_ticks"]),
+                        window_s=float(r["window_s"] or 900.0))
 
     def save_settings(self, s: Settings) -> Settings:
         with self._tx() as conn:
             conn.execute(
                 "INSERT INTO journal_settings"
-                " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks)"
-                " VALUES (?,?,?,?,?,?)"
+                " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
+                "  window_s) VALUES (?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
-                " sl_ticks=excluded.sl_ticks",
+                " sl_ticks=excluded.sl_ticks,"
+                " window_s=excluded.window_s",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
-                 max(0.0, float(s.sl_ticks))))
+                 max(0.0, float(s.sl_ticks)),
+                 300.0 if float(s.window_s or 900) <= 300 else 900.0))
         return self.settings(s.coin)
 
     # -- trades ----------------------------------------------------------
@@ -496,7 +517,8 @@ class Journal(ThreadedDB):
 
 
 def should_close(t: Trade, s: Settings, px: float,
-                 agree: str, diverged: str = "") -> str:
+                 agree: str, diverged: str = "",
+                 window_rule: bool = False) -> str:
     """Why this open trade should end now, or "" to hold it.
 
     LOSING AGREEMENT IS NOT AN EXIT. ONLY A FLIP IS.
@@ -528,23 +550,30 @@ def should_close(t: Trade, s: Settings, px: float,
     other = "down" if t.side == "up" else "up"
     if agree == other:
         return "flip"
-    # DIVERGENCE IS THE TAKE PROFIT. Chris: "taking profit when you
-    # feel it should be taken based on the OFI and price divergence".
-    # The trade was opened because the OFI lean and price were going
-    # the same way; when price stops going that way the reason for
-    # being in it has gone, whether or not the lean has flipped.
+    # THE DIVERGENCE EXIT IS OFF FOR A WINDOW SIGNAL.
     #
-    # Only once price has gone the OTHER way -- flat is not
-    # divergence. Closing on flat is what gave back a tick at a time
-    # when the exit last fired on noise.
-    if diverged == other:
+    # It was written when the signal was the OFI lean and price was
+    # the separate confirmation: price turning meant the reason for
+    # the trade had gone. Once the 15-minute window became the
+    # signal, its mid candle is one of the three that FORM the
+    # agreement -- so the exit fired the instant that candle ticked
+    # the other way, while the OFI and the CVD still agreed and
+    # price carried on. Chris watched trades close on a diverge and
+    # the move continue without him.
+    #
+    # A trade now ends when the window agrees the OTHER way, or on a
+    # target or a stop. `diverged` is still taken so a caller using
+    # the old bucket rule keeps its behaviour, and it is ignored
+    # when it is simply one of the three.
+    if diverged and diverged == other and not window_rule:
         return "diverge"
     return ""
 
 
 def decide(t: Trade | None, s: Settings, px: float,
            agree: str, taken: tuple = (),
-           price: str = "") -> tuple[str, str]:
+           price: str = "",
+           window_rule: bool = False) -> tuple[str, str]:
     """What the journal should do right now.
 
     ("open", side), ("close", why), or ("", reason) -- and the reason
@@ -579,7 +608,8 @@ def decide(t: Trade | None, s: Settings, px: float,
     if not px or px <= 0:
         return "", "no live price -- the tape has not printed"
     if t is not None and t.open:
-        why = should_close(t, s, px, agree, price)
+        why = should_close(t, s, px, agree, price,
+                           window_rule)
         if why in ("flip", "diverge") and t.mode != "auto":
             why = ""
         return ("close", why) if why else ("", "a trade is already open")

@@ -150,6 +150,10 @@ class Tape:
     # contract-bucket candles above can be compared against a time
     # version on equal terms.
     clockwin: object = None
+    # ONE PER PERIOD, fed from the same events. Chris picks between
+    # them; both are always running, so switching does not start an
+    # empty window.
+    clockwins: dict | None = None
     # WHICH SIDE IS WINNING, continuously, independent of the bars.
     # One instance, not one per target: the five builders are five
     # slicings of one tape, and the flow underneath them is one thing.
@@ -379,6 +383,10 @@ class Tape:
                     _rpx = dbn.price(dbn._get(rec, "price"))
                     self.clockwin.on_trade_px(
                         _ts, _rpx, _rsz, dbn._side(rec))
+                    for _cw in (self.clockwins or {}).values():
+                        if _cw is not self.clockwin:
+                            _cw.on_trade_px(_ts, _rpx, _rsz,
+                                            dbn._side(rec))
             except Exception:                           # noqa: BLE001
                 pass            # a measurement must not stop the tape
         t = dbn.trade_from(rec)
@@ -424,6 +432,9 @@ class Tape:
                     asz = int(dbn._get(l0, "ask_sz", 0) or 0)
                     for _b in self.ofibars.values():
                         _b.on_book(bts, bpx, bsz, apx, asz)
+                    if self.clockwins:
+                        for _cw in self.clockwins.values():
+                            _cw.on_book(bts, bpx, bsz, apx, asz)
                     if self.clockwin is not None:
                         # Same book update, same OFI formula. The
                         # comparison is worthless if the two versions

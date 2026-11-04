@@ -1076,11 +1076,16 @@ class Runtime:
                     # disk that will not take it is a slow start, not a
                     # dead feed.
                     self._candlerec = None
-            if svc.tape.clockwin is None:
-                # The clock version of the same three measurements,
-                # for comparing against the contract-bucket candles.
+            if not svc.tape.clockwins:
+                # ONE PER PERIOD, all running. Switching between them
+                # must not start an empty window -- a selector that
+                # costs you fifteen minutes of history is a selector
+                # nobody touches twice.
                 from .clockwin import ClockWindows
-                svc.tape.clockwin = ClockWindows()
+                svc.tape.clockwins = {
+                    300.0: ClockWindows(period_s=300.0),
+                    900.0: ClockWindows(period_s=900.0)}
+                svc.tape.clockwin = svc.tape.clockwins[900.0]
             if svc.tape.flowread is None:
                 from .flowread import FlowRead
                 svc.tape.flowread = FlowRead()
@@ -5348,7 +5353,8 @@ def create_app() -> FastAPI:
                              tp_on: bool | None = None,
                              sl_on: bool | None = None,
                              tp_ticks: float | None = None,
-                             sl_ticks: float | None = None
+                             sl_ticks: float | None = None,
+                             window_s: float | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
         from .journal import Settings as _JS
@@ -5362,7 +5368,9 @@ def create_app() -> FastAPI:
                 tp_ticks=(cur.tp_ticks if tp_ticks is None
                           else max(0.0, float(tp_ticks))),
                 sl_ticks=(cur.sl_ticks if sl_ticks is None
-                          else max(0.0, float(sl_ticks))))
+                          else max(0.0, float(sl_ticks))),
+                window_s=(cur.window_s if window_s is None
+                          else float(window_s)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
 
     @app.post("/api/journal/clear",
@@ -5382,8 +5390,8 @@ def create_app() -> FastAPI:
         return {"ok": True, "deleted": n}
 
     @app.get("/api/clockwindows", dependencies=[Depends(require_token)])
-    def api_clockwindows(coin: str = "ES", limit: int = 40
-                         ) -> dict[str, Any]:
+    def api_clockwindows(coin: str = "ES", limit: int = 40,
+                         period: float = 0.0) -> dict[str, Any]:
         """Fifteen-minute windows: mid OHLC, net OFI, net CVD.
 
         ALL REBUILT FROM RAW EVENTS as they arrive, never resampled.
@@ -5400,11 +5408,13 @@ def create_app() -> FastAPI:
         """
         svc = rt.ofi
         tape = getattr(svc, "tape", None) if svc else None
-        cw = getattr(tape, "clockwin", None) if tape else None
+        want = float(period) if period else float(
+            rt.journal.settings(coin).window_s or 900.0)
+        cw = _windows_for(rt, want)
         if cw is None:
             rt.footprint(rule="1m", volume=0, min_volume=0,
                          multiplier=4.0)
-            cw = getattr(tape, "clockwin", None) if tape else None
+            cw = _windows_for(rt, want)
         if cw is None:
             return {"ok": False, "why": "the CME engine is not "
                                         "configured"}
@@ -5432,6 +5442,8 @@ def create_app() -> FastAPI:
                 bucket = {}
         return {"ok": True, "coin": coin, "source": "cme",
                 "bucket": bucket,
+                "periods": [300.0, 900.0],
+                "selected": want,
                 "candle": "mid-price from the book",
                 "ofi": "level-level at the touch (MBP-10)",
                 "places_orders": False, **out}
@@ -6465,7 +6477,16 @@ def create_app() -> FastAPI:
 
     from .journal import signal as jn_signal
 
-    def _window_now(rt_) -> dict:
+    def _windows_for(rt_, period_s: float):
+        """The state machine for one period, or None."""
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        wins = getattr(tape, "clockwins", None) if tape else None
+        if wins:
+            return wins.get(float(period_s)) or wins.get(900.0)
+        return getattr(tape, "clockwin", None) if tape else None
+
+    def _window_now(rt_, period_s: float = 900.0) -> dict:
         """The forming 15-minute window, as the panel draws it.
 
         FROM THE SAME OBJECT THE PANEL READS. A second accumulation
@@ -6473,9 +6494,7 @@ def create_app() -> FastAPI:
         with the one on the screen, and the first time they drifted
         the column would be trading a window nobody could see.
         """
-        svc = getattr(rt_, "ofi", None)
-        tape = getattr(svc, "tape", None) if svc else None
-        cw = getattr(tape, "clockwin", None) if tape else None
+        cw = _windows_for(rt_, period_s)
         cur = getattr(cw, "current", None) if cw else None
         try:
             return cur.to_dict() if cur is not None else {}
@@ -6574,7 +6593,7 @@ def create_app() -> FastAPI:
         # the column traded the 2,000-contract bar while the window
         # was only ever a comparison panel, so an agreement there
         # drove nothing and looked broken.
-        win = _window_now(rt_)
+        win = _window_now(rt_, float(s.window_s or 900.0))
         side, blocked_why = jn.window_signal(win)
         says = {"candle": win.get("mid_dir") or None,
                 "ofi": win.get("ofi_dir") or None,
@@ -6592,14 +6611,16 @@ def create_app() -> FastAPI:
         # agreement -- so deleting the auto check broke nothing that
         # any test could see.
         act, arg = jn.decide(t, s, px, side, taken,
-                             (win.get("mid_dir") or ""))
+                             (win.get("mid_dir") or ""),
+                             window_rule=True)
         idle_why = arg if act == "" else ""
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
             t = None
             taken = j.sides_in_bar(coin_, bar_ts)
             act, arg = jn.decide(None, s, px, side, taken,
-                                 (win.get("mid_dir") or ""))
+                                 (win.get("mid_dir") or ""),
+                                 window_rule=True)
             idle_why = arg if act == "" else ""
         if act == "open":
             t = j.open_trade(
@@ -9160,9 +9181,10 @@ has to be running before the gate stops refusing.">spike
           <b>The 15-minute window decides.</b> A trade opens when all
           three of that window agree &mdash; its mid-price candle, its
           net OFI and its net CVD, every one rebuilt from the raw
-          events. One trade per direction per window. The bucket
-          candle no longer drives this; it is the comparison in the
-          panel below. It exits when
+          events. One trade per direction per window, and it is held
+          until the window agrees the <b>other</b> way, or your target
+          or stop. Pick 5 or 15 minutes above &mdash; both run all the
+          time, so switching never costs you a window. It exits when
           price <b>diverges</b> from the lean &mdash; that is the take
           profit &mdash; or when the candle flips. A turn the
           <b>CVD has not followed</b> is a suspect turn and is not
@@ -9188,6 +9210,12 @@ has to be running before the gate stops refusing.">spike
                    places an order.">MANUAL</button>
           <input type="checkbox" id="jnlAuto" style="display:none"
             onchange="jnlSet()">
+          <label>window
+            <select id="jnlWin" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="300">5 minutes</option>
+              <option value="900">15 minutes</option>
+            </select></label>
           <label><input type="checkbox" id="jnlTpOn"
             onchange="jnlSet()"> take profit
             <input type="number" id="jnlTp" value="16" min="0" step="1"
@@ -12407,7 +12435,8 @@ async function ofiTick(fromTimer) {
        would be a second clock to keep in step with this one, and the
        two panels are read together. */
     try { paintClockWindows(await api('/api/clockwindows?'
-      + q({coin: coin(), limit: 40}))); }
+      + q({coin: coin(), limit: 40,
+           period: ($('jnlWin') ? $('jnlWin').value : 900)}))); }
     catch (e) { /* the OFI panel below is the louder failure */ }
     if (!d.ok) {
       /* "ES is not a CME symbol" is true and useless. The reason this
@@ -14089,7 +14118,8 @@ async function jnlSet() {
     tp_on: $('jnlTpOn').checked ? 'true' : 'false',
     sl_on: $('jnlSlOn').checked ? 'true' : 'false',
     tp_ticks: $('jnlTp').value || 0,
-    sl_ticks: $('jnlSl').value || 0 });
+    sl_ticks: $('jnlSl').value || 0,
+    window_s: $('jnlWin') ? $('jnlWin').value : 900 });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
 }
@@ -14282,6 +14312,7 @@ function paintJournal(d) {
     if (e && document.activeElement !== e) e.checked = !!v; };
   chk('jnlAuto', S.auto); chk('jnlTpOn', S.tp_on); chk('jnlSlOn', S.sl_on);
   set('jnlTp', S.tp_ticks); set('jnlSl', S.sl_ticks);
+  set('jnlWin', String(Math.round(S.window_s || 900)));
   const mode = $('jnlMode');
   if (mode) mode.textContent = S.auto ? 'AUTO — rows write themselves'
                                       : 'MANUAL — you log the trades';
@@ -14340,7 +14371,8 @@ function paintJournal(d) {
         + ' <span class="thin">candle, OFI and CVD all the same way</span>'
       : '<b class="short">NO TRADE</b> <span class="thin">'
         + esc(J.blocked || 'no window yet') + '</span>')
-      + '<div class="thin" style="margin-top:4px">15-minute window'
+      + '<div class="thin" style="margin-top:4px">'
+      + esc(S.window_label || '15m') + ' window'
       + ' &mdash; candle ' + word(W.mid_dir === 'flat' ? null : W.mid_dir)
       + (W.mid_dir === 'flat' ? ' <b>FLAT</b>' : '')
       + ' <span class="thin">' + ((W.ticks > 0 ? '+' : '')
