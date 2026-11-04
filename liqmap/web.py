@@ -5339,7 +5339,8 @@ def create_app() -> FastAPI:
         s = j.settings(coin)
         t = j.open_trade(coin, want, price, mode="manual",
                          tp=(s.tp_ticks if s.tp_on else 0.0),
-                         sl=(s.sl_ticks if s.sl_on else 0.0))
+                         sl=(s.sl_ticks if s.sl_on else 0.0),
+                         strategy=s.strategy)
         if t is None:
             return {"ok": False, "why":
                     "a trade is already open on this market -- close "
@@ -5354,7 +5355,8 @@ def create_app() -> FastAPI:
                              sl_on: bool | None = None,
                              tp_ticks: float | None = None,
                              sl_ticks: float | None = None,
-                             window_s: float | None = None
+                             window_s: float | None = None,
+                             strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
         from .journal import Settings as _JS
@@ -5370,7 +5372,9 @@ def create_app() -> FastAPI:
                 sl_ticks=(cur.sl_ticks if sl_ticks is None
                           else max(0.0, float(sl_ticks))),
                 window_s=(cur.window_s if window_s is None
-                          else float(window_s)))
+                          else float(window_s)),
+                strategy=(cur.strategy if strategy is None
+                          else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
 
     @app.post("/api/journal/clear",
@@ -6594,14 +6598,15 @@ def create_app() -> FastAPI:
         # was only ever a comparison panel, so an agreement there
         # drove nothing and looked broken.
         win = _window_now(rt_, float(s.window_s or 900.0))
-        side, blocked_why = jn.window_signal(win)
+        strat = s.strategy if s.strategy in jn.STRATEGIES else "ofi"
+        side, blocked_why = jn.window_signal(win, strat)
         says = {"candle": win.get("mid_dir") or None,
                 "ofi": win.get("ofi_dir") or None,
                 "cvd": win.get("cvd_dir") or None}
         vetoed = blocked_why
         # The window is the candle the cap counts against.
         bar_ts = float(win.get("start_ts") or 0.0)
-        taken = j.sides_in_bar(coin_, bar_ts)
+        taken = j.sides_in_bar(coin_, bar_ts, strat)
 
         t = j.open_trade_for(coin_)
         closed = None
@@ -6617,7 +6622,7 @@ def create_app() -> FastAPI:
         if act == "close":
             closed = j.close_trade(coin_, px, why=arg)
             t = None
-            taken = j.sides_in_bar(coin_, bar_ts)
+            taken = j.sides_in_bar(coin_, bar_ts, strat)
             act, arg = jn.decide(None, s, px, side, taken,
                                  (win.get("mid_dir") or ""),
                                  window_rule=True)
@@ -6625,11 +6630,12 @@ def create_app() -> FastAPI:
         if act == "open":
             t = j.open_trade(
                 coin_, arg, px, mode="auto", bar_ts=bar_ts,
+                strategy=strat,
                 tp=(s.tp_ticks if s.tp_on else 0.0),
                 sl=(s.sl_ticks if s.sl_on else 0.0))
-            taken = j.sides_in_bar(coin_, bar_ts)
+            taken = j.sides_in_bar(coin_, bar_ts, strat)
 
-        st = j.stats(coin_)
+        st = j.stats(coin_, strategy=strat)
         return {
             "settings": s.to_dict(),
             "agree": side, "says": says, "price": px,
@@ -6662,7 +6668,10 @@ def create_app() -> FastAPI:
             "open": t.to_dict(px) if t is not None else None,
             "just_closed": closed.to_dict() if closed is not None else None,
             "stats": st.to_dict(),
-            "recent": [x.to_dict() for x in j.closed(coin_, 20)],
+            "recent": [x.to_dict()
+                       for x in j.closed(coin_, 20, strat)],
+            "strategy": strat,
+            "strategies": jn.STRATEGIES,
             # Said on every response so it cannot be forgotten: this
             # records, it does not trade.
             "places_orders": False,
@@ -9210,6 +9219,12 @@ has to be running before the gate stops refusing.">spike
                    places an order.">MANUAL</button>
           <input type="checkbox" id="jnlAuto" style="display:none"
             onchange="jnlSet()">
+          <label>strategy
+            <select id="jnlStrat" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="ofi">OFI</option>
+              <option value="candle">Candle</option>
+            </select></label>
           <label>window
             <select id="jnlWin" onchange="jnlSet()"
               style="margin:0 4px">
@@ -14119,7 +14134,8 @@ async function jnlSet() {
     sl_on: $('jnlSlOn').checked ? 'true' : 'false',
     tp_ticks: $('jnlTp').value || 0,
     sl_ticks: $('jnlSl').value || 0,
-    window_s: $('jnlWin') ? $('jnlWin').value : 900 });
+    window_s: $('jnlWin') ? $('jnlWin').value : 900,
+    strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
 }
@@ -14313,9 +14329,12 @@ function paintJournal(d) {
   chk('jnlAuto', S.auto); chk('jnlTpOn', S.tp_on); chk('jnlSlOn', S.sl_on);
   set('jnlTp', S.tp_ticks); set('jnlSl', S.sl_ticks);
   set('jnlWin', String(Math.round(S.window_s || 900)));
+  set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
-  if (mode) mode.textContent = S.auto ? 'AUTO — rows write themselves'
-                                      : 'MANUAL — you log the trades';
+  if (mode) mode.textContent =
+    (S.strategy === 'candle' ? 'CANDLE' : 'OFI') + ' · '
+    + (S.auto ? 'AUTO — rows write themselves'
+              : 'MANUAL — you log the trades');
   /* ONE BUTTON, TWO STATES, and the label says which one is live
      rather than which one it would switch to -- a toggle that reads
      as a command is the commonest way to end up in the mode you

@@ -783,7 +783,7 @@ class TestTheCandleDecidesAndTheStackVetoes:
         assert '"blocked"' in blk
         assert '"would_be"' in blk
         assert '"window"' in blk
-        assert "jn.window_signal(win)" in blk
+        assert "jn.window_signal(win, strat)" in blk
 
     def test_the_stack_veto_no_longer_gates_the_trade(self):
         """IT WAS DROPPED, NOT FORGOTTEN. The veto belonged to the
@@ -1231,9 +1231,10 @@ class TestOneTradePerCandle:
 
     def test_the_route_passes_the_candle_through(self):
         blk = py_func("_journal_step")
-        assert "j.sides_in_bar(coin_, bar_ts)" in blk
+        assert "j.sides_in_bar(coin_, bar_ts, strat)" in blk
         assert "bar_ts=bar_ts" in blk
         assert "jn.decide(t, s, px, side, taken," in blk
+        assert "window_rule=True" in blk
 
     def test_the_panel_shows_what_the_candle_has_had(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
@@ -1687,3 +1688,144 @@ class TestTheDivergeExitIsOffForTheWindow:
     def test_the_route_asks_for_the_window_rule(self):
         blk = py_func("_journal_step")
         assert "window_rule=True" in blk
+
+
+class TestTheTwoStrategies:
+    """Chris: keep the current rule as "OFI", add a "Candle" rule
+    that trades the window candle alone, and swap between them.
+
+    SEPARATE RECORDS. Two rules sharing one table makes a combined
+    total that measures neither, and the whole reason for having
+    both is to find out which is worth more.
+    """
+
+    AUTH = {"Authorization": "Bearer t0ken"}
+    W = {"mid_dir": "up", "ofi_dir": "down", "cvd_dir": "flat",
+         "start_ts": 0.0, "ts_last": 600.0}
+
+    def test_the_ofi_rule_needs_all_three(self):
+        from liqmap.journal import window_signal
+
+        side, why = window_signal(self.W, "ofi")
+        assert side == ""
+        assert "OFI is down" in why and "CVD is flat" in why
+
+    def test_the_candle_rule_needs_only_the_candle(self):
+        from liqmap.journal import window_signal
+
+        assert window_signal(self.W, "candle") == ("up", "")
+
+    def test_the_candle_rule_still_needs_a_direction(self):
+        from liqmap.journal import window_signal
+
+        flat = {**self.W, "mid_dir": "flat"}
+        assert window_signal(flat, "candle")[0] == ""
+
+    def test_an_unknown_strategy_falls_back_to_ofi(self):
+        from liqmap.journal import window_signal
+
+        assert window_signal(self.W, "nonsense")[0] == ""
+
+    def test_trades_are_tagged(self, jn):
+        jn.open_trade("ES", "up", 6700.0, bar_ts=1.0,
+                      strategy="candle")
+        jn.close_trade("ES", 6701.0)
+        assert jn.closed("ES")[0].strategy == "candle"
+
+    def test_the_totals_are_per_strategy(self, jn):
+        jn.open_trade("ES", "up", 6700.0, bar_ts=1.0, strategy="ofi")
+        jn.close_trade("ES", 6701.0)                      # +4
+        jn.open_trade("ES", "up", 6700.0, bar_ts=1.0,
+                      strategy="candle")
+        jn.close_trade("ES", 6699.0)                      # -4
+        assert jn.stats("ES", strategy="ofi").ticks == 4.0
+        assert jn.stats("ES", strategy="candle").ticks == -4.0
+        assert jn.stats("ES").ticks == 0.0       # mixed: meaningless
+
+    def test_the_cap_is_per_strategy(self, jn):
+        """A window the OFI rule has used must not block the candle
+        rule from using it."""
+        jn.open_trade("ES", "up", 6700.0, bar_ts=99.0, strategy="ofi")
+        jn.close_trade("ES", 6701.0)
+        assert jn.sides_in_bar("ES", 99.0, "ofi") == ("up",)
+        assert jn.sides_in_bar("ES", 99.0, "candle") == ()
+
+    def test_the_setting_persists(self, client, monkeypatch):
+        from tests.test_cme_panels import _cme
+
+        _cme(monkeypatch)
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "strategy": "candle"},
+                        headers=self.AUTH).json()
+        assert d["settings"]["strategy"] == "candle"
+        j = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m"},
+                       headers=self.AUTH).json()["journal"]
+        assert j["strategy"] == "candle"
+        assert "candle" in j["strategies"]
+
+    def test_the_route_uses_the_chosen_one(self):
+        blk = py_func("_journal_step")
+        assert "jn.window_signal(win, strat)" in blk
+        assert "strategy=strat" in blk
+        assert "j.stats(coin_, strategy=strat)" in blk
+
+    def test_the_settings_table_migrates_again(self, tmp_path):
+        import sqlite3
+
+        from liqmap.journal import Journal
+
+        path = tmp_path / "old.db"
+        c = sqlite3.connect(path)
+        c.execute("""CREATE TABLE journal_settings (
+            coin TEXT PRIMARY KEY, auto INTEGER NOT NULL DEFAULT 0,
+            tp_on INTEGER NOT NULL DEFAULT 0,
+            sl_on INTEGER NOT NULL DEFAULT 0,
+            tp_ticks REAL NOT NULL DEFAULT 16,
+            sl_ticks REAL NOT NULL DEFAULT 8)""")
+        c.execute("INSERT INTO journal_settings (coin) VALUES ('ES')")
+        c.commit()
+        c.close()
+        assert Journal(path).settings("ES").strategy == "ofi"
+
+
+class TestNothingIsTakenAtTheOpen:
+    """Chris: "we never take a trade at the very opening of the
+    candle thats when the candle is unstable".
+
+    A window a few events old has an OFI of a few hundred and a CVD
+    of one print. Its three can agree on almost nothing, and that
+    agreement means almost nothing.
+    """
+
+    def _w(self, into):
+        return {"mid_dir": "up", "ofi_dir": "up", "cvd_dir": "up",
+                "start_ts": 0.0, "ts_last": float(into)}
+
+    def test_the_first_seconds_take_nothing(self):
+        from liqmap.journal import window_signal
+
+        side, why = window_signal(self._w(5), "ofi")
+        assert side == ""
+        assert "first 30s" in why
+
+    def test_it_says_how_far_in_it_is(self):
+        from liqmap.journal import window_signal
+
+        assert "5s old" in window_signal(self._w(5), "ofi")[1]
+
+    def test_after_the_warmup_it_trades(self):
+        from liqmap.journal import WARMUP_S, window_signal
+
+        assert window_signal(self._w(WARMUP_S), "ofi") == ("up", "")
+
+    def test_it_applies_to_the_candle_rule_too(self):
+        from liqmap.journal import window_signal
+
+        assert window_signal(self._w(5), "candle")[0] == ""
+
+    def test_the_boundary_is_not_off_by_a_second(self):
+        from liqmap.journal import WARMUP_S, window_signal
+
+        assert window_signal(self._w(WARMUP_S - 0.1), "ofi")[0] == ""
+        assert window_signal(self._w(WARMUP_S + 0.1), "ofi")[0] == "up"

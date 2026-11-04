@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS journal_trades (
     -- candle and one per direction, and a cap held only in memory
     -- resets on every restart -- which on a poll-driven column is
     -- indistinguishable from no cap at all.
-    bar_ts     REAL    NOT NULL DEFAULT 0
+    bar_ts     REAL    NOT NULL DEFAULT 0,
+    -- WHICH STRATEGY TOOK IT. Two rules share this table and the
+    -- totals are meaningless mixed together.
+    strategy   TEXT    NOT NULL DEFAULT 'ofi'
 );
 CREATE INDEX IF NOT EXISTS journal_open
     ON journal_trades (coin, closed_ts);
@@ -76,7 +79,8 @@ CREATE TABLE IF NOT EXISTS journal_settings (
     tp_ticks   REAL    NOT NULL DEFAULT 16,
     sl_ticks   REAL    NOT NULL DEFAULT 8,
     -- Which clock the signal reads. 300 or 900 seconds.
-    window_s   REAL    NOT NULL DEFAULT 900
+    window_s   REAL    NOT NULL DEFAULT 900,
+    strategy   TEXT    NOT NULL DEFAULT 'ofi'
 );
 """
 
@@ -90,6 +94,7 @@ class Settings:
     tp_ticks: float = 16.0
     sl_ticks: float = 8.0
     window_s: float = 900.0
+    strategy: str = "ofi"
 
     def to_dict(self) -> dict:
         return {"coin": self.coin, "auto": self.auto,
@@ -98,6 +103,9 @@ class Settings:
                 "window_s": self.window_s,
                 "window_label": ("5m" if self.window_s <= 300
                                  else "15m"),
+                "strategy": self.strategy,
+                "strategy_label": STRATEGIES.get(self.strategy,
+                                                 self.strategy),
                 "tick_value": TICK_VALUE, "tick": TICK}
 
 
@@ -116,6 +124,7 @@ class Trade:
     sl: float = 0.0
     note: str = ""
     bar_ts: float = 0.0
+    strategy: str = "ofi"
 
     @property
     def open(self) -> bool:
@@ -325,7 +334,8 @@ def _trade_of(r: sqlite3.Row) -> Trade:
                            if r["close_px"] is not None else None),
                  why=r["why"] or "", tp=float(r["tp"]),
                  sl=float(r["sl"]), note=r["note"] or "",
-                 bar_ts=float(r["bar_ts"] or 0.0))
+                 bar_ts=float(r["bar_ts"] or 0.0),
+                 strategy=(r["strategy"] or "ofi"))
 
 
 # Columns added after the table first shipped. CREATE TABLE IF NOT
@@ -336,11 +346,13 @@ def _trade_of(r: sqlite3.Row) -> Trade:
 # could be logged at all.
 _ADDED = (
     ("bar_ts", "REAL NOT NULL DEFAULT 0"),
+    ("strategy", "TEXT NOT NULL DEFAULT 'ofi'"),
 )
 # Columns the SETTINGS table grew. Same rule, same reason: CREATE
 # TABLE IF NOT EXISTS does not alter one that already exists.
 _ADDED_SETTINGS = (
     ("window_s", "REAL NOT NULL DEFAULT 900"),
+    ("strategy", "TEXT NOT NULL DEFAULT 'ofi'"),
 )
 
 
@@ -398,23 +410,26 @@ class Journal(ThreadedDB):
                         tp_on=bool(r["tp_on"]), sl_on=bool(r["sl_on"]),
                         tp_ticks=float(r["tp_ticks"]),
                         sl_ticks=float(r["sl_ticks"]),
-                        window_s=float(r["window_s"] or 900.0))
+                        window_s=float(r["window_s"] or 900.0),
+                        strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
         with self._tx() as conn:
             conn.execute(
                 "INSERT INTO journal_settings"
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
-                "  window_s) VALUES (?,?,?,?,?,?,?)"
+                "  window_s, strategy) VALUES (?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
                 " sl_ticks=excluded.sl_ticks,"
-                " window_s=excluded.window_s",
+                " window_s=excluded.window_s,"
+                " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
                  max(0.0, float(s.sl_ticks)),
-                 300.0 if float(s.window_s or 900) <= 300 else 900.0))
+                 300.0 if float(s.window_s or 900) <= 300 else 900.0,
+                 s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 
     # -- trades ----------------------------------------------------------
@@ -422,7 +437,8 @@ class Journal(ThreadedDB):
     def open_trade(self, coin: str, side: str, px: float,
                    mode: str = "manual", ts: float | None = None,
                    tp: float = 0.0, sl: float = 0.0,
-                   bar_ts: float = 0.0) -> Trade | None:
+                   bar_ts: float = 0.0,
+                   strategy: str = "ofi") -> Trade | None:
         """Open one. Returns None when one is already open.
 
         ONE AT A TIME, enforced here rather than in the page. A double
@@ -442,10 +458,12 @@ class Journal(ThreadedDB):
                 cur = conn.execute(
                     "INSERT INTO journal_trades"
                     " (coin, side, mode, opened_ts, open_px, tp, sl,"
-                    "  bar_ts) VALUES (?,?,?,?,?,?,?,?)",
+                    "  bar_ts, strategy)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
                     (str(coin), side, str(mode),
                      float(ts if ts is not None else time.time()),
-                     float(px), float(tp), float(sl), float(bar_ts)))
+                     float(px), float(tp), float(sl), float(bar_ts),
+                     str(strategy)))
                 new_id = int(cur.lastrowid)
         return self.get(new_id)
 
@@ -477,7 +495,8 @@ class Journal(ThreadedDB):
             (int(trade_id),)).fetchone()
         return _trade_of(r) if r else None
 
-    def sides_in_bar(self, coin: str, bar_ts: float) -> tuple:
+    def sides_in_bar(self, coin: str, bar_ts: float,
+                     strategy: str = "") -> tuple:
         """Which directions have already been opened in this candle.
 
         FROM THE TABLE, NOT FROM MEMORY. The column is driven by a
@@ -487,20 +506,35 @@ class Journal(ThreadedDB):
         """
         if not bar_ts:
             return ()
-        rows = self._conn.execute(
-            "SELECT side FROM journal_trades WHERE coin=? AND bar_ts=?"
-            " ORDER BY id", (str(coin), float(bar_ts))).fetchall()
+        # PER STRATEGY. They share the table, so a window the OFI
+        # rule has used must not block the candle rule from using it.
+        sql = ("SELECT side FROM journal_trades WHERE coin=?"
+               " AND bar_ts=?")
+        args: list = [str(coin), float(bar_ts)]
+        if strategy:
+            sql += " AND strategy=?"
+            args.append(str(strategy))
+        rows = self._conn.execute(sql + " ORDER BY id", args).fetchall()
         return tuple(r["side"] for r in rows)
 
-    def closed(self, coin: str, limit: int = 200) -> list:
-        rows = self._conn.execute(
-            "SELECT * FROM journal_trades WHERE coin=? AND closed_ts IS"
-            " NOT NULL ORDER BY id DESC LIMIT ?",
-            (str(coin), max(1, int(limit)))).fetchall()
-        return [_trade_of(r) for r in rows]
+    def closed(self, coin: str, limit: int = 200,
+               strategy: str = "") -> list:
+        sql = ("SELECT * FROM journal_trades WHERE coin=?"
+               " AND closed_ts IS NOT NULL")
+        args: list = [str(coin)]
+        if strategy:
+            sql += " AND strategy=?"
+            args.append(str(strategy))
+        sql += " ORDER BY id DESC LIMIT ?"
+        args.append(max(1, int(limit)))
+        return [_trade_of(r) for r in
+                self._conn.execute(sql, args).fetchall()]
 
-    def stats(self, coin: str, limit: int = 1000) -> Stats:
-        return Stats(trades=self.closed(coin, limit))
+    def stats(self, coin: str, limit: int = 1000,
+              strategy: str = "") -> Stats:
+        """TOTALS PER STRATEGY. Two rules share this table and a
+        combined score measures neither."""
+        return Stats(trades=self.closed(coin, limit, strategy))
 
     def delete(self, trade_id: int) -> bool:
         with self._tx() as conn:
@@ -708,7 +742,26 @@ def signal(says: dict, read: str, cvd: str = "",
 MAX_PER_BAR = 2
 
 
-def window_signal(win: dict) -> tuple[str, str]:
+# NO TRADE IN THE FIRST SECONDS OF A WINDOW. Chris: "we never take a
+# trade at the very opening of the candle thats when the candle is
+# unstable". A window a few events old has an OFI of a few hundred
+# and a CVD of one print; its three can agree on almost nothing and
+# the agreement means almost nothing.
+#
+# A fixed thirty seconds rather than a fraction: the instability is
+# a property of how little has arrived, not of how long the window
+# is, and the same thirty seconds carries about the same number of
+# events whether the window is five minutes or fifteen.
+WARMUP_S = 30.0
+
+STRATEGIES = {
+    "ofi": "OFI -- candle, OFI and CVD must agree",
+    "candle": "Candle -- the window candle alone",
+}
+
+
+def window_signal(win: dict,
+                  strategy: str = "ofi") -> tuple[str, str]:
     """The direction a 15-minute window is trading, and what stopped it.
 
     ALL THREE THE SAME WAY: the mid-price candle, the net OFI and the
@@ -733,11 +786,23 @@ def window_signal(win: dict) -> tuple[str, str]:
     """
     if not win:
         return "", "no window yet"
+    into = float(win.get("ts_last") or 0.0) - float(
+        win.get("start_ts") or 0.0)
+    if into < WARMUP_S:
+        return "", (f"the window is {int(into)}s old -- nothing is "
+                    f"taken in the first {int(WARMUP_S)}s, that is "
+                    "when it is least settled")
     candle = win.get("mid_dir") or ""
     ofi = win.get("ofi_dir") or ""
     cvd = win.get("cvd_dir") or ""
     if candle not in ("up", "down"):
         return "", "the window candle is flat"
+    if strategy == "candle":
+        # THE CANDLE STRATEGY. The window's own candle and nothing
+        # else -- one trade per direction per window, so a candle
+        # that turns inside its window is traded both ways. Chris
+        # wants it beside the OFI rule to see which is worth more.
+        return candle, ""
     off = []
     if ofi != candle:
         off.append(f"OFI is {ofi or 'flat'}")
