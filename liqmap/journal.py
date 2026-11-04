@@ -607,7 +607,7 @@ class Journal(ThreadedDB):
 def should_close(t: Trade, s: Settings, px: float,
                  agree: str, diverged: str = "",
                  window_rule: bool = False,
-                 exit_on_disagree: bool = False) -> str:
+                 m5_against: str = "") -> str:
     """Why this open trade should end now, or "" to hold it.
 
     LOSING AGREEMENT IS NOT AN EXIT. ONLY A FLIP IS.
@@ -639,28 +639,26 @@ def should_close(t: Trade, s: Settings, px: float,
     other = "down" if t.side == "up" else "up"
     if agree == other:
         return "flip"
-    # THE FUSION RULE IS SYMMETRIC, AND ONLY THAT RULE.
+    # THE FIVE-MINUTE BAR IS THE ONLY THING THAT ENDS A FUSION TRADE.
     #
-    # Chris, on the two independent series: "exiting when they
-    # disagree reenter when they agree again exit when they
-    # disagree". So for this strategy losing agreement IS the exit,
-    # including the merely-neutral case the flip test above lets
-    # through -- one series going flat is a disagreement, because
-    # the reason for the trade was that both pointed the same way
-    # and now they do not.
+    # It was the fast pair disagreeing. Chris ran it: "it literally
+    # took 14 trades in a matter of a few minutes that closed due to
+    # disagreement that cant happen in real trading". The tick bar
+    # and the OFI break step constantly inside a move, so every one
+    # of those exits was noise charged a round trip -- the same
+    # failure the window rule had, where 1,582 trades became 72 once
+    # the disagreement exit came out.
     #
-    # IT IS OFF EVERYWHERE ELSE, ON PURPOSE. The same construction
-    # on the window signal closed for -1 tick over and over: the
-    # read crossed its own reference constantly, agreement broke for
-    # an instant, the trade closed and the next look re-opened it.
-    # Measured then: 1,582 trades became 72 when the exit was
-    # removed. These two series are not that read -- a tick bar and
-    # an OFI bar turn far less often than price against a bar open
-    # -- but the risk is the same shape, so the column counts the
-    # re-entries and the churn is meant to be looked at rather than
-    # assumed away.
-    if exit_on_disagree and agree != t.side:
-        return "disagree"
+    # So the fast pair no longer closes anything. The caller passes
+    # the 5m direction only when it is AGAINST the open side, and
+    # that is the exit. A flat or still-settling 5m holds: "flat is
+    # not a reason to exit".
+    #
+    # The consequence is deliberate and worth knowing: a full
+    # reversal of both fast series no longer closes a position
+    # either, so the stop is the only fast protection left on it.
+    if m5_against:
+        return "m5"
     # THE DIVERGENCE EXIT IS OFF FOR A WINDOW SIGNAL.
     #
     # It was written when the signal was the OFI lean and price was
@@ -685,7 +683,7 @@ def decide(t: Trade | None, s: Settings, px: float,
            agree: str, taken: tuple = (),
            price: str = "",
            window_rule: bool = False,
-           exit_on_disagree: bool = False) -> tuple[str, str]:
+           m5_against: str = "") -> tuple[str, str]:
     """What the journal should do right now.
 
     ("open", side), ("close", why), or ("", reason) -- and the reason
@@ -721,8 +719,8 @@ def decide(t: Trade | None, s: Settings, px: float,
         return "", "no live price -- the tape has not printed"
     if t is not None and t.open:
         why = should_close(t, s, px, agree, price,
-                           window_rule, exit_on_disagree)
-        if why in ("flip", "diverge", "disagree") and t.mode != "auto":
+                           window_rule, m5_against)
+        if why in ("flip", "diverge", "m5") and t.mode != "auto":
             why = ""
         return ("close", why) if why else ("", "a trade is already open")
     if not s.auto:
