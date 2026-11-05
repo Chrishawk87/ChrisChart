@@ -5687,6 +5687,17 @@ def create_app() -> FastAPI:
                         else {"running": False, "steps": 0, "errors": 0,
                               "last_error": "not started", "age_s": None}),
         }
+        # The journal's own timing, so the delay shows on the panel
+        # that is already being watched rather than in a log.
+        try:
+            extra["journal_timing"] = {
+                "px_age_s": _px_age(rt_),
+                "step_ms": _step_timing.get("ms"),
+                "gap_s": _step_timing.get("gap"),
+                "queued_ms": _step_timing.get("queued_ms"),
+                "lock_waits": _step_timing.get("waits")}
+        except Exception:                               # noqa: BLE001
+            pass
         if not st.get("tick") or not (st["tick"].get("per_bar")):
             return {**st, **extra,
                     "error": ("the tick bars are built from the ES "
@@ -6807,6 +6818,22 @@ def create_app() -> FastAPI:
         px = float(getattr(tape, "last_px", 0.0) or 0.0)
         return round(px, 4) if px > 0 else 0.0
 
+    def _px_age(rt_) -> float | None:
+        """How old the fill price is, in seconds.
+
+        "The trader is delayed" is a feeling until this is a number.
+        If it reads 0.2 the price is live and the delay is in the
+        decision; if it reads 9 the tape is behind and no amount of
+        stepping faster will help. One of those is worth fixing and
+        the other is worth knowing about first.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        last = float(getattr(tape, "last_ts", 0.0) or 0.0)
+        if last <= 0:
+            return None
+        return round(max(0.0, time.time() - last), 2)
+
     # How many of the four have to point the same way. THREE, by
     # Chris's rule: a fourth pointing the other way does not block it.
     MIN_AGREE = 3
@@ -7164,10 +7191,31 @@ def create_app() -> FastAPI:
     # rows that are already written and cannot help with a race.
     _step_lock = threading.Lock()
 
+    _step_timing = {"last": 0.0, "ms": 0.0, "gap": 0.0, "waits": 0}
+
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
-        """Serialised entry point. The policy is in `_journal_step_un`."""
+        """Serialised entry point. The policy is in `_journal_step_un`.
+
+        TIMED, because "the trader is extremely delayed" has to
+        become a number before it can be fixed. `ms` is how long one
+        step takes and `gap` is how long since the previous one --
+        if the gap is seconds, nothing is stepping; if the ms is
+        large, the step itself is the delay.
+        """
+        t0 = time.time()
+        if _step_lock.locked():
+            _step_timing["waits"] += 1
         with _step_lock:
-            return _journal_step_un(rt_, coin_, out_)
+            began = time.time()
+            prev = _step_timing["last"] or began
+            try:
+                return _journal_step_un(rt_, coin_, out_)
+            finally:
+                done = time.time()
+                _step_timing["last"] = done
+                _step_timing["ms"] = round((done - began) * 1000.0, 1)
+                _step_timing["gap"] = round(began - prev, 2)
+                _step_timing["queued_ms"] = round((began - t0) * 1000.0, 1)
 
     def _journal_step_un(rt_, coin_: str, out_: dict) -> dict:
         """Close what should close, open what auto should open, report.
@@ -7342,6 +7390,13 @@ def create_app() -> FastAPI:
             # been taken.
             "advice": _advice(jn, j, s, t, px, side, taken, cap,
                               strat, fus, win, coin_, bar_ts),
+            # WHERE THE DELAY IS, as numbers. The price's age, how
+            # long this step took, and how long since the last one.
+            "timing": {"px_age_s": _px_age(rt_),
+                       "step_ms": _step_timing.get("ms"),
+                       "gap_s": _step_timing.get("gap"),
+                       "queued_ms": _step_timing.get("queued_ms"),
+                       "lock_waits": _step_timing.get("waits")},
             "taken_this_candle": [x for x in taken if x != "?"],
             "candle_known": "?" not in taken,
             "max_per_candle": jn.MAX_PER_BAR,
@@ -15079,6 +15134,22 @@ function paintFusion(d) {
      standing between this rule and the churn, so whether this bar
      has spent its trade is not a detail to be inferred from the
      trade list below. */
+  /* WHERE THE DELAY IS. Shown on the panel because "it feels late"
+     cannot be acted on and "the price was 6 seconds old" can. */
+  const tmg = (d.journal_timing) || {};
+  const slow = (tmg.px_age_s != null && tmg.px_age_s > 2)
+            || (tmg.gap_s != null && tmg.gap_s > 3)
+            || (tmg.step_ms != null && tmg.step_ms > 500);
+  const timingLine = (tmg.px_age_s == null && tmg.step_ms == null) ? ''
+    : `<div class="thin" style="margin-top:2px;color:var(--`
+      + (slow ? 'down' : 'dim') + `)">`
+      + `price ${tmg.px_age_s == null ? '?' : tmg.px_age_s + 's'} old`
+      + ` &middot; step ${tmg.step_ms == null ? '?' : tmg.step_ms + 'ms'}`
+      + ` &middot; ${tmg.gap_s == null ? '?' : tmg.gap_s + 's'} since the last one`
+      + (tmg.lock_waits ? ` &middot; ${tmg.lock_waits} queued` : '')
+      + (slow ? ' &mdash; <b>this is the delay</b>' : '')
+      + `</div>`;
+
   const capLine = `<div class="thin" style="margin-top:2px;color:var(--`
     + (d.bar_used ? 'dim' : 'ink') + `)">`
     + (d.bar_used ? '&#9679; ' : '&#9675; ') + esc(d.bar_say || '')
@@ -15120,7 +15191,7 @@ function paintFusion(d) {
       `<div style="margin-bottom:10px">${verdict}`
     + `<div class="thin">${why}</div>`
     + `<div class="thin" style="margin-top:2px">${holdLine}</div>`
-    + capLine
+    + capLine + timingLine
     + `<div class="thin" style="margin-top:4px">${stepLine}</div></div>`
     + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
     + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)

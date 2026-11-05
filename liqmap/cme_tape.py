@@ -112,6 +112,9 @@ class Tape:
     instrument_ts: float = 0.0
     other_instrument: int = 0
     rolls: int = 0
+    # Prints Databento could not attribute to a side. They still
+    # move `last_px`; they are counted so the share is visible.
+    unknown_side: int = 0
     intervals: tuple = DEFAULT_INTERVALS
     keep: int = KEEP_CLOSED
 
@@ -607,7 +610,32 @@ class Tape:
                     self.obstacles.observe_book(rec)
             except Exception:                           # noqa: BLE001
                 pass            # a display must not stop the tape
+        # THE LAST TRADED PRICE IS THE LAST PRINT, whatever side it
+        # was. `trade_from` returns None when Databento cannot
+        # attribute the aggressor (side 'N'), and everything below
+        # this gate was therefore skipping those prints -- including
+        # `last_px`, which is the price the journal FILLS AND STOPS
+        # AT.
+        #
+        # An unattributed print is a real trade at a real price. Not
+        # knowing who crossed the spread is a reason to leave it out
+        # of a DELTA; it is not a reason to pretend the market never
+        # traded there. So the fill price is updated from the raw
+        # record first, and the share that arrives this way is
+        # counted so it can be seen rather than assumed small.
         if t is None:
+            try:
+                if dbn._action(rec) in (dbn.ACTION_TRADE,
+                                        dbn.ACTION_FILL):
+                    _px = dbn.price(dbn._get(rec, "price"))
+                    _sz = float(dbn._get(rec, "size", 0) or 0)
+                    if _px > 0 and _sz > 0:
+                        self.unknown_side += 1
+                        self.last_px = _px
+                        self.last_ts = float(dbn.seconds(
+                            dbn._get(rec, "ts_event")) or 0.0)
+            except Exception:                           # noqa: BLE001
+                pass
             return False
         self.trades += 1
         self.last_px, self.last_side, self.last_ts = t.px, t.aggressor, t.ts
@@ -729,6 +757,7 @@ class Tape:
             "symbol": self.symbol,
             "instrument_id": self.instrument_id,
             "other_instrument": self.other_instrument,
+            "unknown_side": self.unknown_side,
             "rolls": self.rolls,
             "intervals": [label(s) for s in self.intervals],
             "interval": interval,
