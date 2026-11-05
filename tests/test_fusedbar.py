@@ -824,7 +824,7 @@ class TestTheStrategyMovedOut:
 
     def test_this_module_no_longer_feeds_the_strategy(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
-        step = py_func("_journal_step")
+        step = py_func("_journal_step_un")
         assert "_fusion_now(rt_)" in step
         assert "_fused_now(" not in step
 

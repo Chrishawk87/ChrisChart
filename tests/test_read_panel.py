@@ -268,14 +268,14 @@ class TestTheCapLeakAfterAClose:
         bar -- the "immediately jumps in for another trade" shape,
         surviving in the one place the cap was not threaded through.
         """
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         i = blk.index("if act == \"close\":")
         j = blk.index("if act == \"open\":", i)
         assert "max_per_bar=cap" in blk[i:j], \
             "the post-close decide must carry the cap"
 
     def test_both_decides_carry_it(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert blk.count("max_per_bar=cap") >= 2
 
 

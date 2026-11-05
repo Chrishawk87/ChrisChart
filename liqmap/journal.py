@@ -549,6 +549,22 @@ class Journal(ThreadedDB):
             (int(trade_id),)).fetchone()
         return _trade_of(r) if r else None
 
+    def coins(self) -> tuple:
+        """Every market that has journal settings, so the stepper
+        knows what to step without being told.
+
+        From the SETTINGS table rather than the trades table: a
+        market Chris has configured but not yet traded still needs
+        stepping, and that is exactly the state a fresh strategy is
+        in.
+        """
+        try:
+            rows = self._conn.execute(
+                "SELECT DISTINCT coin FROM journal_settings").fetchall()
+        except Exception:                               # noqa: BLE001
+            return ()
+        return tuple(r["coin"] for r in rows if r["coin"])
+
     def sides_in_bar(self, coin: str, bar_ts: float,
                      strategy: str = "", strict: bool = False) -> tuple:
         """Which directions have already been opened in this candle.

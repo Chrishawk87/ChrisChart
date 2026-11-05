@@ -207,7 +207,7 @@ class TestTheRouteReadsBothSeries:
     def test_the_strategy_reads_the_same_function_the_panel_does(self):
         """One source, so the screen cannot show an agreement the
         rule did not see."""
-        step = py_func("_journal_step")
+        step = py_func("_journal_step_un")
         route = py_func("api_fusion")
         assert "_fusion_now(rt_)" in step
         assert "_fusion_now(rt_" in route
@@ -223,7 +223,7 @@ class TestTheRouteReadsBothSeries:
 
     def test_only_fused_trades_use_the_three_way_exit(self):
         """The exit reading is taken for this strategy and no other."""
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert 'if strat == "fused" and t is not None and t.open:' in blk
         assert 'disagreed = ""' in blk
 
@@ -495,14 +495,14 @@ class TestTheFiveMinuteLeg:
     def test_the_route_counts_against_the_5m_bar(self):
         """Not the 15-minute window: a cap from that clock would
         refuse a good entry because of a trade twelve minutes old."""
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert 'bar_ts = float((fus.get("m5") or {}).get("start_ts") or 0.0)' \
             in blk
         assert "cap = 1" in blk
         assert "max_per_bar=cap" in blk
 
     def test_the_route_passes_only_two_legs_to_the_exit(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "holds_exit(" in blk
         assert "disagreed=disagreed" in blk
 
@@ -634,7 +634,7 @@ class TestOneTradePerCandleIsAirtight:
         assert opens == 1
 
     def test_the_sentinel_never_reaches_the_panel_as_a_side(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert '[x for x in taken if x != "?"]' in blk
 
     def test_the_panel_states_whether_the_bar_is_spent(self):

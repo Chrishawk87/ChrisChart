@@ -3247,6 +3247,58 @@ def _flow_snapshot(tape, interval: str) -> dict:
 def create_app() -> FastAPI:
     rt = runtime()
 
+    # ---- the rule's own clock, independent of any browser ----------
+    #
+    # THE STRATEGY USED TO STOP WHEN THE LAPTOP SHUT. Everything that
+    # evaluates it -- the entry test, the exit test, the cap, the
+    # alert -- hangs off `/api/read`, and that route is only called
+    # by a page. Close the tab and the rule is not late, it is gone:
+    # an open position sits there with nothing watching its stop.
+    #
+    # So it runs here too. Same function the route calls, same lock,
+    # so the two cannot both act on one signal.
+    #
+    # It does NOT reach a broker. Auto still only writes journal
+    # rows; this makes those rows happen on time rather than when
+    # someone happens to be looking.
+    class _JournalStepper(threading.Thread):
+        """Steps every configured market once a second."""
+
+        def __init__(self, rt_, every: float = 1.0):
+            super().__init__(daemon=True, name="journal-stepper")
+            self.rt = rt_
+            self.every = max(0.2, float(every))
+            self._stop = threading.Event()
+            self.steps = 0
+            self.errors = 0
+            self.last_error = ""
+            self.last_ts = 0.0
+
+        def stop(self) -> None:
+            self._stop.set()
+
+        def run(self) -> None:
+            while not self._stop.wait(self.every):
+                try:
+                    coins = self.rt.journal.coins()
+                except Exception as exc:                # noqa: BLE001
+                    self.errors += 1
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    continue
+                for c in coins:
+                    try:
+                        _journal_step(self.rt, c, {})
+                        self.steps += 1
+                        self.last_ts = time.time()
+                    except Exception as exc:            # noqa: BLE001
+                        # One bad market must not stop the others,
+                        # and nothing here may take the service down
+                        # -- a dead stepper is a position nobody is
+                        # managing, which is the failure this exists
+                        # to prevent.
+                        self.errors += 1
+                        self.last_error = f"{c}: {type(exc).__name__}: {exc}"
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Deploy logs are the only place these warnings will be seen, so they
@@ -3266,6 +3318,18 @@ def create_app() -> FastAPI:
         rt.signal_broadcaster.set_loop(loop)
         rt.ingest_hub.set_loop(loop)
         rt.delta_worker.start()
+
+        # The rule keeps running with every browser closed.
+        try:
+            _stepper = _JournalStepper(rt, every=1.0)
+            _stepper.start()
+            rt.journal_stepper = _stepper
+            print("[liqmap] journal stepper started -- the strategy "
+                  "runs without a browser", flush=True)
+        except Exception as exc:                        # noqa: BLE001
+            rt.journal_stepper = None
+            print(f"[liqmap] journal stepper did NOT start: {exc}",
+                  flush=True)
         if rt.ofi is not None and rt.ofi.tape is not None:
             _tape = rt.ofi.tape
             _bc   = rt.book_broadcaster
@@ -3311,6 +3375,16 @@ def create_app() -> FastAPI:
             rt.ofi.on_reading(_ofi_notify)
 
         yield
+
+        # Let the stepper finish its current pass and stop. A daemon
+        # thread would die with the process anyway; asking it first
+        # means it is never killed halfway through writing a row.
+        _st = getattr(rt, "journal_stepper", None)
+        if _st is not None:
+            try:
+                _st.stop()
+            except Exception:                           # noqa: BLE001
+                pass
 
     app = FastAPI(title=APP_TITLE, docs_url="/api/docs", redoc_url=None,
                   lifespan=lifespan)
@@ -5592,10 +5666,32 @@ def create_app() -> FastAPI:
         if rt_ is None:
             return {"error": "the service is still starting"}
         st = _fusion_now(rt_, int(per_bar or 0))
+        # THE TIMED READINGS AND THE STEPPER DO NOT DEPEND ON THE
+        # TICK BARS, so they are built before the early return
+        # rather than going out with it. This route had the same
+        # shape of bug `/api/read` had: one missing subsystem took
+        # the whole panel's data with it, including the part that
+        # says whether the rule is running at all. That is the
+        # reading you most want when something is wrong.
+        st_ = getattr(rt_, "journal_stepper", None)
+        extra = {
+            "timed": _timed_now(rt_),
+            "stepper": ({"running": bool(st_ and st_.is_alive()),
+                         "steps": getattr(st_, "steps", 0),
+                         "errors": getattr(st_, "errors", 0),
+                         "last_error": getattr(st_, "last_error", ""),
+                         "age_s": (round(time.time()
+                                         - getattr(st_, "last_ts", 0.0), 1)
+                                   if getattr(st_, "last_ts", 0.0) else None)}
+                        if st_ is not None
+                        else {"running": False, "steps": 0, "errors": 0,
+                              "last_error": "not started", "age_s": None}),
+        }
         if not st.get("tick") or not (st["tick"].get("per_bar")):
-            return {**st, "error": ("the tick bars are built from the ES "
-                                    "tape and that engine is not running "
-                                    "here")}
+            return {**st, **extra,
+                    "error": ("the tick bars are built from the ES "
+                              "tape and that engine is not running "
+                              "here")}
         # HAS THIS 5m BAR ALREADY USED ITS ONE TRADE? Read from the
         # same table the rule reads, so the panel cannot say "free"
         # while the rule says "taken". Chris: "i dont want this
@@ -5612,7 +5708,10 @@ def create_app() -> FastAPI:
             used = ()
         unknown = "?" in used
         real = tuple(x for x in used if x != "?")
-        return {**st, "coin": c_,
+        # THE 1-MINUTE, BESIDE THE 5. The timed rule reads these two
+        # and nothing else, and they were not on any panel -- Chris:
+        # "i dont see the 1 minute live with the 5 minute".
+        return {**st, **extra, "coin": c_,
                 "sizes": list(PER_BAR_CHOICES),
                 "default_per_bar": STRATEGY_PER_BAR,
                 "bar_used": bool(real) or unknown,
@@ -7056,7 +7155,21 @@ def create_app() -> FastAPI:
                 "holding": holding, "key": key,
                 "price": round(float(px or 0.0), 2)}
 
+    # ONE STEP AT A TIME, WHOEVER ASKED.
+    #
+    # The browser polls `/api/read` once a second and the server
+    # stepper runs on its own thread, so without this two of them
+    # can be inside the entry test at the same instant: both see no
+    # open trade, both see the signal, both open one. The cap counts
+    # rows that are already written and cannot help with a race.
+    _step_lock = threading.Lock()
+
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
+        """Serialised entry point. The policy is in `_journal_step_un`."""
+        with _step_lock:
+            return _journal_step_un(rt_, coin_, out_)
+
+    def _journal_step_un(rt_, coin_: str, out_: dict) -> dict:
         """Close what should close, open what auto should open, report.
 
         READ-ONLY WHEN AUTO IS OFF, with one exception: a stop or a
@@ -14878,8 +14991,24 @@ function paintFusion(d) {
   const box = $('fusionBox');
   if (!box) return;
   if (!d || d.error) {
+    /* THE STEPPER LINE SURVIVES THE ERROR. Whether the rule is
+       running at all is the reading you most want when something
+       else is broken, and this used to go out with everything
+       else -- the same shape of bug as the trade column dying
+       with the ladder, and the fusion payload dying with the tick
+       bars. Third time, so it is written down here too. */
+    const sp0 = (d && d.stepper) || {};
+    const T0 = (d && d.timed) || {};
     box.innerHTML = `<span class="stamp" style="width:100%">`
-      + esc((d && d.error) || 'no reading') + '</span>';
+      + esc((d && d.error) || 'no reading') + '</span>'
+      + `<div class="thin" style="margin-top:6px">`
+      + (sp0.running
+          ? `<span style="color:var(--up)">&#9679;</span> the rule is `
+            + `still stepping on the server (${sp0.steps || 0} steps)`
+          : `<span style="color:var(--down)">&#9675;</span> the rule is `
+            + `NOT stepping on the server`)
+      + (T0.say ? ` &middot; 1m/5m: ${esc(T0.say)}` : '')
+      + `</div>`;
     return;
   }
   const t = d.tick || {}, o = d.ofi || {};
@@ -14955,15 +15084,55 @@ function paintFusion(d) {
     + (d.bar_used ? '&#9679; ' : '&#9675; ') + esc(d.bar_say || '')
     + `</div>`;
 
+  /* THE TIMED RULE'S TWO CANDLES, live, beside each other. They
+     drive the Timed strategy and they were on no panel at all. */
+  const T = d.timed || {};
+  const t1 = T.m1 || {}, t5 = T.m5 || {};
+  const tLine = (c) => {
+    const out = [];
+    if (c.ticks != null)
+      out.push(`${c.ticks > 0 ? '+' : ''}${c.ticks} ticks from its open`);
+    if (c.open != null && c.close != null)
+      out.push(`open ${chPx(c.open)} &middot; now ${chPx(c.close)}`);
+    if (c.seconds != null) out.push(`${Math.round(c.seconds)}s into the bar`);
+    return out;
+  };
+  const timedVerdict = T.side
+    ? `<b style="color:var(--${T.side === 'up' ? 'up' : 'down'})">`
+      + `${esc(String(T.side).toUpperCase())}</b> &mdash; both agree`
+    : `<b style="color:var(--dim)">no entry</b> &mdash; `
+      + esc(T.why || 'no reading');
+
+  /* IS THE RULE RUNNING WITHOUT A BROWSER? Shown rather than
+     claimed: a stepper that died silently looks exactly like one
+     that is working, right up until a position is left unmanaged. */
+  const sp = d.stepper || {};
+  const stepLine = sp.running
+    ? `<span style="color:var(--up)">&#9679;</span> the rule is running `
+      + `on the server &mdash; ${sp.steps.toLocaleString()} steps`
+      + (sp.age_s != null ? `, last ${sp.age_s}s ago` : '')
+      + (sp.errors ? ` &middot; ${sp.errors} errors (${esc(sp.last_error)})` : '')
+    : `<span style="color:var(--down)">&#9675;</span> the rule is NOT `
+      + `running on the server &mdash; it only steps while this page is `
+      + `open (${esc(sp.last_error || 'stepper not started')})`;
+
   box.innerHTML =
       `<div style="margin-bottom:10px">${verdict}`
     + `<div class="thin">${why}</div>`
     + `<div class="thin" style="margin-top:2px">${holdLine}</div>`
-    + capLine + `</div>`
+    + capLine
+    + `<div class="thin" style="margin-top:4px">${stepLine}</div></div>`
     + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
     + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)
     + cell('OFI BAR &mdash; shown, decides nothing', o.dir, ofiLines)
     + cell('5 MINUTE BAR &mdash; the slow one', m.dir, m5Lines)
+    + `</div>`
+    + `<div class="thin" style="margin:12px 0 6px">`
+    + `<b>Timed strategy</b> &mdash; the 1-minute and the 5-minute, `
+    + `live: ${timedVerdict}</div>`
+    + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
+    + cell('1 MINUTE &mdash; the truth teller', t1.dir, tLine(t1))
+    + cell('5 MINUTE &mdash; the direction', t5.dir, tLine(t5))
     + `</div>`;
 
   const note = $('fusNote');

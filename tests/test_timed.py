@@ -281,7 +281,7 @@ class TestOnePerFiveMinuteCandle:
                       max_per_bar=1)[0] == ""
 
     def test_the_route_caps_it_against_the_five_minute_bar(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert 'if strat in ("fused", "timed"):' in blk
         assert 'bar_ts = float((fus.get("m5") or {}).get("start_ts") or 0.0)' \
             in blk
@@ -301,12 +301,12 @@ class TestTheRouteWiring:
         assert "tape.candle(" not in blk
 
     def test_the_step_picks_the_right_reading(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert '_timed_now(rt_) if strat == "timed" else _fusion_now(rt_)' \
             in blk
 
     def test_the_exit_uses_the_reversal_not_a_disagreement(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "_tm.reversed_against(" in blk
 
     def test_the_exit_is_guided_by_the_ONE_minute(self):
@@ -319,7 +319,7 @@ class TestTheRouteWiring:
         before exiting a trade but to guide it" -- the 1-minute is
         what says so first.
         """
-        for fn in ("_journal_step", "_advice"):
+        for fn in ("_journal_step_un", "_advice"):
             blk = py_func(fn)
             i = blk.index("_tm.reversed_against(")
             seg = blk[i:i + 160]
@@ -332,7 +332,7 @@ class TestTheRouteWiring:
         assert "_tm.reversed_against(" in blk
 
     def test_the_panel_shows_what_the_rule_read(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert 'elif strat == "timed":' in blk
         assert '"1m": (fus.get("m1") or {}).get("dir")' in blk
 

@@ -42,6 +42,13 @@ from .flow import FlowTape
 from .live import STALE_AFTER_S, CandleBuilder, LiveCandle
 
 DEFAULT_INTERVALS = (60.0, 300.0, 900.0)      # 1m, 5m, 15m
+
+# How long the locked instrument may go silent before another one is
+# allowed to take over. A real contract roll is a once-a-quarter
+# event and the old month goes quiet for good; a stray print from a
+# neighbouring month is a single record in a live stream. Ten
+# minutes tells those apart without a calendar.
+RELOCK_S = 600.0
 # PER INTERVAL, and 300 was chosen when these candles only fed the
 # panels that read the last few hours.
 #
@@ -96,6 +103,15 @@ class Tape:
     """Trades from a CME record stream, as candles per timeframe."""
 
     symbol: str = "ES"
+    # THE CONTRACT THIS TAPE IS FOLLOWING. Zero until the first
+    # record locks it. Everything from another instrument is counted
+    # in `other_instrument` and dropped, because one print from a
+    # different month is enough to break a stop at a price the
+    # traded contract never reached.
+    instrument_id: int = 0
+    instrument_ts: float = 0.0
+    other_instrument: int = 0
+    rolls: int = 0
     intervals: tuple = DEFAULT_INTERVALS
     keep: int = KEEP_CLOSED
 
@@ -365,8 +381,57 @@ class Tape:
         The book is updated from every record that has levels, because
         the book call wants the state as of now and most records are
         not trades.
+
+        ONE INSTRUMENT ONLY, AND THAT WAS MISSING.
+
+        `book_from(rec, symbol=self.symbol)` takes the symbol as a
+        LABEL -- it does not filter -- and `trade_from` never saw a
+        symbol at all. So every record the subscription delivered
+        set `last_px`, whatever contract it belonged to, and
+        `last_px` is the price the journal fills and stops at.
+
+        Chris watched a long entered at 7478 go to 7486 and get
+        recorded as a 13-tick LOSS at 7474.75, a price the front
+        month never traded while he was looking at it. An ES
+        calendar month sits ten to fifteen points away from the
+        front; 7486 against 7474.75 is 11.25. A single print from
+        another contract is enough to break a stop that the market
+        never came near.
+
+        So the first instrument seen locks it, and records from any
+        other are counted and dropped. The count is published rather
+        than hidden: if it is zero this was never the cause, and if
+        it is not, it says so without anyone having to guess.
+
+        It unlocks again after `RELOCK_S` of silence from the locked
+        instrument, so a genuine contract roll is picked up instead
+        of freezing the tape on an expired month.
         """
         self.records += 1
+        iid = dbn._get(rec, "instrument_id")
+        if iid is not None:
+            try:
+                iid = int(iid)
+            except (TypeError, ValueError):
+                iid = 0
+            if iid:
+                ts_now = float(dbn.seconds(
+                    dbn._get(rec, "ts_event")) or 0.0)
+                if not self.instrument_id:
+                    self.instrument_id = iid
+                    self.instrument_ts = ts_now
+                elif iid != self.instrument_id:
+                    stale = (ts_now and self.instrument_ts
+                             and ts_now - self.instrument_ts > RELOCK_S)
+                    if stale:
+                        self.rolls += 1
+                        self.instrument_id = iid
+                        self.instrument_ts = ts_now
+                    else:
+                        self.other_instrument += 1
+                        return False
+                else:
+                    self.instrument_ts = ts_now or self.instrument_ts
         if self.bookdiag is not None:
             try:
                 self.bookdiag.observe(rec)
@@ -662,6 +727,9 @@ class Tape:
         cur = self.candle(interval, now)
         out = {
             "symbol": self.symbol,
+            "instrument_id": self.instrument_id,
+            "other_instrument": self.other_instrument,
+            "rolls": self.rolls,
             "intervals": [label(s) for s in self.intervals],
             "interval": interval,
             "records": self.records,

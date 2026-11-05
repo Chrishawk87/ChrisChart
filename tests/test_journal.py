@@ -113,7 +113,7 @@ class TestItDoesNotTrade:
     def test_the_payload_says_so_on_every_response(self):
         """Stated in the data, not only in a comment, so a reader of
         the API cannot mistake what auto means."""
-        assert '"places_orders": False' in py_func("_journal_step")
+        assert '"places_orders": False' in py_func("_journal_step_un")
 
 
 class TestATickIsTwelveFifty:
@@ -699,7 +699,7 @@ class TestAutoEntryAndExitFire:
     def test_the_route_applies_the_decision(self):
         """The policy is called AND acted on. A decision nothing acts
         on is the same bug in a different place."""
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "jn.decide(" in blk
         assert 'act == "close"' in blk
         assert 'act == "open"' in blk
@@ -773,7 +773,7 @@ class TestTheCandleDecidesAndTheStackVetoes:
         """A block that fires invisibly is worse than no block -- it
         reads as a market with nothing in it. It names which of the
         window's three is off now, not which timeframe."""
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert '"blocked"' in blk
         assert '"would_be"' in blk
         assert '"window"' in blk
@@ -790,7 +790,7 @@ class TestTheCandleDecidesAndTheStackVetoes:
         Pinned so the removal is a decision on the record rather
         than something that quietly stopped firing.
         """
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "jn_signal(" not in blk
         assert "_agreement(" not in blk
 
@@ -1225,7 +1225,7 @@ class TestOneTradePerCandle:
         assert jn.sides_in_bar("ES", 0.0) == ()
 
     def test_the_route_passes_the_candle_through(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "j.sides_in_bar(coin_, bar_ts, strat)" in blk
         assert "bar_ts=bar_ts" in blk
         assert "jn.decide(t, s, px, side, taken," in blk
@@ -1512,7 +1512,7 @@ class TestTheWindowOpensTheTrade:
         _rt, _tape, cw = self._set_up(monkeypatch)
         self._auto_on(client)
         self._read(client)
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert 'win.get("start_ts")' in blk
 
     def test_the_signal_comes_from_the_panels_own_object(self):
@@ -1681,7 +1681,7 @@ class TestTheDivergeExitIsOffForTheWindow:
                             "down", window_rule=False) == "diverge"
 
     def test_the_route_asks_for_the_window_rule(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "window_rule=True" in blk
 
 
@@ -1760,7 +1760,7 @@ class TestTheTwoStrategies:
         assert "candle" in j["strategies"]
 
     def test_the_route_uses_the_chosen_one(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "jn.window_signal(" in blk
         assert "strat" in blk
         assert "strategy=strat" in blk
@@ -1900,7 +1900,7 @@ class TestTheFootprintStrategy:
                 else "") == "up"
 
     def test_the_route_passes_it_in(self):
-        blk = py_func("_journal_step")
+        blk = py_func("_journal_step_un")
         assert "_footprint_imbalance(rt_)" in blk
         assert 'fpi.get("side")' in blk
         assert '"footprint": fpi' in blk
