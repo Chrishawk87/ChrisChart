@@ -550,7 +550,7 @@ class Journal(ThreadedDB):
         return _trade_of(r) if r else None
 
     def sides_in_bar(self, coin: str, bar_ts: float,
-                     strategy: str = "") -> tuple:
+                     strategy: str = "", strict: bool = False) -> tuple:
         """Which directions have already been opened in this candle.
 
         FROM THE TABLE, NOT FROM MEMORY. The column is driven by a
@@ -559,7 +559,20 @@ class Journal(ThreadedDB):
         no cap.
         """
         if not bar_ts:
-            return ()
+            # NO BAR ID MEANS NO CAP, and an empty tuple here reads
+            # to the caller as "this candle has taken nothing" --
+            # which permits an entry on every single poll. A rule
+            # capped at one trade a bar then takes them as fast as
+            # the poll runs, which is indistinguishable from having
+            # no rule at all.
+            #
+            # OPT-IN, and that is deliberate. Returning the sentinel
+            # to everyone changes what the OFI, candle and footprint
+            # rules do in a case Chris has not complained about, and
+            # a strategy that silently stops trading is a worse
+            # surprise than one that caps loosely. Only the caller
+            # that genuinely depends on the cap asks for it.
+            return ("?",) if strict else ()
         # PER STRATEGY. They share the table, so a window the OFI
         # rule has used must not block the candle rule from using it.
         sql = ("SELECT side FROM journal_trades WHERE coin=?"
@@ -737,6 +750,13 @@ def decide(t: Trade | None, s: Settings, px: float,
     # same bar and the same idea, charged a round trip every time.
     #
     # `taken` is the sides already opened in THIS candle.
+    # THE SENTINEL FROM `sides_in_bar`: the candle could not be
+    # identified. Refusing is the only safe reading -- an
+    # unidentifiable candle cannot hold a one-trade cap, so allowing
+    # the entry means allowing one on every poll.
+    if "?" in taken:
+        return "", ("the candle this would be counted against could "
+                    "not be identified -- nothing opens until it can")
     if agree in taken:
         return "", f"this candle has already taken its {agree}"
     # THE TWO RULES COINCIDE AT TWO DIRECTIONS, so this one never

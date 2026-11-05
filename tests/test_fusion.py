@@ -536,3 +536,184 @@ class TestTheFiveMinuteLeg:
     def test_the_panel_no_longer_claims_a_hold(self):
         blk = js_func("paintFusion")
         assert "held until the <b>5m</b> turns" not in blk
+
+
+class TestOneTradePerCandleIsAirtight:
+    """Chris: "i dont want this taking trades randomly just once
+    every 5 minute candle if the setup is there".
+
+    The cap is the only thing between this rule and the churn, so it
+    is tested for the way it FAILS as well as the way it works.
+    """
+
+    @staticmethod
+    def _s():
+        return Settings(coin="ES", auto=True, strategy="fused")
+
+    def test_a_fresh_bar_allows_one(self):
+        assert decide(None, self._s(), 6800.0, "up", taken=(),
+                      max_per_bar=1) == ("open", "up")
+
+    def test_a_used_bar_allows_none(self):
+        assert decide(None, self._s(), 6800.0, "up", taken=("up",),
+                      max_per_bar=1)[0] == ""
+
+    def test_not_even_the_other_way(self):
+        assert decide(None, self._s(), 6800.0, "down", taken=("up",),
+                      max_per_bar=1)[0] == ""
+
+    def test_an_unidentifiable_candle_opens_nothing(self):
+        """THE HOLE THAT FAILED THE RIGHT WAY ROUND.
+
+        `sides_in_bar` returned () when it had no bar id, which
+        reads as "this candle has taken nothing" -- so a rule capped
+        at one trade a bar would take one on EVERY POLL, which is
+        indistinguishable from having no cap. It returns a sentinel
+        now and the policy refuses.
+        """
+        act, why = decide(None, self._s(), 6800.0, "up", taken=("?",),
+                          max_per_bar=1)
+        assert act == ""
+        assert "could not be identified" in why
+
+    def test_the_store_returns_the_sentinel_not_an_empty_tuple(self, tmp_path):
+        from liqmap.journal import Journal
+        j = Journal(tmp_path / "j.db")
+        assert j.sides_in_bar("ES", 0.0, "fused", strict=True) == ("?",)
+        # Unchanged for everyone else.
+        assert j.sides_in_bar("ES", 0.0, "fused") == ()
+        assert j.sides_in_bar("ES", 1_700_000_000.0, "fused") == ()
+
+    def test_a_closed_trade_still_counts_against_its_bar(self, tmp_path):
+        """Otherwise a take profit frees the bar immediately, which
+        is the exact bug Chris reported: "after one trade hit the
+        take profit it immediately jumps in for another trade"."""
+        from liqmap.journal import Journal
+        j = Journal(tmp_path / "j.db")
+        bar = 1_700_000_000.0
+        j.open_trade("ES", "up", 6800.0, mode="auto", bar_ts=bar,
+                     strategy="fused")
+        j.close_trade("ES", 6801.0, why="tp")
+        assert j.sides_in_bar("ES", bar, "fused") == ("up",)
+        assert decide(None, self._s(), 6801.0, "up",
+                      taken=j.sides_in_bar("ES", bar, "fused"),
+                      max_per_bar=1)[0] == ""
+
+    def test_a_new_bar_frees_it(self, tmp_path):
+        from liqmap.journal import Journal
+        j = Journal(tmp_path / "j.db")
+        bar = 1_700_000_000.0
+        j.open_trade("ES", "up", 6800.0, mode="auto", bar_ts=bar,
+                     strategy="fused")
+        j.close_trade("ES", 6801.0, why="tp")
+        nxt = bar + 300.0
+        assert j.sides_in_bar("ES", nxt, "fused") == ()
+        assert decide(None, self._s(), 6801.0, "up",
+                      taken=j.sides_in_bar("ES", nxt, "fused"),
+                      max_per_bar=1) == ("open", "up")
+
+    def test_fifty_polls_through_one_bar_open_one_trade(self, tmp_path):
+        """The shape of the complaint, run as a simulation."""
+        from liqmap.journal import Journal
+        j = Journal(tmp_path / "j.db")
+        bar = 1_700_000_000.0
+        opens = 0
+        for i in range(50):
+            taken = j.sides_in_bar("ES", bar, "fused")
+            act, _ = decide(None, self._s(), 6800.0, "up", taken=taken,
+                            max_per_bar=1)
+            if act == "open":
+                opens += 1
+                j.open_trade("ES", "up", 6800.0, mode="auto",
+                             bar_ts=bar, strategy="fused")
+                j.close_trade("ES", 6800.5, why="tp")   # and out again
+        assert opens == 1
+
+    def test_the_sentinel_never_reaches_the_panel_as_a_side(self):
+        blk = py_func("_journal_step")
+        assert '[x for x in taken if x != "?"]' in blk
+
+    def test_the_panel_states_whether_the_bar_is_spent(self):
+        blk = js_func("paintFusion")
+        assert "bar_say" in blk and "bar_used" in blk
+
+    def test_the_route_reads_the_same_table_the_rule_does(self):
+        """A panel that says "free" while the rule says "taken" is
+        worse than no panel."""
+        blk = py_func("api_fusion")
+        assert "sides_in_bar(c_, bar_ts" in blk
+
+
+class TestNoEntryAtTheEndOfTheBar:
+    """Chris: "the strategy never takes a trade at the end of the 5
+    minutes either".
+
+    The 5m leg is half of both the entry and the exit, and its
+    direction RESETS at the bar boundary -- close against open
+    becomes close against a brand new open. A trade opened at 4:50 is
+    opened ten seconds before one of the two things holding it is
+    re-rolled, and it is usually closed by that reset rather than by
+    anything the market did.
+    """
+
+    def test_mid_bar_is_fine(self):
+        assert fu.tail_block({"seconds": 120}) == ""
+
+    def test_the_last_minute_is_closed(self):
+        why = fu.tail_block({"seconds": 250})
+        assert why
+        assert "50s left" in why and "last 60s" in why
+
+    def test_the_boundary_is_inclusive(self):
+        """At exactly 60s left the tail has started."""
+        assert fu.tail_block({"seconds": 240.0}) != ""
+        assert fu.tail_block({"seconds": 239.0}) == ""
+
+    def test_it_blocks_an_entry_the_legs_would_have_allowed(self):
+        ok = fu.state({"dir": "up"}, {"read": "up"},
+                      {"dir": "up", "seconds": 120})
+        late = fu.state({"dir": "up"}, {"read": "up"},
+                        {"dir": "up", "seconds": 270})
+        assert ok["side"] == "up"
+        assert late["side"] == ""
+        assert late["tail_blocked"] is True
+        assert "last 60s" in late["why"]
+
+    def test_a_disagreement_is_still_the_reported_reason(self):
+        """"they do not agree" is more useful than "no room left"
+        when they also do not agree."""
+        st = fu.state({"dir": "up"}, {"read": "up"},
+                      {"dir": "down", "seconds": 280})
+        assert st["side"] == ""
+        assert st["why"] == "the tick bar is up and the 5m is down"
+
+    def test_the_strategy_refuses_in_the_tail(self):
+        st = fu.state({"dir": "up"}, {"read": "up"},
+                      {"dir": "up", "seconds": 290})
+        assert window_signal({}, "fused", "", st)[0] == ""
+
+    def test_it_never_closes_an_open_trade(self):
+        """The tail is a bad place to START something, not a reason
+        to abandon something already working. `holds_exit` is not
+        even given the age."""
+        import inspect
+        assert "seconds" not in inspect.signature(fu.holds_exit).parameters
+        assert fu.holds_exit("up", "up", "up") == (True, "")
+
+    def test_a_missing_age_is_treated_as_room(self):
+        """Refusing every entry over a missing timestamp is a louder
+        failure than taking one slightly late."""
+        assert fu.tail_block({}) == ""
+        assert fu.tail_block(None) == ""
+        assert fu.tail_block({"seconds": "x"}) == ""
+        assert fu.tail_block({"seconds": 0}) == ""
+
+    def test_the_window_is_one_constant(self):
+        assert fu.M5_TAIL_S == 60.0
+        assert fu.M5_PERIOD_S == 300.0
+        assert fu.tail_block({"seconds": 250}, tail_s=10.0) == ""
+
+    def test_the_panel_shows_the_time_left(self):
+        blk = js_func("paintFusion")
+        assert "s left" in blk
+        assert "tail_blocked" in blk

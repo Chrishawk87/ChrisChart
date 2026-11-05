@@ -5596,9 +5596,33 @@ def create_app() -> FastAPI:
             return {**st, "error": ("the tick bars are built from the ES "
                                     "tape and that engine is not running "
                                     "here")}
-        return {**st, "coin": rt_.resolve_symbol(coin)[0] or coin,
+        # HAS THIS 5m BAR ALREADY USED ITS ONE TRADE? Read from the
+        # same table the rule reads, so the panel cannot say "free"
+        # while the rule says "taken". Chris: "i dont want this
+        # taking trades randomly just once every 5 minute candle if
+        # the setup is there" -- the cap is the answer and it has to
+        # be visible, not inferred from the trade list.
+        c_ = rt_.resolve_symbol(coin)[0] or coin
+        bar_ts = float((st.get("m5") or {}).get("start_ts") or 0.0)
+        used: tuple = ()
+        try:
+            used = rt_.journal.sides_in_bar(c_, bar_ts, "fused",
+                                            strict=True)
+        except Exception:                               # noqa: BLE001
+            used = ()
+        unknown = "?" in used
+        real = tuple(x for x in used if x != "?")
+        return {**st, "coin": c_,
                 "sizes": list(PER_BAR_CHOICES),
-                "default_per_bar": STRATEGY_PER_BAR}
+                "default_per_bar": STRATEGY_PER_BAR,
+                "bar_used": bool(real) or unknown,
+                "bar_sides": list(real),
+                "bar_known": not unknown,
+                "bar_say": ("this 5m bar cannot be identified -- "
+                            "nothing opens until it can" if unknown
+                            else f"this 5m bar has taken its trade "
+                                 f"({', '.join(real)})" if real
+                            else "this 5m bar has not traded yet")}
 
     @app.get("/api/clockwindows", dependencies=[Depends(require_token)])
     def api_clockwindows(coin: str = "ES", limit: int = 40,
@@ -7001,7 +7025,7 @@ def create_app() -> FastAPI:
         if strat == "fused":
             cap = 1
             bar_ts = float((fus.get("m5") or {}).get("start_ts") or 0.0)
-            taken = j.sides_in_bar(coin_, bar_ts, strat)
+            taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
 
         t = j.open_trade_for(coin_)
         closed = None
@@ -7069,7 +7093,11 @@ def create_app() -> FastAPI:
             # WHY NOTHING HAPPENED, on every poll that does
             # nothing. Blank only when a trade was opened or closed.
             "idle": idle_why,
-            "taken_this_candle": list(taken),
+            # The sentinel is an internal signal, not a side. It
+            # must not reach the panel as if a trade called "?" had
+            # been taken.
+            "taken_this_candle": [x for x in taken if x != "?"],
+            "candle_known": "?" not in taken,
             "max_per_candle": jn.MAX_PER_BAR,
             # THE READ ITSELF, not only its direction. The column
             # could show which timeframe was holding a signal up and
@@ -14771,13 +14799,27 @@ function paintFusion(d) {
   const m5Lines = [];
   if (m.ticks != null)
     m5Lines.push(`${m.ticks > 0 ? '+' : ''}${m.ticks} ticks from its open`);
-  if (m.seconds != null) m5Lines.push(`${m.seconds}s into the bar`);
+  if (m.seconds != null) {
+    const left = Math.max(0, Math.round(300 - m.seconds));
+    m5Lines.push(`${Math.round(m.seconds)}s in, ${left}s left`
+      + (d.tail_blocked ? ' &mdash; <b>tail, no new entry</b>' : ''));
+  }
   if (m.why) m5Lines.push(esc(m.why));
+
+  /* THE CAP, STATED. One trade per 5-minute bar is the thing
+     standing between this rule and the churn, so whether this bar
+     has spent its trade is not a detail to be inferred from the
+     trade list below. */
+  const capLine = `<div class="thin" style="margin-top:2px;color:var(--`
+    + (d.bar_used ? 'dim' : 'ink') + `)">`
+    + (d.bar_used ? '&#9679; ' : '&#9675; ') + esc(d.bar_say || '')
+    + `</div>`;
 
   box.innerHTML =
       `<div style="margin-bottom:10px">${verdict}`
     + `<div class="thin">${why}</div>`
-    + `<div class="thin" style="margin-top:2px">${holdLine}</div></div>`
+    + `<div class="thin" style="margin-top:2px">${holdLine}</div>`
+    + capLine + `</div>`
     + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
     + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)
     + cell('OFI BAR &mdash; shown, decides nothing', o.dir, ofiLines)

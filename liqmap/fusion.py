@@ -67,6 +67,26 @@ SIDES = ("up", "down")
 # put back by passing one, but the default is none.
 M5_SETTLE_S = 0.0
 
+# How long a 5-minute bar runs, and how much of its tail is closed to
+# new entries.
+#
+# NOTHING OPENS IN THE LAST MINUTE OF A 5-MINUTE BAR. Chris: "the
+# strategy never takes a trade at the end of the 5 minutes either".
+#
+# The reason is structural rather than superstitious. The 5m leg is
+# half of both the entry and the exit, and at the bar boundary its
+# direction RESETS -- close against open becomes close against a
+# brand new open. A trade opened at 4:50 is therefore opened ten
+# seconds before one of the two things holding it is re-rolled from
+# scratch, and it will usually be closed by that reset rather than by
+# anything the market did. Those are not trades, they are artefacts
+# of where the clock happened to be.
+#
+# Sixty seconds of three hundred. One constant, and the first dial to
+# turn if it proves too much or too little.
+M5_PERIOD_S = 300.0
+M5_TAIL_S = 60.0
+
 
 def agreement(tick_dir: str, ofi_dir: str) -> tuple[str, str]:
     """The side both point at, or "" and the reason there is none.
@@ -116,6 +136,35 @@ def m5_direction(m5: dict | None,
     if d not in SIDES:
         return "", "the 5m bar is flat"
     return d, ""
+
+
+def tail_block(m5: dict | None, period_s: float = M5_PERIOD_S,
+               tail_s: float = M5_TAIL_S) -> str:
+    """"" if there is room left in the 5m bar, else why there is not.
+
+    ENTRY ONLY. An open position is never closed by this -- the tail
+    is a bad place to START something, not a reason to abandon
+    something already working.
+
+    An age that cannot be read is treated as room rather than as a
+    block: the age is advisory here, and refusing every entry
+    because a timestamp was missing would be a far louder failure
+    than taking one slightly late.
+    """
+    if not m5:
+        return ""
+    try:
+        age = float(m5.get("seconds") or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if age <= 0:
+        return ""
+    left = float(period_s) - age
+    if left > float(tail_s):
+        return ""
+    return (f"only {max(0, int(left))}s left in the 5m bar -- nothing "
+            f"opens in its last {int(tail_s)}s, the 5m direction "
+            "resets at the boundary")
 
 
 def entry_side(tick_dir: str, m5_dir: str) -> tuple[str, str]:
@@ -221,6 +270,13 @@ def state(tick: dict | None, ofi: dict | None,
     # allowed to change it.
     concurs = bool(o_dir in SIDES)
     side, why = entry_side(t_dir, m_dir)
+    # The tail closes the door on a NEW trade even when the two
+    # legs agree. Applied after the direction test so the reported
+    # reason is the one a reader needs: "they do not agree" is more
+    # useful than "no room left" when they also do not agree.
+    tail = tail_block(m5) if side else ""
+    if tail:
+        side, why = "", tail
     return {
         "tick": {
             "dir": t_dir,
@@ -257,6 +313,7 @@ def state(tick: dict | None, ofi: dict | None,
         "ofi_known": concurs,
         "side": side,
         "agree": bool(side),
+        "tail_blocked": bool(tail),
         "why": why,
         "say": (f"the tick bar and the 5m both point {side}" if side
                 else why or "no reading yet"),
