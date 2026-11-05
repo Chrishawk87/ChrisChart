@@ -5735,23 +5735,25 @@ def create_app() -> FastAPI:
                 else:
                     kept = (" -- nothing is saving these candles, so "
                             "every restart starts from empty")
-                return {**out,
+                return _with_journal(rt, coin, {**out,
                         "error": (
                             f"the CME tape has {len(bars)} closed "
                             f"{interval} bars so far. It builds candles "
                             f"from prints as they arrive, so this fills "
                             f"in as the session runs"
                             + kept
-                            + (f" -- {why}" if why else ""))}
+                            + (f" -- {why}" if why else ""))})
         else:
             try:
                 bars = client.candles(coin, interval, bars=200)
             except Exception as exc:
-                return {**out, "error": f"candles unavailable: {exc}"}
+                return _with_journal(
+                    rt, coin,
+                    {**out, "error": f"candles unavailable: {exc}"})
             if len(bars) < 10:
-                return {**out,
+                return _with_journal(rt, coin, {**out,
                         "error": f"only {len(bars)} candles came back — "
-                                 f"not enough to read structure"}
+                                 f"not enough to read structure"})
 
         from .structure import Candle
         from .live import INTERVALS as _LIVE_INTERVALS
@@ -6959,6 +6961,80 @@ def create_app() -> FastAPI:
             bool((read or {}).get("flip_ok")))
         return side, says, blocked
 
+    def _with_journal(rt_, coin_: str, payload: dict) -> dict:
+        """Attach the trade column to a payload that is giving up.
+
+        THE COLUMN IS NOT PART OF THE LADDER AND MUST NOT DIE WITH
+        IT. `/api/read` has three early returns -- the CME tape has
+        under ten closed bars, the candle fetch failed, too few
+        candles came back -- and every one of them returned with no
+        `journal` key at all. The panel then had nothing to draw: no
+        trades, no stats, and no way to see whether AUTO was even on.
+        Chris: "it doesnt show the trades and i cant see if its auto
+        trading either".
+
+        The first of those three is the UNREAD condition he has been
+        looking at for days, so the column vanished exactly when he
+        most needed to know what the rule was doing.
+
+        Nothing the column needs comes from the ladder. It reads the
+        tick bar, the 5-minute candle and the last print; none of
+        that requires ten closed 15-minute bars.
+        """
+        try:
+            payload["journal"] = _journal_step(rt_, coin_, payload)
+        except Exception as exc:                        # noqa: BLE001
+            payload["journal"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return payload
+
+    def _advice(jn, j, s, t, px, side, taken, cap, strat, fus, win,
+                coin_, bar_ts) -> dict:
+        """What the rule WOULD do, regardless of AUTO or who opened it.
+
+        Chris cannot get an Ironbeam API key until the account is
+        funded, so he is trading the signals by hand. For that the
+        EXIT has to be called out as loudly as the entry -- an exit
+        he does not notice is an unmanaged position, which is worse
+        than a missed entry.
+
+        The acting path still refuses to end a hand-taken row and
+        still does nothing with AUTO off. This only answers the
+        question. It is the SAME `decide`, with one flag, because a
+        second implementation would let the alert advertise a rule
+        the column does not follow -- and he would find out which
+        one was right while holding a position.
+        """
+        from . import fusion as _fu
+
+        disagreed = ""
+        if strat == "fused" and t is not None and t.open:
+            ok, why_out = _fu.holds_exit(
+                t.side,
+                (fus.get("tick") or {}).get("dir") or "",
+                (fus.get("m5") or {}).get("dir") or "")
+            if not ok:
+                disagreed = why_out
+        try:
+            act, why = jn.decide(
+                t, s, px, side, taken, (win.get("mid_dir") or ""),
+                window_rule=True, disagreed=disagreed,
+                max_per_bar=cap, advisory=True)
+        except Exception as exc:                        # noqa: BLE001
+            return {"act": "", "why": f"{type(exc).__name__}: {exc}",
+                    "side": "", "holding": "", "key": ""}
+
+        holding = t.side if (t is not None and t.open) else ""
+        if act == "close" and t is not None:
+            key = f"close:{t.id}:{why}"
+        elif act == "open":
+            key = f"open:{bar_ts:.0f}:{side}"
+        else:
+            key = ""
+        return {"act": act, "why": why,
+                "side": side if act == "open" else "",
+                "holding": holding, "key": key,
+                "price": round(float(px or 0.0), 2)}
+
     def _journal_step(rt_, coin_: str, out_: dict) -> dict:
         """Close what should close, open what auto should open, report.
 
@@ -7057,9 +7133,18 @@ def create_app() -> FastAPI:
             closed = j.close_trade(coin_, px, why=arg)
             t = None
             taken = j.sides_in_bar(coin_, bar_ts, strat)
+            # THE CAP HAS TO BE PASSED HERE TOO. It was not, so
+            # after a close this fell back to the default of two per
+            # candle -- the just-closed side was blocked but the
+            # OPPOSITE one was free, and the rule could turn round
+            # inside the same 5-minute bar. That is the
+            # "immediately jumps in for another trade" shape
+            # surviving in the one place the cap was not threaded
+            # through.
             act, arg = jn.decide(None, s, px, side, taken,
                                  (win.get("mid_dir") or ""),
-                                 window_rule=True)
+                                 window_rule=True,
+                                 max_per_bar=cap)
             idle_why = arg if act == "" else ""
         if act == "open":
             t = j.open_trade(
@@ -7096,6 +7181,8 @@ def create_app() -> FastAPI:
             # The sentinel is an internal signal, not a side. It
             # must not reach the panel as if a trade called "?" had
             # been taken.
+            "advice": _advice(jn, j, s, t, px, side, taken, cap,
+                              strat, fus, win, coin_, bar_ts),
             "taken_this_candle": [x for x in taken if x != "?"],
             "candle_known": "?" not in taken,
             "max_per_candle": jn.MAX_PER_BAR,
@@ -9762,8 +9849,14 @@ has to be running before the gate stops refusing.">spike
       <div class="conbar" style="margin-top:-2px">
         <label>tick series <select id="fusTick" onchange="fusLoad()"
           style="margin:0 4px"></select></label>
+        <label title="Sound, a desktop notification and a banner the
+moment the rule fires -- and again when it says to get out. For
+placing the trade in Ironbeam yourself."><input type="checkbox"
+          id="fusAlarm" onchange="armFusionAlert()">alert me to trade
+          this by hand</label>
         <span class="thin" id="fusNote"></span>
       </div>
+      <div id="fusAlertBar" class="alertbar" style="display:none"></div>
       <div id="fusionBox"><span class="stamp" style="width:100%">waiting
         for the first prints and book updates &mdash; this fills as the
         tape runs</span></div>
@@ -14839,6 +14932,128 @@ function paintFusion(d) {
   if (st) st.textContent = d.agree ? d.side : 'no side';
 }
 
+/* ---- the hand-trading alert ------------------------------------------ */
+/*
+   Chris is trading these signals by hand until the Ironbeam account is
+   funded, so the signal has to reach him when he is not looking at the
+   screen. Sound, a desktop notification and a bar that stays up.
+
+   THE EXIT IS ALERTED AS LOUDLY AS THE ENTRY. A missed entry costs a
+   trade; a missed exit leaves a position nobody is managing.
+*/
+const fusAlert = {armed: false, ctx: null, last: ''};
+
+function restoreFusionAlarm() {
+  try {
+    const on = localStorage.getItem('liqmap_fusalarm') === '1';
+    const box = $('fusAlarm');
+    // The checkbox is restored but NOT armed: the browser only grants
+    // sound and notifications off a real click, so arming silently here
+    // would leave a ticked box that makes no noise -- worse than an
+    // unticked one, because it is trusted.
+    if (box && on) box.indeterminate = true;
+  } catch (e) {}
+}
+
+function armFusionAlert() {
+  const on = $('fusAlarm') && $('fusAlarm').checked;
+  fusAlert.armed = !!on;
+  try { localStorage.setItem('liqmap_fusalarm', on ? '1' : '0'); } catch (e) {}
+  if (!on) { const b = $('fusAlertBar'); if (b) b.style.display = 'none'; return; }
+  // Both need a user gesture to be allowed, which is why this hangs off
+  // the checkbox rather than running on load.
+  try {
+    if (!fusAlert.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) fusAlert.ctx = new AC();
+    }
+    if (fusAlert.ctx && fusAlert.ctx.state === 'suspended') fusAlert.ctx.resume();
+  } catch (e) {}
+  try {
+    if (window.Notification && Notification.permission === 'default')
+      Notification.requestPermission();
+  } catch (e) {}
+}
+
+function fusBeep(kind) {
+  const ctx = fusAlert.ctx;
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    // Rising for a buy, falling for a sell, and three flat urgent notes
+    // for an exit -- the direction is audible without looking, and the
+    // exit does not sound like either entry.
+    const pair = kind === 'up' ? [660, 990]
+               : kind === 'down' ? [660, 440]
+               : [880, 880, 880];
+    pair.forEach((f, i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, now + i * 0.16);
+      g.gain.exponentialRampToValueAtTime(0.25, now + i * 0.16 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.16 + 0.15);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(now + i * 0.16); o.stop(now + i * 0.16 + 0.16);
+    });
+  } catch (e) {}
+}
+
+/* Called on every journal poll with the column's payload. */
+function checkFusionAlert(J) {
+  const bar = $('fusAlertBar');
+  if (!bar) return;
+  const a = (J && J.advice) || {};
+  if (!fusAlert.armed || !a.act) {
+    bar.style.display = 'none';
+    if (!a.act) fusAlert.last = '';
+    return;
+  }
+
+  const isClose = a.act === 'close';
+  const side = isClose ? (a.holding || '') : (a.side || '');
+  const word = isClose
+    ? (side === 'up' ? 'SELL to close your LONG'
+                     : 'BUY to close your SHORT')
+    : (side === 'up' ? 'BUY' : 'SELL');
+  const px = a.price ? chPx(a.price) : '';
+  const line = `${word} ${esc(coin())}${px ? ' — ' + px : ''}`
+    + (isClose ? ` — ${esc(a.why || '')}`
+               : ' — the tick bar and the 5m agree');
+
+  bar.className = 'alertbar ' + (isClose ? 'short' : (side === 'up' ? 'long' : 'short'));
+  bar.style.display = '';
+  bar.innerHTML = `<b>${line}</b>`
+    + '<span class="thin" style="margin-left:10px">place this in Ironbeam '
+    + 'yourself, then log the fill so the numbers are real</span>'
+    + `<button style="margin-left:auto" onclick="fusLogFill('${esc(side)}',`
+    + `${isClose ? 'true' : 'false'})">I did it</button>`
+    + `<button onclick="$('fusAlertBar').style.display='none'">dismiss</button>`;
+
+  if (a.key === fusAlert.last) return;     // already called, same event
+  fusAlert.last = a.key;
+  fusBeep(isClose ? 'exit' : side);
+  try {
+    if (window.Notification && Notification.permission === 'granted')
+      new Notification(isClose ? 'ChrisChart — EXIT' : 'ChrisChart — ENTRY',
+                       {body: line.replace(/<[^>]*>/g, ''), tag: a.key});
+  } catch (e) {}
+}
+
+/* Record what you ACTUALLY did, by hand.
+   The signal price is where the rule fired, not where you got filled,
+   and scoring the first as if it were the second flatters every number
+   on the panel. */
+async function fusLogFill(side, closing) {
+  try {
+    await api('/api/journal/trade?' + q(
+      closing ? {coin: coin(), action: 'close'}
+              : {coin: coin(), action: 'open', side: side}),
+      {method: 'POST'});
+  } catch (e) {}
+  const b = $('fusAlertBar'); if (b) b.style.display = 'none';
+  loadRead();
+}
+
 function paintClockWindows(d) {
   const el = $('clockWin');
   if (!el) return;
@@ -14956,6 +15171,10 @@ function paintClockWindows(d) {
 }
 
 function paintJournal(d) {
+  /* The hand-trading alert rides this painter: one poll, one source,
+     so the bar cannot announce a signal the column does not show. */
+  try { checkFusionAlert((d && d.journal) || {}); } catch (e) {}
+
   const J = (d && d.journal) || null;
   _jnlLast = J;
   const box = $('jnlBox');
@@ -16089,7 +16308,15 @@ function paintRead(d) {
   }
   if (d.error) {
     $('readHead').textContent = d.error;
-    $('readSignals').innerHTML = ''; $('readSay').style.display = 'none'; return;
+    $('readSignals').innerHTML = ''; $('readSay').style.display = 'none';
+    /* THE TRADE COLUMN IS DRAWN ANYWAY. It has its own data and its
+       own error line, and it used to be skipped here -- so when the
+       ladder could not build (the UNREAD case, which is most of the
+       first two hours after a restart) the column showed no trades,
+       no stats and no AUTO state. That reads as a broken strategy
+       rather than a stack that is still filling. */
+    paintJournal(d);
+    return;
   }
 
   const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';

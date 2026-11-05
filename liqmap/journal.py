@@ -696,7 +696,8 @@ def decide(t: Trade | None, s: Settings, px: float,
            price: str = "",
            window_rule: bool = False,
            disagreed: str = "",
-           max_per_bar: int = 0) -> tuple[str, str]:
+           max_per_bar: int = 0,
+           advisory: bool = False) -> tuple[str, str]:
     """What the journal should do right now.
 
     ("open", side), ("close", why), or ("", reason) -- and the reason
@@ -733,10 +734,26 @@ def decide(t: Trade | None, s: Settings, px: float,
     if t is not None and t.open:
         why = should_close(t, s, px, agree, price,
                            window_rule, disagreed)
-        if why in ("flip", "diverge", "disagree") and t.mode != "auto":
+        # ADVISORY MODE ANSWERS "what would you do", NOT "do it".
+        #
+        # Chris cannot get an Ironbeam API key until the account is
+        # funded, so he is trading the signals by hand in the
+        # meantime. For that he needs the EXIT called out as loudly
+        # as the entry -- an exit he does not notice is an
+        # unmanaged position, which is worse than a missed entry.
+        #
+        # But a hand-taken row is his to end, so the acting path
+        # still suppresses a flip or a disagreement on it. The two
+        # questions are different and this is the only difference
+        # between them: advisory says what the rule sees, the
+        # normal path says what the journal is allowed to do about
+        # it. Sharing the function is what stops the panel
+        # advertising one rule while the column follows another.
+        if (why in ("flip", "diverge", "disagree")
+                and t.mode != "auto" and not advisory):
             why = ""
         return ("close", why) if why else ("", "a trade is already open")
-    if not s.auto:
+    if not s.auto and not advisory:
         return "", "AUTO is off -- the button says MANUAL"
     if agree not in ("up", "down"):
         return "", "no signal"
