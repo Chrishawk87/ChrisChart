@@ -99,10 +99,23 @@ class Result:
 
 
 def replay(prints, tp_ticks: float, sl_ticks: float,
-           cost: float = ROUND_TRIP) -> Result:
-    """One pass over (ts, px). Bars are built here, the rule is not."""
+           cost: float = ROUND_TRIP, exit_on_close: bool = False,
+           entry_buffer: float = 0.0) -> Result:
+    """One pass over (ts, px). Bars are built here, the rule is not.
+
+    `exit_on_close` evaluates the reversal only when a 1-minute bar
+    ENDS, rather than on every print inside it. "A candle crosses
+    its open" is ambiguous between those two and they are not close
+    to the same rule: a forming bar crosses its own open constantly.
+
+    `entry_buffer` requires the 1-minute to be that many ticks clear
+    of its open before the entry counts. Without it the entry can be
+    taken one tick from the price that will trigger the exit, which
+    is the same threshold doing both jobs.
+    """
     res = Result()
     b1 = b5 = None
+    k1_prev = None
     open_t: Trade | None = None
     taken_bar = -1.0
 
@@ -115,6 +128,10 @@ def replay(prints, tp_ticks: float, sl_ticks: float,
             if b5 is not None:
                 res.bars5 += 1
             b5 = Bar(start=k5)
+        closed_1m = False
+        if b1.start != k1_prev and k1_prev is not None:
+            closed_1m = True
+        k1_prev = b1.start
         b1.feed(px)
         b5.feed(px)
 
@@ -133,7 +150,7 @@ def replay(prints, tp_ticks: float, sl_ticks: float,
                 why = "sl"
             elif tp_ticks > 0 and ticks >= tp_ticks:
                 why = "tp"
-            else:
+            elif not exit_on_close or closed_1m:
                 rev, _w = tm.reversed_against(t.side, d1)
                 if rev:
                     why = "reversal"
@@ -146,6 +163,13 @@ def replay(prints, tp_ticks: float, sl_ticks: float,
         if taken_bar == k5:
             continue
         side, _why = tm.entry_side(d1, d5)
+        if side and entry_buffer > 0:
+            # How far the 1-minute is from the open that will also be
+            # its exit trigger. Too close and the trade is opened at
+            # the price it will be stopped out of.
+            clear = abs(b1.close - b1.open) / TICK
+            if clear < entry_buffer:
+                side = ""
         if side:
             open_t = Trade(side=side, entry_ts=ts, entry=px, bar=k5)
             taken_bar = k5
@@ -165,9 +189,23 @@ def report(res: Result, tp: float, sl: float, cost: float) -> dict:
     by_why: dict[str, list] = {}
     for t in done:
         by_why.setdefault(t.why, []).append(t.ticks - cost)
+    holds = sorted(t.exit_ts - t.entry_ts for t in done)
+    gross = sorted(t.ticks for t in done)
+
+    def q(xs, f):
+        return round(xs[int(f * (len(xs) - 1))], 2) if xs else 0.0
+
     return {
         "trades": len(done),
         "bars5": res.bars5,
+        "hold_med_s": q(holds, 0.5),
+        "hold_q1_s": q(holds, 0.25),
+        "hold_q3_s": q(holds, 0.75),
+        "under_5s_pct": round(100.0 * sum(1 for h in holds if h <= 5)
+                              / len(holds), 1),
+        "gross_med": q(gross, 0.5),
+        "gross_q1": q(gross, 0.25),
+        "gross_q3": q(gross, 0.75),
         "wins": len(wins),
         "win_pct": round(100.0 * len(wins) / len(done), 1),
         "net_ticks": round(sum(net), 2),
@@ -211,6 +249,12 @@ def main(argv: list[str]) -> int:
                     help="round-trip cost in ticks")
     ap.add_argument("--sweep", action="store_true",
                     help="a grid of take profit and stop loss")
+    ap.add_argument("--exit-on-close", action="store_true",
+                    help="only check the reversal when a 1m bar ENDS")
+    ap.add_argument("--buffer", type=float, default=0.0,
+                    help="ticks the 1m must be clear of its open to enter")
+    ap.add_argument("--shapes", action="store_true",
+                    help="compare the rule against its variants")
     ap.add_argument("--csv", default="", help="write every trade here")
     a = ap.parse_args(argv)
 
@@ -241,7 +285,33 @@ def main(argv: list[str]) -> int:
               "TOTAL is the\nonly question worth asking of this table.")
         return 0
 
-    res = replay(prints, a.tp, a.sl, a.cost)
+    if a.shapes:
+        print(f"{'variant':<34}{'trades':>7}{'win%':>7}"
+              f"{'net':>10}{'avg':>8}{'hold s':>8}{'<=5s':>7}")
+        print("-" * 81)
+        for label, kw in (
+                ("as specified (intrabar)", {}),
+                ("exit only on a 1m CLOSE", {"exit_on_close": True}),
+                ("entry 2 ticks clear of open", {"entry_buffer": 2.0}),
+                ("entry 4 ticks clear", {"entry_buffer": 4.0}),
+                ("both: close exit + 2t buffer",
+                 {"exit_on_close": True, "entry_buffer": 2.0}),
+                ("both: close exit + 4t buffer",
+                 {"exit_on_close": True, "entry_buffer": 4.0})):
+            rr = report(replay(prints, a.tp, a.sl, a.cost, **kw),
+                        a.tp, a.sl, a.cost)
+            if not rr.get("trades"):
+                print(f"{label:<34}{'no trades':>7}")
+                continue
+            print(f"{label:<34}{rr['trades']:>7}{rr['win_pct']:>7.1f}"
+                  f"{rr['net_ticks']:>10.0f}{rr['avg_ticks']:>8.3f}"
+                  f"{rr['hold_med_s']:>8.0f}{rr['under_5s_pct']:>7.0f}")
+        print(f"\n  tp {a.tp} / sl {a.sl}, {a.cost} tick round trip.")
+        print("  'hold s' is the MEDIAN seconds a trade lasted.")
+        return 0
+
+    res = replay(prints, a.tp, a.sl, a.cost,
+                 exit_on_close=a.exit_on_close, entry_buffer=a.buffer)
     r = report(res, a.tp, a.sl, a.cost)
     if not r.get("trades"):
         print("the rule took no trades on this tape")
@@ -255,6 +325,11 @@ def main(argv: list[str]) -> int:
           f"  (${r['net_dollars']:+,.2f})")
     print(f"  {'average':<26}{r['avg_ticks']:+.3f} ticks a trade")
     print(f"  {'best / worst':<26}{r['best']:+.2f} / {r['worst']:+.2f}")
+    print(f"  {'held, median':<26}{r['hold_med_s']:.0f}s"
+          f"   (quartiles {r['hold_q1_s']:.0f}s / {r['hold_q3_s']:.0f}s)")
+    print(f"  {'closed within 5s':<26}{r['under_5s_pct']}%")
+    print(f"  {'gross ticks, median':<26}{r['gross_med']:+.2f}"
+          f"   (quartiles {r['gross_q1']:+.2f} / {r['gross_q3']:+.2f})")
     print(f"\n  how they ended")
     for why, v in r["by_reason"].items():
         print(f"    {why:<22}{v['n']:>5}   {v['ticks']:+10.2f} ticks")
