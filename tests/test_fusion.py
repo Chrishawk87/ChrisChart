@@ -123,42 +123,6 @@ class TestAgreement:
         assert fu.agreement("sideways", "up")[0] == ""
 
 
-class TestHolds:
-    """The exit test, stated apart from the entry test."""
-
-    def test_it_holds_while_both_still_point_that_way(self):
-        assert fu.holds("up", "up", "up") is True
-
-    def test_it_breaks_when_one_turns(self):
-        assert fu.holds("up", "up", "down") is False
-        assert fu.holds("up", "down", "up") is False
-
-    def test_it_breaks_when_one_goes_flat(self):
-        """Neutral is a disagreement here, by Chris's rule.
-
-        The reason for the trade was that BOTH pointed the same way.
-        One of them no longer does.
-        """
-        assert fu.holds("up", "up", "flat") is False
-        assert fu.holds("up", "flat", "up") is False
-
-    def test_it_does_not_hold_the_wrong_side(self):
-        assert fu.holds("down", "up", "up") is False
-
-    def test_entry_and_exit_cannot_drift_apart(self):
-        """`holds` is defined in terms of `agreement`.
-
-        Two separate implementations of the same comparison is how a
-        rule ends up entering on one definition and exiting on
-        another.
-        """
-        for t in ("up", "down", "flat"):
-            for o in ("up", "down", "flat"):
-                side = fu.agreement(t, o)[0]
-                for guess in ("up", "down"):
-                    assert fu.holds(guess, t, o) == (side == guess), (t, o)
-
-
 class TestState:
     def test_it_reads_each_series_own_field(self):
         """The tick bar reports `dir`; the OFI bar reports `read`.
@@ -199,10 +163,10 @@ class TestTheStrategyUsesIt:
         assert window_signal({}, "fused", "", st) == ("up", "")
 
     def test_disagreement_passes_the_reason_through(self):
-        st = fu.state({"dir": "up"}, {"read": "down"})
+        st = fu.state({"dir": "up"}, {"read": "up"}, {"dir": "down"})
         side, why = window_signal({}, "fused", "", st)
         assert side == ""
-        assert why == "the tick bar is up and the OFI is down"
+        assert why == "the tick bar is up and the 5m is down"
 
     def test_it_never_reads_the_window(self):
         """Every other strategy refuses on an empty window."""
@@ -278,18 +242,19 @@ class TestThePanel:
     def test_it_shows_both_series_separately(self):
         blk = js_func("paintFusion")
         assert "TICK BAR" in blk and "OFI BAR" in blk
+        assert "5 MINUTE BAR" in blk
         assert "prints and price only" in blk
-        assert "the resting book only" in blk
+        assert "decides nothing" in blk, "the OFI box must say so"
 
     def test_the_verdict_is_the_loud_part(self):
         blk = js_func("paintFusion")
-        assert "ALL THREE" in blk and "NO ENTRY" in blk
+        assert "BOTH" in blk and "NO ENTRY" in blk
 
     def test_it_says_what_actually_ends_a_trade(self):
         """The entry and the exit are the same test now, and the
         panel has to say the one that is true today."""
         blk = js_func("paintFusion")
-        assert "turning closes" in blk
+        assert "tick bar" in blk and "turns against it" in blk
 
     def test_the_sizes_come_from_the_server(self):
         """Hard-coded sizes are how a panel offers a series that has
@@ -364,39 +329,115 @@ class TestTheFiveMinuteLeg:
 
     # -- the exit is the entry, run again ---------------------------------
 
-    def test_all_three_holds(self):
-        assert fu.holds_three("up", "up", "up", "up") == (True, "")
+    def test_it_holds_while_both_still_point_that_way(self):
+        assert fu.holds_exit("up", "up", "up") == (True, "")
 
-    @pytest.mark.parametrize("t,o,m", [("down", "up", "up"),
-                                       ("up", "down", "up"),
-                                       ("up", "up", "down")])
-    def test_any_one_turning_ends_it(self, t, o, m):
-        ok, why = fu.holds_three("up", t, o, m)
+    def test_the_tick_bar_turning_ends_it(self):
+        ok, why = fu.holds_exit("up", "down", "up")
         assert ok is False
-        assert why.strip()
+        assert why == "the tick bar turned down against a up"
 
-    @pytest.mark.parametrize("t,o,m", [("", "up", "up"),
-                                       ("up", "", "up"),
-                                       ("up", "up", "")])
-    def test_any_one_going_flat_ends_it(self, t, o, m):
-        """One of them going flat is a disagreement: the reason for
-        the trade was that all three pointed the same way."""
-        assert fu.holds_three("up", t, o, m)[0] is False
+    def test_the_5m_turning_ends_it(self):
+        ok, why = fu.holds_exit("up", "up", "down")
+        assert ok is False
+        assert why == "the 5m turned down against a up"
 
-    def test_the_exit_cannot_drift_from_the_entry(self):
-        """`holds_three` is defined in terms of `entry_side`.
+    def test_the_ofi_cannot_end_it(self):
+        """"the ones that have to disagree in order for a exit to
+        happen is the tick bar and the 5 minute".
 
-        This pair has been rewritten twice; entering on one
-        definition and exiting on another is the bug that hides
-        until a live position is sitting in it.
+        The exit test is not even GIVEN the OFI, so there is no way
+        for it to leak back in.
         """
-        for t in ("up", "down", "flat"):
-            for o in ("up", "down", "flat"):
-                for m in ("up", "down", "flat"):
-                    side = fu.entry_side(t, o, m)[0]
-                    for guess in ("up", "down"):
-                        assert fu.holds_three(guess, t, o, m)[0] == (
-                            side == guess), (t, o, m, guess)
+        import inspect
+        sig = inspect.signature(fu.holds_exit)
+        assert "ofi" not in " ".join(sig.parameters), sig
+
+    def test_the_ofi_does_not_gate_entry_either(self):
+        """"a entry follows the same rules both the tick bar and the
+        5 minute has to agree". The OFI is shown and ignored."""
+        st_against = fu.state({"dir": "up"}, {"read": "down"},
+                              {"dir": "up"})
+        assert st_against["side"] == "up", "the book disagreeing is not a veto"
+        assert st_against["ofi_concurs"] is False
+
+    def test_the_5m_is_required_to_enter(self):
+        """A MUTATION SURVIVED HERE and this is why it exists.
+
+        Deleting the 5m check from `entry_side` -- so the fast pair
+        alone opened a trade -- broke no test, because the entry
+        cases went out with a superseded class and nothing replaced
+        them. The exit tests were thorough and the entry had a hole
+        straight through it.
+        """
+        assert fu.entry_side("up", "")[0] == ""
+        assert fu.entry_side("up", "flat")[0] == ""
+
+    def test_a_flat_leg_is_named_as_flat_not_left_blank(self):
+        """The reason is what shows on the panel.
+
+        Two mutations survived here that changed no decision at all
+        -- removing either flat guard still refuses the entry,
+        because the directions differ anyway. What they broke was
+        the sentence: "the tick bar is up and the 5m is " with
+        nothing after it. The rule was fine and the explanation was
+        garbage, which on this panel has been the more expensive
+        failure.
+        """
+        assert fu.entry_side("up", "")[1] == (
+            "the tick bar is up but the 5m is flat")
+        assert fu.entry_side("", "up")[1] == (
+            "the 5m is up but the tick bar is flat")
+        assert fu.entry_side("up", "flat")[1].endswith("the 5m is flat")
+        assert fu.entry_side("flat", "up")[1].endswith(
+            "the tick bar is flat")
+
+    def test_no_reason_ends_mid_sentence(self):
+        for t in ("up", "down", "flat", ""):
+            for m in ("up", "down", "flat", ""):
+                why = fu.entry_side(t, m)[1]
+                if why:
+                    assert not why.rstrip().endswith("is"), (t, m, why)
+                    assert why == why.strip(), (t, m, why)
+
+    def test_a_5m_pointing_the_other_way_blocks_entry(self):
+        side, why = fu.entry_side("up", "down")
+        assert side == ""
+        assert "the 5m is down" in why
+
+    def test_every_leg_is_load_bearing_on_the_way_in(self):
+        """One at a time, each turned off, nothing opens."""
+        assert fu.entry_side("up", "up")[0] == "up"
+        for t, m in (("", "up"), ("up", ""), ("flat", "up"),
+                     ("up", "flat"), ("down", "up"), ("up", "down")):
+            assert fu.entry_side(t, m)[0] == "", (t, m)
+
+    def test_the_strategy_refuses_without_the_5m(self):
+        """Through the journal, not just the helper."""
+        st = fu.state({"dir": "up"}, {"read": "up"}, {"dir": "flat"})
+        assert window_signal({}, "fused", "", st)[0] == ""
+
+    @pytest.mark.parametrize("t,m", [("", "up"), ("up", ""), ("", "")])
+    def test_flat_is_not_a_disagreement(self, t, m):
+        """Chris's own answer for the 5m, applied to both: "flat is
+        not a reason to exit". A close sitting exactly on its open
+        has not turned against anything."""
+        assert fu.holds_exit("up", t, m) == (True, "")
+
+    def test_a_short_is_the_mirror(self):
+        assert fu.holds_exit("down", "down", "down")[0] is True
+        assert fu.holds_exit("down", "up", "down")[0] is False
+        assert fu.holds_exit("down", "down", "up")[0] is False
+
+    def test_no_side_holds_nothing(self):
+        assert fu.holds_exit("", "up", "up")[0] is False
+
+    def test_the_reason_is_never_blank_when_it_closes(self):
+        for t in ("up", "down", "flat", ""):
+            for m in ("up", "down", "flat", ""):
+                ok, why = fu.holds_exit("up", t, m)
+                if not ok:
+                    assert why.strip(), (t, m)
 
     def test_the_journal_closes_on_a_disagreement(self):
         why = should_close(self._open(), self._s(), 6800.25, "",
@@ -456,9 +497,9 @@ class TestTheFiveMinuteLeg:
         assert "cap = 1" in blk
         assert "max_per_bar=cap" in blk
 
-    def test_the_route_passes_all_three_to_the_exit(self):
+    def test_the_route_passes_only_two_legs_to_the_exit(self):
         blk = py_func("_journal_step")
-        assert "holds_three(" in blk
+        assert "holds_exit(" in blk
         assert "disagreed=disagreed" in blk
 
     def test_the_cap_makes_the_churn_arithmetically_impossible(self):
@@ -480,10 +521,13 @@ class TestTheFiveMinuteLeg:
 
     # -- the panel --------------------------------------------------------
 
-    def test_the_panel_says_any_one_turning_closes_it(self):
+    def test_the_panel_names_the_two_legs_that_close_it(self):
+        """And says the OFI does not, because that asymmetry is the
+        single most surprising thing about the rule."""
         blk = js_func("paintFusion")
-        assert "any one of the three turning closes" in blk \
-            or "any one turning closes it" in blk
+        assert "tick bar" in blk and "5m" in blk
+        assert "does not open anything" in blk, \
+            "the OFI gating nothing is the surprising part"
 
     def test_the_panel_states_the_cap(self):
         blk = js_func("paintFusion")

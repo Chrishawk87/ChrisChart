@@ -7010,17 +7010,16 @@ def create_app() -> FastAPI:
         # HTTP request through a fixture that never produced
         # agreement -- so deleting the auto check broke nothing that
         # any test could see.
-        # ANY ONE OF THE THREE TURNING ENDS A FUSION TRADE. The exit
-        # test is the entry test run again -- `holds_three` is
-        # defined in terms of `entry_side` -- so the two cannot drift
-        # apart. Computed here because it is a reading, and readings
-        # are taken in one place.
+        # THE TICK BAR AND THE 5m END A FUSION TRADE. NOT THE OFI.
+        # It is an entry filter only -- it flips sign about once a
+        # bar even against a wide deadband, because it measures
+        # resting size, and a position abandoned on that is the
+        # churn this rule keeps being rewritten to remove.
         disagreed = ""
         if strat == "fused" and t is not None and t.open:
-            ok, why_out = jn_fusion.holds_three(
+            ok, why_out = jn_fusion.holds_exit(
                 t.side,
                 (fus.get("tick") or {}).get("dir") or "",
-                (fus.get("ofi") or {}).get("dir") or "",
                 (fus.get("m5") or {}).get("dir") or "")
             if not ok:
                 disagreed = why_out
@@ -9710,8 +9709,8 @@ has to be running before the gate stops refusing.">spike
     <!-- THE FUSION READ. Its own top-level panel, titled, because the
          last reading that went inside another section rendered
          correctly and could not be found. -->
-    <div class="panel full" id="fusionPanel"><h2>Fusion &mdash; tick bar,
-      OFI and the 5-minute hold<span class="stamp"
+    <div class="panel full" id="fusionPanel"><h2>Fusion &mdash; the tick
+      bar and the 5-minute bar<span class="stamp"
       id="fusionStamp"></span></h2>
       <div class="msg" style="margin-bottom:8px">Three readings, built
         by <b>different builders from different events</b>. The tick
@@ -9720,8 +9719,13 @@ has to be running before the gate stops refusing.">spike
         about how many prints it took; the 5-minute bar is the ordinary
         time candle. None of them influences the others &mdash; that
         independence is the only reason their agreement says anything.
-        <b>Entry: all three point the same way. Exit: any one of them
-        turning.</b> The same test both ways. The 5m is read
+        <b>Entry: the tick bar and the 5m both point the same way.
+        Exit: either of them turning against the trade.</b> The same
+        two readings both ways. <b>The OFI decides nothing</b> &mdash;
+        it is shown because it is worth seeing whether the resting
+        book concurs, but it flips sign about once a bar and every
+        version of this rule that let it decide something churned.
+        The 5m is read
         immediately &mdash; close against open, exactly what colours
         that candle on the chart. What stops this churning is not a
         softer exit but a hard limit on entries: <b>one trade per
@@ -14717,7 +14721,7 @@ function paintFusion(d) {
   const m = d.m5 || {};
   const verdict = d.agree
     ? `<div style="font-size:22px;font-weight:700;color:var(--`
-      + (d.side === 'up' ? 'up' : 'down') + `)">ALL THREE &mdash; `
+      + (d.side === 'up' ? 'up' : 'down') + `)">BOTH &mdash; `
       + esc(String(d.side).toUpperCase()) + `</div>`
     : `<div style="font-size:22px;font-weight:700;color:var(--dim)">`
       + `NO ENTRY</div>`;
@@ -14725,13 +14729,21 @@ function paintFusion(d) {
      says so, because reading "no entry" as "get out" is exactly the
      mistake that produced fourteen trades in a few minutes. */
   const why = d.agree
-    ? 'all three point the same way &mdash; this is the entry'
+    ? 'the tick bar and the 5m point the same way &mdash; this is '
+      + 'the entry'
+      + (d.ofi_known
+          ? (d.ofi_concurs ? ', and the book agrees'
+                           : ', though the book does not')
+          : '')
     : esc(d.why || '') + ' &mdash; no new entry';
-  const holdLine = d.agree
-    ? 'an open trade is held while all three stay this way &mdash; '
-      + 'any one turning closes it'
-    : 'any one of the three turning closes an open trade &mdash; '
-      + esc(d.why || '');
+  /* IN IS STRICT, OUT IS NARROW. All three to enter; only the tick
+     bar or the 5m can close it. The OFI is a filter on the way in
+     and is ignored on the way out, because it changes sign about
+     once a bar and a position abandoned on that is pure churn. */
+  const holdLine = 'in when the <b>tick bar</b> and the <b>5m</b> '
+    + 'agree, out when either turns against it &mdash; the OFI '
+    + 'turning does not close anything, and does not open anything '
+    + 'either';
 
   const cell = (title, dir, lines) =>
     `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
@@ -14768,14 +14780,15 @@ function paintFusion(d) {
     + `<div class="thin" style="margin-top:2px">${holdLine}</div></div>`
     + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
     + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)
-    + cell('OFI BAR &mdash; the resting book only', o.dir, ofiLines)
+    + cell('OFI BAR &mdash; shown, decides nothing', o.dir, ofiLines)
     + cell('5 MINUTE BAR &mdash; the slow one', m.dir, m5Lines)
     + `</div>`;
 
   const note = $('fusNote');
   if (note) {
     note.innerHTML = 'the Fused strategy trades exactly this: in '
-      + 'when all three agree, out when any one of them turns, and '
+      + 'when the tick bar and the 5m agree, out when either turns '
+      + 'against it, and '
       + '<b>at most one trade per 5-minute bar</b> &mdash; that cap '
       + 'is what stops it stepping straight back in after a take '
       + 'profit.';

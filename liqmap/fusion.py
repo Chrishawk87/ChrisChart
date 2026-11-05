@@ -91,18 +91,6 @@ def agreement(tick_dir: str, ofi_dir: str) -> tuple[str, str]:
     return t, ""
 
 
-def holds(side: str, tick_dir: str, ofi_dir: str) -> bool:
-    """Does an open `side` still have both series behind it?
-
-    The exit test, stated separately from the entry test so the two
-    cannot drift apart. Chris's rule is symmetric: in on agreement,
-    out the moment it breaks, in again when it returns.
-    """
-    if side not in SIDES:
-        return False
-    return agreement(tick_dir, ofi_dir)[0] == side
-
-
 def m5_direction(m5: dict | None,
                  settle_s: float = M5_SETTLE_S) -> tuple[str, str]:
     """The forming 5-minute bar's direction, or "" and why not.
@@ -130,72 +118,82 @@ def m5_direction(m5: dict | None,
     return d, ""
 
 
-def entry_side(tick_dir: str, ofi_dir: str, m5_dir: str) -> tuple[str, str]:
-    """ALL THREE pointing the same way, or "" and the reason.
+def entry_side(tick_dir: str, m5_dir: str) -> tuple[str, str]:
+    """THE TICK BAR AND THE 5-MINUTE BAR, both pointing the same way.
 
-    The fast pair is checked first so its reason is the one reported
-    when it is the thing missing -- a trader looking at this wants to
-    know which reading failed, and "the 5m is flat" is unhelpful when
-    the tick bar and the OFI were never agreeing in the first place.
+    Chris: "a entry follows the same rules both the tick bar and the
+    5 minute has to agree". The same two readings that end a trade
+    are the two that start one, so the rule is one sentence in both
+    directions and cannot be stated two ways.
+
+    THE OFI IS NO LONGER PART OF THE RULE AT ALL. It is still built,
+    still read and still on the panel -- it is worth seeing whether
+    the resting book concurs -- but it gates nothing. It flips sign
+    about once a bar even against a wide deadband because it
+    measures size that is withdrawn and replaced constantly, and
+    every version of this rule that let it decide something churned.
+
+    What is left is two measurements of PRICE THAT HAPPENED over
+    very different spans: a few thousand prints, and five minutes of
+    clock. They are independent in the way that matters -- one is
+    cut by activity and the other by time -- so their agreeing is
+    still evidence rather than arithmetic.
+
+    Flat is not a side. Both must actually point somewhere.
     """
-    side, why = agreement(tick_dir, ofi_dir)
-    if not side:
-        return "", why
+    t = (tick_dir or "").strip().lower()
     m = (m5_dir or "").strip().lower()
+    if t not in SIDES and m not in SIDES:
+        return "", "neither the tick bar nor the 5m has a direction"
+    if t not in SIDES:
+        return "", f"the 5m is {m} but the tick bar is flat"
     if m not in SIDES:
-        return "", f"the tick bar and the OFI are {side} but the 5m is flat"
-    if m != side:
-        return "", f"the tick bar and the OFI are {side} but the 5m is {m}"
-    return side, ""
+        return "", f"the tick bar is {t} but the 5m is flat"
+    if t != m:
+        return "", f"the tick bar is {t} and the 5m is {m}"
+    return t, ""
 
 
-def hold_against_m5(side: str, m5_dir: str) -> tuple[bool, str]:
-    """Kept for callers that want the 5m test on its own.
+def holds_exit(side: str, tick_dir: str, m5_dir: str) -> tuple[bool, str]:
+    """Does an open `side` survive? Only two of the three can end it.
 
-    NO LONGER THE EXIT. Chris: "all 3 must agree for a entry if one
-    disagrees it exits that simple" -- so the exit is symmetric with
-    the entry again and lives in `holds_three` below. This remains
-    because asking "has the 5m turned against this position" is a
-    real question worth being able to ask by itself.
+    THE OFI IS AN ENTRY FILTER, NOT AN EXIT. Chris: "the ones that
+    have to disagree in order for a exit to happen is the tick bar
+    and the 5 minute".
+
+    That is the right leg to drop, and the flip counts say why. The
+    OFI accumulator changes sign 3.17 times a bar against a zero
+    deadband -- 1.00 a bar even at +/-500 -- because it measures
+    RESTING size, which is withdrawn and replaced constantly inside
+    a move that is going nowhere unusual. It is excellent at saying
+    "the book is behind this" at the moment of entry and hopeless as
+    a reason to abandon a position thirty seconds later.
+
+    The tick bar and the 5m both measure PRICE THAT HAPPENED, over
+    different spans. When either of those turns against the trade,
+    the thing being traded has actually moved the other way.
+
+    FLAT IS NOT A DISAGREEMENT HERE, and that is deliberate -- it is
+    the answer Chris already gave for the 5m ("flat is not a reason
+    to exit"), applied to both. A bar whose close sits exactly on
+    its open has not turned against anything; it is momentarily
+    uncommitted, and exiting on that is the churn this rule keeps
+    being rewritten to remove. Only an OPPOSITE direction ends it.
+
+    Note the asymmetry with the entry, which does require all three
+    and does treat flat as "no". In is strict, out is narrow: it
+    takes more to start a trade than to keep one, which is the shape
+    every version of this rule has been converging on.
     """
     if side not in SIDES:
         return False, "no side"
+    t = (tick_dir or "").strip().lower()
     m = (m5_dir or "").strip().lower()
+    if t in SIDES and t != side:
+        return False, f"the tick bar turned {t} against a {side}"
     if m in SIDES and m != side:
         return False, f"the 5m turned {m} against a {side}"
     return True, ""
-
-
-def holds_three(side: str, tick_dir: str, ofi_dir: str,
-                m5_dir: str) -> tuple[bool, str]:
-    """Do all three still stand behind an open `side`?
-
-    THE EXIT, AND IT IS THE ENTRY TEST RUN AGAIN. Chris: "all 3 must
-    agree for a entry if one disagrees it exits that simple". One of
-    them going flat is a disagreement, because the reason for the
-    trade was that all three pointed the same way and now they do
-    not.
-
-    Defined in terms of `entry_side` rather than reimplemented. A
-    rule that enters on one definition and exits on another is a bug
-    that hides until a live position is sitting in it, and this pair
-    has already been rewritten twice.
-
-    THE CHURN THIS CAN CAUSE IS REAL AND IS CAPPED ELSEWHERE. The
-    same construction took fourteen trades in a few minutes when the
-    pair alone drove it. What stops it now is not a softer exit but
-    a hard limit on entries: one trade per 5-minute bar, enforced by
-    the caller. The exit can fire as often as it likes; nothing can
-    re-enter until a new 5m bar opens.
-    """
-    if side not in SIDES:
-        return False, "no side"
-    now, why = entry_side(tick_dir, ofi_dir, m5_dir)
-    if now == side:
-        return True, ""
-    if now:
-        return False, f"all three turned {now} against a {side}"
-    return False, why or "the three no longer agree"
 
 
 def state(tick: dict | None, ofi: dict | None,
@@ -217,8 +215,12 @@ def state(tick: dict | None, ofi: dict | None,
     # the panel can show WHICH of the two tests is failing: the pair
     # disagreeing and the pair agreeing without the 5m behind them
     # are different situations and used to look identical.
-    pair, pair_why = agreement(t_dir, o_dir)
-    side, why = entry_side(t_dir, o_dir, m_dir)
+    # The OFI, as information only. It no longer gates anything --
+    # `concurs` says whether the resting book happens to be pointing
+    # the same way as the decision, which is worth seeing and is not
+    # allowed to change it.
+    concurs = bool(o_dir in SIDES)
+    side, why = entry_side(t_dir, m_dir)
     return {
         "tick": {
             "dir": t_dir,
@@ -248,13 +250,14 @@ def state(tick: dict | None, ofi: dict | None,
             "close": (m5 or {}).get("close"),
             "ticks": (m5 or {}).get("ticks"),
         },
-        # The fast pair alone. NOT the entry -- it was, and that is
-        # what took fourteen trades in a few minutes.
-        "pair": pair,
-        "pair_why": pair_why,
+        # Whether the resting book agrees with the decision. NOT an
+        # input to it: shown so a trade taken against the book can
+        # be seen being taken, not prevented.
+        "ofi_concurs": (concurs and o_dir == side) if side else False,
+        "ofi_known": concurs,
         "side": side,
         "agree": bool(side),
         "why": why,
-        "say": (f"all three point {side}" if side
+        "say": (f"the tick bar and the 5m both point {side}" if side
                 else why or "no reading yet"),
     }
