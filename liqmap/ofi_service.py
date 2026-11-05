@@ -252,6 +252,84 @@ class Config:
         return ""
 
 
+def _fold(minutes: list, secs: float) -> list:
+    """Minute bars into `secs`-second bars. Open first, close last.
+
+    A FOLD IS NOT A RESAMPLE OF PRICES, it is a regrouping of bars
+    that already happened: the open of a 15-minute bar is the open
+    of its first minute and nothing else, and taking the mean of
+    anything here would invent a candle the market never printed.
+
+    Buckets are floor(ts / secs) * secs, the same grid the live
+    builders close on, so a folded bar and a live one for the same
+    stretch carry the same timestamp and the history does not
+    develop a seam at the moment the seed stops.
+
+    A partial bucket at either end is kept. It is a real bar of a
+    real market; the live builder will replace the trailing one as
+    soon as it closes that interval itself.
+    """
+    if not minutes or secs <= 0:
+        return []
+    from .structure import Candle
+
+    buckets: dict[float, list] = {}
+    for c in minutes:
+        key = float(int(float(c.ts) // secs) * secs)
+        buckets.setdefault(key, []).append(c)
+
+    out: list = []
+    for key in sorted(buckets):
+        rows = sorted(buckets[key], key=lambda r: float(r.ts))
+        out.append(Candle(
+            ts=key,
+            open=float(rows[0].open),
+            high=max(float(r.high) for r in rows),
+            low=min(float(r.low) for r in rows),
+            close=float(rows[-1].close),
+            volume=sum(float(r.volume or 0.0) for r in rows)))
+    return out
+
+
+def _fetch_ohlcv(client, dataset: str, symbol: str, stype_in,
+                 schema: str, hours: int) -> list:
+    """One OHLCV pull, decoded. Returns [] rather than raising.
+
+    A seed that cannot be fetched is a slow start. A seed that takes
+    the ingest thread down with it is a dead chart, and the whole
+    point of this data is to make the first two hours readable.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from .structure import Candle
+
+    now_utc = datetime.now(timezone.utc)
+    # Databento historical runs about an hour behind live.
+    hist_end = now_utc - timedelta(minutes=70)
+    start = now_utc - timedelta(hours=hours)
+    try:
+        store = client.timeseries.get_range(
+            dataset=dataset, schema=schema, symbols=[symbol],
+            stype_in=stype_in, start=start, end=hist_end)
+    except Exception:                                   # noqa: BLE001
+        return []
+    out: list = []
+    for rec in store:
+        ts = getattr(rec, "ts_event", None)
+        if ts is None:
+            continue
+        o = getattr(rec, "open", 0) * 1e-9
+        h = getattr(rec, "high", 0) * 1e-9
+        lo = getattr(rec, "low", 0) * 1e-9
+        c = getattr(rec, "close", 0) * 1e-9
+        if o <= 0 or h <= 0 or lo <= 0 or c <= 0:
+            continue
+        out.append(Candle(ts=int(ts) * 1e-9, open=o, high=h, low=lo,
+                          close=c,
+                          volume=float(getattr(rec, "volume", 0) or 0)))
+    return out
+
+
 class OfiService:
     """Runs the live engine on a background thread; serves the latest.
 
@@ -383,6 +461,31 @@ class OfiService:
             self.error = f"historical seed: {exc}"
             return
 
+        # DATABENTO HAS NO ohlcv-5m AND NO ohlcv-15m.
+        #
+        # The schema was built as f"ohlcv-{interval}", so both of
+        # those asked for something that does not exist and failed
+        # on every start. The service recorded it -- "The `schema`
+        # was not a valid value of Schema, was 'ohlcv-15m'" -- in a
+        # field nobody reads, and the visible symptom was the stack
+        # saying UNREAD for two and a half hours after every restart
+        # while it rebuilt those bars from live prints.
+        #
+        # The fix is to fetch the minute bars and fold them. ONE
+        # request covers every derived interval: 48 hours of
+        # ohlcv-1m is 2,880 records, which folds into 192 fifteens
+        # and 576 fives without asking for anything twice.
+        native = {"1s", "1m", "1h", "1d"}
+        derived = [(iv, hr) for iv, hr in SEED if iv not in native]
+        minutes: list[Candle] = []
+        if derived:
+            want_h = max(hr for _iv, hr in derived)
+            minutes = _fetch_ohlcv(client, dataset, symbol, stype_in,
+                                   "ohlcv-1m", want_h)
+            if not minutes:
+                self.error = ("historical seed: no 1-minute bars came "
+                              "back, so 5m and 15m cannot be folded")
+
         for interval, hours in SEED:
             # Skip intervals whose builder does not exist yet and that
             # the tape was not configured to build.
@@ -391,6 +494,16 @@ class OfiService:
                 secs = seconds_of(interval)
                 if not secs:
                     continue
+
+            secs_iv = seconds_of(interval) or 0.0
+            if interval not in native:
+                # Folded from the minutes already in hand.
+                if not minutes or secs_iv <= 0:
+                    continue
+                rolled = _fold(minutes, secs_iv)
+                if rolled:
+                    self.tape.seed_interval(interval, rolled)
+                continue
 
             schema = f"ohlcv-{interval}"
             now_utc = datetime.now(timezone.utc)

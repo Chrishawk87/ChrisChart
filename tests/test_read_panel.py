@@ -277,3 +277,63 @@ class TestTheCapLeakAfterAClose:
     def test_both_decides_carry_it(self):
         blk = py_func("_journal_step")
         assert blk.count("max_per_bar=cap") >= 2
+
+
+class TestTheRuleHasAClock:
+    """Chris: "the trade on this rule is behind real time data
+    completely by several points at a time".
+
+    It was not late, it was ASLEEP. `/api/read` is the only thing
+    that runs the trade column -- entry test, exit test, cap, alert
+    -- and nothing polled it. The 10-second poll had been removed on
+    the reasoning that "/ws/live already pushes the forming bar",
+    which is true and beside the point: the socket updates what is
+    DRAWN, it does not evaluate the rule.
+
+    So the strategy stepped only when something happened to call
+    loadRead -- a click, a page load, a dropdown -- and the first
+    poll after a click acted on a signal that had fired minutes
+    earlier at a price long gone. Several points, not several ticks.
+    """
+
+    def test_the_read_route_is_polled(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert "_readBusy" in src
+        i = src.index("let _readBusy")
+        blk = src[i:i + 400]
+        assert "await loadRead()" in blk
+        assert "}, 1000);" in blk
+
+    def test_it_does_not_stack_requests(self):
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("let _readBusy")
+        blk = src[i:i + 400]
+        assert "if (_readBusy) return;" in blk
+        assert "finally { _readBusy = false; }" in blk
+
+    def test_it_does_not_depend_on_the_auto_checkbox(self):
+        """The alert needs the rule stepping even with AUTO off --
+        that is the whole hand-trading path."""
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        i = src.index("let _readBusy")
+        blk = src[i:i + 400]
+        assert "rAuto" not in blk
+
+    def test_the_toggle_no_longer_claims_the_socket_runs_the_rule(self):
+        blk = js_func("toggleReadAuto")
+        assert "ws/live already push" not in blk
+
+    def test_the_journal_step_is_only_reachable_through_that_route(self):
+        """If this ever grows a second caller, the comment above the
+        poll stops being true and the clock stops being the clock."""
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        # The def line matches the same text; count call sites only.
+        calls = src.count("_journal_step(rt") - src.count(
+            "def _journal_step(rt")
+        assert calls == 2, f"{calls} call sites -- expected the route " \
+            "and the give-up path, and nothing else"
+        # And both of them are the read route: the direct call, and
+        # the one inside `_with_journal` that the early returns use.
+        assert "out[\"journal\"] = _journal_step(rt, coin, out)" in src
+        assert "payload[\"journal\"] = _journal_step(rt_, coin_, payload)" \
+            in src

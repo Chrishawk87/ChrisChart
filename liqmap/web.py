@@ -6753,23 +6753,28 @@ def create_app() -> FastAPI:
                 if cur.open else 0.0}
 
     def _m5_now(rt_) -> dict:
-        """The forming FIVE-MINUTE time candle, and how old it is.
+        """The forming FIVE-MINUTE candle. One line, one reader.
 
-        The ordinary 5m bar -- the one on the chart and in the stack
-        -- not a mid-price window and not a counted bar. Chris named
-        "the 5 minute timeframe bar", and a confirmation he cannot
-        see on his own screen is a confirmation he cannot check.
+        It had its own copy of the decode. The timed rule needed the
+        same thing for the 1-minute, and a second copy is a second
+        place for the price frame to drift.
+        """
+        return _candle_now(rt_, "5m")
 
-        Its age travels with it because the direction is not read
-        until the bar has settled, and the thing doing that reading
-        needs to know how far in it is rather than guessing.
+    def _candle_now(rt_, interval: str) -> dict:
+        """One forming TIME candle, as the chart draws it.
+
+        `_m5_now` was this for "5m" alone. The timed rule needs the
+        1-minute too, and two near-identical readers is two places
+        for the price frame to be got wrong -- so there is one, and
+        `_m5_now` calls it.
         """
         svc = getattr(rt_, "ofi", None)
         tape = getattr(svc, "tape", None) if svc else None
         if tape is None:
             return {}
         try:
-            c = tape.candle("5m")
+            c = tape.candle(interval)
         except Exception:                               # noqa: BLE001
             return {}
         if c is None:
@@ -6786,6 +6791,16 @@ def create_app() -> FastAPI:
                 "open": o, "close": cl, "seconds": round(age, 1),
                 "start_ts": float(c.start_ts),
                 "ticks": round((cl - o) / 0.25, 1) if o else 0.0}
+
+    def _timed_now(rt_) -> dict:
+        """The 1-minute and the 5-minute, and what they say together.
+
+        THE SAME CALL THE PANEL MAKES. One source, so the screen
+        cannot show an agreement the rule did not see.
+        """
+        from . import timed as _tm
+
+        return _tm.state(_candle_now(rt_, "1m"), _candle_now(rt_, "5m"))
 
     def _fusion_now(rt_, per_bar: int = 0) -> dict:
         """The two series side by side, and whether they agree.
@@ -7005,6 +7020,7 @@ def create_app() -> FastAPI:
         one was right while holding a position.
         """
         from . import fusion as _fu
+        from . import timed as _tm
 
         disagreed = ""
         if strat == "fused" and t is not None and t.open:
@@ -7014,6 +7030,11 @@ def create_app() -> FastAPI:
                 (fus.get("m5") or {}).get("dir") or "")
             if not ok:
                 disagreed = why_out
+        elif strat == "timed" and t is not None and t.open:
+            rev, why_rev = _tm.reversed_against(
+                t.side, (fus.get("m1") or {}).get("dir") or "")
+            if rev:
+                disagreed = why_rev
         try:
             act, why = jn.decide(
                 t, s, px, side, taken, (win.get("mid_dir") or ""),
@@ -7063,7 +7084,11 @@ def create_app() -> FastAPI:
         # The tick bar and the OFI bar are built by different
         # builders from different events and neither influences the
         # other; this only asks each which way it points.
-        fus = _fusion_now(rt_)
+        # The timed rule reads two TIME candles; the fused rule
+        # reads the tick bar and the OFI. They travel through the
+        # same argument because `window_signal` dispatches on the
+        # strategy, and only one of them is ever computed.
+        fus = (_timed_now(rt_) if strat == "timed" else _fusion_now(rt_))
         side, blocked_why = jn.window_signal(
             win, strat, fpi.get("side") or "", fus)
         says = {"candle": win.get("mid_dir") or None,
@@ -7076,6 +7101,9 @@ def create_app() -> FastAPI:
             # decision and explain nothing about why it fired.
             says = {"tick": (fus.get("tick") or {}).get("dir") or None,
                     "OFI": (fus.get("ofi") or {}).get("dir") or None,
+                    "5m": (fus.get("m5") or {}).get("dir") or None}
+        elif strat == "timed":
+            says = {"1m": (fus.get("m1") or {}).get("dir") or None,
                     "5m": (fus.get("m5") or {}).get("dir") or None}
         vetoed = blocked_why
         # The window is the candle the cap counts against.
@@ -7098,7 +7126,13 @@ def create_app() -> FastAPI:
         # fourteen-trades-in-minutes shape is arithmetically
         # impossible -- the ceiling is twelve an hour.
         cap = 0
-        if strat == "fused":
+        if strat in ("fused", "timed"):
+            # ONE TRADE PER 5-MINUTE CANDLE, for both rules, counted
+            # against that candle rather than the 15-minute window.
+            # Chris stated it twice for the timed rule: "1 trade per
+            # 5 minute timeframe". A candle that turns you round
+            # twice is a candle that cost two spreads to end where
+            # it started.
             cap = 1
             bar_ts = float((fus.get("m5") or {}).get("start_ts") or 0.0)
             taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
@@ -7123,6 +7157,18 @@ def create_app() -> FastAPI:
                 (fus.get("m5") or {}).get("dir") or "")
             if not ok:
                 disagreed = why_out
+        elif strat == "timed" and t is not None and t.open:
+            # THE ONLY SIGNAL EXIT IS AN EVENT, NOT AN ABSENCE. The
+            # 1-minute has to have closed back THROUGH ITS OPEN
+            # against the position. A flat minute does not do it and
+            # a quiet one does not either -- the rule this replaces
+            # exited on exactly those, twelve times in an afternoon
+            # at 2 to 5 ticks each.
+            from . import timed as _tm
+            rev, why_rev = _tm.reversed_against(
+                t.side, (fus.get("m1") or {}).get("dir") or "")
+            if rev:
+                disagreed = why_rev
         act, arg = jn.decide(t, s, px, side, taken,
                              (win.get("mid_dir") or ""),
                              window_rule=True,
@@ -9785,6 +9831,7 @@ has to be running before the gate stops refusing.">spike
               <option value="candle">Candle</option>
               <option value="footprint">Footprint</option>
               <option value="fused">Fused (intrabar)</option>
+              <option value="timed">Timed (1m guides the 5m)</option>
             </select></label>
           <label>window
             <select id="jnlWin" onchange="jnlSet()"
@@ -16087,15 +16134,40 @@ async function paintFeed() {
     + (f.errors && f.errors.length ? `<br><span style="color:var(--short)">${f.errors[f.errors.length-1]}</span>` : '');
 }
 
-let readPoll = null;
-
 function toggleReadAuto() {
-  if (readPoll) { clearInterval(readPoll); readPoll = null; }
-  // Auto-read used to HTTP-poll /api/read every 10s. The SSE stream and
-  // /ws/live already push the forming bar; this checkbox now just seeds
-  // once when turned on.
   if ($('rAuto').checked) loadRead();
 }
+
+/* THE RULE'S CLOCK. /api/read is the ONLY thing that runs the trade
+   column -- the entry test, the exit test, the cap, the alert. It is
+   not a display route.
+
+   The 10-second poll that used to drive it was removed on the
+   reasoning that "/ws/live already pushes the forming bar". That is
+   true and it is beside the point: the socket updates what is DRAWN.
+   It does not evaluate the rule. So the strategy only stepped when
+   something happened to call loadRead -- a click, a page load, a
+   dropdown -- and in between, nothing. Chris: "the trade on this
+   rule is behind real time data completely by several points at a
+   time". Several points, because the rule was not late, it was
+   ASLEEP, and the first poll after a click acted on a signal that
+   had fired minutes earlier at a price long gone.
+
+   One second, in flight tracked so a slow answer cannot stack.
+
+   THE LIMIT THIS DOES NOT FIX, said plainly: the rule still only
+   runs while this page is open, and browsers throttle timers in a
+   hidden tab to about once a minute. Auto-trading that must run
+   with the laptop shut needs a stepper on the server, which this is
+   not. */
+let _readBusy = false;
+setInterval(async () => {
+  if (_readBusy) return;
+  const el = $('rInt');
+  if (!el) return;
+  _readBusy = true;
+  try { await loadRead(); } catch (e) {} finally { _readBusy = false; }
+}, 1000);
 
 /* The order-flow ladder.
 

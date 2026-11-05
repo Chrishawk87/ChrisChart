@@ -884,6 +884,7 @@ STRATEGIES = {
     "candle": "Candle -- the window candle alone",
     "footprint": "Footprint -- candle and footprint imbalance agree",
     "fused": "Fused -- the tick bar and the OFI, read separately, agree",
+    "timed": "Timed -- the 5m candle, guided in and out by the 1m",
 }
 
 
@@ -928,6 +929,22 @@ def window_signal(win: dict, strategy: str = "ofi",
     # Checked BEFORE the window guards below, because a fused signal
     # must not be refused for "no window yet" when the window is not
     # what it is looking at.
+    # THE TIMED RULE READS TWO TIME CANDLES AND NOTHING ELSE.
+    #
+    # The 5-minute names the direction and the 1-minute says whether
+    # the fight inside it is continuation or pullback. Checked here
+    # with the fused rule, before the window guards, because like
+    # that one it does not look at the window at all and must not be
+    # refused for "no window yet".
+    if strategy == "timed":
+        if not fused:
+            return "", "no reading from the 1m or the 5m yet"
+        side = str(fused.get("side") or "")
+        if side in ("up", "down"):
+            return side, ""
+        return "", (str(fused.get("why") or "")
+                    or "the 1m and the 5m do not agree")
+
     if strategy == "fused":
         if not fused:
             return "", "no reading from the tick bar or the OFI yet"

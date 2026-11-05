@@ -323,9 +323,13 @@ class TestTheFiveMinuteLeg:
         A confirmation that disagrees with what Chris can see on his
         own screen is worse than no confirmation.
         """
-        blk = py_func("_m5_now")
+        # The decode moved into one shared reader when the timed
+        # rule needed the same thing for the 1-minute. The claim is
+        # unchanged; it is asserted where the code now lives.
+        blk = py_func("_candle_now")
         assert '"up" if cl > o else "down" if cl < o else "flat"' in blk
-        assert 'tape.candle("5m")' in blk
+        assert "tape.candle(interval)" in blk
+        assert '_candle_now(rt_, "5m")' in py_func("_m5_now")
 
     # -- the exit is the entry, run again ---------------------------------
 
