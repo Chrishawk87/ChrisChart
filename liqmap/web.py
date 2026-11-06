@@ -15037,7 +15037,20 @@ function jnlToggleAuto() {
   jnlSet();
 }
 
+/* What was last SENT for each control, cleared once the server
+   reports it back. See the pin in the settings painter. */
+let _jnlWant = {};
+
 async function jnlSet() {
+  _jnlWant = {
+    jnlAuto: $('jnlAuto').checked,
+    jnlTpOn: $('jnlTpOn').checked,
+    jnlSlOn: $('jnlSlOn').checked,
+    jnlTp: $('jnlTp').value || 0,
+    jnlSl: $('jnlSl').value || 0,
+    jnlWin: $('jnlWin') ? String(Math.round($('jnlWin').value || 900)) : undefined,
+    jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
+  };
   const q = new URLSearchParams({
     coin: coin(),
     auto: $('jnlAuto').checked ? 'true' : 'false',
@@ -15781,12 +15794,37 @@ function paintJournal(d) {
     return;
   }
   const S = J.settings || {};
-  /* The inputs are only written when they are not being typed in,
-     so a value does not get yanked back mid-edit by a poll. */
+  /* THE INPUTS ARE WRITTEN FROM THE SERVER ON EVERY POLL, AND THE
+     POLL IS NOW ONCE A SECOND.
+
+     The old guard was `document.activeElement !== e`, which holds a
+     text box while it is being typed in. It does nothing for a
+     SELECT: picking an option drops focus immediately, so between
+     the change firing `jnlSet()` and that POST landing, the next
+     poll still carries the OLD strategy and writes it straight back
+     into the dropdown. At one poll a second that reads as the
+     setting fighting you -- Chris: "glitching really bad between my
+     strategies fused and timed".
+
+     So a control the user has just set is PINNED to what was sent
+     until the server reports the same value back. It self-heals: a
+     save that never lands leaves the pin, and the moment the
+     server agrees the pin is dropped and polls own the field
+     again. */
   const set = (id, v) => { const e = $(id);
-    if (e && document.activeElement !== e) e.value = v; };
+    if (!e || document.activeElement === e) return;
+    if (_jnlWant[id] !== undefined) {
+      if (String(_jnlWant[id]) !== String(v)) return;   // still in flight
+      delete _jnlWant[id];                              // server caught up
+    }
+    e.value = v; };
   const chk = (id, v) => { const e = $(id);
-    if (e && document.activeElement !== e) e.checked = !!v; };
+    if (!e || document.activeElement === e) return;
+    if (_jnlWant[id] !== undefined) {
+      if (!!_jnlWant[id] !== !!v) return;
+      delete _jnlWant[id];
+    }
+    e.checked = !!v; };
   chk('jnlAuto', S.auto); chk('jnlTpOn', S.tp_on); chk('jnlSlOn', S.sl_on);
   set('jnlTp', S.tp_ticks); set('jnlSl', S.sl_ticks);
   set('jnlWin', String(Math.round(S.window_s || 900)));
@@ -16301,12 +16339,18 @@ function openStream() {
   closeStream();
   // EventSource cannot set headers, so the token travels in the query. It is
   // encoded like every other parameter.
-  const url = '/api/stream?' + q({coin: coin(), interval: $('rInt').value,
+  // The market this stream speaks for, captured at open. Every
+  // frame it pushes is stamped with it, so if the selection moves
+  // on before the stream is closed its frames are dropped instead
+  // of fighting the poll for the panel.
+  const sCoin = coin();
+  const url = '/api/stream?' + q({coin: sCoin, interval: $('rInt').value,
                                   higher: $('rHigh').value, token: tok()});
   stream = new EventSource(url);
 
   stream.onmessage = (ev) => {
-    try { paintRead(JSON.parse(ev.data)); } catch (e) {}
+    try { const f = JSON.parse(ev.data); f.__coin = sCoin; paintRead(f); }
+    catch (e) {}
   };
 
   // Price arrives on its own channel, on every batch of fills. The full read
@@ -16895,11 +16939,13 @@ function readTfChanged() {
 
 async function loadRead() {
   let d;
+  const want = coin();
   try {
-    d = await api('/api/read?' + q({coin: coin(), interval: $('rInt').value,
+    d = await api('/api/read?' + q({coin: want, interval: $('rInt').value,
                   higher: $('rHigh').value,
                   size: parseFloat($('liqSize').value || '0') || 0}));
   } catch (e) { $('readHead').textContent = e.message; return; }
+  d.__coin = want;
   paintRead(d);
 }
 
@@ -16911,6 +16957,20 @@ let flowAt = 0;
 
 function paintRead(d) {
   if (!d) return;
+  /* TWO WRITERS, ONE PANEL. The one-second poll fetches the
+     selected market; the SSE stream pushes whatever market it was
+     OPENED on. Switch coin and the old stream keeps pushing while
+     the new poll fetches, so the panel alternates once a second
+     between the two -- Chris: "price between the ES and the BTC
+     keeps fluctuating between the 2 like it cant select one or the
+     other".
+
+     Neither writer could tell, because nothing in the payload said
+     which market it answered for. Each writer now stamps what it
+     ASKED for and anything that does not match the current
+     selection is dropped. A stale writer becomes harmless rather
+     than needing to be hunted down. */
+  if (d.__coin && d.__coin !== coin()) return;
 
   /* THE LADDER REFRESHES FROM HERE, NOT FROM loadRead.
      
