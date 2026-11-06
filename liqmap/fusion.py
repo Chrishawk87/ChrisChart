@@ -286,6 +286,13 @@ def state(tick: dict | None, ofi: dict | None,
             "close": tick.get("close"),
             "ticks": tick.get("ticks"),
             "seconds": tick.get("seconds"),
+            # THE SMOOTHED READING TRAVELS WITH THE RAW ONE. This
+            # dict is a reshape, so a field not named here is
+            # silently dropped -- the smoothing arrived at the
+            # route and died one function later, reading exactly
+            # like a mode that does nothing.
+            "raw_dir": tick.get("raw_dir") or t_dir,
+            "smooth": tick.get("smooth") or {},
         },
         "ofi": {
             "dir": o_dir,

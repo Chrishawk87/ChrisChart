@@ -5660,7 +5660,9 @@ def create_app() -> FastAPI:
         return {"ok": True, "deleted": n}
 
     @app.get("/api/fusion", dependencies=[Depends(require_token)])
-    def api_fusion(coin: str = "ES", per_bar: int = 0) -> dict[str, Any]:
+    def api_fusion(coin: str = "ES", per_bar: int = 0,
+                   smooth: str = "raw", flip_ticks: float = 0.0,
+                   ema_n: int = 0) -> dict[str, Any]:
         """The tick bar and the OFI bar, read separately, compared.
 
         THE SAME CALL THE RULE MAKES. The panel and the strategy read
@@ -5678,7 +5680,8 @@ def create_app() -> FastAPI:
         rt_ = RT
         if rt_ is None:
             return {"error": "the service is still starting"}
-        st = _fusion_now(rt_, int(per_bar or 0))
+        st = _fusion_now(rt_, int(per_bar or 0), smooth,
+                         float(flip_ticks or 0.0), int(ema_n or 0))
         # THE TIMED READINGS AND THE STEPPER DO NOT DEPEND ON THE
         # TICK BARS, so they are built before the early return
         # rather than going out with it. This route had the same
@@ -6893,7 +6896,35 @@ def create_app() -> FastAPI:
             return wins.get(float(period_s)) or wins.get(900.0)
         return getattr(tape, "clockwin", None) if tape else None
 
-    def _tick_now(rt_, per_bar: int = 0) -> dict:
+    def _tick_smoothed(bld, mode: str, flip_ticks: float,
+                       ema_n: int, live_px: float) -> dict:
+        """Run one smoother over this builder's closed bars.
+
+        COMPUTED ON DEMAND RATHER THAN KEPT ON THE TAPE. Three modes
+        over 1,500 kept bars is a few thousand float operations a
+        poll, which is nothing, and it means the smoothed reading
+        cannot drift out of step with the bars it claims to
+        describe -- a stateful copy fed from a second place is
+        exactly how the panel and the rule ended up disagreeing
+        about the 5-minute candle.
+        """
+        from .smooth import Smoother
+
+        try:
+            sm = Smoother(mode, flip_ticks=flip_ticks, ema_n=ema_n)
+        except ValueError:
+            return {}
+        for b in (getattr(bld, "done", None) or []):
+            sm.on_bar(b.open, b.high, b.low, b.close)
+        if live_px > 0:
+            # The forming bar, so THRESHOLD can act between closes.
+            # The averages ignore this by construction, which is
+            # the difference between the methods.
+            sm.on_price(live_px)
+        return sm.to_dict()
+
+    def _tick_now(rt_, per_bar: int = 0, smooth: str = "raw",
+                  flip_ticks: float = 0.0, ema_n: int = 0) -> dict:
         """The tick bar BEING BUILT, and which way it points.
 
         Its direction is its own traded price, close against open.
@@ -6912,11 +6943,29 @@ def create_app() -> FastAPI:
         bld = bars.get(want)
         if bld is None:
             bld = bars[min(bars, key=lambda k: abs(int(k) - want))]
+        from .smooth import DEFAULT_EMA_N, DEFAULT_FLIP_TICKS
+
         cur = bld.current
+        live = float(getattr(cur, "close", 0.0) or 0.0) if cur else 0.0
+        sm = {}
+        if smooth and smooth != "raw":
+            sm = _tick_smoothed(bld, smooth,
+                                flip_ticks or DEFAULT_FLIP_TICKS,
+                                ema_n or DEFAULT_EMA_N, live)
         if cur is None:
             return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
+                    "smooth": sm,
                     "why": "between bars -- the last print closed one"}
-        return {"per_bar": bld.per_bar, "dir": cur.direction,
+        raw_dir = cur.direction
+        return {"per_bar": bld.per_bar,
+                # THE SMOOTHED DIRECTION WINS WHEN ONE IS ASKED FOR,
+                # and the raw one stays beside it under its own name.
+                # Replacing `dir` outright would have left no way to
+                # see what the smoothing changed, which is the only
+                # way to find out whether it helped.
+                "dir": (sm.get("dir") or raw_dir) if sm else raw_dir,
+                "raw_dir": raw_dir,
+                "smooth": sm,
                 "prints": cur.trades, "open": cur.open,
                 "close": cur.close, "seconds": round(cur.seconds, 1),
                 "ticks": round((cur.close - cur.open) / 0.25, 1)
@@ -6989,7 +7038,8 @@ def create_app() -> FastAPI:
             m5 = dict(m5, push=round(float(push), 2))
         return _tm.state(_candle_now(rt_, "1m"), m5, m5_dir=d5)
 
-    def _fusion_now(rt_, per_bar: int = 0) -> dict:
+    def _fusion_now(rt_, per_bar: int = 0, smooth: str = "raw",
+                    flip_ticks: float = 0.0, ema_n: int = 0) -> dict:
         """The two series side by side, and whether they agree.
 
         THE SAME READINGS THE PANEL DRAWS AND THE RULE TRADES. One
@@ -6999,7 +7049,8 @@ def create_app() -> FastAPI:
         """
         from . import fusion as _fu
 
-        return _fu.state(_tick_now(rt_, per_bar), _bar_read(rt_),
+        return _fu.state(_tick_now(rt_, per_bar, smooth, flip_ticks,
+                                   ema_n), _bar_read(rt_),
                          _m5_now(rt_))
 
     def _fused_now(rt_, pair: tuple[int, int] | None = None) -> dict:
@@ -10153,6 +10204,29 @@ has to be running before the gate stops refusing.">spike
       <div class="conbar" style="margin-top:-2px">
         <label>tick series <select id="fusTick" onchange="fusLoad()"
           style="margin:0 4px"></select></label>
+        <label title="How the tick bar's direction is steadied.
+RAW is the control -- the bar itself, no smoothing, so you can see
+what the others changed.
+THRESHOLD holds the direction until price gives back N ticks from
+the best level since the last turn. No time lag at all: a real
+reversal registers on the print that completes it. It is late in
+PRICE instead -- every turn gives back those N ticks.
+HEIKIN-ASHI averages each bar with the one before it, which is both
+why a run stays one colour and why it trails by about a bar.
+EMA is price against an N-bar average: the smoothest and the
+latest, and it whipsaws when price sits on the line.">smoothing
+          <select id="fusSmooth" onchange="fusLoad()"
+            style="margin:0 4px">
+            <option value="raw" selected>raw (control)</option>
+            <option value="threshold">threshold</option>
+            <option value="heikin">heikin-ashi</option>
+            <option value="ema">ema</option>
+          </select></label>
+        <label title="Ticks of give-back before THRESHOLD turns.
+Bigger holds a trade longer and hands back more at every turn.">
+          flip <input id="fusFlip" type="number" min="1" max="40"
+            step="1" value="4" onchange="fusLoad()"
+            style="width:48px;margin:0 4px"></label>
         <label title="Sound, a desktop notification and a banner the
 moment the rule fires -- and again when it says to get out. For
 placing the trade in Ironbeam yourself."><input type="checkbox"
@@ -15123,8 +15197,12 @@ async function fusLoad() {
   const sel = $('fusTick');
   let d;
   try {
+    const sm = $('fusSmooth');
+    const ft = $('fusFlip');
     d = await api('/api/fusion?' + q({
-      coin: coin(), per_bar: (sel && sel.value) || 0}));
+      coin: coin(), per_bar: (sel && sel.value) || 0,
+      smooth: (sm && sm.value) || 'raw',
+      flip_ticks: (ft && ft.value) || 0}));
   } catch (e) { return; }
   if (!_fusSized && d && d.sizes) {
     // Filled once from the server's own list. Hard-coding the sizes
@@ -15387,6 +15465,27 @@ function paintFusion(d) {
   if (t.ticks != null)
     tickLines.push(`${t.ticks > 0 ? '+' : ''}${t.ticks} ticks from its open`);
   if (t.seconds != null) tickLines.push(`${t.seconds}s old`);
+  /* WHAT THE SMOOTHING CHANGED, and what it costs.
+
+     The raw direction stays visible beside the smoothed one. A
+     steadier line that is never compared against the bar it
+     smoothed is a line nobody can judge -- every idea in this
+     engine that went in without its control had to come back out
+     again. When they disagree, THAT is the smoothing working, and
+     it is the moment to decide whether you believe it. */
+  const sm_ = t.smooth || {};
+  if (sm_.mode && sm_.mode !== 'raw') {
+    if (t.raw_dir && sm_.dir && t.raw_dir !== sm_.dir)
+      tickLines.push(`<b style="color:var(--dim)">raw bar says `
+        + `${esc(t.raw_dir)}</b> &mdash; held by the smoothing`);
+    else if (t.raw_dir)
+      tickLines.push(`raw bar agrees (${esc(t.raw_dir)})`);
+    if (sm_.say) tickLines.push(esc(sm_.say));
+    if (sm_.flips != null)
+      tickLines.push(`${sm_.flips} direction change`
+        + `${sm_.flips === 1 ? '' : 's'} in ${Number(sm_.bars || 0)
+           .toLocaleString()} bars`);
+  }
   if (t.why) tickLines.push(esc(t.why));
 
   const ofiLines = [];
