@@ -97,8 +97,12 @@ KEEP = 1_500
 class TickBar:
     """One bar: N prints, and what they did.
 
-    `trades` is N for every closed bar by construction, so it is only
-    interesting on the forming one, where it says how far along it is.
+    `trades` is N for every closed bar WHEN THE BUILDER HAS NO
+    PERIOD. Give it one and a bar can also be cut by the clock, in
+    which case it closes short and `by_clock` says so -- the
+    invariant that used to hold by construction now holds only for
+    `period_s == 0`, and anything reading `trades` on a closed bar
+    has to look at `by_clock` first.
     """
 
     start_ts: float
@@ -114,6 +118,11 @@ class TickBar:
     unknown: int = 0
     unknown_size: float = 0.0
     closed: bool = False
+    # Closed because a time boundary arrived, not because the count
+    # was reached. Such a bar is SHORT -- possibly a single print in
+    # a quiet minute -- and a direction read off three prints is not
+    # the same measurement as one read off five thousand.
+    by_clock: bool = False
 
     @property
     def seconds(self) -> float:
@@ -178,6 +187,7 @@ class TickBar:
             "unknown": self.unknown,
             "unknown_size": round(self.unknown_size, 2),
             "closed": bool(self.closed),
+            "by_clock": bool(self.by_clock),
             # The chart painter already knows what `live` means and
             # draws that bar differently. Spelling the same state two
             # ways is not redundancy here -- `closed` is this
@@ -199,11 +209,12 @@ class TickBars:
     target).
     """
 
-    __slots__ = ("per_bar", "keep", "done", "_cur", "_prints",
-                 "_unknown", "_bars_built")
+    __slots__ = ("per_bar", "keep", "period_s", "done", "_cur",
+                 "_prints", "_unknown", "_bars_built", "_clock_cuts",
+                 "_last_by_clock")
 
     def __init__(self, per_bar: int = DEFAULT_PER_BAR,
-                 keep: int = KEEP) -> None:
+                 keep: int = KEEP, period_s: float = 0.0) -> None:
         # Only a floor of 1 here, not MIN_PER_BAR. The sane-size
         # clamp belongs at the boundary where an untrusted number
         # arrives -- `parse_interval` -- not in the core, where it
@@ -212,11 +223,29 @@ class TickBars:
         n = int(per_bar or DEFAULT_PER_BAR)
         self.per_bar = max(1, n)
         self.keep = max(1, int(keep))
+        # A TICK BAR THAT ALSO ANSWERS TO THE CLOCK. Chris: "i know
+        # that tick bars are not natively time based but i want to
+        # make my tick bar time based as well resetting every 5 or
+        # 15 minutes".
+        #
+        # Zero keeps the native behaviour and is the default, so
+        # every existing builder is untouched. Set it, and a bar
+        # closes on whichever comes first -- the count or the
+        # boundary -- so no bar ever straddles one and the series
+        # lines up with the 5-minute candle a rule is reading.
+        self.period_s = max(0.0, float(period_s or 0.0))
         self.done: deque[TickBar] = deque(maxlen=self.keep)
         self._cur: TickBar | None = None
         self._prints = 0            # prints seen, all time
         self._unknown = 0           # of those, with no side
         self._bars_built = 0
+        self._clock_cuts = 0        # of those, closed short by time
+        # WHETHER THE MOST RECENT CLOSE WAS A CLOCK CUT, kept here
+        # rather than read back off `last_closed`. The intrabar
+        # readers are held by test to touching only the FORMING
+        # bar -- reaching into a closed one for a flag is how that
+        # rule gets eroded one harmless-looking line at a time.
+        self._last_by_clock = False
 
     # -- feeding ---------------------------------------------------------
 
@@ -246,6 +275,24 @@ class TickBars:
         s = (side or "").strip().upper()[:1]
 
         b = self._cur
+        # THE BOUNDARY IS CHECKED BEFORE THE PRINT IS APPLIED, and
+        # the print that crosses it starts the NEW bar rather than
+        # finishing the old one. Applying it first would credit a
+        # trade to a bar that had already ended by the clock -- the
+        # same ordering rule the tape uses for trade-then-book.
+        cut = None
+        if (b is not None and self.period_s > 0
+                and int(t // self.period_s)
+                != int(b.start_ts // self.period_s)):
+            b.closed = True
+            b.by_clock = True
+            self.done.append(b)
+            self._bars_built += 1
+            self._clock_cuts += 1
+            self._last_by_clock = True
+            cut = b
+            b = self._cur = None
+
         if b is None:
             b = self._cur = TickBar(start_ts=t, open=p, high=p,
                                     low=p, close=p, ts_last=t)
@@ -270,9 +317,14 @@ class TickBars:
             b.closed = True
             self.done.append(b)
             self._bars_built += 1
+            self._last_by_clock = False
             self._cur = None
             return b
-        return None
+        # One print can close two bars -- the clock cut above and
+        # then a count close, when `per_bar` is 1. Both are in
+        # `done`; the return names the LAST one closed, so a caller
+        # driving a chart off it never draws a bar out of order.
+        return cut
 
     # -- reading ---------------------------------------------------------
 
@@ -280,6 +332,11 @@ class TickBars:
     def current(self) -> TickBar | None:
         """The bar being built, or None when the last print closed one."""
         return self._cur
+
+    @property
+    def last_by_clock(self) -> bool:
+        """Was the most recent close a clock cut rather than a count?"""
+        return self._last_by_clock
 
     @property
     def last_closed(self) -> TickBar | None:

@@ -293,6 +293,9 @@ def state(tick: dict | None, ofi: dict | None,
             # like a mode that does nothing.
             "raw_dir": tick.get("raw_dir") or t_dir,
             "smooth": tick.get("smooth") or {},
+            "reset_s": tick.get("reset_s") or 0.0,
+            "by_clock": bool(tick.get("by_clock")),
+            "clock_cuts": tick.get("clock_cuts") or 0,
         },
         "ofi": {
             "dir": o_dir,

@@ -182,6 +182,14 @@ class Tape:
     # ATTRIBUTABLE prints would close at a different rate than the
     # one the panel says it is drawing.
     tickbars: dict | None = None
+    # THE SAME SIZES, CUT BY THE CLOCK AS WELL. Chris wanted the
+    # tick bar to reset every 5 or 15 minutes so it lines up with
+    # the candle a rule reads. Kept as a SEPARATE family rather than
+    # changing the key of `tickbars`, so every existing reader --
+    # the chart route, the fusion read, the strategy -- is untouched
+    # and the native series stays available beside the cut one to
+    # compare against. Keyed (per_bar, period_s).
+    tickbars_timed: dict | None = None
     # DUAL-TRIGGER BARS, keyed by (prints, contracts). These need
     # BOTH feeds -- the raw side character for the tick leg, because
     # `trade_from` drops side 'N', and the raw integer levels for the
@@ -475,6 +483,7 @@ class Tape:
         # record itself: a tape full of unknown-side prints must not
         # be able to look like a balanced one.
         if (self.clockwin is not None or self.tickbars
+                or self.tickbars_timed
                 or self.fusedbars or self.kinetic is not None
                 or self.kinetic_bar is not None):
             try:
@@ -497,6 +506,8 @@ class Tape:
                     # series would then disagree about a print
                     # they both saw.
                     for _tb in (self.tickbars or {}).values():
+                        _tb.on_trade(_ts, _rpx, _rsz, _sd)
+                    for _tb in (self.tickbars_timed or {}).values():
                         _tb.on_trade(_ts, _rpx, _rsz, _sd)
                     # THE TICK LEG of the fused bars, from the same
                     # decode. Their OFI leg is fed from the book

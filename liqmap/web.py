@@ -1105,6 +1105,16 @@ class Runtime:
                 svc.tape.tickbars = {
                     int(n): TickBars(per_bar=int(n))
                     for n in PER_BAR_CHOICES}
+            if not svc.tape.tickbars_timed:
+                # THE SAME SIZES CUT AT 5 AND 15 MINUTES. Two more
+                # periods is two more handfuls of adds per print,
+                # and it means switching the reset is instant
+                # rather than starting an empty chart -- the same
+                # reason there is a builder per size.
+                from .tickbar import PER_BAR_CHOICES as _PBC, TickBars as _TB
+                svc.tape.tickbars_timed = {
+                    (int(n), float(p_)): _TB(per_bar=int(n), period_s=p_)
+                    for n in _PBC for p_ in (300.0, 900.0)}
             if not svc.tape.fusedbars:
                 # DUAL-TRIGGER BARS. Not persisted either, and for a
                 # stronger reason than the tick bars: a half-built
@@ -5662,7 +5672,8 @@ def create_app() -> FastAPI:
     @app.get("/api/fusion", dependencies=[Depends(require_token)])
     def api_fusion(coin: str = "ES", per_bar: int = 0,
                    smooth: str = "raw", flip_ticks: float = 0.0,
-                   ema_n: int = 0) -> dict[str, Any]:
+                   ema_n: int = 0, reset_s: float = 0.0
+                   ) -> dict[str, Any]:
         """The tick bar and the OFI bar, read separately, compared.
 
         THE SAME CALL THE RULE MAKES. The panel and the strategy read
@@ -5681,7 +5692,8 @@ def create_app() -> FastAPI:
         if rt_ is None:
             return {"error": "the service is still starting"}
         st = _fusion_now(rt_, int(per_bar or 0), smooth,
-                         float(flip_ticks or 0.0), int(ema_n or 0))
+                         float(flip_ticks or 0.0), int(ema_n or 0),
+                         float(reset_s or 0.0))
         # THE TIMED READINGS AND THE STEPPER DO NOT DEPEND ON THE
         # TICK BARS, so they are built before the early return
         # rather than going out with it. This route had the same
@@ -6924,7 +6936,8 @@ def create_app() -> FastAPI:
         return sm.to_dict()
 
     def _tick_now(rt_, per_bar: int = 0, smooth: str = "raw",
-                  flip_ticks: float = 0.0, ema_n: int = 0) -> dict:
+                  flip_ticks: float = 0.0, ema_n: int = 0,
+                  reset_s: float = 0.0) -> dict:
         """The tick bar BEING BUILT, and which way it points.
 
         Its direction is its own traded price, close against open.
@@ -6936,13 +6949,23 @@ def create_app() -> FastAPI:
 
         svc = getattr(rt_, "ofi", None)
         tape = getattr(svc, "tape", None) if svc else None
-        bars = getattr(tape, "tickbars", None) if tape else None
-        if not bars:
-            return {}
         want = int(per_bar or STRATEGY_PER_BAR)
-        bld = bars.get(want)
-        if bld is None:
-            bld = bars[min(bars, key=lambda k: abs(int(k) - want))]
+        if reset_s > 0:
+            fam = getattr(tape, "tickbars_timed", None) if tape else None
+            if not fam:
+                return {}
+            key = (want, float(reset_s))
+            bld = fam.get(key)
+            if bld is None:
+                bld = fam[min(fam, key=lambda k: (abs(float(k[1]) - reset_s),
+                                                  abs(int(k[0]) - want)))]
+        else:
+            bars = getattr(tape, "tickbars", None) if tape else None
+            if not bars:
+                return {}
+            bld = bars.get(want)
+            if bld is None:
+                bld = bars[min(bars, key=lambda k: abs(int(k) - want))]
         from .smooth import DEFAULT_EMA_N, DEFAULT_FLIP_TICKS
 
         cur = bld.current
@@ -6955,9 +6978,19 @@ def create_app() -> FastAPI:
         if cur is None:
             return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
                     "smooth": sm,
+                    "reset_s": getattr(bld, "period_s", 0.0),
+                    "by_clock": bool(getattr(bld, "last_by_clock", False)),
+                    "clock_cuts": getattr(bld, "_clock_cuts", 0),
                     "why": "between bars -- the last print closed one"}
         raw_dir = cur.direction
         return {"per_bar": bld.per_bar,
+                "reset_s": getattr(bld, "period_s", 0.0),
+                # Short because the clock cut it, not because the
+                # count was reached. A direction off three prints is
+                # not the same measurement as one off five thousand,
+                # and the panel has to be able to say so.
+                "by_clock": bool(getattr(bld, "last_by_clock", False)),
+                "clock_cuts": getattr(bld, "_clock_cuts", 0),
                 # THE SMOOTHED DIRECTION WINS WHEN ONE IS ASKED FOR,
                 # and the raw one stays beside it under its own name.
                 # Replacing `dir` outright would have left no way to
@@ -7039,7 +7072,8 @@ def create_app() -> FastAPI:
         return _tm.state(_candle_now(rt_, "1m"), m5, m5_dir=d5)
 
     def _fusion_now(rt_, per_bar: int = 0, smooth: str = "raw",
-                    flip_ticks: float = 0.0, ema_n: int = 0) -> dict:
+                    flip_ticks: float = 0.0, ema_n: int = 0,
+                    reset_s: float = 0.0) -> dict:
         """The two series side by side, and whether they agree.
 
         THE SAME READINGS THE PANEL DRAWS AND THE RULE TRADES. One
@@ -7050,7 +7084,7 @@ def create_app() -> FastAPI:
         from . import fusion as _fu
 
         return _fu.state(_tick_now(rt_, per_bar, smooth, flip_ticks,
-                                   ema_n), _bar_read(rt_),
+                                   ema_n, reset_s), _bar_read(rt_),
                          _m5_now(rt_))
 
     def _fused_now(rt_, pair: tuple[int, int] | None = None) -> dict:
@@ -10221,6 +10255,19 @@ latest, and it whipsaws when price sits on the line.">smoothing
             <option value="threshold">threshold</option>
             <option value="heikin">heikin-ashi</option>
             <option value="ema">ema</option>
+          </select></label>
+        <label title="A tick bar closes on a count of prints. Give
+it a reset and it also closes on the clock, whichever comes first,
+so no bar straddles a boundary and the series lines up with the
+5-minute candle the rule reads.
+The cost: in a quiet stretch a bar can close with very few prints,
+and a direction off three prints is not the measurement a
+five-thousand-print bar gives. The panel says when the last bar was
+cut short.">reset <select id="fusReset" onchange="fusLoad()"
+            style="margin:0 4px">
+            <option value="0" selected>none (native)</option>
+            <option value="300">every 5m</option>
+            <option value="900">every 15m</option>
           </select></label>
         <label title="Ticks of give-back before THRESHOLD turns.
 Bigger holds a trade longer and hands back more at every turn.">
@@ -15202,7 +15249,8 @@ async function fusLoad() {
     d = await api('/api/fusion?' + q({
       coin: coin(), per_bar: (sel && sel.value) || 0,
       smooth: (sm && sm.value) || 'raw',
-      flip_ticks: (ft && ft.value) || 0}));
+      flip_ticks: (ft && ft.value) || 0,
+      reset_s: ($('fusReset') && $('fusReset').value) || 0}));
   } catch (e) { return; }
   if (!_fusSized && d && d.sizes) {
     // Filled once from the server's own list. Hard-coding the sizes
@@ -15473,6 +15521,13 @@ function paintFusion(d) {
      engine that went in without its control had to come back out
      again. When they disagree, THAT is the smoothing working, and
      it is the moment to decide whether you believe it. */
+  if (t.reset_s) {
+    tickLines.push(`cut every ${Math.round(t.reset_s / 60)}m as well `
+      + `as every ${Number(t.per_bar || 0).toLocaleString()} prints`);
+    if (t.by_clock)
+      tickLines.push(`<b style="color:var(--dim)">the last bar closed `
+        + `on the clock, short of its count</b>`);
+  }
   const sm_ = t.smooth || {};
   if (sm_.mode && sm_.mode !== 'raw') {
     if (t.raw_dir && sm_.dir && t.raw_dir !== sm_.dir)
