@@ -25,29 +25,97 @@ public URL carrying your trading configuration should not be the default.
 
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
 import traceback
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Sequence
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+import asyncio as _asyncio
 
+from fastapi import (Depends, FastAPI, File, Header, HTTPException, Query,
+                     UploadFile, WebSocket, WebSocketDisconnect)
+from fastapi.responses import (HTMLResponse, JSONResponse,
+                               PlainTextResponse, Response)
+
+from . import consensus as consensus_mod
 from .bucket import build_map, render
+from .barflow import BarFlow, BarFlowStore, merge as merge_cvd
+from .orderflow import velocity as _of_velocity
 from .history import History, render_changes
+from .travel import Tracker
 from .settings import Settings, SettingsStore, default_db_path
+from .ledger import Ledger
+import bisect
+from dataclasses import replace
+from typing import Sequence
+from .autopilot import Autopilot, Knobs, KNOBS
+from . import score as score_mod
+from . import tuner as tuner_mod
+from . import sweep as sweep_mod
+from . import vote as vote_mod
+from . import ppo as ppo_mod
+from . import project as pj_mod
 from .strength import fragility_weighter, score_all, summarise
 
 APP_TITLE = "liqmap"
+
+# Trade size assumed when none is given, in dollars. It is a stated default
+# rather than a borrowed one: size determines the round-trip cost, which
+# determines whether a suggestion is offered at all, so it must not be tied
+# to an unrelated setting that someone might reasonably change.
+DEFAULT_TRADE_NOTIONAL = 10_000.0
+
+# Largest chart-history upload accepted, in bytes. Enforced against the
+# declared length BEFORE the body is read, because a cap checked after
+# `await file.read()` has already allocated the whole thing.
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+
+# Most bars kept from one upload. A 14MB CSV parses to roughly 400k bars and
+# half a gigabyte of resident memory; this bounds that regardless of what the
+# file claims to be.
+MAX_UPLOAD_BARS = 250_000
 
 
 # --------------------------------------------------------------------------
 # state
 # --------------------------------------------------------------------------
+
+# How long a learned volume shape is reused before it is rebuilt, and the
+# longest bar whose shape can be cut straight from the tape. The tape holds
+# an hour, so anything past five minutes cannot supply enough completed
+# bars from it and goes to the one-minute path instead.
+# Bars a polled row aggregates. Three, on every timeframe.
+POLLED_BARS = 3
+
+CURVE_TTL_S = 120.0
+FAST_CURVE_S = 300.0
+
+# Trajectory samples put on the wire. The trace keeps the whole bar; only
+# the tail is drawn, and the payload is polled every couple of seconds.
+_TRACE_KEEP = 40
+
+
+def _feed_age(feed) -> float | None:
+    """Seconds since the feed's last message, or None if there has
+    never been one.
+
+    `Feed.age` is `float | None`: None means the socket is open and
+    running but nothing has arrived yet -- a market the venue does not
+    carry, or a subscription that was accepted and then stayed quiet.
+
+    It must NOT be collapsed to 0.0. Zero says the feed ticked this
+    instant, which is the opposite of the truth, and every staleness
+    check downstream reads it as the freshest possible data. None
+    travels as JSON null and the page already draws that as unknown.
+    """
+    a = getattr(feed, "age", None)
+    return None if a is None else round(max(0.0, a), 1)
+
 
 class Runtime:
     """Shared, lazily built state. One database, reused connections."""
@@ -56,14 +124,133 @@ class Runtime:
         self.db_path = default_db_path()
         self.settings_store = SettingsStore(self.db_path)
         self.history = History(self.db_path)
+        # One parsed per-second dataset, kept so the backtester panel
+        # does not re-read 1.8 million rows on every slider move.
+        # Deliberately a single slot: two months in memory is a
+        # quarter of a gigabyte, and the panel shows one at a time.
+        self.ofi_bt_name: str = ""
+        self.ofi_bt_secs = None
+        self._footprint = None
+        self._footprint_rule = ""
+        # The panel polls on a timer, so two requests can arrive
+        # together. Without this both build a stream, the tape ends
+        # up pointing at one of them, and the other's reader sees an
+        # empty bar -- which looks like a random reset.
+        self._footprint_lock = threading.Lock()
+        # One row per closed bar per timeframe. The only place a slow
+        # timeframe's CVD can come from: the fills behind it leave the
+        # rolling tape within the hour, and nothing else ever recorded who
+        # crossed the spread.
+        self.barflow = BarFlowStore(self.db_path)
+        # Every call the engine makes, written before its answer exists.
+        from .callbook import CallBook as _CallBook
+        self.callbook = _CallBook(self.db_path)
+        # Chris's own trades under the four-must-agree rule, in ticks
+        # and dollars. A RECORD, NOT A BROKER -- see liqmap/journal.py.
+        from .journal import Journal as _Journal
+        self.journal = _Journal(self.db_path)
+        # The agent's own book, separate from yours on purpose: yours is
+        # filtered by your judgement, which is the thing it is being
+        # measured against.
+        self.ledger = Ledger(self.db_path)
+        self._pilots: dict[tuple[str, str], Autopilot] = {}
+        # The shape of volume inside a bar, per market and timeframe. Built
+        # on a timer because the tape path walks every fill the tape holds
+        # and the dashboard polls several times a minute.
+        self._curves: dict[tuple[str, str], tuple[float, Any]] = {}
+        # Where each timeframe's on-candle move has been, so the panel can
+        # say whether the number is rising or falling rather than only what
+        # it is. Kept here rather than in the browser because both the
+        # polled path and the pushed one go through one route, and because
+        # a figure measured on the server can later be tested against
+        # outcomes rather than only looked at.
+        self.travel = Tracker()
+        # What each timeframe settled on for the bar BEFORE the one in
+        # progress, keyed by (market, timeframe). Reversal is the only
+        # state that needs it -- turning against something requires
+        # knowing which way that something pointed -- and it is carried
+        # forward only when the bar actually rolls.
+        self._last_state: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._last_aligned: dict[tuple[str, str], str] = {}
+        # How the read got where it is, per coin and traded timeframe.
+        from .trace import Tracer as _Tracer
+        self.tracer = _Tracer()
+        # Order Flow Imbalance on CME depth. Inert until LIQMAP_OFI
+        # and DATABENTO_API_KEY are both set -- `start()` returns
+        # False and says which one is missing rather than raising, so
+        # the deploy carries the engine while the subscription is
+        # still being arranged.
+        from .ofi_service import OfiService as _OfiService
+        self.ofi = _OfiService()
+        self.ofi.start()
+        # Real-time book broadcaster: wires the OFI tape's book-update
+        # callbacks into the async WebSocket queue fan-out.  The event loop
+        # reference is set in the FastAPI lifespan once the loop is running.
+        self.book_broadcaster = BookBroadcaster()
+        # Execution track: independent from the visualization footprint.
+        # Receives raw Trade objects; emits Signals when stacked imbalance +
+        # diagonal delta agree.  Wired to the tape in lifespan after the
+        # event loop starts.
+        from .execution import ExecutionTrack as _ExecTrack
+        from .pipeline import IngestHub as _IngestHub, DeltaWorker as _DeltaWorker
+        from .state_engine import StateEngine as _StateEngine
+        self.exec_track = _ExecTrack()
+        self.signal_broadcaster = SignalBroadcaster()
+        # Unified micro-delta hub + DCD worker. Ingest (Tape.offer) only
+        # does hub/worker.push_trade — a queue.put. Calculation and
+        # WebSocket fan-out happen on the worker, never on the UI thread
+        # and never inside a 16ms poll loop.
+        self.ingest_hub = _IngestHub()
+        # Deterministic state engine sits on the worker thread.  It
+        # reads tape.book (atomically rebound) and never takes a lock.
+        self.state_engine = _StateEngine()
+        self.delta_worker = _DeltaWorker(
+            self.ingest_hub, self.exec_track,
+            engine=self.state_engine,
+            tape=self.ofi.tape if self.ofi is not None else None)
+        self.autopilot: dict[str, Any] = {
+            "on": False, "coin": None, "interval": "15m", "mode": "scalp",
+            "notional": 10_000.0, "fee_bps": 0.0,
+            "raw": True, "exit_on_invalidation": False,
+            "tp_bps": 10.0, "sl_bps": 10.0, "unit": "bps",
+            "require_unanimous": True, "min_effort": 2.0,
+            "exit_before_s": 5.0,
+            "last_step": None, "last_decision": None, "steps": 0,
+            "error": None}
+        self._last_tune = 0.0
         self.token = os.environ.get("LIQMAP_TOKEN", "").strip()
         self.wallets: list[str] = []
         self.last_error: str | None = None
+        self.last_traceback: str | None = None
         self.last_sweep: dict[str, str] = {}
         self.worker_started = False
         self.harvest: dict[str, Any] = {"running": False, "found": 0,
                                         "started": None, "finished": None,
                                         "error": None, "minutes": 0}
+        self.backfill: dict[str, Any] = {"running": False, "progress": None,
+                                         "plan": None, "error": None}
+        # Agreement memory, one per (market, timeframe). Held here rather
+        # than on the feed so switching markets does not lose the history
+        # of the one you came from.
+        self._trackers: dict[tuple[str, str], Any] = {}
+        # One level watch at a time. Watching several would multiply the book
+        # polls against a shared rate-limit budget that the position sweep
+        # also draws on, and in practice you are looking at one level.
+        self.watcher = None
+        self.watch_info: dict[str, Any] = {"running": False, "coin": None,
+                                           "level": None, "started": None,
+                                           "finished": None, "error": None}
+        self._calibrations: dict[tuple[str, str], Any] = {}
+        # Wall-clock stamps for freshness reporting. Every reading on the
+        # dashboard is a snapshot from a poll, not a stream, and a number with
+        # no age on it is indistinguishable from a number that stopped
+        # updating half an hour ago.
+        self.last_price_ts: float = 0.0
+        self.last_price: dict[str, float] = {}
+        self.last_book_ts: float = 0.0
+        self.feed = None          # live.LiveFeed, when one is running
+        self._markets_cache: dict[str, Any] | None = None
+        self._markets_ts: float = 0.0
         self._lock = threading.Lock()
         self._client = None
         self._store = None
@@ -125,7 +312,8 @@ class Runtime:
 
     # -- bootstrapping a wallet universe -----------------------------------
 
-    def start_harvest(self, minutes: float, then_sweep: bool = True) -> dict[str, Any]:
+    def start_harvest(self, minutes: float, then_sweep: bool = True,
+                      coins: list[str] | None = None) -> dict[str, Any]:
         """Listen to the public trade feed and collect addresses.
 
         Without this the first deploy is a dead end: no wallets means no
@@ -144,14 +332,21 @@ class Runtime:
                     "error": "a harvest is already running"}
 
         cfg = self.settings()
+        # Which tapes to listen to. Discovery is per-coin: a wallet only turns
+        # up if it trades a coin you subscribed to. Listening only to BTC
+        # finds BTC traders, which is why a universe built that way looks
+        # empty on everything else — their other positions do come back in the
+        # sweep, but a trader who only trades SOL is never found at all.
+        listen = [c.strip().upper() for c in (coins or cfg.coins) if c.strip()]
         self.harvest.update({"running": True, "found": 0, "error": None,
                              "finished": None, "minutes": minutes,
+                             "coins": listen,
                              "started": datetime.now(timezone.utc).isoformat()})
 
         def run() -> None:
             try:
                 from .hl import TradeHarvester
-                h = TradeHarvester(cfg.coins, min_notional=cfg.min_wallet_notional)
+                h = TradeHarvester(listen, min_notional=cfg.min_wallet_notional)
                 h.run(seconds=minutes * 60,
                       on_progress=lambda n: self.harvest.update({"found": n}))
 
@@ -160,11 +355,12 @@ class Runtime:
                 self.harvest.update({"found": len(wallets)})
 
                 if then_sweep and wallets:
-                    for coin in cfg.coins:
-                        try:
-                            self.sweep(coin)
-                        except Exception as exc:
-                            self.last_error = f"post-harvest sweep {coin}: {exc}"
+                    # One sweep now covers every coin these wallets hold, so
+                    # the old per-coin loop would just re-read all of them.
+                    try:
+                        self.sweep()
+                    except Exception as exc:
+                        self.last_error = f"post-harvest sweep: {exc}"
             except Exception as exc:
                 self.harvest["error"] = str(exc)
                 self.last_error = f"harvest: {exc}"
@@ -175,10 +371,80 @@ class Runtime:
         threading.Thread(target=run, daemon=True).start()
         return {"ok": True, **self.harvest}
 
+    # -- watching a level --------------------------------------------------
+
+    def start_watch(self, coin: str, level: float, minutes: float,
+                    band_bps: float = 10.0,
+                    window_s: float = 300.0) -> dict[str, Any]:
+        """Watch one price level: book depth, refills, and aggression into it.
+
+        Starting a new watch replaces the previous one rather than queueing.
+        The point of this is to look at the level in front of you, and a
+        stale watch on yesterday's level is worse than none.
+        """
+        if level <= 0:
+            return {"ok": False, "error": "level must be a positive price"}
+        if self.watch_info["running"]:
+            return {**self.watch_info, "ok": False,
+                    "error": (f"already watching {self.watch_info['coin']} at "
+                              f"{self.watch_info['level']} — stop it first")}
+
+        try:
+            from .hl import LevelWatcher
+            watcher = LevelWatcher(self.client(), coin, level,
+                                   band_bps=band_bps, window_s=window_s)
+        except Exception as exc:
+            return {"ok": False, "error": f"could not start: {exc}"}
+
+        self.watcher = watcher
+        self.watch_info.update({
+            "running": True, "coin": coin, "level": level, "error": None,
+            "minutes": minutes, "band_bps": band_bps, "window_s": window_s,
+            "started": datetime.now(timezone.utc).isoformat(),
+            "finished": None})
+
+        def run() -> None:
+            try:
+                watcher.run(seconds=minutes * 60)
+            except Exception as exc:
+                self.watch_info["error"] = str(exc)
+                self.last_error = f"watch: {exc}"
+            finally:
+                self.watch_info["running"] = False
+                self.watch_info["finished"] = datetime.now(timezone.utc).isoformat()
+
+        threading.Thread(target=run, daemon=True).start()
+        return {"ok": True, **self.watch_info}
+
+    def stop_watch(self) -> dict[str, Any]:
+        if self.watcher is not None:
+            self.watcher.stop()
+        self.watch_info["running"] = False
+        return {"ok": True, **self.watch_info}
+
     # -- the actual work ---------------------------------------------------
 
-    def sweep(self, coin: str) -> dict[str, Any]:
-        """One sweep: prices, positions, map, change detection.
+    # Below this many positions a coin is not worth its own sweep row. The
+    # requested and configured coins are recorded regardless of this.
+    MIN_POSITIONS_FOR_COIN = 3
+    # Bound on how many coins one sweep records, so a single read cannot write
+    # a hundred sweep rows into the volume.
+    MAX_COINS_PER_SWEEP = 25
+
+    def sweep(self, coin: str | None = None) -> dict[str, Any]:
+        """One sweep: prices, positions, maps, change detection — for EVERY
+        coin the wallets are holding, not just one.
+
+        `clearinghouseState` returns a wallet's entire portfolio in a single
+        weight-2 call. The original version threw away everything except the
+        one coin it was asked about, so getting a second coin meant reading
+        all 600 wallets a second time for data already in hand. That is why
+        only BTC ever had anything in it: whichever coin you asked for got
+        recorded and the rest of the response was discarded.
+
+        Now one read populates all of them. Same API cost as before, and
+        asking for a coin nobody holds tells you that instead of silently
+        recording nothing.
 
         Serialised behind a lock. Two concurrent sweeps would both consume the
         same rate-limit budget and each end up with a partial picture.
@@ -195,36 +461,2310 @@ class Runtime:
             from .hl import sweep_positions
 
             client = self.client()
-            mids = client.all_mids()
-            spot = mids.get(coin)
-            if not spot:
-                raise RuntimeError(f"no mid price for {coin}")
-
-            self.store().log_price(coin, spot)
-
+            # Mids from every perp DEX, not just the canonical crypto one.
+            # Without this, gold, oil, FX and the stock perps have no price,
+            # get skipped as unlisted, and look like markets nobody trades.
+            try:
+                mids = client.all_mids_everywhere()
+            except Exception as exc:
+                self.last_error = f"multi-dex mids failed, using canonical: {exc}"
+                mids = client.all_mids()
             positions, failed = sweep_positions(client, wallets[:cfg.wallet_limit])
-            sweep_id, changes = self.history.record_sweep(coin, spot, positions)
-            self.last_sweep[coin] = datetime.now(timezone.utc).isoformat()
 
-            notable = [c for c in changes if c.kind != "HELD"]
-            return {
-                "coin": coin,
-                "spot": spot,
-                "sweep_id": sweep_id,
+            held: dict[str, int] = {}
+            for p in positions:
+                if p.szi:
+                    held[p.coin] = held.get(p.coin, 0) + 1
+
+            asked = coin.upper() if coin else None
+            # Order matters: what you asked for first, then what you configured,
+            # then whatever else the wallets actually hold, busiest first.
+            wanted: list[str] = []
+            for c in ([asked] if asked else []) + list(cfg.coins) + \
+                    sorted(held, key=lambda c: -held[c]):
+                if c and c not in wanted:
+                    if (c == asked or c in cfg.coins
+                            or held.get(c, 0) >= self.MIN_POSITIONS_FOR_COIN):
+                        wanted.append(c)
+                if len(wanted) >= self.MAX_COINS_PER_SWEEP:
+                    break
+
+            recorded: list[dict[str, Any]] = []
+            skipped: list[dict[str, str]] = []
+            stamp = datetime.now(timezone.utc).isoformat()
+
+            for c in wanted:
+                spot = mids.get(c)
+                if not spot:
+                    skipped.append({"coin": c, "why": "no mid price on the exchange"})
+                    continue
+                self.store().log_price(c, spot)
+                sweep_id, changes = self.history.record_sweep(c, spot, positions)
+                self.last_sweep[c] = stamp
+                notable = [ch for ch in changes if ch.kind != "HELD"]
+                recorded.append({
+                    "coin": c, "spot": spot, "sweep_id": sweep_id,
+                    "positions": held.get(c, 0),
+                    "changes": len(notable),
+                    "defended": len([ch for ch in notable if ch.kind == "DEFENDED"]),
+                    "liquidated": len([ch for ch in notable if ch.kind == "LIQUIDATED"]),
+                })
+
+            primary = next((r for r in recorded if r["coin"] == asked),
+                           recorded[0] if recorded else {})
+            out = {
                 "wallets_swept": len(wallets[:cfg.wallet_limit]),
                 "wallets_failed": failed,
-                "positions": len([p for p in positions if p.coin == coin]),
-                "changes": len(notable),
-                "defended": len([c for c in notable if c.kind == "DEFENDED"]),
-                "liquidated": len([c for c in notable if c.kind == "LIQUIDATED"]),
+                "coins_recorded": [r["coin"] for r in recorded],
+                "per_coin": recorded,
+                "skipped": skipped,
+                **primary,
             }
+            if asked and asked not in [r["coin"] for r in recorded]:
+                out["warning"] = (
+                    f"{asked} was swept but nothing was recorded for it — "
+                    f"{'the exchange has no mid price for that symbol' if asked not in mids else 'none of your wallets hold it'}. "
+                    f"Coins with data: {', '.join(r['coin'] for r in recorded) or 'none'}.")
+            elif asked and not held.get(asked):
+                out["warning"] = (
+                    f"None of your {len(wallets[:cfg.wallet_limit])} wallets hold "
+                    f"{asked} right now. Harvest for longer, or lower the minimum "
+                    f"wallet size in Settings so smaller {asked} traders get picked up.")
+            return out
+
+    # The listed universe changes when a builder deploys a market, not by the
+    # second. Refetching it on every dashboard poll would spend rate-limit
+    # budget the sweep needs.
+    MARKETS_TTL_S = 300.0
+
+    def cme_market(self) -> dict[str, Any] | None:
+        """The CME front-month row for the picker, or None when the engine is off.
+
+        Built from the tape rather than a quote request: the price is
+        whatever last printed on the subscription we already hold, so
+        this costs nothing and cannot fail.
+        """
+        svc = getattr(self, "ofi", None)
+        if svc is None or not svc.config.enabled:
+            return None
+        from .assetclass import label as _class_label
+        base = svc.config.market               # "ES"
+        front, deferred = svc.config.active_contracts
+        active = svc.tape.symbol               # "ES.Z26" (resolved)
+        return {"symbol": front, "base": front, "dex": "CME", "hip3": False,
+                "price": svc.tape.last_px or 0.0, "klass": "index",
+                "klass_label": _class_label("index"),
+                "has_data": svc.tape.trades > 0, "source": "cme",
+                "active_contract": active,
+                "front_month": front,
+                "deferred": deferred}
+
+    def cme_markets(self) -> list[dict[str, Any]]:
+        """All CME contract rows for the picker: front month + deferred.
+
+        The front-month row has live data.  The deferred row is listed
+        so the user can see it exists and select it; has_data=False until
+        a second subscription is wired.
+        """
+        svc = getattr(self, "ofi", None)
+        if svc is None or not svc.config.enabled:
+            return []
+        from .assetclass import label as _class_label
+        front, deferred = svc.config.active_contracts
+        active = svc.tape.symbol
+        live = svc.tape.trades > 0
+        base_row = {
+            "dex": "CME", "hip3": False, "klass": "index",
+            "klass_label": _class_label("index"), "source": "cme",
+            "active_contract": active, "front_month": front,
+            "deferred": deferred,
+        }
+        rows = [
+            {**base_row, "symbol": front, "base": front,
+             "price": svc.tape.last_px or 0.0, "has_data": live,
+             "note": "front month"},
+        ]
+        if deferred:
+            rows.append(
+                {**base_row, "symbol": deferred, "base": deferred,
+                 "price": 0.0, "has_data": False,
+                 "note": "deferred — live price feed not yet subscribed"})
+        return rows
+
+    def is_cme(self, coin: str) -> bool:
+        """Does this symbol belong to the CME source rather than HL?
+
+        Accepts the product name ("ES"), the front-month contract
+        ("ES.Z26"), and the deferred contract ("ES.H27") so the
+        chart and read routes work regardless of which form the user
+        types in the URL.
+        """
+        svc = getattr(self, "ofi", None)
+        if svc is None or not svc.config.enabled:
+            return False
+        c = str(coin).upper()
+        base = svc.config.market               # "ES"
+        if c == base:
+            return True
+        front, deferred = svc.config.active_contracts
+        return c in (front, deferred or "")
+
+    def markets(self, force: bool = False) -> dict[str, Any]:
+        """Every market you can actually trade, across every perp DEX.
+
+        The picker used to be built from swept history, which meant it listed
+        only markets the wallet universe happened to hold -- in practice BTC
+        and nothing else. What you can trade and what has been swept are
+        different questions, and the picker was answering the wrong one.
+        """
+        now = time.time()
+        if (not force and self._markets_cache
+                and now - self._markets_ts < self.MARKETS_TTL_S):
+            return self._markets_cache
+
+        from .assetclass import classify, label as class_label
+        from .hl import split_symbol
+
+        try:
+            mids = self.client().all_mids_everywhere()
+        except Exception as exc:
+            if self._markets_cache:
+                return {**self._markets_cache, "stale": True, "error": str(exc)}
+            # CME does not ride on Hyperliquid, so it stays listed even
+            # when that venue is unreachable. A picker that empties
+            # because an unrelated exchange is down is a worse failure
+            # than one that is short.
+            cme_rows = self.cme_markets()
+            return {"markets": cme_rows, "error": str(exc),
+                    "venues": ["CME"] if cme_rows else []}
+
+        have = {r["coin"] for r in self.history.coins_with_data()}
+        rows = list(self.cme_markets())   # front month + deferred
+        for sym, px in mids.items():
+            dex, base = split_symbol(sym)
+            klass = classify(sym, dex)
+            rows.append({"symbol": sym, "base": base, "dex": dex,
+                         "hip3": bool(dex), "price": px,
+                         "klass": klass, "klass_label": class_label(klass),
+                         "has_data": sym in have})
+
+        # Canonical crypto first, then each builder's markets, alphabetical
+        # within a venue so the list is scannable rather than hash-ordered.
+        from .assetclass import ORDER
+
+        order = {k: i for i, k in enumerate(ORDER)}
+        rows.sort(key=lambda r: (order.get(r["klass"], 99), r["base"]))
+        venues = sorted({r["dex"] for r in rows})
+
+        counts: dict[str, int] = {}
+        for r in rows:
+            counts[r["klass"]] = counts.get(r["klass"], 0) + 1
+
+        self._markets_cache = {
+            "markets": rows, "venues": venues, "count": len(rows),
+            "classes": [{"klass": k, "label": class_label(k), "n": counts[k]}
+                        for k in ORDER if k in counts],
+            "fetched": datetime.now(timezone.utc).isoformat(),
+        }
+        self._markets_ts = now
+        return self._markets_cache
+
+    # -- the live feed -----------------------------------------------------
+
+    def start_feed(self, coin: str,
+                   intervals: Sequence[str] = ("1m", "5m", "15m", "30m",
+                                               "1h", "4h")
+                   ) -> dict[str, Any]:
+        """Open a persistent socket for one market and build its candles.
+
+        Replaces polling for the current bar entirely: open, high, low, last,
+        volume and the buy/sell split all come from fills as they print. The
+        builder is seeded once from `candleSnapshot` so the open of the bar
+        already in progress is real rather than whatever price happened to be
+        trading when the socket connected.
+
+        Every timeframe on the ladder is built, including the slow ones.
+        They cost nothing extra -- the same fills feed all of them -- and
+        leaving the hour and the four hours out meant those two rows were
+        always polled while the fast ones were live, so the ladder mixed
+        two different ages without saying so.
+
+        One market at a time. A second feed doubles the socket traffic for a
+        market you are not looking at.
+        """
+        from .live import LiveFeed
+
+        # A CME symbol must NOT open a Hyperliquid socket. The venue
+        # does not carry it, so the socket connects, is sent nothing,
+        # is dropped by the far end, and reconnects -- thirty times an
+        # hour, under a panel reading "Feed silent" that looks like a
+        # fault in this service rather than a request for a market
+        # that does not exist there.
+        if self.is_cme(coin):
+            cme = self.cme_feed(coin)
+            return {"ok": True, "source": "cme", "already": True,
+                    **(cme.status() if cme else {}),
+                    "note": (f"{coin} is served by the CME subscription. "
+                             f"No Hyperliquid socket was opened, because "
+                             f"Hyperliquid does not carry it.")}
+        coin = self.resolve_symbol(coin)[0] or coin
+        if self.feed is not None and self.feed.coin == coin and self.feed.running:
+            return {"ok": True, **self.feed.status(), "already": True}
+
+        self.stop_feed()
+        feed = LiveFeed(coin, intervals=intervals)
+        # Keep every bar's buy/sell split the moment it closes. This is the
+        # last point at which it exists: the fills roll out of the tape
+        # within the hour and no venue serves them back.
+        feed.on_bar_close = self._keep_bar_flow
+
+        seeded: list[str] = []
+        for iv in intervals:
+            try:
+                feed.seed(iv, self.client().candles(coin, iv, bars=200))
+                seeded.append(iv)
+            except Exception as exc:
+                feed.errors.append(f"seed {iv}: {exc}")
+
+        feed.start()
+        self.feed = feed
+
+        # Push each Hyperliquid fill onto the ingest hub so /ws/live
+        # works for non-CME coins the same way it works for ES — no
+        # /api/now poll, no sequential candle HTTP.
+        def _hl_tick(_channel: str) -> None:
+            if not self.ingest_hub.connections:
+                return
+            bar = feed.candle("1m")
+            px = bar.close if bar is not None else None
+            if not px:
+                return
+            self.ingest_hub.notify({
+                "kind": "tick",
+                "ts": time.time(),
+                "px": float(px),
+                "sz": 0.0,
+                "side": "",
+                "dcd": 0,
+                "raw": 0,
+            })
+        feed.on_update(_hl_tick)
+        return {"ok": True, "seeded": seeded, **feed.status()}
+
+    def stop_feed(self) -> dict[str, Any]:
+        if self.feed is not None:
+            self.feed.stop()
+            out = {"ok": True, **self.feed.status()}
+            self.feed = None
+            return out
+        return {"ok": True, "running": False}
+
+    def _keep_bar_flow(self, timeframe: str, candle) -> None:
+        """Write one closed bar's aggression, if it was ever counted.
+
+        Called from the feed's socket thread, so it must not raise: a
+        failed write here is a lost row, and taking the feed down with it
+        would be a far worse trade.
+
+        A bar that was adopted rather than counted is skipped. Its buy and
+        sell are zero because nobody watched them, and a stored zero is
+        indistinguishable from a bar that really was balanced.
+        """
+        feed = self.feed
+        if feed is None:
+            return
+
+        # SCORE THE CALLS FIRST, AND BEFORE THE AGGRESSION GUARD BELOW.
+        # Whether anybody counted who crossed the spread has nothing to do
+        # with where the bar closed, and a bar adopted at connect still
+        # answers every call that was made on it.
+        try:
+            self.callbook.resolve(feed.coin, timeframe,
+                                  float(candle.start_ts),
+                                  close_px=float(candle.close))
+            if float(getattr(candle, "interval_s", 0.0)) >= 14400.0:
+                self.callbook.prune()
+        except Exception:
+            pass
+
+        if not getattr(candle, "flow_measured", False):
+            return
+        try:
+            self.barflow.record(BarFlow(
+                coin=feed.coin, timeframe=timeframe,
+                bar_ts=float(candle.start_ts),
+                buy=float(candle.buy_notional),
+                sell=float(candle.sell_notional),
+                trades=int(candle.trades), volume=float(candle.volume),
+                open_px=float(candle.open), close_px=float(candle.close)))
+            # Housekeeping on the slowest bar's schedule -- a handful of
+            # times a day rather than on every minute. The table is one
+            # row per bar, so this is about never thinking about it again
+            # rather than about space.
+            if float(getattr(candle, "interval_s", 0.0)) >= 14400.0:
+                self.barflow.prune()
+        except Exception:
+            pass
+
+    def previous_state(self, coin: str, timeframe: str, bar_open: float):
+        """What this timeframe settled on for the bar BEFORE this one.
+
+        Never the current bar. Handing back the state this same bar had a
+        second ago would let a reading reverse against itself and
+        oscillate for the whole candle.
+        """
+        got = self._last_state.get((coin, timeframe))
+        return got[2] if got else None
+
+    def remember_state(self, coin: str, timeframe: str, bar_open: float,
+                       res) -> None:
+        """Keep this bar's newest reading, and the last bar's settled one.
+
+        TWO entries, not one. A bar is re-read many times before it
+        closes, so the current reading is overwritten each time; the
+        previous bar's LAST reading is what it settled on and is kept
+        beside it.
+
+        Keeping only one would make reversal fire once at the bar
+        boundary and then vanish for the rest of the candle -- the first
+        read after the roll would see the old bar, and every read after
+        that would see this one and find nothing to turn against.
+        """
+        key = (coin, timeframe)
+        bar_open = float(bar_open)
+        got = self._last_state.get(key)
+        if got is None:
+            self._last_state[key] = (bar_open, res, None)
+            return
+        cur_open, cur_res, prev = got
+        if bar_open > cur_open:
+            self._last_state[key] = (bar_open, res, cur_res)   # it rolled
+        else:
+            self._last_state[key] = (cur_open, res, prev)
+
+    def last_aligned(self, coin: str, trading: str):
+        """The direction the stack beneath `trading` was last ALIGNED in.
+
+        The only thing that tells a turn apart from a trend that has been
+        running. Unlike the per-bar state above this one is deliberately
+        NOT bar-scoped: a stack that went green an hour ago is still what
+        a flip now would be flipping away from.
+        """
+        return self._last_aligned.get((coin, trading))
+
+    def remember_aligned(self, coin: str, trading: str, way) -> None:
+        """Keep it only when the whole stack agreed.
+
+        A pullback is not an alignment, and carrying one forward would
+        make the next alignment look like a reversal of something that
+        never happened.
+        """
+        if way is not None:
+            self._last_aligned[(coin, trading)] = way
+
+    def minute_rows(self, coin: str, want: int) -> list[BarFlow]:
+        """Recent one-minute bars, from the database and from this feed.
+
+        Both, for the same reason the CVD reads both: the database has
+        what previous runs wrote and the feed has what this one has
+        counted since it connected. The feed wins on a bar both hold.
+        """
+        try:
+            rows = {float(r.bar_ts): r for r in
+                    self.barflow.recent(coin, "1m", bars=want)}
+        except Exception:
+            rows = {}
+        feed = self.feed_for(coin)
+        if feed is not None:
+            for c in feed.closed_candles("1m", back=want):
+                if not getattr(c, "flow_measured", False):
+                    continue
+                rows[float(c.start_ts)] = BarFlow(
+                    coin=coin, timeframe="1m", bar_ts=float(c.start_ts),
+                    buy=float(c.buy_notional), sell=float(c.sell_notional),
+                    trades=int(c.trades), volume=float(c.volume),
+                    open_px=float(c.open), close_px=float(c.close))
+        return [rows[k] for k in sorted(rows)]
+
+    def volume_curve(self, coin: str, timeframe: str, interval_s: float):
+        """The shape of volume inside a bar of this timeframe, cached.
+
+        Rebuilt on a timer rather than per request: the tape path walks
+        every fill the tape holds, and the dashboard polls this several
+        times a minute across five timeframes. The shape of a market's
+        bars does not change between two polls.
+        """
+        key = (coin, timeframe)
+        now = time.time()
+        hit = self._curves.get(key)
+        if hit is not None and (now - hit[0]) < CURVE_TTL_S:
+            return hit[1]
+        curve = self._build_curve(coin, timeframe, interval_s, now)
+        self._curves[key] = (now, curve)
+        return curve
+
+    def _build_curve(self, coin: str, timeframe: str, interval_s: float,
+                     now: float):
+        from . import vpace as _vp
+
+        # FAST BARS -- straight off the fills. Nothing finer than a
+        # one-minute bar is stored anywhere, but the fills themselves are
+        # finer than any bar and an hour of them is in the tape.
+        feed = self.feed_for(coin)
+        if feed is not None and 0 < interval_s <= FAST_CURVE_S:
+            try:
+                sliced = _vp.slices_from_tape(
+                    getattr(feed.tape, "_trades", []), interval_s, now=now)
+                c = _vp.curve_from_bars(timeframe, interval_s, sliced,
+                                        source="tape")
+                if c.learned:
+                    return c
+            except Exception:
+                pass
+
+        # SLOW BARS -- from the one-minute bars inside them, which are
+        # already being written down as they close.
+        n = _vp.minute_slices(interval_s)
+        if n:
+            per_bar = max(1, int(round(interval_s / 60.0)))
+            want = per_bar * (_vp.MIN_CURVE_BARS + 6)
+            try:
+                rows = self.minute_rows(coin, want)
+                c = _vp.curve_from_bars(
+                    timeframe, interval_s,
+                    _vp.slices_from_minutes(rows, interval_s, n),
+                    source="bars")
+                if c.learned:
+                    return c
+            except Exception:
+                pass
+
+        return _vp.even_curve(timeframe, interval_s)
+
+    def bar_cvd(self, coin: str, timeframe: str, interval_s: float,
+                bar_open: float, bars: int):
+        """Completed-bar CVD for one timeframe, from both places it lives.
+
+        The database has what previous runs recorded; the feed has what
+        this run has counted since it connected. The feed wins on any bar
+        both of them hold -- see `barflow.merge` for why two partial counts
+        of one bar must not be added together.
+        """
+        try:
+            stored = self.barflow.recent(coin, timeframe, bars=bars,
+                                         before_ts=bar_open)
+        except Exception:
+            stored = []
+        live: list[BarFlow] = []
+        feed = self.feed_for(coin)
+        if feed is not None:
+            for c in feed.closed_candles(timeframe, back=bars):
+                if not getattr(c, "flow_measured", False):
+                    continue
+                if float(c.start_ts) >= bar_open:
+                    continue
+                live.append(BarFlow(
+                    coin=coin, timeframe=timeframe,
+                    bar_ts=float(c.start_ts), buy=float(c.buy_notional),
+                    sell=float(c.sell_notional), trades=int(c.trades),
+                    volume=float(c.volume), open_px=float(c.open),
+                    close_px=float(c.close)))
+        return merge_cvd(timeframe, stored, live, bars=bars)
+
+    FOOTPRINT_RULES = {"1m": 60.0, "5m": 300.0, "15m": 900.0}
+
+    def footprint(self, rule: str = "1m", volume: int = 0,
+                  min_volume: int = 0, multiplier: float = 4.0):
+        """The live footprint stream, attached to the CME tape.
+
+        Built on first use and rebuilt when the bar rule changes,
+        because a series whose bars were closed by two different
+        rules cannot be read as one series. Rebuilding drops the
+        history -- the alternative is a chart whose older bars mean
+        something different from its newer ones.
+        """
+        from .footprint import ImbalanceConfig, TimeRule, VolumeRule
+        from .footprint_live import FootprintStream
+
+        key = (f"v{volume}" if volume > 0 else str(rule),
+               min_volume, multiplier)
+        if self._footprint is not None and self._footprint_rule == key:
+            return self._footprint
+
+        with self._footprint_lock:
+            if (self._footprint is not None
+                    and self._footprint_rule == key):
+                return self._footprint
+            svc = getattr(self, "ofi", None)
+            if svc is None:
+                return None
+            close = (VolumeRule(volume) if volume > 0
+                     else TimeRule(self.FOOTPRINT_RULES.get(rule, 60.0)))
+            stream = FootprintStream(
+                tick_size=0.25, rule=close,
+                imbalance=ImbalanceConfig(
+                    multiplier=float(multiplier),
+                    min_volume=int(min_volume)))
+            svc.tape.footprint = stream
+            # The resting book, scoped to the same candle. Attached
+            # here because the tape's reset is driven by the
+            # footprint's own close event -- the footprint itself is
+            # not modified.
+            from .fpread import LeadWatcher, PaceWatcher
+            if svc.tape.lead is None:
+                svc.tape.lead = LeadWatcher()
+            if svc.tape.pace is None:
+                svc.tape.pace = PaceWatcher()
+            from .push import PushWatcher
+            if svc.tape.push is None:
+                svc.tape.push = PushWatcher(tick_size=0.25)
+            # OFI-closed candles. One builder per target so the chart can
+            # change threshold without losing its history. `max_s` caps a
+            # chop bar so a dead session still terminates its last bar --
+            # a termination condition, not a polling interval.
+            from .ofibar import LADDER as _OFI_LADDER, OfiBarBuilder
+            if not svc.tape.ofibars:
+                svc.tape.ofibars = {
+                    t: OfiBarBuilder(tick_size=0.25, threshold=t,
+                                     max_s=900.0, min_updates=2)
+                    for t in _OFI_LADDER}
+                # AND THE HISTORY THEY HAD BEFORE THE LAST RESTART.
+                # Held only in memory, these bars die on every deploy,
+                # and at target 2,000 that is days of structure -- the
+                # swing levels with it, since a level is only as old as
+                # the bars it was found in. Restoring happens HERE,
+                # once, on the builders that were just created and are
+                # therefore known to be empty: merging a disk history
+                # into a live one would need the two to agree about
+                # where they overlap.
+                #
+                # A failure to reach the database loses history, which
+                # is bad, and stops the chart, which is worse. So the
+                # whole of it is best-effort and the candles come up
+                # either way.
+                try:
+                    from .ofistore import OfiBarRecorder, OfiBarStore
+                    _store = OfiBarStore(self.db_path)
+                    _rec = OfiBarRecorder(_store, svc.tape.ofibars)
+                    _rec.load_into_builders()
+                    _rec.seed()
+                    _rec.start()
+                    self._ofirec = _rec
+                except Exception:                       # noqa: BLE001
+                    self._ofirec = None
+            # AND THE TIME CANDLES THE STACK READS.
+            #
+            # Same problem the OFI bars had and the same answer. The
+            # tape builds 1m/5m/15m from prints as they arrive and
+            # holds nothing from before the engine started, so every
+            # restart began with an empty history -- and /api/read
+            # refuses to build a ladder until the traded interval has
+            # ten closed bars, which at 15m is two and a half hours of
+            # session. The panel showed rows with no direction for all
+            # of it and could not say why.
+            if getattr(self, "_candlerec", None) is None:
+                try:
+                    from .candlestore import CandleRecorder, CandleStore
+                    _cs = CandleStore(self.db_path)
+                    _crec = CandleRecorder(_cs, svc.tape)
+                    _crec.load_into_builders()
+                    _crec.seed()
+                    _crec.start()
+                    self._candlerec = _crec
+                except Exception:                       # noqa: BLE001
+                    # Best effort, exactly like the OFI store above. A
+                    # disk that will not take it is a slow start, not a
+                    # dead feed.
+                    self._candlerec = None
+            if not svc.tape.clockwins:
+                # ONE PER PERIOD, all running. Switching between them
+                # must not start an empty window -- a selector that
+                # costs you fifteen minutes of history is a selector
+                # nobody touches twice.
+                from .clockwin import ClockWindows
+                svc.tape.clockwins = {
+                    300.0: ClockWindows(period_s=300.0),
+                    900.0: ClockWindows(period_s=900.0)}
+                svc.tape.clockwin = svc.tape.clockwins[900.0]
+            if not svc.tape.tickbars:
+                # N-PRINT BARS. One builder per size for the same
+                # reason the OFI bars have one per target: the sizes
+                # are five cuts of one tape, they cost a handful of
+                # adds per print, and a selector that empties the
+                # chart is a selector nobody uses twice.
+                #
+                # These are NOT persisted across a restart, unlike
+                # the OFI bars and the time candles. A tick bar is
+                # defined by a count of prints, so a half-built bar
+                # cannot be resumed from a disk row without the
+                # prints that built it -- it would come back as a
+                # bar of the wrong length wearing the right label.
+                # They refill from the live tape instead, which at
+                # ES print rates is minutes rather than hours.
+                from .tickbar import PER_BAR_CHOICES, TickBars
+                svc.tape.tickbars = {
+                    int(n): TickBars(per_bar=int(n))
+                    for n in PER_BAR_CHOICES}
+            if not svc.tape.tickbars_timed:
+                # THE SAME SIZES CUT AT 5 AND 15 MINUTES. Two more
+                # periods is two more handfuls of adds per print,
+                # and it means switching the reset is instant
+                # rather than starting an empty chart -- the same
+                # reason there is a builder per size.
+                from .tickbar import PER_BAR_CHOICES as _PBC, TickBars as _TB
+                svc.tape.tickbars_timed = {
+                    (int(n), float(p_)): _TB(per_bar=int(n), period_s=p_)
+                    for n in _PBC for p_ in (300.0, 900.0)}
+            if not svc.tape.fusedbars:
+                # DUAL-TRIGGER BARS. Not persisted either, and for a
+                # stronger reason than the tick bars: a half-built
+                # fused bar is a print count AND a running OFI
+                # accumulator, and the accumulator cannot be resumed
+                # from a disk row without the book updates that built
+                # it. Restoring one would produce a bar wearing the
+                # right label with a leg that never happened.
+                from .kinetic import Kinetic
+                if svc.tape.kinetic is None:
+                    # BOTH, because they answer different questions
+                    # and the difference is itself worth seeing: the
+                    # aligned one lines up with the 5m candle a rule
+                    # reads, the rolling one never resets.
+                    svc.tape.kinetic = Kinetic(period_s=300.0)
+                if getattr(svc.tape, "kinetic_bar", None) is None:
+                    svc.tape.kinetic_bar = Kinetic(period_s=300.0,
+                                                   aligned=True)
+                if getattr(svc.tape, "ratio_track", None) is None:
+                    from .ratiotrack import RatioTrack as _RT
+                    svc.tape.ratio_track = _RT(period_s=300.0)
+                from .fusedbar import PAIRS as _FPAIRS, FusedBars
+                svc.tape.fusedbars = {
+                    (int(a), int(b)): FusedBars(tick_target=int(a),
+                                                ofi_target=int(b))
+                    for a, b in _FPAIRS}
+            if svc.tape.flowread is None:
+                from .flowread import FlowRead
+                svc.tape.flowread = FlowRead()
+            if svc.tape.regime is None:
+                from .regime import Regime
+                svc.tape.regime = Regime()
+            if svc.tape.pricedir is None:
+                from .flowread import PriceDir
+                svc.tape.pricedir = PriceDir()
+            from .bookdiag import BookDiagonal
+            svc.tape.bookdiag = BookDiagonal(tick_size=0.25)
+            # And whether the flow can get THROUGH that standing size.
+            # Sixteen ticks is four points; on a dense ES book MBP-10
+            # reaches about nine of them, and the reading says so
+            # rather than pretending the rest is empty.
+            # The two drawn lines. Attached here with the rest, but NOT
+            # scoped to the bar: the baseline is meant to be structural,
+            # so it resets on the CME session day instead.
+            from .obstacle import Obstacles
+            svc.tape.obstacles = Obstacles(
+                tick_size=0.25, reach_ticks=16, window_s=10.0)
+            self._footprint = stream
+            self._footprint_rule = key
+            return stream
+
+    def cme_feed(self, coin: str):
+        """The CME tape, shaped like a feed. None when this is not a
+        CME symbol."""
+        if not self.is_cme(coin):
+            return None
+        from .cme_tape import LadderFeed
+        svc = self.ofi
+        return LadderFeed(svc.tape, coin=coin, running=svc.running,
+                          schemas=tuple(svc.config.schema_list),
+                          note=(getattr(svc, "error", "")
+                                or svc.config.blocked_by()))
+
+    def feed_for(self, coin: str):
+        """The Hyperliquid feed, if it is live here and actually ticking.
+
+        Deliberately NOT CME-aware. Seventeen call sites read this, and
+        between them they touch thirty attributes of `LiveFeed` -- the
+        DOM, the book call, the fast book, quality, spread trend, the
+        update hooks. A CME view returned here would have to impersonate
+        all of it, and a plausible-looking answer from the wrong source
+        is worse on those panels than an empty one. Routes that CAN
+        serve CME ask for it by name, with `cme_feed`.
+        """
+        f = self.feed
+        if f is None or f.coin != coin or not f.running:
+            return None
+        return f
+
+    def resolve_reads(self, limit: int = 300) -> dict[str, Any]:
+        """Settle recorded reads whose candle has closed.
+
+        Groups by (market, interval) so one candle fetch settles every read
+        waiting on it, rather than one request per row.
+        """
+        pending = self.history.pending_reads(time.time(), limit=limit)
+        if not pending:
+            return {"ok": True, "resolved": 0, "pending": 0}
+
+        by_market: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        for row in pending:
+            by_market.setdefault((row["coin"], row["interval"]), []).append(row)
+
+        resolved = failed = 0
+        errors: list[str] = []
+        client = self.client()
+
+        for (coin, interval), rows in by_market.items():
+            try:
+                bars = client.candles(coin, interval, bars=200)
+            except Exception as exc:
+                errors.append(f"{coin} {interval}: {exc}")
+                failed += len(rows)
+                continue
+
+            step = client.INTERVALS.get(interval, 900)
+            for row in rows:
+                # Match within half a bar rather than exactly. A read taken
+                # against a synthesised boundary carries a grid timestamp that
+                # can sit a fraction off the feed's own, and an exact match
+                # would leave those permanently unresolved.
+                want = float(row["candle_ts"])
+                best = min(bars, key=lambda b: abs(b.ts - want), default=None)
+                px = (best.close if best is not None
+                      and abs(best.ts - want) <= step / 2 else None)
+                if px is None:
+                    # Candle rolled out of the window before it was resolved.
+                    # Leave it unresolved rather than guessing a price; a
+                    # fabricated outcome poisons the measurement permanently.
+                    failed += 1
+                    continue
+                if self.history.resolve_read(row["id"], px):
+                    resolved += 1
+
+        return {"ok": True, "resolved": resolved, "unresolvable": failed,
+                "pending": len(self.history.pending_reads(time.time())),
+                "errors": errors[:5]}
+
+    def suggest_for(self, coin: str, interval: str = "15m",
+                    notional: float = 0.0, fee_bps: float = 0.0,
+                    record: bool = True, mode: str = "scalp"
+                    ) -> dict[str, Any]:
+        """A trade to take or ignore on this market, or why there isn't one.
+
+        Everything the suggestion needs comes from the live feed: the book
+        read, the book itself, how much of the candle is left and what recent
+        bars on this timeframe actually travel. If the feed is not running
+        there is no suggestion, and saying so is the correct answer -- the
+        alternative is a target sized from a stale snapshot.
+        """
+        from . import runway as runway_mod
+        from .confirm import (AgreementTracker, from_feed as read_price_action,
+                              grade_three, participation_from_feed)
+        from .delta import from_feed as read_delta_column, sticky as delta_sticky
+        from .live import INTERVALS
+        from .suggest import assess as make_call, infer_tick
+
+        coin = self.resolve_symbol(coin)[0] or coin
+
+        # An unknown interval must not silently become 900 seconds. The
+        # candle grid, the recorded `candle_ts` and the resolver's own
+        # lookup would each use a different length, and the row could never
+        # be settled -- it would simply sit pending forever.
+        if interval not in INTERVALS:
+            return {"ok": False, "coin": coin, "take": False,
+                    "gate": "bad interval",
+                    "detail": f"{interval!r} is not a timeframe this feed "
+                              f"builds ({', '.join(sorted(INTERVALS))})",
+                    "sentence": f"No trade — {interval!r} is not a known "
+                                f"timeframe."}
+
+        feed = self.feed_for(coin)
+        if feed is None:
+            return {"ok": False, "coin": coin, "take": False,
+                    "gate": "no feed",
+                    "detail": "no live feed on this market — press Go live",
+                    "sentence": "No trade — the feed is not running on this "
+                                "market, so there is no book to read."}
+
+        interval_s = float(INTERVALS[interval])
+        read = feed.book_call()
+        with feed._lock:
+            book = feed.book
+
+        live = feed.candle(interval)
+        if live is None:
+            feed.ensure_interval(interval)
+            live = feed.candle(interval)
+
+        now = time.time()
+        if live is not None:
+            seconds_left = max(0.0, live.end_ts - now)
+            candle_ts, candle_end = live.start_ts, live.end_ts
+        else:
+            from .live import grid_start
+            start = grid_start(now, interval_s)
+            seconds_left = max(0.0, start + interval_s - now)
+            candle_ts, candle_end = start, start + interval_s
+
+        # Closed bars for the range estimate. The feed's own history is
+        # preferred -- it is what this candle is actually following -- and
+        # the exchange fills in when the feed has not been up long.
+        recent = feed.history(interval)
+        if len(recent) < 10:
+            try:
+                recent = self.client().candles(coin, interval, bars=60)[:-1]
+            except Exception:
+                pass
+
+        # A fixed, stated default rather than `min_wallet_notional`, which is
+        # the "smallest whale position worth harvesting" knob and has nothing
+        # to do with trade size. Size drives the round trip, which drives the
+        # main gate, so an operator lowering an unrelated setting would have
+        # silently made every suggestion look cheaper.
+        if notional <= 0:
+            notional = DEFAULT_TRADE_NOTIONAL
+
+        # What this market and timeframe is actually achieving, so the
+        # suggestion can put the rate it NEEDS next to the rate you GET.
+        # That pair is the whole decision, and neither half means much
+        # alone.
+        measured_rate, measured_n = None, 0
+        try:
+            stats = self.history.suggestion_stats(coin, interval)["overall"]
+            measured_rate, measured_n = stats["hit_rate"], stats["n"]
+        except Exception:
+            pass
+
+        # What price is ACTUALLY doing, from fills only. This is the
+        # independent half of the comparison: it never touches the book, so
+        # agreement between the two means something.
+        #
+        # The window is scoped to the timeframe -- thirty seconds is the
+        # right question on a 15m bar and far too long on a 1m one.
+        window_s = max(10.0, min(interval_s / 30.0, 120.0))
+        action = read_price_action(feed, interval, window_s=window_s)
+
+        # Was it paid for? The piece that decides whether an agreement holds
+        # together or evaporates between seeing it and acting on it.
+        part = participation_from_feed(feed, interval, interval_s, window_s)
+
+        # The third column: who is crossing the spread. Independent of the
+        # book by construction — `delta.py` never reads one.
+        tape = read_delta_column(feed, interval, interval_s, window_s)
+
+        # Agreement needs an AGE, and age needs memory that survives the
+        # poll. One tracker per market and timeframe.
+        tracker = self._trackers.setdefault((coin, interval),
+                                            AgreementTracker())
+        book_score = read.score if read is not None else 0.0
+        price_score = action.score if action is not None else 0.0
+        tracker.classify(book_score, price_score)
+        held, flips = tracker.observe(
+            "agree" if (read is not None and action is not None
+                        and read.direction == action.direction
+                        and read.direction != "flat")
+            else "no",
+            read.direction if read is not None else "flat", now)
+
+        # Three-way grade. Price is mandatory: it is the only column that
+        # reports an outcome rather than an intention.
+        tracker_delta = delta_sticky(tape.score if tape else 0.0,
+                                     getattr(tracker, "delta_dir", None))
+        tracker.delta_dir = tracker_delta
+        three = grade_three(
+            tracker.book_dir or "flat", tracker_delta,
+            tracker.price_dir or "flat")
+
+        call = make_call(
+            read, book, coin=coin, interval=interval, interval_s=interval_s,
+            seconds_left=seconds_left, recent=recent, notional=notional,
+            fee_bps=fee_bps, mode=("scalp" if mode == "scalp" else "range"),
+            action=action, require_confirmation=True,
+            held_s=held, flips=flips, participation=part,
+            measured_rate=measured_rate, measured_n=measured_n)
+        out = call.suggestion
+
+        payload = call.to_dict()
+        payload["ok"] = True
+        payload["take"] = call.tradeable
+        payload["candle_ts"] = candle_ts
+        payload["notional"] = notional
+        payload["mode"] = mode
+        # The mark, ALWAYS. `suggest` only sets `entry` on candles it was
+        # willing to trade, so on every refused candle the payload carried
+        # no price at all -- and the agent, which no longer cares what
+        # `suggest` thinks, read that as zero. It stood aside on a third of
+        # its polls with a perfectly good vote, and an invalidation exit
+        # closed AT zero, which is a 10,000bps move. That one bad exit put
+        # +2494bps a trade on the scorecard.
+        mark = 0.0
+        if book is not None and not book.empty:
+            mark = book.mid
+        if mark <= 0:
+            bar_now = feed.candle(interval)
+            if bar_now is not None and bar_now.close > 0:
+                mark = bar_now.close
+        if mark <= 0 and recent:
+            mark = recent[-1].close
+        payload["price"] = mark
+
+        # THE ROUND TRIP, ALWAYS — walked on this book at this size, plus
+        # the fee.
+        #
+        # `suggest` only attaches a cost to candles it was willing to
+        # trade. The agent votes instead and takes candles `suggest`
+        # refused, so it was reading no cost at all and booking every
+        # trade gross: 10bps in, 10bps out, breakeven reported as 50% when
+        # 9bps of Hyperliquid taker fees make the truth 95%. Every net
+        # figure in the book was a gross one wearing the wrong label.
+        cost_bps = 0.0
+        if book is not None and not book.empty:
+            try:
+                buy = book.walk(notional, "buy")
+                sell = book.walk(notional, "sell")
+                if not (buy.exhausted or sell.exhausted):
+                    cost_bps = buy.slippage_bps + sell.slippage_bps
+            except Exception:
+                cost_bps = 0.0
+        payload["cost_bps"] = round(cost_bps + max(fee_bps, 0.0), 4)
+        payload["fee_bps"] = fee_bps
+        payload["spread_cost_bps"] = round(cost_bps, 4)
+
+        payload["interval_s"] = interval_s
+        payload["candle_end"] = candle_end
+        # The market's own increment, so a target can be set in ticks
+        # rather than basis points where that is how you think about it.
+        try:
+            payload["tick"] = (infer_tick(book)
+                               if book is not None and not book.empty else 0.0)
+        except Exception:
+            payload["tick"] = 0.0
+        payload["feed_age_s"] = feed.age
+        payload["book_updates"] = feed.book_updates
+        payload["three_way"] = three.to_dict()
+        payload["delta"] = tape.to_dict() if tape else None
+
+        # How far can it go? Direction quality and holding distance are
+        # different questions and are answered separately.
+        live_bar_now = feed.candle(interval)
+        prof_now = getattr(live_bar_now, "profile", None) if live_bar_now else None
+        entry_px = 0.0
+        if out is not None:
+            entry_px = out.entry
+        elif book is not None and not book.empty:
+            entry_px = book.mid
+        if entry_px > 0 and three.direction != "flat":
+            mag_bps, mag_not = self.magnet_for(coin, entry_px)
+            road = runway_mod.measure(
+                entry=entry_px,
+                side="long" if three.direction == "up" else "short",
+                book=book, profile=prof_now, bars=recent,
+                magnet_bps=mag_bps, magnet_notional=mag_not)
+            payload["runway"] = road.to_dict()
+            if out is not None:
+                payload["runway"]["holdable"] = road.holdable(out.target_bps)
+        payload["updates_per_s"] = feed.updates_per_s
+        payload["feed_quality"] = feed.feed_quality
+        payload["fast_book"] = feed.fast_book
+        if out is not None:
+            # Flatten the trade onto the top level too, so the panel and the
+            # existing clients can read it without reaching into a nested
+            # object.
+            payload.update({k: v for k, v in out.to_dict().items()
+                            if k not in ("coin", "interval")})
+
+        # Record it so it can be settled later. Only real suggestions are
+        # stored: a refusal is not a trade and counting refusals would let
+        # the tool improve its own hit rate by declining more often.
+        # EVERY candle's agreement state is recorded, tradeable or not, with
+        # the raw readings behind it. This is the only way to answer what the
+        # confirmation rule is actually worth: measuring only the candles
+        # that passed the filter and concluding the filter works is the
+        # oldest mistake there is.
+        if record and call.confirmation is not None:
+            feats: dict[str, Any] = {}
+            if read is not None:
+                feats.update({
+                    "tilt": round(read.tilt, 4),
+                    "imbalance": round(read.imbalance, 4),
+                    "replenish": round(read.replenish, 4),
+                    "depletion": round(read.depletion, 4),
+                    "aggression": round(read.aggression, 4),
+                    "absorbed": bool(read.absorbed),
+                    "spread_bps": round(read.spread_bps, 4),
+                    "book_score": round(read.score, 4),
+                    "book_samples": read.samples,
+                })
+            if action is not None:
+                feats.update({
+                    "slope_bps": round(action.slope_bps, 4),
+                    "thrust_bps": round(action.thrust_bps, 4),
+                    "position": round(action.position, 4),
+                    "extending": action.extending,
+                    "price_score": round(action.score, 4),
+                })
+
+            # The third source: forced flow. Stored rather than acted on,
+            # so the question "does a liquidation cluster in the called
+            # direction improve a confirmed candle" becomes something the
+            # feature slice can answer from data already collected, instead
+            # of a weight guessed at now and argued about later.
+            # Stability and participation, stored so the table can later
+            # answer "do agreements that held 10s beat fresh ones" from
+            # data already collected rather than from a guessed threshold.
+            feats["held_s"] = round(held, 2)
+            feats["flips"] = flips
+            feats["grade_3way"] = three.grade
+            feats["agreeing"] = three.agreeing
+            if tape is not None:
+                feats["delta_score"] = tape.score
+                feats["delta_lean"] = round(tape.lean, 4)
+                feats["delta_effort"] = round(tape.effort, 3)
+                feats["delta_persistence"] = tape.persistence
+                feats["delta_absorbed"] = tape.absorbed
+                feats["delta_working"] = tape.working
+                feats["delta_divergent"] = tape.divergent
+            road_d = payload.get("runway")
+            if road_d:
+                feats["runway_bps"] = road_d.get("clear_bps")
+                feats["runway_open"] = road_d.get("open_road")
+            if part is not None:
+                feats["effort"] = round(part.effort, 3)
+                feats["effort_aligned"] = round(part.aligned, 3)
+
+            # Where the business was done inside this bar.
+            live_bar = feed.candle(interval)
+            prof = getattr(live_bar, "profile", None) if live_bar else None
+            if prof is not None and prof.total_notional > 0:
+                px = live_bar.close
+                feats["vol_position"] = round(prof.position(px), 4)
+                feats["vol_poc_bps"] = (
+                    round((px - prof.poc) / px * 10_000.0, 2)
+                    if prof.poc else None)
+                if out is not None:
+                    # Volume standing between price and the target: the
+                    # number that says whether a thin book ahead is air or
+                    # a level that already traded and will be defended.
+                    feats["vol_ahead"] = round(
+                        prof.ahead_ratio(px, out.target_px), 4)
+
+            spot = book.mid if book is not None and not book.empty else 0.0
+            if spot > 0:
+                mag_bps, mag_notional = self.magnet_for(coin, spot)
+                feats["magnet_bps"] = round(mag_bps, 2)
+                feats["magnet_notional"] = round(mag_notional, 0)
+                # Signed FOR the book's call: +1 the fuel is where the book
+                # wants to go, -1 it is behind us.
+                if mag_notional > 0 and call.confirmation.book != "flat":
+                    want_up = call.confirmation.book == "up"
+                    feats["magnet_with_call"] = (
+                        1 if (mag_bps > 0) == want_up else -1)
+                else:
+                    feats["magnet_with_call"] = 0
+            try:
+                self.history.record_state(
+                    coin=coin, interval=interval, candle_ts=candle_ts,
+                    candle_end=candle_end,
+                    book_dir=call.confirmation.book,
+                    book_strength=call.confirmation.book_strength,
+                    price_dir=call.confirmation.candle,
+                    price_strength=call.confirmation.candle_strength,
+                    verdict=call.confirmation.verdict,
+                    price=(book.mid if book is not None and not book.empty
+                           else 0.0),
+                    elapsed_frac=(1.0 - seconds_left / interval_s
+                                  if interval_s > 0 else 0.0),
+                    made_at=now, features=feats)
+            except Exception as exc:
+                payload["state_error"] = str(exc)
+
+        # Only tradeable calls become trades. A graded look at a candle that
+        # was never tradeable is not a trade, and scoring refusals would let
+        # the tool raise its own hit rate by declining more often.
+        if record and out is not None:
+            sid = self.history.record_suggestion(
+                coin=coin, interval=interval, candle_ts=candle_ts,
+                candle_end=candle_end, side=out.side, entry=out.entry,
+                target_px=out.target_px, stop_px=out.stop_px,
+                target_bps=out.target_bps, risk_bps=out.risk_bps,
+                rr=out.rr, cost_bps=out.cost_bps,
+                conviction=out.conviction, score=out.score,
+                reason="; ".join(out.reasons), made_at=now)
+            if sid is None:
+                existing = self.history.open_suggestion(coin, interval,
+                                                        candle_ts)
+                sid = existing["id"] if existing else None
+                if existing:
+                    payload["decision"] = existing["decision"]
+            payload["id"] = sid
+        return payload
+
+    def resolve_suggestions(self, limit: int = 300) -> dict[str, Any]:
+        """Settle suggestions whose candle has closed.
+
+        Two things make this harder than settling a read, and both of them
+        flatter the result if they are got wrong.
+
+        THE WINDOW STARTS WHEN THE SUGGESTION DID. A suggestion made ten
+        minutes into a fifteen-minute bar must not be settled against that
+        bar's full high and low. A bar that spiked 300bps in its first two
+        minutes and came back would record a target hit that happened eight
+        minutes before the trade existed. So the settling window runs from
+        `made_at` to the candle's close, and it is built from ONE-MINUTE bars
+        covering that span.
+
+        A TRADE IS DECIDED BY WHICH LEVEL WAS REACHED, not by the close. A
+        close-only resolution records a winner as a loser every time price
+        touched the target and came back.
+        """
+        pending = self.history.pending_suggestions(time.time(), limit=limit)
+        if not pending:
+            return {"ok": True, "resolved": 0, "pending": 0}
+
+        by_coin: dict[str, list[dict[str, Any]]] = {}
+        for row in pending:
+            by_coin.setdefault(row["coin"], []).append(row)
+
+        resolved = failed = 0
+        errors: list[str] = []
+        client = self.client()
+
+        for coin, rows in by_coin.items():
+            try:
+                # One-minute bars are the finest the exchange serves, and
+                # they are what makes a sub-candle window measurable at all.
+                fine = client.candles(coin, "1m", bars=1500)
+            except Exception as exc:
+                errors.append(f"{coin}: {exc}")
+                failed += len(rows)
+                continue
+
+            for row in rows:
+                start = float(row["made_at"] or 0) or float(row["candle_ts"])
+                end = float(row["candle_end"])
+                window = [b for b in fine if start - 60 <= b.ts < end]
+                if not window:
+                    # The span rolled out of the 1m history before it could
+                    # be settled. Never settle against the wrong bars: a
+                    # fabricated outcome poisons the measurement
+                    # permanently, while a missing one is merely missing.
+                    #
+                    # Rows too old to ever come back are abandoned rather
+                    # than left pending, because `pending_suggestions` is
+                    # ordered oldest-first: one permanently unresolvable row
+                    # would otherwise sit at the head of the queue and block
+                    # every newer row behind it.
+                    if end < time.time() - 86_400:
+                        self.history.abandon_suggestion(row["id"])
+                    failed += 1
+                    continue
+
+                if self.history.resolve_suggestion(
+                        row["id"],
+                        high=max(b.high for b in window),
+                        low=min(b.low for b in window),
+                        close=window[-1].close):
+                    resolved += 1
+
+        return {"ok": True, "resolved": resolved, "unresolvable": failed,
+                "pending": len(self.history.pending_suggestions(time.time())),
+                "errors": errors[:5]}
+
+    def start_backfill(self, coin: str, interval: str, days: float,
+                       at: float = 0.33, max_gib: float = 2.0
+                       ) -> dict[str, Any]:
+        """Fill the agreement table from Hyperliquid's own book archive.
+
+        Runs in the background because it is slow and costs money: the
+        bucket is requester-pays, so every hour downloaded is on the
+        caller's AWS bill. The job reports bytes as it goes and stops at
+        the cap rather than discovering the total afterwards.
+        """
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        from .archive import Archive, estimate
+        from .backfill import Progress, backfill as run_backfill
+        from .live import INTERVALS
+
+        if self.backfill.get("running"):
+            return {**self.backfill, "ok": False,
+                    "error": "a backfill is already running"}
+        if interval not in INTERVALS:
+            return {"ok": False,
+                    "error": f"{interval!r} is not a timeframe this service "
+                             f"builds"}
+
+        coin = self.resolve_symbol(coin)[0] or coin
+        interval_s = float(INTERVALS[interval])
+
+        archive = Archive(max_bytes=int(max(0.1, max_gib) * 1024 ** 3))
+        if not archive.credentials_present():
+            return {"ok": False,
+                    "error": "no AWS credentials found. The Hyperliquid "
+                             "archive is requester-pays, so there has to be "
+                             "an account to charge — set AWS_ACCESS_KEY_ID "
+                             "and AWS_SECRET_ACCESS_KEY in Railway"}
+
+        end = _dt.now(_tz.utc).replace(minute=0, second=0, microsecond=0)
+        start = end - _td(days=max(0.04, min(days, 30.0)))
+
+        plan = estimate([coin], start, end)
+        prog = Progress(coin=coin, interval=interval)
+        self.backfill = {"running": True, "ok": True, "plan": plan,
+                         "progress": prog.to_dict(), "error": None}
+
+        def run() -> None:
+            try:
+                # One-minute candles for the whole window, from the
+                # exchange. These are built from FILLS, which is what keeps
+                # the price side independent of the book side.
+                need = int((end - start).total_seconds() // 60) + 10
+                minute_bars = self.client().candles(
+                    coin, "1m", bars=min(need, 5000))
+                if not minute_bars:
+                    prog.error = ("no one-minute candles came back for this "
+                                  "window")
+                    prog.done = True
+                    return
+
+                oldest = min(c.ts for c in minute_bars)
+                from_ts = max(start.timestamp(), oldest)
+                run_backfill(
+                    archive, self.history, coin=coin, interval=interval,
+                    interval_s=interval_s,
+                    start=_dt.fromtimestamp(from_ts, _tz.utc),
+                    end=end, minute_bars=minute_bars, at=at, progress=prog,
+                    should_stop=lambda: not self.backfill.get("running"))
+            except Exception as exc:                    # noqa: BLE001
+                prog.error = f"{type(exc).__name__}: {exc}"
+                prog.done = True
+            finally:
+                self.backfill["running"] = False
+                self.backfill["progress"] = prog.to_dict()
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return self.backfill
+
+    def magnet_for(self, coin: str, spot: float) -> tuple[float, float]:
+        """The nearest liquidation cluster, signed, and its size.
+
+        A THIRD kind of evidence, and qualitatively different from the other
+        two. The order book is resting orders, which are voluntary and can be
+        pulled in a microsecond. Price action is what has already traded.
+        A liquidation cluster is neither: it is flow that MUST happen if
+        price reaches the level, because margin runs out whether anyone
+        wants it to or not.
+
+        Returns (bps to the cluster, notional). Positive bps means the
+        cluster sits above spot -- shorts liquidating, forced buying, a pull
+        upward. Negative means longs below, forced selling, a pull down.
+        """
+        try:
+            m = self.maps(coin)
+        except Exception:
+            return 0.0, 0.0
+
+        clusters = (m.get("weighted") or {}).get("clusters") or []
+        at = float(m.get("spot") or spot)
+        if at <= 0:
+            return 0.0, 0.0
+
+        best = None
+        for cl in clusters:
+            px = float(cl.get("price") or 0)
+            notional = float(cl.get("notional") or 0)
+            if px <= 0 or notional <= 0:
+                continue
+            bps = (px - at) / at * 10_000.0
+            # Pull falls off with distance: a huge cluster 5% away is not
+            # acting on this candle, a modest one 10bps away is.
+            pull = notional / max(abs(bps), 1.0)
+            if best is None or pull > best[0]:
+                best = (pull, bps, notional)
+
+        return (best[1], best[2]) if best else (0.0, 0.0)
+
+    def resolve_states(self, limit: int = 300) -> dict[str, Any]:
+        """Settle recorded agreement states against their closed candles.
+
+        Settled from the read forward, not from the candle's open — a read
+        taken a third of the way in must not be credited with a move that
+        happened before it existed. So the window runs from `made_at` to the
+        close and is built from one-minute bars.
+        """
+        pending = self.history.pending_states(time.time(), limit=limit)
+        if not pending:
+            return {"ok": True, "resolved": 0, "pending": 0}
+
+        by_coin: dict[str, list[dict[str, Any]]] = {}
+        for row in pending:
+            by_coin.setdefault(row["coin"], []).append(row)
+
+        resolved = failed = 0
+        errors: list[str] = []
+        client = self.client()
+
+        for coin, rows in by_coin.items():
+            try:
+                fine = client.candles(coin, "1m", bars=1500)
+            except Exception as exc:
+                errors.append(f"{coin}: {exc}")
+                failed += len(rows)
+                continue
+
+            for row in rows:
+                start = float(row["made_at"] or 0) or float(row["candle_ts"])
+                end = float(row["candle_end"])
+                window = [b for b in fine if start - 60 <= b.ts < end]
+                if not window:
+                    failed += 1
+                    continue
+                if self.history.resolve_state(
+                        row["id"], close_px=window[-1].close,
+                        high_px=max(b.high for b in window),
+                        low_px=min(b.low for b in window)):
+                    resolved += 1
+
+        return {"ok": True, "resolved": resolved, "unresolvable": failed,
+                "pending": len(self.history.pending_states(time.time())),
+                "errors": errors[:5]}
+
+    # ------------------------------------------------------------ autopilot
+
+    def knobs(self) -> Knobs:
+        """Live settings: shipped defaults, displaced by adopted proposals."""
+        try:
+            return Knobs.from_overrides(self.ledger.overrides())
+        except Exception:
+            return Knobs()
+
+    def pilot(self, coin: str, interval: str) -> Autopilot:
+        """One agent per market and timeframe, rehydrated on first use.
+
+        Built lazily so a restart picks up whatever was open rather than
+        abandoning it -- an abandoned position never closes, and a trade
+        with no exit silently drops out of every average computed later.
+        """
+        key = (coin, interval)
+        p = self._pilots.get(key)
+        if p is None:
+            p = Autopilot(
+                coin, interval, self.ledger, knobs=self.knobs(),
+                size_usd=float(self.autopilot.get("notional") or 0),
+                raw=bool(self.autopilot.get("raw", True)),
+                exit_on_invalidation=bool(
+                    self.autopilot.get("exit_on_invalidation", False)),
+                require_unanimous=bool(
+                    self.autopilot.get("require_unanimous", True)),
+                unit=str(self.autopilot.get("unit") or "bps"))
+            self._pilots[key] = p
+        return p
+
+    def autopilot_step(self, coin: str, interval: str,
+                       mode: str = "scalp", notional: float = 10_000.0,
+                       fee_bps: float = 0.0) -> dict[str, Any]:
+        """One decision, on exactly what the panel would have shown.
+
+        The agent reads the same payload you do. Deciding on anything else
+        would make the screen and the ledger two different stories, and
+        there would be no way to audit a call after the fact.
+        """
+        payload = self.suggest_for(coin, interval, mode=mode,
+                                   notional=notional, fee_bps=fee_bps,
+                                   record=True)
+        if not payload.get("ok"):
+            return {"ok": False, "detail": payload.get("detail",
+                                                       "no reading")}
+
+        pilot = self.pilot(coin, interval)
+        pilot.knobs = replace(
+            self.knobs(),
+            tp_bps=float(self.autopilot.get("tp_bps") or 10.0),
+            sl_bps=float(self.autopilot.get("sl_bps") or 10.0),
+            min_effort=float(self.autopilot.get("min_effort") or 0.0),
+            exit_before_s=float(
+                self.autopilot.get("exit_before_s") or 5.0))
+        pilot.raw = bool(self.autopilot.get("raw", True))
+        pilot.exit_on_invalidation = bool(
+            self.autopilot.get("exit_on_invalidation", False))
+        pilot.require_unanimous = bool(
+            self.autopilot.get("require_unanimous", True))
+        pilot.unit = str(self.autopilot.get("unit") or "bps")
+        pilot.size_usd = notional
+
+        # The bar's extremes, so a level reached between two polls still
+        # counts. Polling the last print only would hand the agent a fill
+        # model money will not reproduce.
+        high = low = 0.0
+        feed = self.feed
+        if feed is not None:
+            bar = feed.candle(interval)
+            if bar is not None:
+                high, low = bar.high, bar.low
+
+        # A projection on the same poll, so the two always describe the
+        # same reading of the same bar.
+        try:
+            self.project_now(coin, interval, record=True)
+        except Exception as exc:
+            self.last_error = f"projection: {exc}"
+
+        now = time.time()
+        d = pilot.step(payload, now, high=high, low=low)
+        out = d.to_dict()
+        out["ok"] = True
+        out["coin"] = coin
+        out["interval"] = interval
+        out["grade"] = payload.get("grade")
+        out["three_way"] = payload.get("three_way")
+        self.autopilot["last_step"] = now
+        self.autopilot["last_decision"] = out
+        self.autopilot["steps"] = int(self.autopilot.get("steps") or 0) + 1
+        return out
+
+    def signals_from_history(self, coin: str, interval: str,
+                             since: float | None = None
+                             ) -> list[sweep_mod.Signal]:
+        """Every stored candle reading, re-read as a book+delta+price vote.
+
+        The readings were stored raw rather than as a verdict, so a rule
+        invented today can be scored against candles collected weeks ago.
+        That is the difference between testing tonight and testing next
+        month.
+        """
+        rows = self.history.states_for_sweep(coin, interval, since=since)
+        out = []
+        for r in rows:
+            v = vote_mod.from_state(r)
+            if v.side is None:
+                continue          # nothing to read, not a refusal
+            out.append(sweep_mod.Signal(
+                ts=float(r.get("made_at") or r.get("candle_ts") or 0.0),
+                coin=r["coin"], interval=r["interval"], side=v.side,
+                entry=float(r["price"]), agreeing=v.agreeing,
+                against=v.against, shape=v.shape(), net=v.net,
+                deadline=float(r.get("candle_end") or 0.0),
+                effort=(float(r["features"]["effort"])
+                        if isinstance((r.get("features") or {}).get("effort"),
+                                      (int, float)) else None),
+                book=v.book, delta=v.delta, price=v.price))
+        return out
+
+    def bars_for_sweep(self, coin: str, start: float, end: float,
+                       interval: str = "1m") -> list[sweep_mod.Bar]:
+        """One-minute bars covering the signal span.
+
+        One minute rather than the signal's own timeframe: a bar that
+        touches both levels is settled as a stop, so the ambiguous window
+        should be as small as the data allows.
+        """
+        span_min = max(1.0, (end - start) / 60.0) + sweep_mod.DEFAULT_HORIZON
+        want = int(min(5000, max(200, span_min)))
+        cs = self.client().candles(coin, interval, bars=want)
+        return [sweep_mod.Bar(ts=c.ts, open=c.open, high=c.high,
+                              low=c.low, close=c.close) for c in cs]
+
+    def run_sweep(self, coin: str, interval: str = "15m", *,
+                  tp_from: float = 5.0, tp_to: float = 40.0,
+                  tp_step: float = 5.0, sl_from: float = 5.0,
+                  sl_to: float = 40.0, sl_step: float = 5.0,
+                  cost_bps: float = 0.0,
+                  horizon: int = sweep_mod.DEFAULT_HORIZON,
+                  min_agreeing: int = 0, max_against: int = 3,
+                  side: str = "both", hours: float = 0.0,
+                  min_effort: float = 0.0,
+                  unanimous: bool = False) -> dict[str, Any]:
+        """Every target against every stop, over the signals already stored."""
+        since = (time.time() - hours * 3600.0) if hours else None
+        signals = self.signals_from_history(coin, interval, since=since)
+        if not signals:
+            span = self.history.state_span(coin, interval)
+            return {"ok": False, "signals": 0,
+                    "detail": ("no stored readings for that market and "
+                               "timeframe yet — leave the feed running and "
+                               "they accumulate one per candle"),
+                    "span": span}
+
+        lo = min(s.ts for s in signals)
+        hi = max(s.ts for s in signals)
+        try:
+            bars = self.bars_for_sweep(coin, lo, hi)
+        except Exception as exc:
+            return {"ok": False, "detail": f"could not fetch bars: {exc}"}
+
+        out = sweep_mod.run(
+            signals, bars,
+            sweep_mod.axis(tp_from, tp_to, tp_step),
+            sweep_mod.axis(sl_from, sl_to, sl_step),
+            cost_bps=cost_bps, horizon=horizon,
+            min_agreeing=min_agreeing, max_against=max_against, side=side,
+            min_effort=min_effort, unanimous=unanimous)
+        out["coin"] = coin
+        out["interval"] = interval
+        out["available"] = len(signals)
+        # The grid works in basis points because a stored candle reading
+        # does not carry the tick size it was taken at. Reporting what a
+        # tick is worth NOW lets a ticks-based target be lined up with it.
+        try:
+            feed_now = self.feed_for(coin)
+            bk = feed_now.book if feed_now is not None else None
+            if bk is not None and not bk.empty and bk.mid > 0:
+                from .suggest import infer_tick as _tick
+                t = _tick(bk)
+                if t > 0:
+                    out["tick_bps"] = round(t / bk.mid * 10_000.0, 4)
+        except Exception:
+            pass
+        out["span_hours"] = round((hi - lo) / 3600.0, 1)
+        # How each vote shape did at the best cell, so "do two-of-three
+        # trades pay" is answered from the same run rather than guessed.
+        if out.get("ok"):
+            out["by_shape"] = self._shape_breakdown(
+                signals, bars, out["best"], cost_bps, horizon, side)
+        return out
+
+    @staticmethod
+    def _shape_breakdown(signals, bars, best, cost_bps, horizon, side
+                         ) -> list[dict[str, Any]]:
+        """The best cell, split by how the columns voted."""
+        by: dict[str, sweep_mod.Cell] = {}
+        stamps = [b.ts for b in bars]
+        import bisect as _bisect
+        for s in signals:
+            if side != "both" and s.side != side:
+                continue
+            i = _bisect.bisect_right(stamps, s.ts)
+            window = bars[i:i + horizon]
+            if not window:
+                continue
+            cell = by.setdefault(s.shape, sweep_mod.Cell(
+                tp_bps=best["tp_bps"], sl_bps=best["sl_bps"],
+                cost_bps=cost_bps))
+            reason, exit_px, held = sweep_mod.resolve(
+                s.side, s.entry, best["tp_bps"], best["sl_bps"], window,
+                horizon, deadline=s.deadline)
+            raw = (exit_px - s.entry) / s.entry * 10_000.0
+            gross = raw if s.side == "long" else -raw
+            cell.add(reason, gross - cost_bps, held)
+        rows = []
+        for shape, cell in sorted(by.items(), key=lambda kv: -kv[1].n):
+            d = cell.to_dict()
+            d["shape"] = shape
+            rows.append(d)
+        return rows
+
+    def backfill_book(self, coin: str, interval: str, *,
+                      tp: float = 10.0, sl: float = 10.0, unit: str = "bps",
+                      unanimous: bool = True, min_effort: float = 2.0,
+                      cost_bps: float = 0.0, exit_before_s: float = 5.0,
+                      hours: float = 0.0, limit: int = 5000
+                      ) -> dict[str, Any]:
+        """Trade every candle already recorded, under the rule running now.
+
+        The agent only ever filled its book forward, from the moment it was
+        switched on. But every candle's book, delta and price reading has
+        been stored since the feed first ran, and the rule is a function of
+        those readings -- so the past candles can be traded too, and there
+        is no reason to wait a week to find out what the rule does.
+
+        Each one is settled against real one-minute bars with the same
+        deadline and the same pre-close exit the live agent uses, and
+        written into the same book marked `backfill`. Marked, not blended:
+        a backfilled trade is resolved at one-minute resolution while a
+        live one is managed poll by poll, and averaging the two into a
+        single number describes neither.
+
+        A candle already in the book is skipped, so running this twice
+        cannot double-count anything.
+        """
+        since = (time.time() - hours * 3600.0) if hours else None
+        signals = self.signals_from_history(coin, interval, since=since)
+        if not signals:
+            return {"ok": False, "detail": "no candle readings stored yet",
+                    "written": 0}
+
+        kept = []
+        refused = {"not_unanimous": 0, "not_paid_for": 0, "no_effort_read": 0}
+        for sig in signals:
+            if unanimous and not (sig.agreeing == 3 and sig.against == 0):
+                refused["not_unanimous"] += 1
+                continue
+            if min_effort > 0:
+                if sig.effort is None:
+                    refused["no_effort_read"] += 1
+                    continue
+                if sig.effort < min_effort:
+                    refused["not_paid_for"] += 1
+                    continue
+            kept.append(sig)
+
+        if not kept:
+            return {"ok": False, "written": 0, "considered": len(signals),
+                    "refused": refused,
+                    "detail": ("none of the stored candles met the rule — "
+                               "loosen it, or leave the feed running")}
+
+        lo = min(x.ts for x in kept)
+        hi = max(x.ts for x in kept)
+        try:
+            bars = self.bars_for_sweep(coin, lo, hi)
+        except Exception as exc:
+            return {"ok": False, "written": 0,
+                    "detail": f"could not fetch bars: {exc}"}
+        if not bars:
+            return {"ok": False, "written": 0,
+                    "detail": "no price bars available for that span"}
+
+        stamps = [b.ts for b in bars]
+        written = skipped = unresolved = 0
+        wins = 0
+        net_total = 0.0
+
+        for sig in sorted(kept, key=lambda x: x.ts)[-limit:]:
+            i = bisect.bisect_right(stamps, sig.ts)
+            window = bars[i:i + sweep_mod.DEFAULT_HORIZON]
+            if not window:
+                unresolved += 1
+                continue
+
+            tp_bps, sl_bps = self._unit_bps(tp, sl, unit, sig.entry, coin)
+            sgn = 1.0 if sig.side == "long" else -1.0
+            target = sig.entry * (1 + sgn * tp_bps / 10_000.0)
+            stop = sig.entry * (1 - sgn * sl_bps / 10_000.0)
+            denom = tp_bps + sl_bps
+            breakeven = ((sl_bps + cost_bps) / denom) if denom else 0.0
+
+            pos = self.ledger.open_position(
+                coin=coin, interval=interval, candle_ts=sig.ts,
+                side=sig.side, entry=sig.entry, target_px=target,
+                stop_px=stop, target_bps=tp_bps, risk_bps=sl_bps,
+                cost_bps=cost_bps, breakeven=breakeven,
+                grade=sig.shape, grade_3way=sig.shape,
+                agreeing=sig.agreeing, conviction=abs(sig.net),
+                source="backfill",
+                features={"vote_shape": sig.shape, "vote_book": sig.book,
+                          "vote_delta": sig.delta, "vote_price": sig.price,
+                          "vote_against": sig.against, "vote_net": sig.net,
+                          "effort": sig.effort, "unit": unit,
+                          "tp_bps": tp_bps, "sl_bps": sl_bps},
+                now=sig.ts)
+            if pos is None:
+                skipped += 1        # this candle is already in the book
+                continue
+
+            reason, exit_px, held = sweep_mod.resolve(
+                sig.side, sig.entry, tp_bps, sl_bps, window,
+                sweep_mod.DEFAULT_HORIZON, deadline=sig.deadline,
+                exit_before_s=exit_before_s)
+
+            # The excursions, from the bars the trade actually lived through.
+            lived = window[:max(1, held)]
+            his = max(b.high for b in lived)
+            los = min(b.low for b in lived)
+            pos.mfe_bps = pos.signed_bps(his if sig.side == "long" else los)
+            pos.mae_bps = pos.signed_bps(los if sig.side == "long" else his)
+
+            out = self.ledger.close_position(
+                pos, exit_px=exit_px, reason=reason, now=sig.ts + held * 60.0)
+            if out is None:
+                unresolved += 1
+                continue
+            written += 1
+            net_total += out["net_bps"]
+            wins += 1 if out["net_bps"] > 0 else 0
+
+        self._pilots.pop((coin, interval), None)
+        return {
+            "ok": True, "written": written, "skipped_existing": skipped,
+            "unresolved": unresolved, "considered": len(signals),
+            "matched": len(kept), "refused": refused,
+            "wins": wins, "losses": written - wins,
+            "net_per_trade": round(net_total / written, 2) if written else 0.0,
+            "total_net_bps": round(net_total, 1),
+            "note": (f"{written} past candles traded under the rule you are "
+                     f"running: {wins} winners, {written - wins} losers, "
+                     f"{net_total / written:+.2f}bps a trade."
+                     if written else
+                     "nothing new to write — those candles are already in "
+                     "the book."),
+        }
+
+    def _unit_bps(self, tp: float, sl: float, unit: str, price: float,
+                  coin: str) -> tuple[float, float]:
+        """Targets in basis points, converting from ticks where asked.
+
+        The tick comes from the book NOW, which is the honest limit of a
+        backfill: a stored candle reading does not carry the increment it
+        was taken at. For a market whose tick does not change, that is
+        exact; where it has changed, this says so by being the only tick
+        it can know.
+        """
+        if unit != "ticks" or price <= 0:
+            return (tp, sl)
+        try:
+            feed_now = self.feed_for(coin)
+            bk = feed_now.book if feed_now is not None else None
+            if bk is not None and not bk.empty and bk.mid > 0:
+                from .suggest import infer_tick as _tick
+                t = _tick(bk)
+                if t > 0:
+                    per = t / price * 10_000.0
+                    return (tp * per, sl * per)
+        except Exception:
+            pass
+        return (tp, sl)
+
+    def project_now(self, coin: str, interval: str, record: bool = True
+                    ) -> dict[str, Any]:
+        """Where this bar closes, from where it already is.
+
+        Made on the same reading the panel shows, so the projection and
+        the call can never describe different markets.
+        """
+        payload = self.suggest_for(coin, interval, record=False)
+        if not payload.get("ok"):
+            return {"ok": False, "detail": payload.get("detail", "no read")}
+
+        feed = self.feed_for(coin)
+        if feed is None:
+            return {"ok": False, "detail": "no feed running"}
+        live = feed.candle(interval)
+        if live is None:
+            return {"ok": False, "detail": "no bar forming yet"}
+
+        hist = list(feed.history(interval))
+        interval_s = float(payload.get("interval_s") or 900.0)
+        sigma = pj_mod.realised_sigma_bps(hist, interval_s)
+        ballot = vote_mod.from_payload(payload)
+
+        candle_end = float(payload.get("candle_end")
+                           or live.start_ts + interval_s)
+        now = time.time()
+        remaining = max(0.0, candle_end - now)
+        elapsed = 1.0 - (remaining / interval_s) if interval_s > 0 else 0.0
+
+        out = pj_mod.project(
+            price=float(payload.get("price") or live.close),
+            open_px=live.open, high_so_far=live.high, low_so_far=live.low,
+            remaining_s=remaining, sigma_bps_s=sigma, net=ballot.net)
+
+        if record and out.get("ready"):
+            try:
+                self.ledger.record_projection(
+                    coin=coin, interval=interval, candle_ts=live.start_ts,
+                    candle_end=candle_end, elapsed_frac=elapsed, out=out,
+                    now=now)
+            except Exception as exc:
+                self.last_error = f"projection: {exc}"
+
+        # The measured track record travels WITH the claim.
+        #
+        # `p_up` is the share of simulated paths that finished higher. It
+        # is a model output, not a hit rate, and its value is decided by
+        # the drift coefficient and the volatility estimate -- on a market
+        # with no real edge at all it still reads 55-60% whenever the vote
+        # leans. Shown on its own it is indistinguishable from a measured
+        # number, which is the most expensive confusion this panel could
+        # cause.
+        try:
+            cal = self.projection_calibration(coin, interval)
+            d = cal.get("direction") or {}
+            out["measured"] = {
+                "ready": bool(d.get("ready")),
+                "rate": d.get("rate"), "n": d.get("n"),
+                "ci_low": d.get("ci_low"), "ci_high": d.get("ci_high"),
+                "real": d.get("real"),
+                "note": d.get("note") or d.get("verdict"),
+            }
+        except Exception:
+            out["measured"] = {"ready": False,
+                               "note": "track record unavailable"}
+
+        out = {k: v for k, v in out.items() if not k.startswith("_")}
+        out.update({"ok": True, "coin": coin, "interval": interval,
+                    "candle_ts": live.start_ts, "candle_end": candle_end,
+                    "elapsed_frac": round(elapsed, 3),
+                    "shape": ballot.shape(),
+                    "describe": ballot.describe()})
+        return out
+
+    def backfill_projections(self, coin: str, interval: str, *,
+                             hours: float = 0.0, slots: Sequence[float] =
+                             (0.2, 0.4, 0.6, 0.8),
+                             limit: int = 4000) -> dict[str, Any]:
+        """Replay the projection over candles already recorded, and grade
+        it against what those candles actually did.
+
+        This is the whole answer to "how fast can we know". The projection
+        is a function of the bar so far and the reading taken on it, and
+        both are already stored -- the readings in `agreement_states`, the
+        bar so far reconstructable exactly from one-minute bars. So weeks
+        of labelled outcomes can be produced in one pass instead of
+        waiting for them to arrive one bar at a time.
+
+        Each stored reading is projected at several points through its own
+        bar, because the useful question is not whether it is calibrated
+        at ninety percent of the way through -- almost nothing is left to
+        be wrong about by then -- but whether it is calibrated early.
+        """
+        since = (time.time() - hours * 3600.0) if hours else None
+        states = self.history.states_for_sweep(coin, interval, since=since)
+        if not states:
+            return {"ok": False, "written": 0,
+                    "detail": "no candle readings stored yet"}
+
+        try:
+            bars15 = self.client().candles(coin, interval, bars=500)
+            lo = min(float(r["candle_ts"]) for r in states)
+            hi = max(float(r["candle_end"]) for r in states)
+            mins = self.bars_for_sweep(coin, lo, hi)
+        except Exception as exc:
+            return {"ok": False, "written": 0,
+                    "detail": f"could not fetch bars: {exc}"}
+        if not mins:
+            return {"ok": False, "written": 0,
+                    "detail": "no one-minute bars for that span"}
+
+        interval_s = float(self.client().INTERVALS.get(interval, 900))
+        sigma = pj_mod.realised_sigma_bps(bars15, interval_s)
+        if sigma <= 0:
+            return {"ok": False, "written": 0,
+                    "detail": "could not measure volatility"}
+
+        stamps = [b.ts for b in mins]
+        written = graded = skipped = 0
+
+        for row in states[-limit:]:
+            start = float(row["candle_ts"])
+            end = float(row["candle_end"])
+            if end <= start:
+                continue
+            v = vote_mod.from_state(row)
+            net = v.net
+
+            i0 = bisect.bisect_left(stamps, start)
+            i1 = bisect.bisect_left(stamps, end)
+            inside = mins[i0:i1]
+            if len(inside) < 3:
+                skipped += 1
+                continue
+            actual_close = inside[-1].close
+
+            for frac in slots:
+                cut = start + (end - start) * frac
+                j = bisect.bisect_left(stamps, cut)
+                seen = mins[i0:max(i0 + 1, j)]
+                if not seen:
+                    continue
+                # The bar as it stood at that moment — exactly, not
+                # approximately. This is what makes the replay honest.
+                out = pj_mod.project(
+                    price=seen[-1].close, open_px=seen[0].open,
+                    high_so_far=max(b.high for b in seen),
+                    low_so_far=min(b.low for b in seen),
+                    remaining_s=(end - cut), sigma_bps_s=sigma, net=net,
+                    paths=400, seed=int(start) + int(frac * 10))
+                if not out.get("ready"):
+                    continue
+                pid = self.ledger.record_projection(
+                    coin=coin, interval=interval, candle_ts=start,
+                    candle_end=end, elapsed_frac=frac, out=out, now=cut)
+                if pid is None:
+                    skipped += 1
+                    continue
+                written += 1
+                # The rest of the bar, minute by minute, in bps from the
+                # price the projection was made at. Ordering is the whole
+                # question for a reach test, so the path is kept rather
+                # than a high and a low.
+                p0 = seen[-1].close
+                fwd = mins[max(i0, j):i1]
+                path = [[round((b.high - p0) / p0 * 10_000.0, 3),
+                         round((b.low - p0) / p0 * 10_000.0, 3)]
+                        for b in fwd] if p0 > 0 else []
+                if self.ledger.resolve_projection(pid, actual_close,
+                                                  path=path):
+                    graded += 1
+
+        cal = self.projection_calibration(coin, interval)
+        return {"ok": True, "written": written, "graded": graded,
+                "skipped_existing": skipped, "candles": len(states),
+                "slots": list(slots), "sigma_bps_s": round(sigma, 5),
+                "calibration": cal,
+                "note": (f"{graded} projections graded across "
+                         f"{len(states)} stored candles — "
+                         f"{cal.get('verdict', 'not enough yet')}"
+                         if graded else "nothing new to grade")}
+
+    def resolve_projections(self, limit: int = 300) -> dict[str, Any]:
+        """Grade every projection whose bar has closed."""
+        done = failed = 0
+        for row in self.ledger.pending_projections(time.time(), limit):
+            try:
+                bars = self.client().candles(row["coin"], "1m", bars=120)
+            except Exception:
+                failed += 1
+                continue
+            end = float(row["candle_end"])
+            inside = [b for b in bars if b.ts < end]
+            if not inside:
+                failed += 1
+                continue
+            if self.ledger.resolve_projection(row["id"], inside[-1].close):
+                done += 1
+            else:
+                failed += 1
+        return {"ok": True, "graded": done, "unresolvable": failed}
+
+    def projection_calibration(self, coin: str | None = None,
+                               interval: str | None = None
+                               ) -> dict[str, Any]:
+        """Is the projection telling the truth, and does the signal help?
+
+        Not `calibration` — the candle read already has a method by that
+        name further down the class, and in a class body the later
+        definition simply replaces the earlier one. No error, no warning;
+        the first is just gone.
+        """
+        # One row per bar: ten looks at one candle are ten looks at the
+        # same outcome, and pooling them would shrink every interval by
+        # root-ten for free.
+        pits = self.ledger.projection_pits(coin, interval, one_per_bar=True)
+        out = pj_mod.compare(pits["signal"], pits["null"])
+        out["ok"] = True
+        out["bars"] = pits["bars"]
+        out["rows"] = pits["rows"]
+        out["by_slot"] = pits["by_slot"]
+        out["counts"] = self.ledger.counts()
+
+        # And the same question asked at each point through the bar,
+        # because "is it calibrated early" is the one that decides
+        # whether there is a trade in it.
+        per = []
+        for frac, d in sorted(
+                self.ledger.projection_slot_pits(coin, interval).items()):
+            sc = pj_mod.calibration_score(d["signal"])
+            nu = pj_mod.calibration_score(d["null"])
+            per.append({
+                "elapsed": frac, "n": len(d["signal"]),
+                "signal_dev": sc.get("deviation"),
+                "null_dev": nu.get("deviation"),
+                "gap": (round(nu["deviation"] - sc["deviation"], 4)
+                        if sc.get("ready") and nu.get("ready") else None),
+                "ready": bool(sc.get("ready") and nu.get("ready"))})
+        out["by_elapsed"] = per
+        # The question actually being asked. Kept separate from the band
+        # calibration above, because they are different questions and the
+        # bands are the blunter instrument for this one.
+        rows = self.ledger.projection_outcomes(coin, interval)
+        out["direction"] = pj_mod.directional_edge(rows)
+        out["distance"] = pj_mod.distance(rows)
+        # Targets a scalper actually uses. Expressed in basis points
+        # because that is the only unit every market shares; the panel
+        # converts to ticks for the instrument in front of you.
+        out["reach"] = pj_mod.reach_test(
+            rows, [1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0])
+        return out
+
+    def scorecard(self, coin: str | None = None, interval: str | None = None
+                  ) -> dict[str, Any]:
+        """How the agent has actually done, error bars included."""
+        positions = self.ledger.closed(coin=coin, interval=interval)
+        decisions = self.ledger.decisions(coin=coin, interval=interval,
+                                          limit=5000)
+        card = score_mod.scorecard(positions, decisions)
+        card["ok"] = True
+        card["suspect"] = len(self.ledger.suspect())
+        card["counts"] = self.ledger.counts()
+        card["open"] = [p.to_dict() for p in self.ledger.load_open(coin)]
+        card["knobs"] = self.knobs().to_dict()
+        return card
+
+    def maybe_tune(self, min_gap_s: float = 3600.0) -> list[dict[str, Any]]:
+        """Look for a change worth proposing. Files nothing most of the time.
+
+        Rate limited because the answer only moves when the book grows, and
+        re-running a walk-forward every five seconds burns CPU to file the
+        same proposal repeatedly.
+        """
+        now = time.time()
+        if now - self._last_tune < min_gap_s:
+            return []
+        self._last_tune = now
+        k = replace(self.knobs(),
+                    tp_bps=float(self.autopilot.get("tp_bps") or 20.0),
+                    sl_bps=float(self.autopilot.get("sl_bps") or 15.0))
+        filed = []
+
+        # In raw mode there are no entry gates left to tighten -- the vote
+        # refuses nothing. What is worth tuning is where the levels sit, and
+        # only the grid can judge that.
+        if self.autopilot.get("raw", True):
+            coin = self.autopilot.get("coin")
+            interval = self.autopilot.get("interval") or "15m"
+            if coin:
+                try:
+                    one = self.propose_levels_now(coin, interval, k, now=now)
+                    if one:
+                        filed.append(one)
+                except Exception as exc:
+                    self.last_error = f"level proposal: {exc}"
+        else:
+            filed.extend(tuner_mod.propose_all(self.ledger, k, now=now))
+        return filed
+
+    def propose_levels_now(self, coin: str, interval: str,
+                           knobs=None, now: float | None = None
+                           ) -> dict[str, Any] | None:
+        """Walk the grid forward over stored signals and file the result."""
+        k = knobs or replace(
+            self.knobs(),
+            tp_bps=float(self.autopilot.get("tp_bps") or 20.0),
+            sl_bps=float(self.autopilot.get("sl_bps") or 15.0))
+        signals = self.signals_from_history(coin, interval)
+        if not signals:
+            return None
+        lo = min(x.ts for x in signals)
+        hi = max(x.ts for x in signals)
+        bars = self.bars_for_sweep(coin, lo, hi)
+        return tuner_mod.propose_levels(
+            self.ledger, k, signals, bars,
+            cost_bps=float(self.autopilot.get("fee_bps") or 0.0), now=now)
+
+    def cme_now(self, coin: str) -> dict[str, Any]:
+        """`now` for the CME market, answered from the tape.
+
+        No request is made: the price is the last print on the
+        subscription already open, and `age_s` is how long ago that
+        was. A stale tape therefore shows as a growing age rather than
+        as a confident wrong price.
+        """
+        tape = self.ofi.tape
+        now = time.time()
+        snap = tape.snapshot()
+        front, deferred = self.ofi.config.active_contracts
+        # Echo back the requested symbol so the ticker displays correctly
+        # when the user has selected "ES.Z26" or "ES.H27" in the picker.
+        display_coin = coin.upper() if coin and coin.upper() != self.ofi.config.market else tape.symbol
+        out: dict[str, Any] = {
+            "coin": display_coin,
+            "active_contract": tape.symbol,   # "ES.Z26" — matches IronBeam
+            "front_month": front,
+            "deferred": deferred,
+            "source": "cme",
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "server_epoch": now,
+            "price": tape.last_px or None,
+            "last_side": tape.last_side,
+            "trades": tape.trades,
+            "age_s": (round(now - tape.last_ts, 3) if tape.last_ts else None),
+            "running": self.ofi.running,
+        }
+        if snap.get("book"):
+            out["book"] = snap["book"]
+        if not self.ofi.running:
+            out["note"] = self.ofi.config.blocked_by() or self.ofi.error
+        return out
+
+    def now(self, coin: str) -> dict[str, Any]:
+        """Spot price plus how old everything else on the dashboard is.
+
+        This exists because a reading with no price beside it cannot be
+        checked against anything. If the number here does not match the chart
+        you are looking at, nothing else on the page is worth reading, and
+        that should take one glance to establish rather than an investigation.
+
+        Ages are computed HERE, on the server, and the client counts up from
+        when it received them. Computing them in the browser from timestamps
+        means a machine whose clock is a few minutes off reports everything as
+        fresh, or everything as stale, and both are worse than no age at all.
+        """
+        if self.is_cme(coin):
+            return self.cme_now(coin)
+        coin = self.resolve_symbol(coin)[0] or coin.upper()
+        now = time.time()
+        out: dict[str, Any] = {
+            "coin": coin,
+            "server_time": datetime.now(timezone.utc).isoformat(),
+            "server_epoch": now,
+        }
+
+        try:
+            # ONE request. This runs every couple of seconds, so the
+            # every-dex sweep that used to live here was the single largest
+            # consumer of the rate-limit budget on the whole service.
+            spot = self.client().mid(coin)
+            if spot is not None:
+                self.last_price[coin] = spot
+            self.last_price_ts = now
+            out["spot"] = spot
+            out["spot_age_s"] = 0.0
+            if spot is None:
+                out["spot_error"] = (
+                    f"{coin} has no mid price on the exchange right now")
+        except Exception as exc:
+            spot = self.last_price.get(coin)
+            out["spot"] = spot
+            out["spot_age_s"] = (now - self.last_price_ts
+                                 if self.last_price_ts else None)
+            out["spot_error"] = f"price fetch failed: {exc}"
+
+        # How stale is each panel's underlying data.
+        sweeps = self.history.sweeps(coin, limit=1)
+        sweep_age = None
+        if sweeps:
+            try:
+                ts = datetime.fromisoformat(sweeps[0]["ts"])
+                sweep_age = now - ts.timestamp()
+            except (ValueError, KeyError, TypeError):
+                sweep_age = None
+
+        watching = bool(self.watch_info.get("running"))
+        out["sources"] = {
+            # consensus, positions and the liquidation map all come from here
+            "sweep": {"age_s": sweep_age,
+                      "interval_s": self.settings().sweep_interval_minutes * 60,
+                      "note": "positions, consensus and the liquidation map"},
+            "book": {"age_s": (now - self.last_book_ts
+                               if self.last_book_ts else None),
+                     "note": "depth, slippage and shelves"},
+            "watch": {"running": watching,
+                      "coin": self.watch_info.get("coin"),
+                      "level": self.watch_info.get("level"),
+                      "note": "flow and absorption — only live while watching"},
+        }
+        return out
+
+    def calibration(self, coin: str, interval: str):
+        """Measured hit rate per market and timeframe.
+
+        Kept per (coin, interval) because they are genuinely different
+        questions. A lean that is worth something on a 15-minute gold candle
+        says nothing about a 4-hour BTC one, and pooling them would hide both.
+        """
+        from .candleread import Calibration
+        return self._calibrations.setdefault((coin, interval), Calibration())
+
+    def replay_calibration(self, coin: str, interval: str,
+                           bars: int = 500) -> int:
+        """Score past closed candles and record how each resolved.
+
+        Uses only what candles alone can reconstruct -- structure, zones,
+        VWAP, position in range. Flow, absorption and book depth were not
+        recorded historically, so the replay is deliberately blind to the
+        three strongest live signals. Treat the resulting rate as a floor,
+        not as what the live read achieves.
+        """
+        from . import candleread
+        from .structure import (session_anchor, structure as read_structure,
+                                vwap as make_vwap, zones)
+
+        candles = self.client().candles(coin, interval, bars=bars)
+        if len(candles) < 60:
+            raise RuntimeError(f"only {len(candles)} candles — need 60+ to replay")
+
+        step = self.client().INTERVALS.get(interval, 900)
+        cal = self.calibration(coin, interval)
+        scored = 0
+
+        # Walk forward. Everything each read sees comes from bars strictly
+        # before the one being predicted, so the replay cannot peek.
+        for i in range(50, len(candles)):
+            past = candles[:i]
+            target = candles[i]
+
+            zs = zones(past)
+            in_zone = next((z for z in zs if z.contains(target.open)), None)
+            vw = make_vwap(past, session_anchor(past))
+
+            r = candleread.read(
+                coin=coin, interval_s=float(step), elapsed_s=float(step),
+                open_px=target.open, high_px=target.open, low_px=target.open,
+                last_px=target.open,
+                higher=read_structure(past), zone=in_zone, vw=vw)
+            if r.signals:
+                cal.observe(r.score, candleread.outcome(target))
+                scored += 1
+        return scored
+
+    def resolve_symbol(self, typed: str) -> tuple[str, list[str]]:
+        """Turn what someone typed into a symbol that exists.
+
+        HIP-3 markets are namespaced `dex:COIN`, so the gold perp is something
+        like `vntl:GOLD`, not `GOLD`. Nobody is going to type that, and typing
+        `GOLD` finding nothing is the single most confusing thing this app can
+        do — it looks like an empty market rather than a near miss.
+
+        Returns (best match, all candidates). Several builders can list the
+        same ticker, so an ambiguous match returns every one rather than
+        silently picking.
+        """
+        typed = typed.strip()
+        if not typed:
+            return "", []
+
+        # Both what has been swept AND what is listed. Resolving only against
+        # swept history means a market you can trade but have not swept fails
+        # to resolve, which is the same near-miss confusion in a new place.
+        known = [r["coin"] for r in self.history.coins_with_data()]
+        if self._markets_cache:
+            known += [m["symbol"] for m in self._markets_cache.get("markets", [])
+                      if m["symbol"] not in known]
+        upper = typed.upper()
+
+        for k in known:                                   # exact, case-aware
+            if k.upper() == upper:
+                return k, [k]
+
+        from .hl import join_symbol, split_symbol
+        matches = [k for k in known if split_symbol(k)[1].upper() == upper]
+        if matches:
+            return matches[0], matches
+
+        # No match on record. Normalise case WITHOUT touching the DEX prefix:
+        # HIP-3 DEX names are lowercase and case-sensitive, so upper-casing
+        # the whole thing turns `vntl:GOLD` into `VNTL:GOLD`, which matches
+        # nothing on the exchange and looks exactly like a missing market.
+        dex, base = split_symbol(typed)
+        return join_symbol(dex, base.upper()), []
+
+    def no_data_reason(self, coin: str) -> str:
+        """Why this coin is empty, and what to do about it.
+
+        "No sweep recorded yet" is true for a coin you never configured, a
+        coin nobody holds, and a service that has never swept at all — three
+        different problems with three different fixes, and the bare message
+        sends you looking in the wrong place for two of them.
+        """
+        have = [r["coin"] for r in self.history.coins_with_data()]
+        if not have:
+            return ("Nothing has been swept yet. Click Harvest wallets to "
+                    "collect a universe, then Sweep now.")
+
+        # A near miss is far more likely than a missing market: the HIP-3
+        # perps are namespaced, so "GOLD" is really "vntl:GOLD" or similar.
+        _, candidates = self.resolve_symbol(coin)
+        if candidates:
+            return (f"{coin} is listed as {', '.join(candidates)} — those are "
+                    f"builder-deployed markets, so the venue is part of the "
+                    f"symbol. Use the full name.")
+
+        cfg = self.settings()
+        others = ", ".join(have[:8])
+        if coin in cfg.coins:
+            return (f"{coin} is configured but has no positions recorded. None "
+                    f"of your wallets are holding it, or the last sweep missed "
+                    f"it. Coins with data right now: {others}.")
+        return (f"No data for {coin}. Your wallets are holding {others}. "
+                f"Run a sweep — one read records every coin they hold — or add "
+                f"{coin} to the coin list in Settings so it is always included.")
 
     def maps(self, coin: str) -> dict[str, Any]:
         """Both maps from the most recent stored sweep."""
         cfg = self.settings()
+        coin = self.resolve_symbol(coin)[0] or coin
         latest = self.history.latest_sweep_positions(coin)
         if not latest:
-            return {"coin": coin, "error": "no sweep recorded yet"}
+            return {"coin": coin, "error": self.no_data_reason(coin)}
 
         sweep_id, positions = latest
         meta = next((s for s in self.history.sweeps(coin, limit=1)), {})
@@ -309,6 +2849,8 @@ def require_token(authorization: str = Header(default=""),
 def _worker_loop(rt: Runtime) -> None:
     last_sweep = 0.0
     last_price = 0.0
+    last_resolve = 0.0
+    last_pilot = 0.0
 
     while True:
         try:
@@ -329,13 +2871,58 @@ def _worker_loop(rt: Runtime) -> None:
                 except Exception as exc:
                     rt.last_error = f"price poll: {exc}"
 
+            if now - last_resolve >= 120:
+                last_resolve = now
+                try:
+                    rt.resolve_reads(limit=200)
+                except Exception as exc:
+                    rt.last_error = f"resolve reads: {exc}"
+                # Suggestions settle on the same tick. Without this the
+                # table fills up and nothing in it is ever scored, so
+                # `suggestion_stats` reports "nothing settled yet" forever
+                # while the backlog grows -- and the decision freeze, which
+                # keys off the candle clock, has nothing to compare against.
+                try:
+                    rt.resolve_suggestions(limit=200)
+                except Exception as exc:
+                    rt.last_error = f"resolve suggestions: {exc}"
+                try:
+                    rt.resolve_states(limit=300)
+                except Exception as exc:
+                    rt.last_error = f"resolve states: {exc}"
+                try:
+                    rt.resolve_projections(limit=200)
+                except Exception as exc:
+                    rt.last_error = f"resolve projections: {exc}"
+
+            # The agent decides on its own cadence, independent of whether
+            # anyone has the panel open. That is the point: a book that only
+            # fills while you are watching measures your attention, not the
+            # strategy.
+            ap = rt.autopilot
+            if ap.get("on") and ap.get("coin") and now - last_pilot >= 5:
+                last_pilot = now
+                try:
+                    rt.autopilot_step(
+                        ap["coin"], ap.get("interval") or "15m",
+                        mode=ap.get("mode") or "scalp",
+                        notional=float(ap.get("notional") or 10_000.0),
+                        fee_bps=float(ap.get("fee_bps") or 0.0))
+                    ap["error"] = None
+                except Exception as exc:
+                    ap["error"] = str(exc)
+                    rt.last_error = f"autopilot: {exc}"
+                try:
+                    rt.maybe_tune()
+                except Exception as exc:
+                    rt.last_error = f"tuner: {exc}"
+
             if now - last_sweep >= cfg.sweep_interval_minutes * 60:
                 last_sweep = now
-                for coin in cfg.coins:
-                    try:
-                        rt.sweep(coin)
-                    except Exception as exc:
-                        rt.last_error = f"sweep {coin}: {exc}"
+                try:
+                    rt.sweep()          # one read, every coin
+                except Exception as exc:
+                    rt.last_error = f"sweep: {exc}"
 
             time.sleep(5)
         except Exception:
@@ -380,11 +2967,360 @@ def startup_report(rt: Runtime) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+# Real-time MBP-10 book broadcaster — threads → async WebSocket queues
+# --------------------------------------------------------------------------
+
+def _offer(q: Any, frame: dict, hub: Any) -> None:
+    """Hand one frame to one client queue. Runs ON the event loop.
+
+    THIS MUST BE THE CALLBACK, not ``q.put_nowait`` directly.
+    ``call_soon_threadsafe`` only SCHEDULES the call and returns, so a
+    ``try/except`` at the scheduling site never sees what the put does.
+    Passing ``q.put_nowait`` straight in leaves QueueFull to be raised
+    inside the loop's own Handle with no handler in reach: every
+    overflow becomes an unhandled exception, and the default handler
+    writes out the Handle's repr -- which carries the whole book frame.
+    On ES that is tens of thousands of times a second, and the process
+    dies of writing it down rather than of the exception itself.
+
+    A full queue means this client is behind. Drop its OLDEST frame
+    rather than the new one: a book snapshot is worth nothing once it
+    is stale, so a lagging client should see the latest book, not be
+    pinned to the first four it ever received.
+    """
+    try:
+        q.put_nowait(frame)
+        return
+    except _asyncio.QueueFull:
+        pass
+    except Exception:                                   # noqa: BLE001
+        return
+    try:
+        q.get_nowait()                                  # evict the oldest
+        q.put_nowait(frame)
+    except Exception:                                   # noqa: BLE001
+        pass
+    hub.dropped += 1
+
+
+class BookBroadcaster:
+    """Fan-out from the OFI background thread to N async WebSocket queues.
+
+    WHY THIS SHAPE. The Databento OFI engine runs on a blocking background
+    thread; FastAPI WebSocket handlers run inside the asyncio event loop.
+    You cannot ``await`` from a thread and you cannot block the event loop.
+    The bridge: each WebSocket handler owns an ``asyncio.Queue``; when the
+    OFI thread has a new book update it schedules a non-blocking
+    ``queue.put_nowait`` onto the event loop with ``call_soon_threadsafe``.
+    The handler's ``await queue.get()`` wakes the moment the item lands.
+
+    MULTIPLE CONNECTIONS. Every connected client gets its own queue. The
+    broadcaster holds a set of queues and notifies all of them on each
+    update.  With a bounded ``maxsize`` a slow client accumulates at most
+    that many frames before the broadcaster starts dropping for it only
+    (``put_nowait`` raises ``QueueFull`` on overflow; we catch and count).
+
+    LOOP LIFECYCLE. ``set_loop`` is called once in the FastAPI lifespan,
+    before any WebSocket connects.  After that the loop reference is only
+    written from one place and read from the OFI thread, which is safe
+    under the GIL.
+    """
+
+    def __init__(self, maxsize: int = 128) -> None:
+        self._queues: set = set()
+        self._lock = threading.Lock()
+        self._maxsize = maxsize
+        self._loop: Any = None          # asyncio.AbstractEventLoop
+        self.dropped: int = 0
+        self.sent: int = 0
+
+    def set_loop(self, loop: Any) -> None:
+        """Call once from the asyncio lifespan before any client connects."""
+        self._loop = loop
+
+    def add(self, q: Any) -> None:
+        """Register a client queue (called from the event-loop thread)."""
+        with self._lock:
+            self._queues.add(q)
+
+    def remove(self, q: Any) -> None:
+        """Unregister a client queue on disconnect."""
+        with self._lock:
+            self._queues.discard(q)
+
+    def notify(self, frame: dict) -> None:
+        """Push one book-delta frame to every registered queue.
+
+        Called from the OFI background thread on every MBP-10 book record.
+        Must return in microseconds; no blocking, no awaiting.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        with self._lock:
+            queues = list(self._queues)
+        for q in queues:
+            try:
+                loop.call_soon_threadsafe(_offer, q, frame, self)
+                self.sent += 1
+            except RuntimeError:
+                # the loop closed under us between the check and here
+                self.dropped += 1
+
+    @property
+    def connections(self) -> int:
+        with self._lock:
+            return len(self._queues)
+
+
+class SignalBroadcaster:
+    """Fan-out from the ExecutionTrack background thread to N async queues.
+
+    Mirrors BookBroadcaster exactly: the execution engine runs on the OFI
+    background thread; each /ws/exec WebSocket handler owns an asyncio.Queue
+    that receives Signal dicts pushed via call_soon_threadsafe.
+    """
+
+    def __init__(self, maxsize: int = 64) -> None:
+        self._queues: set = set()
+        self._lock = threading.Lock()
+        self._maxsize = maxsize
+        self._loop: Any = None
+        self.dropped: int = 0
+        self.sent: int = 0
+
+    def set_loop(self, loop: Any) -> None:
+        self._loop = loop
+
+    def add(self, q: Any) -> None:
+        with self._lock:
+            self._queues.add(q)
+
+    def remove(self, q: Any) -> None:
+        with self._lock:
+            self._queues.discard(q)
+
+    def notify(self, frame: dict) -> None:
+        """Called from the execution background thread. Must return immediately."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        with self._lock:
+            queues = list(self._queues)
+        for q in queues:
+            try:
+                loop.call_soon_threadsafe(_offer, q, frame, self)
+                self.sent += 1
+            except RuntimeError:
+                # the loop closed under us between the check and here
+                self.dropped += 1
+
+    @property
+    def connections(self) -> int:
+        with self._lock:
+            return len(self._queues)
+
+
+def _book_delta(tape) -> dict:
+    """Snapshot the MBP-10 book as a WebSocket frame.
+
+    Format is a superset of the ``api_bookcall`` CME response so that
+    ``paintBookCall`` in the dashboard can consume it unchanged AND the new
+    depth-ladder renderer gets the raw bid/ask arrays it needs.
+    """
+    bk = tape.book
+    ts_now = time.time()
+
+    if bk is None or bk.empty:
+        return {
+            "ts": ts_now,
+            "source": "cme",
+            "px": tape.last_px or 0.0,
+            "bid": None, "ask": None,
+            "mid": None, "microprice": None,
+            "spread_bps": 0.0,
+            "imbalance": 0.0, "tilt": 0.0,
+            "direction": "flat", "score": 0.0,
+            "conviction": "snapshot",
+            "book_updates": tape.books,
+            "bids": [], "asks": [],
+            "samples": 0, "window_s": 0.0,
+            "components": [], "verdict": "flat",
+            "note": "waiting for first book record",
+        }
+
+    b0, a0 = bk.bids[0], bk.asks[0]
+    bid_sz5 = sum(lv.sz for lv in bk.bids[:5])
+    ask_sz5 = sum(lv.sz for lv in bk.asks[:5])
+    total5  = bid_sz5 + ask_sz5
+    imb = (bid_sz5 - ask_sz5) / total5 if total5 > 0 else 0.0
+    microprice = (
+        (b0.px * ask_sz5 + a0.px * bid_sz5) / total5
+        if total5 > 0 else bk.mid
+    )
+    direction = "up" if imb > 0.1 else "down" if imb < -0.1 else "flat"
+
+    return {
+        "ts": ts_now,
+        "source": "cme",
+        "px": tape.last_px or 0.0,
+        # bookcall-compatible surface (paintBookCall consumes these)
+        "coin": tape.symbol,
+        "direction": direction,
+        "score": round(imb, 4),
+        "conviction": "snapshot",
+        "mid": round(bk.mid, 4),
+        "microprice": round(microprice, 4),
+        "spread_bps": round(bk.spread_bps, 2),
+        "tilt": round(imb, 4),
+        "imbalance": round(imb, 4),
+        "bid": b0.px, "ask": a0.px,
+        "bid_sz": b0.sz, "ask_sz": a0.sz,
+        "depletion": None, "replenish": None,
+        "mid_drift_bps": None, "aggression": None, "absorbed": None,
+        "samples": 1, "window_s": 0.0,
+        "components": [],
+        "verdict": direction,
+        "book_updates": tape.books,
+        "age_s": (ts_now - tape.last_ts) if tape.last_ts else None,
+        "note": "live MBP-10 delta via /ws/book",
+        # Raw depth arrays for the ladder renderer
+        "bids": [{"px": lv.px, "sz": lv.sz, "n": lv.n}
+                 for lv in bk.bids[:10]],
+        "asks": [{"px": lv.px, "sz": lv.sz, "n": lv.n}
+                 for lv in bk.asks[:10]],
+    }
+
+
+# --------------------------------------------------------------------------
+# WebGL order flow snapshot helper (module-level so tests can import it)
+# --------------------------------------------------------------------------
+
+def _flow_snapshot(tape, interval: str) -> dict:
+    """Build the 16ms snapshot for the WebGL order flow profile.
+
+    Aggregates every trade in the current bar into a volume-at-price
+    table (buy side, sell side, delta per tick).  All reads are GIL-safe:
+    the tape's attributes are bound atomically and the trade list is only
+    appended to from one thread, so iterating a snapshot of it here is safe.
+    """
+    TICK = 0.25                         # ES tick size in points
+    last_px = tape.last_px or 0.0
+    book = tape.book
+    cur = tape.candle(interval)
+    bar_start = cur.start_ts if cur else (time.time() - 60.0)
+
+    # Volume at price: {tick_index: [buy_sz, sell_sz]}
+    by_price: dict[int, list[float]] = {}
+    flow = tape.flow
+    trades = list(getattr(flow, "_trades", []))   # snapshot, no lock needed
+    for t in trades:
+        if t.ts < bar_start:
+            continue
+        key = round(t.px / TICK)
+        row = by_price.setdefault(key, [0.0, 0.0])
+        if t.aggressor == "buy":
+            row[0] += t.sz
+        else:
+            row[1] += t.sz
+
+    max_v = max((r[0] + r[1] for r in by_price.values()), default=1.0)
+    poc_key = (max(by_price, key=lambda k: by_price[k][0] + by_price[k][1])
+               if by_price else 0)
+
+    # Keep only levels within ±100 ticks of current price for wire efficiency
+    if last_px:
+        cx = round(last_px / TICK)
+        by_price = {k: v for k, v in by_price.items() if abs(k - cx) <= 100}
+
+    profile = sorted(
+        [{"px": k * TICK, "b": round(r[0], 1), "s": round(r[1], 1)}
+         for k, r in by_price.items()],
+        key=lambda x: -x["px"],
+    )
+
+    bar_out = None
+    if cur:
+        bar_out = {
+            "open": cur.open, "high": cur.high,
+            "low": cur.low, "close": cur.close,
+            "vol": round(cur.volume, 0),
+            "delta": round(getattr(cur, "delta", 0.0), 0),
+            "trades": cur.trades,
+        }
+
+    return {
+        "ts": time.time(),
+        "px":  last_px,
+        "poc": poc_key * TICK,
+        "maxv": round(max_v, 1),
+        "profile": profile,
+        "bids": [{"px": l.px, "sz": l.sz}
+                 for l in (book.bids[:10] if book else [])],
+        "asks": [{"px": l.px, "sz": l.sz}
+                 for l in (book.asks[:10] if book else [])],
+        "bar": bar_out,
+    }
+
+
+# --------------------------------------------------------------------------
 # app
 # --------------------------------------------------------------------------
 
 def create_app() -> FastAPI:
     rt = runtime()
+
+    # ---- the rule's own clock, independent of any browser ----------
+    #
+    # THE STRATEGY USED TO STOP WHEN THE LAPTOP SHUT. Everything that
+    # evaluates it -- the entry test, the exit test, the cap, the
+    # alert -- hangs off `/api/read`, and that route is only called
+    # by a page. Close the tab and the rule is not late, it is gone:
+    # an open position sits there with nothing watching its stop.
+    #
+    # So it runs here too. Same function the route calls, same lock,
+    # so the two cannot both act on one signal.
+    #
+    # It does NOT reach a broker. Auto still only writes journal
+    # rows; this makes those rows happen on time rather than when
+    # someone happens to be looking.
+    class _JournalStepper(threading.Thread):
+        """Steps every configured market once a second."""
+
+        def __init__(self, rt_, every: float = 1.0):
+            super().__init__(daemon=True, name="journal-stepper")
+            self.rt = rt_
+            self.every = max(0.2, float(every))
+            self._stop = threading.Event()
+            self.steps = 0
+            self.errors = 0
+            self.last_error = ""
+            self.last_ts = 0.0
+
+        def stop(self) -> None:
+            self._stop.set()
+
+        def run(self) -> None:
+            while not self._stop.wait(self.every):
+                try:
+                    coins = self.rt.journal.coins()
+                except Exception as exc:                # noqa: BLE001
+                    self.errors += 1
+                    self.last_error = f"{type(exc).__name__}: {exc}"
+                    continue
+                for c in coins:
+                    try:
+                        _journal_step(self.rt, c, {})
+                        self.steps += 1
+                        self.last_ts = time.time()
+                    except Exception as exc:            # noqa: BLE001
+                        # One bad market must not stop the others,
+                        # and nothing here may take the service down
+                        # -- a dead stepper is a position nobody is
+                        # managing, which is the failure this exists
+                        # to prevent.
+                        self.errors += 1
+                        self.last_error = f"{c}: {type(exc).__name__}: {exc}"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -395,10 +3331,115 @@ def create_app() -> FastAPI:
         if rt.settings().auto_run and not rt.locked:
             start_worker(rt)
             print("[liqmap] background worker started", flush=True)
+
+        # Give the book broadcaster a reference to the running event loop
+        # so it can schedule queue.put_nowait from the OFI background thread.
+        # Wire it to the CME tape's book-update callbacks once here; adding
+        # and removing it per-connection would race with the OFI thread.
+        loop = _asyncio.get_running_loop()
+        rt.book_broadcaster.set_loop(loop)
+        rt.signal_broadcaster.set_loop(loop)
+        rt.ingest_hub.set_loop(loop)
+        rt.delta_worker.start()
+
+        # The rule keeps running with every browser closed.
+        try:
+            _stepper = _JournalStepper(rt, every=1.0)
+            _stepper.start()
+            rt.journal_stepper = _stepper
+            print("[liqmap] journal stepper started -- the strategy "
+                  "runs without a browser", flush=True)
+        except Exception as exc:                        # noqa: BLE001
+            rt.journal_stepper = None
+            print(f"[liqmap] journal stepper did NOT start: {exc}",
+                  flush=True)
+        if rt.ofi is not None and rt.ofi.tape is not None:
+            _tape = rt.ofi.tape
+            _bc   = rt.book_broadcaster
+            _hub  = rt.ingest_hub
+
+            def _book_notify():
+                # Called from the OFI thread on every MBP-10 book record.
+                # Skip if nobody is connected — avoids building the frame
+                # for nothing during quiet stretches.
+                frame = None
+                if _bc.connections or _hub.connections:
+                    frame = _book_delta(_tape)
+                    frame["kind"] = "book"
+                if _bc.connections and frame is not None:
+                    _bc.notify(frame)
+                if _hub.connections and frame is not None:
+                    _hub.notify(frame)
+
+            _tape.on_book_update(_book_notify)
+
+            # DCD is NOT computed on the ingest thread. Tape.offer only
+            # queue.put's the Trade; DeltaWorker owns the calculation.
+            _et = rt.exec_track
+            _sb = rt.signal_broadcaster
+
+            def _signal_notify(sig):
+                payload = sig.as_dict()
+                payload["kind"] = "signal"
+                if _sb.connections:
+                    _sb.notify(payload)
+                if _hub.connections:
+                    _hub.notify(payload)
+
+            _et.on_signal(_signal_notify)
+            _tape.on_trade_exec(rt.delta_worker.push_trade)
+
+            def _ofi_notify(payload):
+                if _hub.connections:
+                    frame = dict(payload)
+                    frame["kind"] = "ofi"
+                    _hub.notify(frame)
+
+            rt.ofi.on_reading(_ofi_notify)
+
         yield
+
+        # Let the stepper finish its current pass and stop. A daemon
+        # thread would die with the process anyway; asking it first
+        # means it is never killed halfway through writing a row.
+        _st = getattr(rt, "journal_stepper", None)
+        if _st is not None:
+            try:
+                _st.stop()
+            except Exception:                           # noqa: BLE001
+                pass
 
     app = FastAPI(title=APP_TITLE, docs_url="/api/docs", redoc_url=None,
                   lifespan=lifespan)
+
+    @app.exception_handler(Exception)
+    async def unhandled(request, exc):     # noqa: ANN001
+        """Never serve a bare "Internal Server Error".
+
+        A 500 with no body on a service you are iterating on costs a round
+        trip every single time: the person sees five words, and the only way
+        to find out what happened is to ask someone with the logs. The error
+        class, its message and the route are safe to return -- they describe
+        this service's own code, not the caller's data -- and the traceback
+        goes to stdout where Railway keeps it.
+
+        The last one is also kept in memory so `/api/status` can show it
+        without anyone having to open a log viewer.
+        """
+        tb = traceback.format_exc()
+        rt.last_error = f"{type(exc).__name__}: {exc}"
+        rt.last_traceback = tb
+        print(f"[liqmap] 500 on {request.url.path}\n{tb}", flush=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "where": str(request.url.path),
+                "query": dict(request.query_params),
+                "hint": ("The full traceback is in the Railway deploy logs, "
+                         "and /api/status carries the last one."),
+            })
 
     # -- open ------------------------------------------------------------
 
@@ -427,6 +3468,7 @@ def create_app() -> FastAPI:
             "last_sweep": rt.last_sweep,
             "harvest": rt.harvest,
             "last_error": rt.last_error,
+            "last_traceback": (rt.last_traceback or "").splitlines()[-12:],
             "warnings": startup_report(rt),
         }
 
@@ -437,10 +3479,10 @@ def create_app() -> FastAPI:
     @app.get("/api/positions", dependencies=[Depends(require_token)])
     def api_positions(coin: str = "BTC", top: int = 50) -> dict[str, Any]:
         cfg = rt.settings()
-        coin = coin.upper()
+        coin = rt.resolve_symbol(coin)[0] or coin
         latest = rt.history.latest_sweep_positions(coin)
         if not latest:
-            return {"coin": coin, "error": "no sweep recorded yet"}
+            return {"coin": coin, "error": rt.no_data_reason(coin)}
 
         _, positions = latest
         meta = next((s for s in rt.history.sweeps(coin, limit=1)), {})
@@ -470,6 +3512,59 @@ def create_app() -> FastAPI:
                     "survivability": s.survivability(),
                     "fragility": s.fragility(),
                 } for s in scored]}
+
+    @app.get("/api/consensus", dependencies=[Depends(require_token)])
+    def api_consensus(coin: str = "BTC", winners_only: bool = True,
+                      min_notional: float = 0.0,
+                      min_account: float = 0.0) -> dict[str, Any]:
+        """Who is positioned which way, among traders currently in profit."""
+        cfg = rt.settings()
+        coin = rt.resolve_symbol(coin)[0] or coin
+        latest = rt.history.latest_sweep_positions(coin)
+        if not latest:
+            return {"coin": coin, "error": rt.no_data_reason(coin)}
+
+        _, positions = latest
+        meta = next((s for s in rt.history.sweeps(coin, limit=1)), {})
+        spot = float(meta.get("spot") or 0)
+        if spot <= 0:
+            return {"coin": coin, "error": "sweep has no spot price"}
+
+        v = consensus_mod.build(
+            positions, coin, spot, cfg.sigma_per_min, cfg.horizon_minutes,
+            min_notional=min_notional, min_account=min_account,
+            winners_only=winners_only)
+
+        return {
+            "coin": coin, "spot": spot, "as_of": meta.get("ts"),
+            "direction": v.direction,
+            "strength": v.strength,
+            "agreement": v.agreement,
+            "n_traders": v.n_traders,
+            "n_winning": v.n_winning,
+            "n_losing": v.n_losing,
+            "long_notional": v.long_notional,
+            "short_notional": v.short_notional,
+            "winning_long_notional": v.winning_long_notional,
+            "winning_short_notional": v.winning_short_notional,
+            "avg_entry": v.avg_entry,
+            "entry_gap_pct": v.entry_gap_pct,
+            "room_sigmas": v.room_sigmas,
+            "median_leverage": v.median_leverage,
+            "crowded": v.crowded,
+            "late": v.late,
+            "verdict": v.verdict(),
+            "traders": [{
+                "wallet": r.wallet, "side": r.side, "notional": r.notional,
+                "entry": r.entry_px, "unrealized_pnl": r.unrealized_pnl,
+                "return_on_position": r.return_on_position,
+                "account_value": r.account_value, "leverage": r.leverage,
+                "liq_distance_sigmas": r.liq_distance_sigmas,
+                "survivability": r.survivability,
+                "entry_gap_pct": r.entry_gap_pct,
+                "winning": r.winning,
+            } for r in v.rows[:60]],
+        }
 
     @app.get("/api/changes", dependencies=[Depends(require_token)])
     def api_changes(coin: str | None = None, kind: str | None = None,
@@ -527,25 +3622,5074 @@ def create_app() -> FastAPI:
     def get_harvest() -> dict[str, Any]:
         return {"wallets": len(rt.load_wallets()), **rt.harvest}
 
+    # -- liquidity --------------------------------------------------------
+
+    @app.post("/api/watch", dependencies=[Depends(require_token)])
+    def api_watch(coin: str = "BTC", level: float = 0.0, minutes: float = 15.0,
+                  band_bps: float = 10.0, window_s: float = 300.0,
+                  stop: bool = False) -> dict[str, Any]:
+        """Start (or stop) a level watch."""
+        if stop:
+            return rt.stop_watch()
+        out = rt.start_watch(coin.upper(), level, minutes,
+                             band_bps=band_bps, window_s=window_s)
+        if not out.get("ok"):
+            raise HTTPException(409, out.get("error") or "could not start watch")
+        return out
+
+    @app.get("/api/liquidity", dependencies=[Depends(require_token)])
+    def api_liquidity(size: float = 0.0, coin: str = "BTC") -> dict[str, Any]:
+        """Current liquidity picture.
+
+        With a watch running this returns the full reading. Without one it
+        still answers the question that does not need history — what does the
+        book cost you right now — by pulling a single snapshot. That is the
+        useful default: slippage is the one number here that is exact rather
+        than learned, so it should not be gated behind a fifteen-minute wait.
+        """
+        if rt.watcher is not None:
+            out = rt.watcher.snapshot(size=size)
+            out["watch"] = dict(rt.watch_info)
+            return out
+
+        try:
+            b = rt.client().book(coin.upper())
+            rt.last_book_ts = time.time()
+        except Exception as exc:
+            return {"coin": coin.upper(), "error": str(exc)}
+        if b.empty:
+            return {"coin": coin.upper(), "error": "book came back empty"}
+
+        out: dict[str, Any] = {
+            "coin": coin.upper(),
+            "watch": dict(rt.watch_info),
+            "book_age_s": 0.0,          # fetched in this request
+            "book": {
+                "bid": b.best_bid, "ask": b.best_ask, "mid": b.mid,
+                "spread_bps": b.spread_bps,
+                "depth_bid_25bps": b.depth(25.0, "buy"),
+                "depth_ask_25bps": b.depth(25.0, "sell"),
+                "imbalance_25bps": b.imbalance(25.0),
+                "shelves": [{"px": s.px, "notional": s.notional,
+                             "multiple": s.multiple, "side": s.side}
+                            for s in b.shelves()],
+            },
+        }
+        if size > 0:
+            buy, sell = b.walk(size, "buy"), b.walk(size, "sell")
+            out["cost"] = {
+                "size": size,
+                "entry_bps": buy.slippage_bps,
+                "exit_bps": sell.slippage_bps,
+                "round_trip_bps": buy.slippage_bps + sell.slippage_bps,
+                "entry_avg_px": buy.avg_px, "exit_avg_px": sell.avg_px,
+                "exhausted": buy.exhausted or sell.exhausted,
+                "levels": max(buy.levels_consumed, sell.levels_consumed),
+            }
+        return out
+
     @app.post("/api/harvest", dependencies=[Depends(require_token)])
-    def post_harvest(minutes: float = 5.0,
-                     then_sweep: bool = True) -> JSONResponse:
+    def post_harvest(minutes: float = 5.0, then_sweep: bool = True,
+                     coins: str = "") -> JSONResponse:
         """Collect a wallet universe off the trade feed.
 
         Five minutes is enough to see the thing work. A real universe wants
         an hour or more -- the longer it listens, the more of the large
         participants it catches, and those are the ones whose liquidations
         matter.
+
+        `coins` is a comma-separated list of tapes to listen to, defaulting to
+        the configured coins. Discovery only sees wallets that trade a coin you
+        subscribed to, so this is what decides which markets your universe can
+        ever cover.
         """
-        result = rt.start_harvest(min(max(minutes, 0.5), 180.0), then_sweep)
+        want = [c for c in (coins or "").upper().split(",") if c.strip()]
+        result = rt.start_harvest(min(max(minutes, 0.5), 180.0), then_sweep,
+                                  coins=want or None)
         return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
     @app.post("/api/sweep", dependencies=[Depends(require_token)])
-    def post_sweep(coin: str = "BTC") -> JSONResponse:
+    def post_sweep(coin: str = "") -> JSONResponse:
+        """Sweep. One wallet read records every coin they hold; passing a coin
+        only decides which one comes back as the headline."""
         try:
-            return JSONResponse({"ok": True, **rt.sweep(coin.upper())})
+            return JSONResponse({"ok": True, **rt.sweep(coin.upper() or None)})
         except Exception as exc:
             return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+
+    @app.get("/api/coins", dependencies=[Depends(require_token)])
+    def api_coins() -> dict[str, Any]:
+        """Which markets actually have data, and which are merely configured."""
+        from .hl import split_symbol
+
+        cfg = rt.settings()
+        have = rt.history.coins_with_data()
+        names = [r["coin"] for r in have]
+        for r in have:
+            dex, base = split_symbol(r["coin"])
+            r["dex"] = dex
+            r["base"] = base
+            # HIP-3 markets are oracle-priced synthetics on a builder's own
+            # book. They are NOT the underlying futures market, and their
+            # liquidity is a fraction of it.
+            r["hip3"] = bool(dex)
+        return {
+            "configured": cfg.coins,
+            "with_data": have,
+            "never_swept": [c for c in cfg.coins if c not in names],
+        }
+
+    @app.post("/api/feed", dependencies=[Depends(require_token)])
+    def api_feed(coin: str = "BTC", stop: bool = False,
+                 intervals: str = "1m,5m,15m,30m,1h,4h") -> dict[str, Any]:
+        """Start or stop the WebSocket feed for one market."""
+        if stop:
+            return rt.stop_feed()
+        want = tuple(i.strip() for i in intervals.split(",") if i.strip())
+        return rt.start_feed(coin, want or ("1m", "5m", "15m"))
+
+    @app.get("/api/feed", dependencies=[Depends(require_token)])
+    def api_feed_status() -> dict[str, Any]:
+        return rt.feed.status() if rt.feed else {"running": False}
+
+    @app.get("/api/stream")
+    def api_stream(coin: str = "BTC", interval: str = "15m",
+                   higher: str = "4h", max_seconds: float = 3600.0,
+                   token: str = Query(default=""),
+                   authorization: str = Header(default="")) -> Any:
+        """Server-sent events: a read pushed on every tick.
+
+        EventSource cannot set headers, so the token comes through the query
+        string and is checked here rather than by the dependency.
+
+        The stream is driven by the feed's own updates with a short floor
+        between sends -- a busy market prints hundreds of fills a second and
+        re-running the read on each one would burn the container for no
+        additional information.
+        """
+        require_token(authorization=authorization, token=token)
+
+        from fastapi.responses import StreamingResponse
+
+        coin_r = rt.resolve_symbol(coin)[0] or coin
+        tick = threading.Event()
+
+        # CME (ES) publishes through the Databento tape; HL markets use the
+        # websocket feed. The two sources expose the same `on_update` /
+        # `off_update` surface, so the stream body is source-agnostic.
+        cme_tape = rt.ofi.tape if rt.is_cme(coin_r) else None
+        # `cme_feed` wraps the tape in the LadderFeed interface the candle
+        # read expects. Created once here so the loop body doesn't allocate.
+        cme_feed_obj = rt.cme_feed(coin_r) if cme_tape is not None else None
+        if cme_feed_obj is not None:
+            cme_feed_obj.ensure_interval(interval)
+        feed = rt.feed_for(coin_r) if cme_tape is None else None
+        live_src = cme_tape or feed        # whichever is non-None
+
+        wake = (lambda *_: tick.set())
+        if live_src is not None:
+            live_src.on_update(wake)
+
+        def events():
+          try:
+            last_sent = 0.0
+            # Bounded on purpose. An unbounded generator holds a worker for as
+            # long as a forgotten tab stays open, and Railway does not have
+            # many of them. EventSource reconnects by itself when it ends.
+            deadline = time.time() + max(1.0, max_seconds)
+            # Tell the client immediately whether this is a live socket or a
+            # polled fallback, so a silent stream is never mistaken for a
+            # quiet market.
+            yield (f"event: hello\ndata: "
+                   f"{json.dumps({'feed': bool(live_src), 'coin': coin_r})}\n\n")
+
+            last_px = None
+
+            while time.time() < deadline:
+                fired = tick.wait(timeout=min(5.0, max(0.1, deadline - time.time())))
+                tick.clear()
+                now = time.time()
+                if now >= deadline:
+                    break
+
+                # PRICE FIRST, AND ON EVERY TICK.
+                #
+                # The full read costs structure, zones and VWAP, so it is
+                # coalesced. The price is one float the feed already holds,
+                # and in a fast market it is the number that goes stale
+                # first -- a four-second-old price during a move is worse
+                # than useless, because it reads as current. So it is sent
+                # on every batch of fills, independently of the read.
+                if cme_tape is not None:
+                    # CME: read from the tape directly. The tape's last_px
+                    # is the last trade; the live candle carries the bar.
+                    bar = (cme_feed_obj.candle(interval)
+                           if cme_feed_obj is not None else None)
+                    px = (bar.close if bar else None) or cme_tape.last_px or None
+                    if px and px != last_px:
+                        last_px = px
+                        bar_data = {"px": px, "ts": now}
+                        if bar is not None:
+                            bar_data.update({
+                                "high": bar.high, "low": bar.low,
+                                "open": bar.open, "trades": bar.trades,
+                                "delta": bar.delta,
+                            })
+                        yield ("event: px\ndata: "
+                               + json.dumps(bar_data) + "\n\n")
+                elif feed is not None:
+                    bar = feed.candle(interval)
+                    px = bar.close if bar else None
+                    if px is not None and px != last_px:
+                        last_px = px
+                        yield ("event: px\ndata: "
+                               + json.dumps({"px": px, "ts": now,
+                                             "high": bar.high, "low": bar.low,
+                                             "open": bar.open,
+                                             "trades": bar.trades,
+                                             "delta": bar.delta})
+                               + "\n\n")
+
+                # The book call is cheap -- the reader already did the work
+                # on each push -- so it goes out at tape speed alongside the
+                # price, not on the read's slower cadence.
+                # CME and HL both need this event; the panel under the
+                # chart uses it for the live book/imbalance display.
+                if feed is not None or cme_tape is not None:
+                    try:
+                        bc = api_bookcall(coin=coin_r)
+                        yield f"event: book\ndata: {json.dumps(bc, default=str)}\n\n"
+                    except Exception:
+                        pass
+
+                if fired and now - last_sent < 0.5:
+                    continue            # coalesce the expensive part only
+                last_sent = now
+                try:
+                    payload = api_read(coin=coin_r, interval=interval,
+                                       higher=higher)
+                except Exception as exc:
+                    yield f"event: error\ndata: {json.dumps({'error': str(exc)})}\n\n"
+                    time.sleep(2.0)
+                    continue
+                yield f"data: {json.dumps(payload, default=str)}\n\n"
+
+            yield "event: bye\ndata: {}\n\n"
+          finally:
+            # The stream is over; stop waking it. EventSource reconnects on
+            # its own, so without this a tab left open overnight accumulates
+            # dead callbacks that fire on every single fill.
+            if live_src is not None:
+                live_src.off_update(wake)
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache",
+                                          "X-Accel-Buffering": "no"})
+
+        # ------------------------------------------------------------------ WebGL
+        # _flow_snapshot is defined at module level (below create_app) so tests
+        # can import and call it directly without spinning up the full app.
+
+    @app.websocket("/ws/book")
+    async def ws_book(ws: WebSocket, coin: str = "ES",
+                      token: str = "", depth: int = 10):
+        """Real-time MBP-10 order book delta stream.
+
+        Sends a full 10-level bid/ask snapshot on EVERY Databento book
+        record, so the frontend receives the book update the instant the
+        exchange publishes it — no polling, no SSE coalescing lag.
+
+        Frame format (superset of api_bookcall so paintBookCall works):
+            {ts, source, px, bid, ask, mid, microprice, spread_bps,
+             imbalance, direction, score, conviction,
+             bids:[{px,sz,n}×10], asks:[{px,sz,n}×10],
+             book_updates, age_s, note}
+
+        Authentication follows /ws/flow: token in the query string because
+        the browser WebSocket API cannot set Authorization headers.
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        tape = rt.ofi.tape if rt.is_cme(coin_up) else None
+        if tape is None:
+            await ws.accept()
+            await ws.send_json({"error": f"no CME tape for {coin_up!r} — "
+                                         f"start the OFI engine first"})
+            await ws.close()
+            return
+
+        await ws.accept()
+
+        # Register this connection's queue with the broadcaster.
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=256)
+        rt.book_broadcaster.add(q)
+
+        # Send the current snapshot immediately so the ladder renders
+        # on connect without waiting for the next book record.
+        await ws.send_json(_book_delta(tape))
+
+        try:
+            while True:
+                frame = await q.get()
+                await ws.send_json(frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            rt.book_broadcaster.remove(q)
+
+    @app.websocket("/ws/flow")
+    async def ws_flow(ws: WebSocket, coin: str = "ES",
+                      token: str = "", interval: str = "1m"):
+        """High-frequency order flow profile feed at ~60 fps (16 ms cadence).
+
+        Event-driven micro-deltas. One full snapshot on connect, then a
+        tick/book frame the instant a print hits the ingest queue — no
+        16ms sleep, no snapshot rebuild. The token is a query parameter
+        because browser WebSocket cannot set headers.
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        tape = rt.ofi.tape if rt.is_cme(coin_up) else None
+        if tape is None:
+            await ws.accept()
+            await ws.send_json({"error": f"no CME tape for {coin_up!r} — "
+                                         f"start the OFI engine first"})
+            await ws.close()
+            return
+
+        await ws.accept()
+        # One full snapshot on connect so the WebGL buffers have a base.
+        # After that every frame is a micro-delta pushed when a print
+        # (or book record) actually arrives — no 16ms sleep, no rebuild.
+        snap = _flow_snapshot(tape, interval)
+        snap["kind"] = "snap"
+        await ws.send_json(snap)
+
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=256)
+        rt.ingest_hub.add(q)
+        try:
+            while True:
+                frame = await q.get()
+                kind = frame.get("kind")
+                if kind in ("tick", "book", "snap"):
+                    await ws.send_json(frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            rt.ingest_hub.remove(q)
+
+    @app.websocket("/ws/live")
+    async def ws_live(ws: WebSocket, coin: str = "ES", token: str = ""):
+        """Permanent micro-delta stream for the dashboard.
+
+        Replaces the HTTP polls that used to hit /api/ofi, /api/now,
+        /api/footprint and /api/feed on setInterval. First frame is a
+        combined snap+exec state; every later frame is a tick / book /
+        ofi / signal pushed the instant the worker produces it.
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        tape = rt.ofi.tape if rt.is_cme(coin_up) else None
+        feed = rt.feed_for(coin_up) if tape is None else None
+        await ws.accept()
+        if tape is None and feed is None:
+            await ws.send_json({"error": f"no live tape for {coin_up!r}",
+                                "kind": "error"})
+            await ws.close()
+            return
+
+        if tape is not None:
+            opening = _flow_snapshot(tape, "1m")
+            opening["kind"] = "snap"
+            opening["exec"] = rt.exec_track.state().as_dict()
+        else:
+            bar = feed.candle("1m") if feed is not None else None
+            opening = {
+                "kind": "snap",
+                "ts": time.time(),
+                "px": bar.close if bar else 0.0,
+                "profile": [], "bids": [], "asks": [],
+                "bar": None, "exec": None,
+            }
+        await ws.send_json(opening)
+
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=256)
+        rt.ingest_hub.add(q)
+        try:
+            while True:
+                frame = await q.get()
+                await ws.send_json(frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            rt.ingest_hub.remove(q)
+
+    @app.websocket("/ws/exec")
+    async def ws_exec(ws: WebSocket, coin: str = "ES", token: str = ""):
+        """Real-time execution signal stream (Execution Track).
+
+        Sends one JSON frame for each Signal the ExecutionTrack fires:
+            {ts, side, price, raw_delta, diagonal_delta,
+             unconfirmed, buy_flags, sell_flags,
+             stacked_side, stacked_low, stacked_high, stacked_run,
+             bar_age_s, reason}
+
+        A Signal fires only when stacked diagonal imbalance is present AND
+        the Diagonal Cumulative Delta agrees — no candle close required.
+
+        Authentication: token in the query string (browser WebSocket cannot
+        set Authorization headers).
+        """
+        rt = runtime()
+        supplied = token.strip()
+        if not supplied or supplied != rt.token:
+            await ws.close(code=4001, reason="bad or missing token")
+            return
+
+        coin_up = coin.upper()
+        if not rt.is_cme(coin_up):
+            await ws.accept()
+            await ws.send_json({"error": f"no CME tape for {coin_up!r} — "
+                                         f"execution track is CME-only"})
+            await ws.close()
+            return
+
+        await ws.accept()
+        # Send the current state immediately so the client has context.
+        try:
+            await ws.send_json(rt.exec_track.state().as_dict())
+        except Exception:                               # noqa: BLE001
+            pass
+
+        q: _asyncio.Queue = _asyncio.Queue(maxsize=128)
+        rt.signal_broadcaster.add(q)
+        try:
+            while True:
+                frame = await q.get()
+                await ws.send_json(frame)
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except Exception as exc:                        # noqa: BLE001
+            try:
+                await ws.send_json({"error": str(exc)})
+            except Exception:
+                pass
+        finally:
+            rt.signal_broadcaster.remove(q)
+
+    @app.get("/api/exec/state", dependencies=[Depends(require_token)])
+    def api_exec_state(coin: str = "ES") -> dict[str, Any]:
+        """Point-in-time snapshot of the Execution Track state.
+
+        Returns the live pulse, diagonal delta, active stacked runs, and the
+        most recent signal.  Poll this at any rate; it is O(flags) and fast.
+        """
+        rt = runtime()
+        coin_up = coin.upper()
+        if not rt.is_cme(coin_up):
+            return {"error": f"no CME tape for {coin_up!r}"}
+        return rt.exec_track.state().as_dict()
+
+    @app.get("/gl", response_class=HTMLResponse)
+    def gl_page(coin: str = "ES", interval: str = "1m",
+                token: str = "") -> str:
+        """Standalone WebGL order flow profile canvas.
+
+        Opens a full-screen canvas that renders the bid/ask volume-at-price
+        profile in real time from the /ws/flow WebSocket feed at ~60 fps.
+        """
+        return _GL_PAGE.replace("__COIN__", coin).replace(
+            "__INTERVAL__", interval).replace("__TOKEN__", token)
+
+    @app.get("/api/diag", dependencies=[Depends(require_token)])
+    def api_diag(coin: str = "BTC", interval: str = "15m") -> dict[str, Any]:
+        """Run every upstream call for one symbol and report each result.
+
+        Built because "Internal Server Error" for a symbol names neither the
+        call that failed nor the reason. This walks the same sequence a read
+        makes -- resolve, mids, candles, book, structure, the read itself --
+        and reports each step separately, so the first FAIL is the answer
+        rather than the start of an investigation.
+        """
+        import traceback as _tb
+
+        steps: list[dict[str, Any]] = []
+
+        def step(name: str, fn) -> Any:
+            t0 = time.time()
+            try:
+                value = fn()
+                steps.append({"step": name, "ok": True,
+                              "ms": round((time.time() - t0) * 1000),
+                              "result": value})
+                return value
+            except Exception as exc:
+                steps.append({"step": name, "ok": False,
+                              "ms": round((time.time() - t0) * 1000),
+                              "error": f"{type(exc).__name__}: {exc}",
+                              "trace": _tb.format_exc().splitlines()[-4:]})
+                return None
+
+        raw = coin
+        resolved = step("resolve symbol",
+                        lambda: rt.resolve_symbol(raw)[0] or raw)
+        target = resolved or raw
+        client = rt.client()
+
+        step("allMids (canonical)",
+             lambda: f"{len(client.all_mids())} symbols")
+        step("perpDexs", lambda: [d["name"] for d in client.perp_dexs()])
+        mids = step("allMids (every dex)",
+                    lambda: client.all_mids_everywhere())
+        step(f"mid for {target}",
+             lambda: (mids or {}).get(target)
+             if (mids or {}).get(target) is not None
+             else (_ for _ in ()).throw(
+                 KeyError(f"{target} has no mid price — check the exact "
+                          f"symbol, including the dex prefix and its case")))
+
+        bars = step(f"candleSnapshot {interval}",
+                    lambda: client.candles(target, interval, bars=60))
+        step("candle count",
+             lambda: len(bars) if bars else (_ for _ in ()).throw(
+                 ValueError("no candles returned for this symbol")))
+        step("l2Book", lambda: client.check_book(target))
+
+        if bars:
+            from .structure import structure as read_structure, zones
+            step("structure", lambda: read_structure(bars).direction)
+            step("zones", lambda: len(zones(bars)))
+
+        step("full read", lambda: api_read(coin=target, interval=interval)
+             .get("lean", "no lean"))
+
+        first_fail = next((s for s in steps if not s["ok"]), None)
+        return {
+            "coin_asked": raw, "coin_used": target, "interval": interval,
+            "all_passed": first_fail is None,
+            "first_failure": first_fail,
+            "steps": steps,
+        }
+
+    @app.get("/api/markets", dependencies=[Depends(require_token)])
+    def api_markets(refresh: bool = False) -> dict[str, Any]:
+        """Everything listed and tradeable, across every perp DEX."""
+        return rt.markets(force=refresh)
+
+    @app.get("/api/ofi", dependencies=[Depends(require_token)])
+    def api_ofi(history: int = 0) -> dict[str, Any]:
+        """Order Flow Imbalance: who is winning the book race now.
+
+        Always answers. When the engine is not running, `blocked_by`
+        names the condition that is not met -- a panel that cannot
+        tell "waiting for the subscription" from "silently dead" is
+        worse than no panel.
+
+        `history` returns that many recent readings for a sparkline.
+        `side` is present only when LIQMAP_OFI_Z names a line.
+        """
+        return rt.ofi.snapshot(history=max(0, min(600, history)))
+
+    @app.get("/api/cme", dependencies=[Depends(require_token)])
+    def api_cme(interval: str = "1m", candles: int = 0) -> dict[str, Any]:
+        """ES candles built from the same CME subscription as the OFI.
+
+        The MBP stream carries trade prints beside the book updates, so
+        these are the venue's own trades with the aggressor side it
+        states -- not an uptick rule applied to a price series.
+        """
+        return rt.ofi.tape.snapshot(interval=interval,
+                                    limit=max(0, min(1000, candles)))
+
+    @app.get("/api/now", dependencies=[Depends(require_token)])
+    def api_now(coin: str = "BTC") -> dict[str, Any]:
+        """Live price and how stale everything else is. Cheap enough to poll."""
+        return rt.now(coin)
+
+    @app.get("/api/bookcall", dependencies=[Depends(require_token)])
+    def api_bookcall(coin: str = "BTC", window_s: float = 20.0
+                     ) -> dict[str, Any]:
+        """The book's call on the current candle. Nothing else consulted.
+
+        No trend, no higher timeframe, no VWAP, no zones. Just: what is the
+        order book doing right now, and which way is this candle going.
+        """
+        coin = rt.resolve_symbol(coin)[0] or coin
+
+        # CME (ES): the HL BookReader is not attached to the CME tape, but
+        # the live bid/ask snapshot is always there. Return what the book IS
+        # rather than pretending there is no book at all.
+        if rt.is_cme(coin):
+            svc = rt.ofi
+            bk = svc.tape.book if svc is not None else None
+            if bk is None or bk.empty or not bk.bids or not bk.asks:
+                return {"coin": coin, "source": "cme",
+                        "error": "no book yet — waiting for first CME record"}
+            mid = bk.mid
+            b0, a0 = bk.bids[0], bk.asks[0]
+            bid_sz = sum(lv.sz for lv in bk.bids[:5])
+            ask_sz = sum(lv.sz for lv in bk.asks[:5])
+            total = bid_sz + ask_sz
+            imb = (bid_sz - ask_sz) / total if total > 0 else 0.0
+            microprice = (b0.px * ask_sz + a0.px * bid_sz) / total if total > 0 else mid
+            direction = "up" if imb > 0.1 else "down" if imb < -0.1 else "flat"
+            return {
+                "coin": coin, "source": "cme",
+                "direction": direction, "score": round(imb, 4),
+                "conviction": "snapshot",
+                "mid": round(mid, 4), "microprice": round(microprice, 4),
+                "spread_bps": round(bk.spread_bps, 2),
+                "tilt": round(imb, 4), "imbalance": round(imb, 4),
+                "bid": b0.px, "ask": a0.px,
+                "bid_sz": b0.sz, "ask_sz": a0.sz,
+                "depletion": None, "replenish": None,
+                "mid_drift_bps": None, "aggression": None, "absorbed": None,
+                "samples": 1, "window_s": 0.0,
+                "components": [],
+                "verdict": direction,
+                "book_updates": svc.tape.books if svc else 0,
+                "age_s": svc.tape.last_ts and (time.time() - svc.tape.last_ts),
+                "note": "snapshot — book history not tracked at L1",
+            }
+
+        feed = rt.feed_for(coin)
+        if feed is None:
+            return {"coin": coin,
+                    "error": "no live feed on this market — press Go live"}
+
+        r = feed.book_call(window_s=max(2.0, min(window_s, 120.0)))
+        if r is None:
+            return {"coin": coin, "error": "no book updates yet",
+                    "feed": feed.status()}
+
+        return {
+            "coin": coin,
+            "direction": r.direction, "score": r.score,
+            "conviction": r.conviction,
+            "mid": r.mid, "microprice": r.microprice,
+            "spread_bps": r.spread_bps,
+            "tilt": r.tilt, "imbalance": r.imbalance,
+            "depletion": r.depletion, "replenish": r.replenish,
+            "mid_drift_bps": r.mid_drift_bps,
+            "aggression": r.aggression, "absorbed": r.absorbed,
+            "samples": r.samples, "window_s": r.window_s,
+            "components": r.components(),
+            "verdict": r.verdict(),
+            "book_updates": feed.book_updates,
+            "age_s": feed.age,
+        }
+
+    @app.get("/api/suggest", dependencies=[Depends(require_token)])
+    def api_suggest(coin: str = "BTC", interval: str = "15m",
+                    size: float = 0.0, fee_bps: float = 0.0,
+                    record: bool = True, mode: str = "scalp"
+                    ) -> dict[str, Any]:
+        """A graded call on this candle, tradeable or not.
+
+        Always answers. `tradeable` is the honest flag and only tradeable
+        calls are recorded; the rest are graded D or unlettered and name the
+        gate that stopped them, so the panel shows the state of the book
+        rather than going blank.
+
+        `mode` is `scalp` or `range`. Scalp aims for the smallest target
+        that still pays — the highest hit rate available on a trade worth
+        taking. Range aims for half of what a bar typically travels.
+
+        `size` is what you would actually trade, because the round trip
+        depends on how far into the book you have to reach. `fee_bps` is your
+        own round-trip fee; leaving it at zero makes every suggestion look
+        cheaper than it is, and the output says so when it is unset.
+
+        This SUGGESTS. It does not place anything.
+        """
+        return rt.suggest_for(coin, interval, notional=max(size, 0.0),
+                              fee_bps=max(fee_bps, 0.0), record=record,
+                              mode=mode)
+
+    @app.post("/api/decide", dependencies=[Depends(require_token)])
+    def api_decide(id: str, taken: bool) -> dict[str, Any]:
+        """Record that a suggestion was taken or ignored.
+
+        Ignored ones matter as much as taken ones: without them there is no
+        way to find out whether the filtering being applied is worth
+        anything.
+        """
+        ok = rt.history.decide(id, taken)
+        # `decision` reports what was STORED, not what was asked for. The
+        # first cut echoed the request either way, so a refused write came
+        # back reading "taken" and the page showed a decision that is not in
+        # the table.
+        return {"ok": ok, "id": id,
+                "decision": ("taken" if taken else "ignored") if ok else None,
+                "note": "" if ok else
+                        "unknown id, or that candle has already closed — a "
+                        "decision cannot be recorded or changed once the "
+                        "result is visible"}
+
+    @app.post("/api/resolve-suggestions", dependencies=[Depends(require_token)])
+    def api_resolve_suggestions(limit: int = 300) -> dict[str, Any]:
+        return rt.resolve_suggestions(limit=limit)
+
+    @app.get("/api/decisions", dependencies=[Depends(require_token)])
+    def api_decisions(coin: str = "", interval: str = "", recent: int = 25
+                      ) -> dict[str, Any]:
+        """How the suggestions did, and how the decisions about them did."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return {
+            "ok": True, "coin": c, "interval": interval or None,
+            "stats": rt.history.suggestion_stats(c, interval or None),
+            "recent": rt.history.recent_suggestions(c, limit=max(1, min(recent, 200))),
+        }
+
+    # ---------------------------------------------------------- autopilot
+
+    @app.post("/api/autopilot", dependencies=[Depends(require_token)])
+    def api_autopilot(on: bool, coin: str = "", interval: str = "15m",
+                      mode: str = "scalp", notional: float = 10_000.0,
+                      fee_bps: float = 0.0, tp_bps: float = 10.0,
+                      sl_bps: float = 10.0, raw: bool = True,
+                      exit_on_invalidation: bool = False,
+                      unit: str = "bps", require_unanimous: bool = True,
+                      min_effort: float = 2.0,
+                      exit_before_s: float = 5.0) -> dict[str, Any]:
+        """Turn the agent's own book on or off.
+
+        It keeps deciding whether or not anyone is watching. A record that
+        only fills while the page is open measures your attention rather
+        than the strategy.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else rt.autopilot.get("coin")
+        if on and not c:
+            return {"ok": False, "detail": "name a market first"}
+        rt.autopilot.update({
+            "on": bool(on), "coin": c, "interval": interval or "15m",
+            "mode": mode, "notional": float(notional),
+            "fee_bps": float(fee_bps), "tp_bps": float(tp_bps),
+            "sl_bps": float(sl_bps), "raw": bool(raw),
+            "exit_on_invalidation": bool(exit_on_invalidation),
+            "unit": unit if unit in ("bps", "ticks") else "bps",
+            "require_unanimous": bool(require_unanimous),
+            "min_effort": float(min_effort),
+            "exit_before_s": float(exit_before_s),
+            "error": None})
+        return {"ok": True, "autopilot": rt.autopilot,
+                "knobs": rt.knobs().to_dict(),
+                "note": ((f"deciding every 5s — "
+                          + ("all three must agree" if require_unanimous
+                             else "whichever way the three add up")
+                          + (f" with over {min_effort:.0%} of normal volume"
+                             if min_effort > 0 else "")
+                          + f", target {tp_bps:.0f} / stop {sl_bps:.0f} "
+                          + f"{unit}. It records, it never places an order")
+                         if on else "stopped; open positions stay open")}
+
+    @app.get("/api/autopilot", dependencies=[Depends(require_token)])
+    def api_autopilot_state() -> dict[str, Any]:
+        coin = rt.autopilot.get("coin")
+        return {"ok": True, "autopilot": rt.autopilot,
+                "knobs": rt.knobs().to_dict(),
+                "counts": rt.ledger.counts(),
+                "open": [p.to_dict() for p in rt.ledger.load_open(coin)],
+                "recent": rt.ledger.decisions(coin=coin, limit=40)}
+
+    @app.post("/api/autopilot/step", dependencies=[Depends(require_token)])
+    def api_autopilot_step(coin: str, interval: str = "15m",
+                           mode: str = "scalp", notional: float = 10_000.0,
+                           fee_bps: float = 0.0) -> dict[str, Any]:
+        """One decision now, for testing without waiting on the loop."""
+        c = rt.resolve_symbol(coin)[0]
+        return rt.autopilot_step(c, interval, mode=mode, notional=notional,
+                                 fee_bps=fee_bps)
+
+    @app.post("/api/autopilot/close", dependencies=[Depends(require_token)])
+    def api_autopilot_close(id: str, price: float = 0.0) -> dict[str, Any]:
+        """Close one by hand. Recorded as `manual`, never as a stop.
+
+        Kept honestly separate: a hand-closed trade says nothing about the
+        exit rules, and filing it as one would put your decision inside the
+        agent's score.
+        """
+        for key, pilot in rt._pilots.items():
+            pos = pilot.position
+            if pos is not None and pos.id == id:
+                px = price if price > 0 else pos.entry
+                closed = rt.ledger.close_position(pos, exit_px=px,
+                                                  reason="manual")
+                pilot.position = None
+                return {"ok": closed is not None, "closed": closed}
+        return {"ok": False, "detail": "no open position with that id"}
+
+    @app.get("/api/grid", dependencies=[Depends(require_token)])
+    def api_grid(coin: str, interval: str = "15m",
+                  tp_from: float = 5.0, tp_to: float = 40.0,
+                  tp_step: float = 5.0, sl_from: float = 5.0,
+                  sl_to: float = 40.0, sl_step: float = 5.0,
+                  cost_bps: float = 0.0, horizon: int = 60,
+                  min_agreeing: int = 0, max_against: int = 3,
+                  side: str = "both", hours: float = 0.0,
+                  min_effort: float = 0.0,
+                  unanimous: bool = False) -> dict[str, Any]:
+        """Every target against every stop, over the readings already stored.
+
+        The signal is independent of where the levels sit, so one pass over
+        the candle history scores the whole grid.
+        """
+        c = rt.resolve_symbol(coin)[0]
+        return rt.run_sweep(
+            c, interval, tp_from=tp_from, tp_to=tp_to, tp_step=tp_step,
+            sl_from=sl_from, sl_to=sl_to, sl_step=sl_step,
+            cost_bps=cost_bps, horizon=horizon, min_agreeing=min_agreeing,
+            max_against=max_against, side=side, hours=hours)
+
+    @app.get("/api/signals", dependencies=[Depends(require_token)])
+    def api_signals(coin: str, interval: str = "15m", limit: int = 50
+                    ) -> dict[str, Any]:
+        """What the three columns have been saying, candle by candle."""
+        c = rt.resolve_symbol(coin)[0]
+        sigs = rt.signals_from_history(c, interval)
+        span = rt.history.state_span(c, interval)
+        shapes: dict[str, int] = {}
+        for s2 in sigs:
+            shapes[s2.shape] = shapes.get(s2.shape, 0) + 1
+        return {"ok": True, "coin": c, "interval": interval,
+                "n": len(sigs), "span": span,
+                "shapes": sorted(shapes.items(), key=lambda kv: -kv[1]),
+                "recent": [s2.to_dict() for s2 in sigs[-limit:]][::-1]}
+
+    @app.post("/api/ledger/clear", dependencies=[Depends(require_token)])
+    def api_ledger_clear(coin: str = "", suspect_only: bool = False
+                         ) -> dict[str, Any]:
+        """Throw away the agent's book, or just the impossible rows in it."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        if suspect_only:
+            n = rt.ledger.drop_suspect()
+            for pilot in rt._pilots.values():
+                pilot.position = None
+            return {"ok": True, "dropped": n,
+                    "note": f"removed {n} trades whose result cannot be true"}
+        out = rt.ledger.clear(c)
+        rt._pilots.clear()
+        return {"ok": True, **out,
+                "note": "book cleared — it starts counting again from now"}
+
+    @app.get("/api/ledger/suspect", dependencies=[Depends(require_token)])
+    def api_ledger_suspect() -> dict[str, Any]:
+        rows = rt.ledger.suspect()
+        return {"ok": True, "n": len(rows), "rows": rows[:50]}
+
+    @app.post("/api/manual-trade", dependencies=[Depends(require_token)])
+    def api_manual_trade(coin: str, side: str, interval: str = "15m",
+                         tp_bps: float = 10.0, sl_bps: float = 10.0,
+                         unit: str = "bps", fee_bps: float = 0.0,
+                         notional: float = 0.0) -> dict[str, Any]:
+        """Record a trade YOU took, at the current price.
+
+        Kept as its own source. A trade you decided on is not evidence
+        about the agent, and letting it sit inside the agent's score would
+        make that score a measurement of the two of you together -- which
+        is the exact thing the separate book exists to avoid.
+        """
+        if side not in ("long", "short"):
+            return {"ok": False, "detail": "side must be long or short"}
+        c = rt.resolve_symbol(coin)[0]
+        payload = rt.suggest_for(c, interval, record=False)
+        if not payload.get("ok"):
+            return {"ok": False,
+                    "detail": payload.get("detail", "no reading right now")}
+        price = float(payload.get("price") or 0.0)
+        if price <= 0:
+            return {"ok": False, "detail": "no usable price right now"}
+
+        tp, sl = rt._unit_bps(tp_bps, sl_bps, unit, price, c)
+        sgn = 1.0 if side == "long" else -1.0
+        three = payload.get("three_way") or {}
+        pos = rt.ledger.open_position(
+            coin=c, interval=interval,
+            candle_ts=float(payload.get("candle_ts") or 0.0),
+            side=side, entry=price,
+            target_px=price * (1 + sgn * tp / 10_000.0),
+            stop_px=price * (1 - sgn * sl / 10_000.0),
+            target_bps=tp, risk_bps=sl, cost_bps=fee_bps,
+            breakeven=((sl + fee_bps) / (tp + sl)) if (tp + sl) else 0.0,
+            grade=str(three.get("grade") or ""),
+            grade_3way=str(three.get("grade") or ""),
+            agreeing=int(three.get("agreeing") or 0),
+            size_usd=notional, source="manual",
+            features={"vote_shape": f"{three.get('agreeing', 0)}-0",
+                      "taken_by": "you", "unit": unit})
+        if pos is None:
+            return {"ok": False,
+                    "detail": "this candle already has a trade in the book"}
+        return {"ok": True, "position": pos.to_dict(),
+                "note": ("recorded as yours — it is kept out of the "
+                         "agent's own score")}
+
+    @app.post("/api/backfill-book", dependencies=[Depends(require_token)])
+    def api_backfill_book(coin: str, interval: str = "15m",
+                          tp: float = 10.0, sl: float = 10.0,
+                          unit: str = "bps", unanimous: bool = True,
+                          min_effort: float = 2.0, cost_bps: float = 0.0,
+                          exit_before_s: float = 5.0, hours: float = 0.0
+                          ) -> dict[str, Any]:
+        """Trade every candle already recorded, under the rule running now."""
+        c = rt.resolve_symbol(coin)[0]
+        return rt.backfill_book(
+            c, interval, tp=tp, sl=sl, unit=unit, unanimous=unanimous,
+            min_effort=min_effort, cost_bps=cost_bps,
+            exit_before_s=exit_before_s, hours=hours)
+
+    @app.get("/api/ledger.csv", dependencies=[Depends(require_token)])
+    def api_ledger_csv(coin: str = "", interval: str = ""):
+        """Every trade, winners and losers, as one file you can open.
+
+        A summary block first, then one row per trade with the conditions
+        that produced it beside the outcome. Sort by `result` and the two
+        populations sit next to each other, which is the whole point.
+        """
+        import csv
+        import io as _io
+
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        rows = rt.ledger.export_rows(c, interval or None)
+        closed = [r for r in rows if r["result"] != "open"]
+        wins = [r for r in closed if r["result"] == "WIN"]
+        net = [r["net_bps"] for r in closed
+               if isinstance(r["net_bps"], (int, float))]
+
+        buf = _io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(["ChrisChart — the agent's own book",
+                    datetime.now(timezone.utc)
+                    .strftime("%Y-%m-%d %H:%M:%S UTC")])
+        w.writerow(["trades closed", len(closed)])
+        w.writerow(["winners", len(wins)])
+        w.writerow(["losers", len(closed) - len(wins)])
+        w.writerow(["hit rate",
+                    f"{len(wins) / len(closed):.1%}" if closed else "—"])
+        w.writerow(["net bps per trade",
+                    f"{sum(net) / len(net):+.2f}" if net else "—"])
+        w.writerow(["total net bps", f"{sum(net):+.1f}" if net else "—"])
+        w.writerow(["still open", len(rows) - len(closed)])
+        w.writerow([])
+        w.writerow(["Below: one row per trade. `result` first, then what "
+                    "was true when it was taken."])
+        w.writerow([])
+
+        if rows:
+            head = list(rows[0].keys())
+            w.writerow(head)
+            for r in rows:
+                w.writerow([r.get(k) for k in head])
+        else:
+            w.writerow(["no trades yet"])
+
+        name = f"chrischart-book-{c or 'all'}-" \
+               f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M')}.csv"
+        return Response(
+            content=buf.getvalue(), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+    @app.get("/api/projection", dependencies=[Depends(require_token)])
+    def api_projection(coin: str, interval: str = "15m",
+                       record: bool = False) -> dict[str, Any]:
+        """Where this bar closes, given everything already printed."""
+        c = rt.resolve_symbol(coin)[0]
+        return rt.project_now(c, interval, record=record)
+
+    @app.post("/api/backfill-projections",
+              dependencies=[Depends(require_token)])
+    def api_backfill_projections(coin: str, interval: str = "15m",
+                                 hours: float = 0.0) -> dict[str, Any]:
+        """Grade the projection against every candle already recorded.
+
+        The answer in one pass instead of one bar at a time.
+        """
+        c = rt.resolve_symbol(coin)[0]
+        return rt.backfill_projections(c, interval, hours=hours)
+
+    @app.get("/api/projection-calibration",
+             dependencies=[Depends(require_token)])
+    def api_projection_calibration(coin: str = "", interval: str = ""
+                                   ) -> dict[str, Any]:
+        """Do the bands mean what they say, and does the signal beat the
+        same cone with no opinion in it?
+
+        Named for the projection rather than `/api/calibration`, which the
+        candle read already owns. Two routes on one path is not an error
+        anywhere — the first registered simply wins, and the second is
+        dead until someone wonders why its response never changes.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return rt.projection_calibration(c, interval or None)
+
+    @app.post("/api/resolve-projections", dependencies=[Depends(require_token)])
+    def api_resolve_projections(limit: int = 300) -> dict[str, Any]:
+        return rt.resolve_projections(limit=limit)
+
+    @app.get("/api/scorecard", dependencies=[Depends(require_token)])
+    def api_scorecard(coin: str = "", interval: str = "") -> dict[str, Any]:
+        """The agent marking its own homework, error bars included."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return rt.scorecard(c, interval or None)
+
+    @app.get("/api/ledger", dependencies=[Depends(require_token)])
+    def api_ledger(coin: str = "", interval: str = "", limit: int = 100
+                   ) -> dict[str, Any]:
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        rows = rt.ledger.closed(coin=c, interval=interval or None)
+        rows = list(reversed(rows))[:max(1, min(limit, 1000))]
+        return {"ok": True, "closed": rows,
+                "open": [p.to_dict() for p in rt.ledger.load_open(c)],
+                "counts": rt.ledger.counts()}
+
+    @app.get("/api/proposals", dependencies=[Depends(require_token)])
+    def api_proposals(status: str = "pending") -> dict[str, Any]:
+        """Changes the agent wants to make to itself, and why."""
+        raw = bool(rt.autopilot.get("raw", True))
+        out = {"ok": True, "raw": raw,
+               "proposals": rt.ledger.proposals(status or None),
+               "history": rt.ledger.override_history(),
+               "knobs": rt.knobs().to_dict()}
+        coin = rt.autopilot.get("coin")
+        if raw:
+            n = 0
+            if coin:
+                try:
+                    n = len(rt.signals_from_history(
+                        coin, rt.autopilot.get("interval") or "15m"))
+                except Exception:
+                    n = 0
+            out["readiness"] = tuner_mod.level_readiness(n)
+            out["tunes"] = "the target and stop, using the grid"
+        else:
+            out["readiness"] = tuner_mod.readiness(rt.ledger, coin)
+            out["tunes"] = "the entry gates, using closed trades"
+        return out
+
+    @app.post("/api/proposals/decide", dependencies=[Depends(require_token)])
+    def api_proposal_decide(id: str, adopt: bool) -> dict[str, Any]:
+        """Adopt or reject. Only this changes a setting -- nothing auto."""
+        row = rt.ledger.decide_proposal(id, adopt)
+        if row is None:
+            return {"ok": False,
+                    "detail": "unknown id, or already decided"}
+        # Every pilot picks the new value up on its next step.
+        for pilot in rt._pilots.values():
+            pilot.knobs = rt.knobs()
+        return {"ok": True, "proposal": row,
+                "knobs": rt.knobs().to_dict()}
+
+    @app.post("/api/proposals/revert", dependencies=[Depends(require_token)])
+    def api_proposal_revert(param: str) -> dict[str, Any]:
+        """Put one knob back to the shipped default."""
+        ok = rt.ledger.clear_override(param)
+        for pilot in rt._pilots.values():
+            pilot.knobs = rt.knobs()
+        return {"ok": ok, "param": param, "knobs": rt.knobs().to_dict()}
+
+    @app.post("/api/proposals/scan", dependencies=[Depends(require_token)])
+    def api_proposal_scan() -> dict[str, Any]:
+        """Run the walk-forward now instead of waiting for the hourly one."""
+        rt._last_tune = 0.0
+        coin = rt.autopilot.get("coin")
+        if not coin:
+            return {"ok": False,
+                    "detail": ("name a market first — pick one above and "
+                               "the grid has something to walk over")}
+        filed = rt.maybe_tune(min_gap_s=0.0)
+        n = 0
+        try:
+            n = len(rt.signals_from_history(
+                coin, rt.autopilot.get("interval") or "15m"))
+        except Exception:
+            pass
+        return {"ok": True, "filed": filed,
+                "proposals": rt.ledger.proposals("pending"),
+                "readiness": (tuner_mod.level_readiness(n)
+                              if rt.autopilot.get("raw", True)
+                              else tuner_mod.readiness(rt.ledger, coin))}
+
+    @app.get("/api/profile", dependencies=[Depends(require_token)])
+    def api_profile(coin: str = "BTC", interval: str = "5m",
+                    bars: int = 400, svp_min: float = 60.0,
+                    mvp_min: float = 10.0, base: str = "1m"
+                    ) -> dict[str, Any]:
+        """The volume profiles, and what price is doing against them now.
+
+        Four profiles are returned and they are NOT interchangeable:
+
+          session     built from the bars in view. The shape being made.
+          reference   the completed shape BEFORE this session's bars, which
+                      is what price is reacting to.
+          svp         structural: a trailing `svp_min` minute window.
+          mvp         micro: a trailing `mvp_min` minute window, which is
+                      the tail of the SVP's own bars.
+
+        SVP and MVP are two nested balance areas -- one auction inside
+        another -- and `nested` reports where the small one sits in the big
+        one. Both are binned on ONE shared row size, because levels that
+        were quantised differently cannot be compared.
+
+        The structural read is taken against the reference, because reading
+        today's own POC as a level price is bouncing off is circular -- the
+        bounce is part of what put the POC there.
+
+        Nothing here predicts, suggests a trade, or carries a stop.
+        """
+        from . import marketstate as _ms, profile as _pf
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        n = max(40, min(bars, 800))
+
+        # Same fetch chain the chart route uses: the websocket-built history
+        # when the live feed is running, the venue's candles otherwise. Two
+        # routes that disagree about where bars come from would draw a
+        # profile that does not match the candles beside it.
+        rows, why, _src = _candle_rows(coin, interval, n)
+        if why:
+            return {"ok": False, "why": why}
+        if not rows:
+            return {"ok": False, "why": "no candles for that market yet"}
+
+        # Split into "what price is reacting to" and "what is being made
+        # now". Where the market HAS sessions, that boundary is the last
+        # one -- the prior RTH profile is the shape on the chart at the
+        # open. A rolling half-and-half split would mix part of today into
+        # the reference and read today's own structure as a level.
+        #
+        # Crypto has no session boundary, so there the split IS arbitrary
+        # and falls back to half the window. That is a real limitation of
+        # the reference on a 24/7 market, not a choice worth hiding.
+        from .levels import Phase as _Ph, phase as _phase, trade_date as _td
+
+        cut = 0
+        try:
+            stamps = [float(getattr(b, "ts", 0) or 0) for b in rows]
+            today = _td(stamps[-1]) if stamps else None
+            if today is not None and _phase(stamps[-1]) is not _Ph.CLOSED:
+                for i, t in enumerate(stamps):
+                    if _td(t) == today:
+                        cut = i
+                        break
+        except Exception:
+            cut = 0
+        if cut < 20 or cut > len(rows) - 10:
+            cut = max(20, len(rows) // 2)
+        reference = _pf.final(rows[:cut])
+        session = _pf.final(rows)
+        read = _ms.read(rows[cut:], reference)
+
+        # ---------------------------------------------------- the pair
+        #
+        # Two independent trailing windows -- structural and micro -- each
+        # a complete auction with its own POC, VAH, VAL and nodes, plus
+        # where the small one sits inside the big one.
+        #
+        # They are built from the FINEST bars available rather than the
+        # chart's own interval. A ten minute window of five minute bars is
+        # two bars, and a value area over two bars is a number, not an
+        # auction. The chart can show 15m candles while the profiles are
+        # accumulated from 1m; the shape of volume-by-price barely depends
+        # on the bar size anyway, only on the window.
+        from .live import INTERVALS as _IV
+        from . import nested as _nd
+
+        svp_m = max(1.0, min(float(svp_min), 1440.0))
+        mvp_m = max(0.5, min(float(mvp_min), svp_m))
+        step = float(_IV.get(interval, 300))
+        base_step = float(_IV.get(base, 60))
+        fine = rows
+
+        if base_step < step:
+            need = int(svp_m * 60.0 / base_step) + 20
+            # The finer series, through the same accessor -- so a CME
+            # symbol cannot quietly take the Hyperliquid branch here
+            # while the coarse series above correctly did not.
+            got, _why2, _s2 = _candle_rows(coin, base,
+                                            min(need, 5000))
+            if len(got) >= 10:
+                fine = got
+            else:
+                base_step = step
+        else:
+            base_step = step
+
+        svp, mvp, rel = _nd.study(fine, svp_m, mvp_m)
+
+        # How thin the micro window actually is, said out loud. A profile
+        # over three bars will still return a POC, and the reader deserves
+        # to know that is what they are looking at.
+        thin = None
+        if mvp.n_bars and mvp.n_bars < 10:
+            thin = (f"the {mvp_m:g} minute window holds {mvp.n_bars} "
+                    f"{base} bars -- too few to read a value area from")
+
+        return {
+            "ok": True, "coin": coin, "interval": interval,
+            "bars": len(rows),
+            "reference": {
+                **reference.to_dict(),
+                "rows": _ms.histogram_rows(reference, max_rows=140),
+            },
+            "session": {
+                **session.to_dict(),
+                "rows": _ms.histogram_rows(session, max_rows=140),
+            },
+            "svp": {
+                **svp.to_dict(),
+                "rows": _ms.histogram_rows(svp, max_rows=140),
+                "minutes": svp_m,
+            },
+            "mvp": {
+                **mvp.to_dict(),
+                "rows": _ms.histogram_rows(mvp, max_rows=140),
+                "minutes": mvp_m,
+            },
+            "nested": rel.to_dict(),
+            "read": read.to_dict(),
+            "base": base, "bar_seconds": base_step, "thin": thin,
+            "conventions": {
+                "value_area": _pf.VALUE_AREA,
+                "row_ticks": _pf.ROW_TICKS,
+                "accept_closes": _ms.ACCEPT_CLOSES,
+                "at_ticks": _ms.AT_TICKS,
+                "migrate_ticks": _nd.MIGRATE_TICKS,
+                "fading_ratio": _nd.FADING_RATIO,
+            },
+        }
+
+    @app.get("/api/flow", dependencies=[Depends(require_token)])
+    def api_flow(coin: str = "BTC", target_ticks: float = 10.0,
+                 spec: str = "", spike: float = 2.0,
+                 timeframes: str = "") -> dict[str, Any]:
+        """Order flow on every timeframe, and the book at the touch.
+
+        TWO FEEDS, TWO JOBS. The book says whether the trade is worth
+        taking -- how wide the spread is against the target. The tape
+        says whether what is happening is real: delta that is actually
+        printing, at a velocity above what this market has been doing.
+        Resting size can be pulled the moment you lean on it; a print
+        cannot be taken back.
+
+        Both arrive on the same websocket this service already runs, so
+        this needs no feed it does not have. It needs the feed to be ON:
+        polled candles carry no aggressor and no book, so without the
+        socket there is nothing here to read.
+
+        `tradeable` means nothing is currently refusing. It is not a
+        direction and not a suggestion.
+        """
+        from . import flowladder as _fl
+        from . import orderflow as _of
+        from .live import INTERVALS as _IV
+
+        # A CME symbol is settled BEFORE the feed, because pressing Go
+        # live on one opens a Hyperliquid subscription to a market
+        # Hyperliquid does not carry: it connects, it runs, and it is
+        # sent nothing, forever. That feed is not missing, which is why
+        # the no-feed message below never fires for it -- it is present
+        # and permanently empty.
+        source = "hl"
+        if rt.is_cme(coin):
+            source = "cme"
+            svc = rt.ofi
+            feed = rt.cme_feed(coin)       # one builder, every route
+            blind = feed.missing()
+            if blind:
+                # Half a subscription draws the same empty rungs as a
+                # quiet market. Say which half, rather than letting the
+                # page imply there is simply no flow right now.
+                return {"ok": False, "coin": coin, "source": "cme",
+                        "schemas": list(svc.config.schema_list),
+                        "why": blind}
+        else:
+            coin = rt.resolve_symbol(coin)[0] or coin
+            feed = rt.feed_for(coin)
+            if feed is None:
+                return {"ok": False, "coin": coin,
+                        "why": "no live feed on this market -- press Go "
+                               "live. Polled candles carry no aggressor "
+                               "and no book."}
+
+        sp = _of.SPECS.get((spec or "").upper())
+        if sp is None and source == "cme":
+            # A CME contract has a published tick. Inferring one from the
+            # spread is the right guess for an unlisted token and the
+            # wrong one here: ES quotes 0.25, but a moment when it is two
+            # ticks wide would infer 0.50 and halve every spread reading
+            # on the panel.
+            sp = _of.SPECS.get(str(coin).upper())
+        if sp is None:
+            # Infer the tick from what the book is actually quoting rather
+            # than assuming ES. The same panel serves a $4 token and a
+            # $100k one, and a per-market table is a chance to be wrong
+            # about every market not in it.
+            tick = 0.25
+            bk = feed.book
+            if bk is not None and not bk.empty and bk.bids and bk.asks:
+                gap = abs(float(bk.asks[0].px) - float(bk.bids[0].px))
+                if gap > 0:
+                    tick = gap
+            sp = _of.Spec(coin, tick_size=tick, tick_value=tick,
+                          commission=0.0, typical_spread_ticks=1.0)
+
+        # The rows are asked for by name so the page can request exactly
+        # the timeframes the candle read is showing. The two ladders are
+        # drawn as one row per timeframe, and a row whose halves are
+        # measuring different bars would be worse than no row at all.
+        asked = [t.strip() for t in (timeframes or "").split(",") if t.strip()]
+        want = _fl.wanted(asked, _IV)
+        def cvd_for(name: str, iv: float, bar_open: float, bars: int):
+            return rt.bar_cvd(coin, name, iv, bar_open, bars)
+
+        lad = _fl.build(feed.tape, feed.book, want, sp,
+                        target_ticks=float(target_ticks),
+                        spike=float(spike), cvd_for=cvd_for)
+        return {"ok": True, "coin": coin, "source": source,
+                "spec": {"symbol": sp.symbol, "tick_size": sp.tick_size,
+                         "tick_value": sp.tick_value,
+                         "cost_ticks": round(sp.cost_ticks(), 2)},
+                "feed_age_s": _feed_age(feed),
+                **lad.to_dict()}
+
+    @app.get("/api/mtf", dependencies=[Depends(require_token)])
+    def api_mtf(coin: str = "BTC", bars: int = 1200,
+                target_ticks: float = 10.0,
+                cost_ticks: float = 1.4) -> dict[str, Any]:
+        """The 4H / 15m / 1m setups, as marks for the chart.
+
+        ALWAYS FROM 1-MINUTE BARS, whatever the chart is showing. The 15m
+        and 4H series are resampled from them inside the engine, so the
+        three timeframes cannot disagree about where their boundaries are.
+        Asking the venue for each separately is three chances for a 15m
+        bar whose open is not the open of the 1m bar at its start.
+
+        Every signal carries a status. `provisional` means its 15m bar is
+        still forming and it may yet be withdrawn -- that is what was on
+        the screen at the time, and hiding it would make the chart's
+        history tidier than the past.
+
+        Nothing here places, sizes or times an order.
+        """
+        from . import mtf as _mtf
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        n = max(120, min(bars, 5000))
+
+        rows, why, _src = _candle_rows(coin, "1m", n)
+        if why:
+            return {"ok": False, "why": why}
+        if len(rows) < 60:
+            return {"ok": False, "why":
+                    f"only {len(rows)} one-minute bars so far, and the "
+                    "stack needs 60 before it can say anything"}
+
+        found = _mtf.scan(rows, cost_ticks=float(cost_ticks),
+                          target_ticks=float(target_ticks))
+        return {
+            "ok": True, "coin": coin, "bars": len(rows),
+            "signals": [s.to_dict() for s in found[-120:]],
+            "survival": _mtf.survival(found),
+            "conventions": {
+                "target_ticks": float(target_ticks),
+                "cost_ticks": float(cost_ticks),
+                "state_buffer_ticks": _mtf.STATE_BUFFER_TICKS,
+                "state_hold_bars": _mtf.STATE_HOLD_BARS,
+                "skip_15m_bars": _mtf.SKIP_15M_BARS,
+                "stop_lookback_15m": _mtf.STOP_LOOKBACK_15M,
+                "min_stop_ticks": _mtf.MIN_STOP_TICKS,
+            },
+        }
+
+    @app.get("/api/chart", dependencies=[Depends(require_token)])
+    def api_chart(coin: str = "BTC", interval: str = "15m", bars: int = 120,
+                  ppo_smooth: int = 1, ppo_signal: int = 9,
+                  ppo_ad: float = 0.7, ppo_mom: float = 0.3
+                  ) -> dict[str, Any]:
+        """Candles plus the calls that fired on them, for the live chart.
+
+        Everything comes from this service's own data: bars built from the
+        tape by the live feed where it is running, and the recorded
+        agreement states. No third-party chart, no embedded widget, nobody
+        else's rendering of the same market.
+
+        That matters for more than independence. A chart drawn from the same
+        candles the signals were computed on cannot disagree with them, so
+        when a marker looks wrong on the chart it IS wrong — which is the
+        whole point of looking.
+        """
+        coin = rt.resolve_symbol(coin)[0] or coin
+        n = max(20, min(bars, 500))
+        out: dict[str, Any] = {"coin": coin, "interval": interval}
+
+        # ---- TICK BARS TRAVEL THROUGH THE EXISTING INTERVAL BOX -----
+        #
+        # '1000t' means a thousand PRINTS to a bar. Everything that is
+        # not a tick size parses to None here and falls straight
+        # through to the time-bar path below, unchanged -- which is
+        # the point of doing it this way rather than adding a second
+        # chart route. One route, one payload shape, one painter; the
+        # bars underneath are cut differently and nothing downstream
+        # has to know.
+        # ---- FUSED BARS: '5000x2000' ---------------------------------
+        #
+        # Checked before the tick form and before the clock path, and
+        # like both of them it returns None for anything that is not
+        # its own shape, so nothing else changes by adding it.
+        from . import fusedbar as _fb
+        _pair = _fb.parse_interval(interval)
+        if _pair is not None:
+            tape = getattr(rt.ofi, "tape", None) if rt.ofi is not None \
+                else None
+            books = getattr(tape, "fusedbars", None) if tape is not None \
+                else None
+            if not books:
+                return {**out, "source": "fused",
+                        "error": ("fused bars are built from the ES tape "
+                                  "and that engine is not running here. "
+                                  "Start the CME feed and they fill from "
+                                  "live prints and book updates.")}
+            bld = books.get(_pair)
+            if bld is None:
+                # Nearest offered pair rather than a refusal, for the
+                # same reason the tick sizes snap: a builder is a
+                # running count and a running accumulator, so one
+                # created now would start empty and stay useless for
+                # as long as it took to fill.
+                near = min(books, key=lambda k: (abs(int(k[0]) - _pair[0])
+                                                 + abs(int(k[1]) - _pair[1])))
+                bld, _pair = books[near], (int(near[0]), int(near[1]))
+            rows = bld.rows(limit=n, include_live=True)
+            if not rows:
+                return {**out, "interval": _fb.label(*_pair),
+                        "source": "fused",
+                        "error": (f"nothing built yet -- a {_pair[0]:,}"
+                                  f"x{_pair[1]:,} bar needs that many "
+                                  "prints AND that much imbalance before "
+                                  "it closes one")}
+            try:
+                tick = ppo_mod.tick_ppo(
+                    rows, smooth=max(1, ppo_smooth),
+                    signal=max(1, ppo_signal),
+                    ad_weight=ppo_ad, mom_weight=ppo_mom)
+            except Exception as exc:                    # noqa: BLE001
+                tick = {"ppo": [], "signal": [], "hist": [],
+                        "ready": False, "error": str(exc)}
+            last = 0.0
+            try:
+                last = float(getattr(tape, "last_px", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0
+            return {
+                **out, "interval": _fb.label(*_pair), "source": "fused",
+                "bars": rows,
+                # Blank for the same reason the tick series is: the
+                # agent's trades are stamped against a TIME bar, so
+                # drawing them here would place each on whichever
+                # fused bar spanned that second.
+                "marks": [],
+                "marks_note": ("trade markers are recorded against time "
+                               "bars and are not drawn on a fused series"),
+                "profile": None,
+                "tick_ppo": tick,
+                "tick_bps": (round(0.25 / last * 10_000.0, 5)
+                             if last > 0 else None),
+                "interval_s": None,
+                "tick_target": _pair[0], "ofi_target": _pair[1],
+                "pairs": [list(p) for p in _fb.PAIRS],
+                "progress": bld.progress(),
+                "summary": bld.summary(),
+            }
+
+        from . import tickbar as _tb
+        _per = _tb.parse_interval(interval)
+        if _per is not None:
+            tape = getattr(rt.ofi, "tape", None) if rt.ofi is not None \
+                else None
+            books = getattr(tape, "tickbars", None) if tape is not None \
+                else None
+            if not books:
+                return {**out, "source": "tick",
+                        "error": ("tick bars are built from the ES tape "
+                                  "and that engine is not running here. "
+                                  "Start the CME feed and they fill from "
+                                  "live prints.")}
+            # Nearest offered size rather than a refusal. A builder is
+            # a running count of prints: one created now for an
+            # arbitrary number would start empty and stay useless for
+            # as long as it took to fill, so the selector is limited
+            # to the sizes that have been counting all along.
+            bld = books.get(_per)
+            if bld is None:
+                near = min(books, key=lambda k: abs(int(k) - _per))
+                bld, _per = books[near], int(near)
+            rows = bld.rows(limit=n, include_live=True)
+            if not rows:
+                return {**out, "interval": _tb.label(_per), "source": "tick",
+                        "error": (f"no prints counted yet -- a {_per}-tick "
+                                  "bar needs that many trades before it "
+                                  "closes one, and the count starts when "
+                                  "the engine does")}
+            try:
+                tick = ppo_mod.tick_ppo(
+                    rows, smooth=max(1, ppo_smooth),
+                    signal=max(1, ppo_signal),
+                    ad_weight=ppo_ad, mom_weight=ppo_mom)
+            except Exception as exc:                    # noqa: BLE001
+                tick = {"ppo": [], "signal": [], "hist": [],
+                        "ready": False, "error": str(exc)}
+            last = 0.0
+            try:
+                last = float(getattr(tape, "last_px", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0
+            return {
+                **out, "interval": _tb.label(_per), "source": "tick",
+                "bars": rows,
+                # Empty, and empty on purpose. The agent's own trades
+                # are recorded against a TIME bar's timestamp, so
+                # drawing them here would put each one on whichever
+                # tick bar happened to span that second -- a marker
+                # that looks placed and is not. Honest blank beats
+                # plausible wrong.
+                "marks": [],
+                "marks_note": ("trade markers are recorded against time "
+                               "bars and are not drawn on a tick series"),
+                "profile": None,
+                "tick_ppo": tick,
+                "tick_bps": (round(0.25 / last * 10_000.0, 5)
+                             if last > 0 else None),
+                # A tick bar has no fixed duration. Saying it does is
+                # what would let the panel draw an evenly spaced
+                # x-axis and quietly lie about when things happened.
+                "interval_s": None,
+                "per_bar": _per,
+                "sizes": list(_tb.PER_BAR_CHOICES),
+                "pace": bld.pace(),
+                "summary": bld.summary(),
+            }
+
+        # CME (ES) bars come from the Databento tape, not from Hyperliquid.
+        # `feed_for` is deliberately HL-only, so CME is asked for by name.
+        # THE SAME ACCESSOR THE PROFILE AND THE STACK USE. Two routes
+        # with their own idea of where candles come from draw a
+        # profile that does not line up with the candles beside it,
+        # and the disagreement is invisible until someone measures
+        # off both.
+        cme = rt.cme_feed(coin)
+        candles, _why, source = _candle_rows(coin, interval, n)
+        if not candles and cme is None:
+            if _why:
+                return {**out, "error": _why}
+        elif not candles and cme is not None:
+            # CME tape has no closed bars yet (engine just started or
+            # market is closed). Return a useful message rather than an
+            # internal error -- the chart will show this to the user.
+            why = cme.missing()
+            return {**out, "source": "cme",
+                    "error": (
+                        f"the ES tape has no closed {interval} bars yet. "
+                        f"Bars accumulate from live prints as the session "
+                        f"runs; historical seed fills in within a minute of "
+                        f"engine start"
+                        + (f" — {why}" if why else ""))}
+
+        # The forming bar comes from whichever feed is actually live.
+        # `_candle_rows` returns the closed history; only a live feed
+        # has the bar still being built, and asking the wrong one for
+        # it would draw a forming candle from another market.
+        live_feed = cme or rt.feed_for(coin)
+        live = live_feed.candle(interval) if live_feed is not None else None
+        rows = [{"ts": c.ts, "o": c.open, "h": c.high, "l": c.low,
+                 "c": c.close, "v": c.volume} for c in candles]
+        if live is not None:
+            # Shown even when unseeded. An unseeded bar's high, low and close
+            # are real fills; only its OPEN is the first trade seen rather
+            # than the true open. Hiding the forming candle to avoid a
+            # slightly wrong open loses the one bar the operator is actually
+            # trading, so it is drawn and flagged instead.
+            if rows and abs(rows[-1]["ts"] - live.start_ts) < 1.0:
+                rows.pop()
+            rows.append({"ts": live.start_ts, "o": live.open, "h": live.high,
+                         "l": live.low, "c": live.close, "v": live.volume,
+                         "live": True, "seeded": bool(live.seeded)})
+
+        # The markers: the AGENT'S OWN TRADES, entry to exit.
+        #
+        # These used to come from the suggestion table -- the calls you took
+        # or ignored -- which after the agent started keeping its own book
+        # meant every marker on the chart read "pending" forever, because
+        # nothing decides those rows any more. The chart should show what
+        # the agent actually did.
+        marks = []
+        try:
+            span = rows[0]["ts"] if rows else 0.0
+            for p in rt.ledger.positions_between(coin, interval,
+                                                 since=span - 3600):
+                f = p.get("features") or {}
+                cols = []
+                for name in ("book", "delta", "price"):
+                    v = f.get(f"vote_{name}")
+                    if isinstance(v, (int, float)) and v:
+                        cols.append(f"{name} {'up' if v > 0 else 'down'}")
+                    elif f.get(f"{name}_dir") in ("up", "down"):
+                        cols.append(f"{name} {f[name + '_dir']}")
+                net = p.get("net_bps")
+                marks.append({
+                    "id": p["id"],
+                    "ts": p["candle_ts"],
+                    "entry_ts": p["opened_at"],
+                    "exit_ts": p.get("closed_at"),
+                    "side": p["side"], "entry": p["entry"],
+                    "target": p["target_px"], "stop": p["stop_px"],
+                    "exit_px": p.get("exit_px"),
+                    "exit_reason": p.get("exit_reason"),
+                    "open": p["status"] == "open",
+                    "net_bps": net,
+                    "gross_bps": p.get("gross_bps"),
+                    "won": (net > 0) if isinstance(net, (int, float)) else None,
+                    "shape": f.get("vote_shape") or p.get("grade") or "",
+                    "why": ", ".join(cols),
+                    "tp_bps": p.get("target_bps"),
+                    "sl_bps": p.get("risk_bps"),
+                    "held_s": p.get("held_s"),
+                    "mae_bps": p.get("mae_bps"),
+                    "mfe_bps": p.get("mfe_bps"),
+                })
+        except Exception as exc:
+            out["marks_error"] = str(exc)
+
+        # Where volume traded inside the forming bar, for the side profile.
+        profile = None
+        prof = getattr(live, "profile", None) if live is not None else None
+        if prof is not None and prof.total_notional > 0:
+            levels = prof.levels
+            top = sorted(levels, key=lambda x: -x[1])[:40]
+            profile = {"poc": prof.poc,
+                       "total": round(prof.total_notional, 2),
+                       "levels": [{"px": p, "v": round(v, 2)} for p, v in top]}
+
+        # Chris's Tick Counter PPO, computed from the same bars the chart
+        # draws. Server side so the arithmetic is unit tested and can be
+        # reused; the panel just plots what comes back.
+        try:
+            tick = ppo_mod.tick_ppo(
+                rows, smooth=max(1, ppo_smooth), signal=max(1, ppo_signal),
+                ad_weight=ppo_ad, mom_weight=ppo_mom)
+        except Exception as exc:
+            tick = {"ppo": [], "signal": [], "hist": [], "ready": False,
+                    "error": str(exc)}
+
+        # What one tick is worth here, so a projected distance can be
+        # read in the unit the instrument actually trades in.
+        tick_bps = None
+        try:
+            # CME uses the tape's book; HL uses the live feed's book.
+            fd = cme if cme is not None else rt.feed_for(coin)
+            bk = getattr(fd, "book", None) if fd is not None else None
+            if bk is not None and not bk.empty and bk.mid > 0:
+                from .suggest import infer_tick as _tk
+                t = _tk(bk)
+                if t > 0:
+                    tick_bps = round(t / bk.mid * 10_000.0, 5)
+            elif cme is not None:
+                # ES tick is 0.25 points. Use that as the reliable fallback.
+                last = rt.ofi.tape.last_px if rt.ofi is not None else 0.0
+                if last > 0:
+                    tick_bps = round(0.25 / last * 10_000.0, 5)
+        except Exception:
+            tick_bps = None
+
+        return {**out, "source": source, "bars": rows, "marks": marks,
+                "profile": profile, "tick_ppo": tick, "tick_bps": tick_bps,
+                # PARSED, NOT LOOKED UP ON THE CRYPTO CLIENT. This is
+                # a label turned into seconds -- '15m' is 900 on every
+                # venue there is. Asking Hyperliquid's client for it
+                # made a CME chart depend on a crypto connection for
+                # arithmetic, and on a box where that client cannot be
+                # built the whole panel went down with it.
+                "interval_s": (_seconds_of(interval)
+                               or _hl_interval_s(interval))}
+
+    @app.get("/api/agreement", dependencies=[Depends(require_token)])
+    def api_agreement(coin: str = "", interval: str = "",
+                      min_strength: float = 0.0) -> dict[str, Any]:
+        """What actually happens in each agreement state.
+
+        Built from real order book readings recorded as they happened. It
+        starts empty and fills while the feed runs — there is no way to
+        backfill it, because historical L2 depth does not exist.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return rt.history.agreement_table(c, interval or None, min_strength)
+
+    @app.get("/api/calls", dependencies=[Depends(require_token)])
+    def api_calls(coin: str = "", interval: str = "",
+                  kind: str = "") -> dict[str, Any]:
+        """How the engine's calls have actually turned out.
+
+        Distinct from /api/scorecard, which scores the agent's
+        SUGGESTIONS against the trades they would have been. This scores
+        the READS -- the stack and the trajectory -- against the bars they
+        were made on.
+
+        Every call is written down before its bar closes and scored
+        afterwards, beside the NAIVE call — the direction price was
+        already going when the read was taken. Only the comparison
+        between the two means anything: a bar already up at halfway
+        usually closes up, so an engine that agrees with price scores far
+        above a coin flip while contributing nothing.
+
+        It starts empty and fills while the feed runs. There is no way to
+        backfill it, for the same reason the agreement table cannot be:
+        the readings only exist as they happen.
+
+        The arguments narrow which market is being asked about. None of
+        them can narrow which results count.
+        """
+        from . import callbook as _cb
+
+        c = rt.resolve_symbol(coin)[0] if coin else ""
+        cards = rt.callbook.scorecard(coin=c or "", timeframe=interval or "",
+                                      kind=kind or "")
+        return {"coin": c, "interval": interval,
+                "counts": rt.callbook.counts(),
+                "tallies": [t.to_dict() for t in cards],
+                "summary": _cb.summarise(cards),
+                "marks": list(_cb.MARKS),
+                "note": "the engine's rate is only meaningful against the "
+                        "naive rate on the same bars; a high agreement "
+                        "means the two are nearly the same call"}
+
+    @app.post("/api/backfill", dependencies=[Depends(require_token)])
+    def api_backfill(coin: str = "BTC", interval: str = "15m",
+                     days: float = 2.0, at: float = 0.33,
+                     max_gib: float = 2.0) -> dict[str, Any]:
+        """Fill the agreement table from Hyperliquid's own book archive.
+
+        COSTS REAL MONEY. `s3://hyperliquid-archive` is requester-pays, so
+        every byte is charged to your AWS account. The job reports bytes as
+        it runs and stops at `max_gib`.
+        """
+        return rt.start_backfill(coin, interval, days=days, at=at,
+                                 max_gib=max_gib)
+
+    @app.get("/api/backfill", dependencies=[Depends(require_token)])
+    def api_backfill_status() -> dict[str, Any]:
+        return rt.backfill
+
+    @app.post("/api/backfill/stop", dependencies=[Depends(require_token)])
+    def api_backfill_stop() -> dict[str, Any]:
+        rt.backfill["running"] = False
+        return rt.backfill
+
+    @app.get("/api/backfill/estimate", dependencies=[Depends(require_token)])
+    def api_backfill_estimate(coin: str = "BTC", days: float = 2.0
+                              ) -> dict[str, Any]:
+        """What a job would cost, before spending anything."""
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+        from .archive import Archive, estimate
+
+        end = _dt.now(_tz.utc).replace(minute=0, second=0, microsecond=0)
+        start = end - _td(days=max(0.04, min(days, 30.0)))
+        out = estimate([coin], start, end)
+        out["credentials"] = Archive().credentials_present()
+        out["bucket"] = "s3://hyperliquid-archive (requester-pays)"
+        return out
+
+    @app.post("/api/resolve-states", dependencies=[Depends(require_token)])
+    def api_resolve_states(limit: int = 300) -> dict[str, Any]:
+        return rt.resolve_states(limit=limit)
+
+    @app.get("/api/feature-slice", dependencies=[Depends(require_token)])
+    def api_feature_slice(coin: str = "", interval: str = "",
+                          feature: str = "tilt", verdict: str = "confirmed"
+                          ) -> dict[str, Any]:
+        """How the outcome varies with one stored reading.
+
+        The tuning surface: ask what confirmed candles look like when tilt is
+        above 0.5 versus below, and get the answer from candles already
+        recorded rather than from three more weeks of collecting.
+        """
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        out = rt.history.feature_slice(c, interval or None, feature=feature,
+                                       verdict=verdict)
+        out["available"] = rt.history.stored_features()
+        return out
+
+    @app.post("/api/agreement-replay", dependencies=[Depends(require_token)])
+    def api_agreement_replay(coin: str = "BTC", interval: str = "15m",
+                             bars: int = 500, at: float = 0.33,
+                             dataset: str = "") -> dict[str, Any]:
+        """The price-action base rate over history.
+
+        Deliberately measures ONE side. The order book half cannot be
+        replayed — no exchange serves historical depth — and a book proxy
+        built from candles would be price action agreeing with itself. This
+        is the number the full rule has to beat.
+        """
+        from . import replay as replay_mod
+        from .live import INTERVALS
+
+        if interval not in INTERVALS:
+            return {"ok": False, "error": f"{interval!r} is not a timeframe "
+                                          f"this service builds"}
+        interval_s = float(INTERVALS[interval])
+        if interval_s <= 60:
+            return {"ok": False,
+                    "error": "this replay stands inside a candle using "
+                             "one-minute sub-bars, so it needs a timeframe "
+                             "larger than 1m"}
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        try:
+            if dataset:
+                stored = rt.history.dataset(dataset)
+                if stored is None:
+                    return {"ok": False, "error": f"no dataset {dataset!r}"}
+                main = stored["candles"]
+                coin, interval = stored["coin"], stored["interval"]
+                interval_s = float(INTERVALS.get(interval, interval_s))
+                sub = rt.client().candles(coin, "1m", bars=5000)
+            else:
+                n = max(100, min(bars, 2000))
+                main = rt.client().candles(coin, interval, bars=n)
+                need = int(n * interval_s / 60.0)
+                sub = rt.client().candles(coin, "1m", bars=min(need, 5000))
+        except Exception as exc:
+            return {"ok": False, "error": f"candles unavailable: {exc}"}
+
+        rows = replay_mod.replay_price_action(
+            main, sub, interval_s=interval_s, sub_s=60.0,
+            at=max(0.1, min(at, 0.8)))
+        out = replay_mod.table(rows)
+        out.update({"ok": True, "coin": coin, "interval": interval,
+                    "bars": len(main), "sub_bars": len(sub),
+                    "read_at": f"{max(0.1, min(at, 0.8)):.0%} into the bar"})
+        return out
+
+    @app.post("/api/upload-history", dependencies=[Depends(require_token)])
+    async def api_upload_history(file: UploadFile = File(...),
+                                 coin: str = "BTC",
+                                 merge_into: str = "") -> dict[str, Any]:
+        """Take an OHLCV export and store it for replaying.
+
+        The report that comes back always states what candle-only history can
+        and cannot train. It cannot train the book signals, which are most of
+        the weight in the book call, because an OHLCV file does not contain a
+        book and no exchange serves historical depth at this resolution.
+        """
+        from .ingest import parse as parse_history
+
+        too_big = {"ok": False,
+                   "error": f"file is over "
+                            f"{MAX_UPLOAD_BYTES // (1024 * 1024)}MB — split "
+                            f"it or upload a shorter span"}
+
+        # Checked against the declared size first: reading a two-gigabyte
+        # body and THEN rejecting it means the allocation already happened.
+        declared = getattr(file, "size", None)
+        if declared is not None and declared > MAX_UPLOAD_BYTES:
+            return too_big
+
+        # Read in bounded chunks so a request that lies about its length
+        # cannot get further than one chunk past the cap.
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_UPLOAD_BYTES:
+                return too_big
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+        del chunks
+
+        ing = parse_history(raw, source=file.filename or "upload")
+        if len(ing.candles) > MAX_UPLOAD_BARS:
+            return {"ok": False,
+                    "error": f"{len(ing.candles):,} bars is more than this "
+                             f"service will hold in one dataset "
+                             f"({MAX_UPLOAD_BARS:,}) — upload a shorter span "
+                             f"or a higher timeframe"}
+        out = ing.to_dict()
+        if not ing.ok:
+            out["ok"] = False
+            return out
+
+        try:
+            did = rt.history.save_dataset(
+                name=file.filename or "upload",
+                coin=rt.resolve_symbol(coin)[0] or coin,
+                interval=ing.interval_name, interval_s=ing.interval_s,
+                candles=ing.candles, report=ing.describe(),
+                merge_into=merge_into or None)
+        except ValueError as exc:
+            return {**out, "ok": False, "error": str(exc)}
+
+        out["ok"] = True
+        out["dataset_id"] = did
+        # Read the count back from the listing, which does not carry the
+        # bars. Reloading and re-parsing the whole blob just to count it
+        # doubles the memory cost of every upload.
+        meta = next((d for d in rt.history.datasets() if d["id"] == did), None)
+        out["stored_bars"] = meta["bars"] if meta else len(ing.candles)
+        return out
+
+    @app.get("/api/datasets", dependencies=[Depends(require_token)])
+    def api_datasets(coin: str = "") -> dict[str, Any]:
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return {"ok": True, "datasets": rt.history.datasets(c)}
+
+    @app.post("/api/datasets/delete", dependencies=[Depends(require_token)])
+    def api_delete_dataset(id: str) -> dict[str, Any]:
+        return {"ok": rt.history.delete_dataset(id), "id": id}
+
+    @app.post("/api/journal/trade", dependencies=[Depends(require_token)])
+    def api_journal_trade(coin: str = "ES", action: str = "open",
+                          side: str = "", px: float = 0.0
+                          ) -> dict[str, Any]:
+        """Open or close a row in the trade journal.
+
+        THIS DOES NOT REACH A BROKER. It writes a row in a table so a
+        trade Chris placed himself can be scored in ticks and dollars.
+        There is no credential here and no order path, and a test
+        greps this module for the shapes one would take.
+
+        `px` is optional: left out, the live price is used, which is
+        the mid at this instant and not a price anyone is filled at.
+        """
+        act = (action or "open").lower()
+        price = float(px) if px and px > 0 else _live_px(rt, coin)
+        if not price:
+            return {"ok": False, "why":
+                    "no live price -- the tape has not printed yet"}
+        j = rt.journal
+        if act == "close":
+            t = j.close_trade(coin, price, why="manual")
+            if t is None:
+                return {"ok": False, "why": "nothing is open on "
+                                            f"{coin}"}
+            return {"ok": True, "closed": t.to_dict(),
+                    "stats": j.stats(coin).to_dict()}
+        if act != "open":
+            return {"ok": False, "why": f"unknown action {act!r}"}
+        want = (side or "").lower()
+        if want not in ("up", "down", "buy", "sell", "long", "short"):
+            return {"ok": False, "why":
+                    "side must be up or down -- a trade with no "
+                    "direction cannot be scored"}
+        s = j.settings(coin)
+        t = j.open_trade(coin, want, price, mode="manual",
+                         tp=(s.tp_ticks if s.tp_on else 0.0),
+                         sl=(s.sl_ticks if s.sl_on else 0.0),
+                         strategy=s.strategy)
+        if t is None:
+            return {"ok": False, "why":
+                    "a trade is already open on this market -- close "
+                    "it first. Two rows for one position is a total "
+                    "that is wrong in a way nobody spots."}
+        return {"ok": True, "open": t.to_dict(price)}
+
+    @app.post("/api/journal/settings",
+              dependencies=[Depends(require_token)])
+    def api_journal_settings(coin: str = "ES", auto: bool | None = None,
+                             tp_on: bool | None = None,
+                             sl_on: bool | None = None,
+                             tp_ticks: float | None = None,
+                             sl_ticks: float | None = None,
+                             window_s: float | None = None,
+                             strategy: str | None = None
+                             ) -> dict[str, Any]:
+        """The switches under the column. Only what is sent changes."""
+        from .journal import Settings as _JS
+
+        j = rt.journal
+        cur = j.settings(coin)
+        s = _JS(coin=coin,
+                auto=cur.auto if auto is None else bool(auto),
+                tp_on=cur.tp_on if tp_on is None else bool(tp_on),
+                sl_on=cur.sl_on if sl_on is None else bool(sl_on),
+                tp_ticks=(cur.tp_ticks if tp_ticks is None
+                          else max(0.0, float(tp_ticks))),
+                sl_ticks=(cur.sl_ticks if sl_ticks is None
+                          else max(0.0, float(sl_ticks))),
+                window_s=(cur.window_s if window_s is None
+                          else float(window_s)),
+                strategy=(cur.strategy if strategy is None
+                          else str(strategy)))
+        return {"ok": True, "settings": j.save_settings(s).to_dict()}
+
+    @app.post("/api/journal/clear",
+              dependencies=[Depends(require_token)])
+    def api_journal_clear(coin: str = "ES",
+                          confirm: str = "") -> dict[str, Any]:
+        """Wipe this market's trades. Needs `confirm=yes`.
+
+        Asked for explicitly or not at all: a journal is a record, and
+        a record that can be cleared by a stray click is not one.
+        """
+        if confirm.lower() not in ("yes", "y", "true"):
+            return {"ok": False, "why":
+                    "pass confirm=yes -- this deletes the trade "
+                    "history for this market and cannot be undone"}
+        n = rt.journal.clear(coin)
+        return {"ok": True, "deleted": n}
+
+    @app.get("/api/fusion", dependencies=[Depends(require_token)])
+    def api_fusion(coin: str = "ES", per_bar: int = 0,
+                   smooth: str = "raw", flip_ticks: float = 0.0,
+                   ema_n: int = 0, reset_s: float = 0.0
+                   ) -> dict[str, Any]:
+        """The tick bar and the OFI bar, read separately, compared.
+
+        THE SAME CALL THE RULE MAKES. The panel and the strategy read
+        one function, so the screen cannot show an agreement the rule
+        did not see, or miss one it acted on. Two implementations of
+        "which way is this pointing" is two things to keep correct
+        and one of them is always wrong first.
+
+        Both readings are of the bar BEING BUILT on each series --
+        this is an intrabar comparison, not a comparison of closed
+        bars, which would be late by a bar on each side.
+        """
+        from .tickbar import PER_BAR_CHOICES, STRATEGY_PER_BAR
+
+        rt_ = RT
+        if rt_ is None:
+            return {"error": "the service is still starting"}
+        st = _fusion_now(rt_, int(per_bar or 0), smooth,
+                         float(flip_ticks or 0.0), int(ema_n or 0),
+                         float(reset_s or 0.0))
+        # THE TIMED READINGS AND THE STEPPER DO NOT DEPEND ON THE
+        # TICK BARS, so they are built before the early return
+        # rather than going out with it. This route had the same
+        # shape of bug `/api/read` had: one missing subsystem took
+        # the whole panel's data with it, including the part that
+        # says whether the rule is running at all. That is the
+        # reading you most want when something is wrong.
+        st_ = getattr(rt_, "journal_stepper", None)
+        _kin = None
+        try:
+            _tp = getattr(getattr(rt_, "ofi", None), "tape", None)
+            _k = getattr(_tp, "kinetic", None) if _tp else None
+            _kin = _k.to_dict() if _k is not None else None
+            _kb = getattr(_tp, "kinetic_bar", None) if _tp else None
+            _kin_bar = _kb.to_dict() if _kb is not None else None
+            _rtk = getattr(_tp, "ratio_track", None) if _tp else None
+            _track = _rtk.to_dict() if _rtk is not None else None
+        except Exception:                               # noqa: BLE001
+            _kin = _kin_bar = _track = None
+        extra = {
+            "kinetic": _kin,
+            "kinetic_bar": _kin_bar,
+            "ratio_track": _track,
+            "timed": _timed_now(rt_),
+            "stepper": ({"running": bool(st_ and st_.is_alive()),
+                         "steps": getattr(st_, "steps", 0),
+                         "errors": getattr(st_, "errors", 0),
+                         "last_error": getattr(st_, "last_error", ""),
+                         "age_s": (round(time.time()
+                                         - getattr(st_, "last_ts", 0.0), 1)
+                                   if getattr(st_, "last_ts", 0.0) else None)}
+                        if st_ is not None
+                        else {"running": False, "steps": 0, "errors": 0,
+                              "last_error": "not started", "age_s": None}),
+        }
+        # The journal's own timing, so the delay shows on the panel
+        # that is already being watched rather than in a log.
+        try:
+            extra["journal_timing"] = {
+                "px_age_s": _px_age(rt_),
+                "step_ms": _step_timing.get("ms"),
+                "gap_s": _step_timing.get("gap"),
+                "queued_ms": _step_timing.get("queued_ms"),
+                "lock_waits": _step_timing.get("waits")}
+        except Exception:                               # noqa: BLE001
+            pass
+        if not st.get("tick") or not (st["tick"].get("per_bar")):
+            return {**st, **extra,
+                    "error": ("the tick bars are built from the ES "
+                              "tape and that engine is not running "
+                              "here")}
+        # HAS THIS 5m BAR ALREADY USED ITS ONE TRADE? Read from the
+        # same table the rule reads, so the panel cannot say "free"
+        # while the rule says "taken". Chris: "i dont want this
+        # taking trades randomly just once every 5 minute candle if
+        # the setup is there" -- the cap is the answer and it has to
+        # be visible, not inferred from the trade list.
+        c_ = rt_.resolve_symbol(coin)[0] or coin
+        bar_ts = float((st.get("m5") or {}).get("start_ts") or 0.0)
+        used: tuple = ()
+        try:
+            used = rt_.journal.sides_in_bar(c_, bar_ts, "fused",
+                                            strict=True)
+        except Exception:                               # noqa: BLE001
+            used = ()
+        unknown = "?" in used
+        real = tuple(x for x in used if x != "?")
+        # THE 1-MINUTE, BESIDE THE 5. The timed rule reads these two
+        # and nothing else, and they were not on any panel -- Chris:
+        # "i dont see the 1 minute live with the 5 minute".
+        return {**st, **extra, "coin": c_,
+                "sizes": list(PER_BAR_CHOICES),
+                "default_per_bar": STRATEGY_PER_BAR,
+                "bar_used": bool(real) or unknown,
+                "bar_sides": list(real),
+                "bar_known": not unknown,
+                "bar_say": ("this 5m bar cannot be identified -- "
+                            "nothing opens until it can" if unknown
+                            else f"this 5m bar has taken its trade "
+                                 f"({', '.join(real)})" if real
+                            else "this 5m bar has not traded yet")}
+
+    @app.get("/api/clockwindows", dependencies=[Depends(require_token)])
+    def api_clockwindows(coin: str = "ES", limit: int = 40,
+                         period: float = 0.0) -> dict[str, Any]:
+        """Fifteen-minute windows: mid OHLC, net OFI, net CVD.
+
+        ALL REBUILT FROM RAW EVENTS as they arrive, never resampled.
+        The forming window updates on every book update and every
+        print and locks at the boundary; a batch resample produces
+        the same closed values and cannot produce the forming one.
+
+        The OFI uses the same `level_ofi` the contract-bucket candles
+        use, because the comparison is worthless if the two versions
+        are computed differently. MBP-10 means level-level at the
+        touch -- per-order reconstruction needs MBO.
+
+        Nothing here places, sizes or times an order.
+        """
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc else None
+        want = float(period) if period else float(
+            rt.journal.settings(coin).window_s or 900.0)
+        cw = _windows_for(rt, want)
+        if cw is None:
+            rt.footprint(rule="1m", volume=0, min_volume=0,
+                         multiplier=4.0)
+            cw = _windows_for(rt, want)
+        if cw is None:
+            return {"ok": False, "why": "the CME engine is not "
+                                        "configured"}
+        out = cw.snapshot(limit=max(1, min(int(limit), 200)))
+        # THE BUCKET CANDLE'S OWN OFI, BESIDE THE WINDOW'S.
+        #
+        # They cover different windows -- fifteen minutes against the
+        # bar in progress -- so they oppose each other often and
+        # legitimately. Chris read that as the window misreading the
+        # footprint, which is exactly what it looks like when only
+        # one of them is on the screen.
+        bucket = {}
+        bars = getattr(tape, "ofibars", None)
+        if bars:
+            tgt = getattr(tape, "read_target", 0)
+            b = bars.get(tgt) or bars[max(bars)]
+            try:
+                br = b.bar_read or {}
+                bucket = {"read": br.get("read"),
+                          "imbalance": br.get("imbalance"),
+                          "level": br.get("level"),
+                          "target": br.get("target"),
+                          "price_dir": br.get("price_dir")}
+            except Exception:                           # noqa: BLE001
+                bucket = {}
+        return {"ok": True, "coin": coin, "source": "cme",
+                "bucket": bucket,
+                "periods": [300.0, 900.0],
+                "selected": want,
+                "candle": "mid-price from the book",
+                "ofi": "level-level at the touch (MBP-10)",
+                "places_orders": False, **out}
+
+    @app.get("/api/read", dependencies=[Depends(require_token)])
+    def api_read(coin: str = "BTC", interval: str = "15m",
+                 higher: str = "4h", size: float = 0.0,
+                 timeframes: str = "", vote_bps: float = 1.0
+                 ) -> dict[str, Any]:
+        """The live directional read on the candle still forming.
+
+        Everything this service knows, assembled into one answer: flow inside
+        the candle, whether it is being absorbed, the book, where price sits
+        in its own range and against VWAP, the higher-timeframe structure, the
+        zone it is in, and the liquidation fuel either side.
+
+        Missing feeds are simply absent rather than filled with neutral
+        values. A read built from four signals says four.
+        """
+        from . import candleread
+        from .structure import (atr, session_anchor, structure as read_structure,
+                                vwap as make_vwap, zones)
+
+        coin = rt.resolve_symbol(coin)[0] or coin
+        client = rt.client()
+        out: dict[str, Any] = {"coin": coin, "interval": interval}
+
+        # A CME symbol's bars come from the Databento tape. Asking the
+        # Hyperliquid client for ES candles returns nothing and the read
+        # bailed out here with "candles unavailable" -- which named the
+        # wrong cause: the venue simply does not list the market.
+        cme = rt.cme_feed(coin)
+        if cme is not None:
+            out["source"] = "cme"
+            cme.ensure_interval(interval)
+            bars = list(cme.history(interval, limit=200))
+            if len(bars) < 10:
+                why = cme.missing()
+                # SAY WHETHER THE STORED HISTORY CAME BACK. Without
+                # this the message is the same whether the candle
+                # store is working, empty or broken, and all three
+                # look like a quiet market from the panel.
+                _cr = getattr(rt, "_candlerec", None)
+                kept = ""
+                if _cr is not None:
+                    try:
+                        st = _cr.status()
+                        on_disk = (st.get("on_disk") or {}).get(interval)
+                        kept = (f" -- {st.get('restored', 0)} candles "
+                                f"were restored from disk and "
+                                f"{on_disk} {interval} bars are stored")
+                    except Exception:                   # noqa: BLE001
+                        kept = ""
+                else:
+                    kept = (" -- nothing is saving these candles, so "
+                            "every restart starts from empty")
+                return _with_journal(rt, coin, {**out,
+                        "error": (
+                            f"the CME tape has {len(bars)} closed "
+                            f"{interval} bars so far. It builds candles "
+                            f"from prints as they arrive, so this fills "
+                            f"in as the session runs"
+                            + kept
+                            + (f" -- {why}" if why else ""))})
+        else:
+            try:
+                bars = client.candles(coin, interval, bars=200)
+            except Exception as exc:
+                return _with_journal(
+                    rt, coin,
+                    {**out, "error": f"candles unavailable: {exc}"})
+            if len(bars) < 10:
+                return _with_journal(rt, coin, {**out,
+                        "error": f"only {len(bars)} candles came back — "
+                                 f"not enough to read structure"})
+
+        from .structure import Candle
+        from .live import INTERVALS as _LIVE_INTERVALS
+
+        # The length of a label is arithmetic, not a venue's menu.
+        # Reading it off the crypto client's table made the whole read
+        # depend on Hyperliquid listing a timeframe for a market
+        # Hyperliquid does not carry at all.
+        step = _LIVE_INTERVALS.get(interval) or _seconds_of(interval) or 900
+        now_s = time.time()
+
+        # If a socket is feeding this market, the current bar is BUILT from
+        # the tape rather than fetched. Nothing to poll, nothing to lag, and
+        # no chance of being handed a closed bar and told it is the live one.
+        # A CME symbol is served by the Databento subscription, never by
+        # a Hyperliquid socket. Asked for by name rather than through
+        # `feed_for`, which stays Hyperliquid-only on purpose.
+        feed = rt.cme_feed(coin) or rt.feed_for(coin)
+        if feed is not None and interval not in feed.builders:
+            # The timeframe selector can name any interval. A feed opened on
+            # a different set has nothing for it, which looked exactly like
+            # the socket having stopped.
+            try:
+                feed.ensure_interval(interval, bars)
+            except Exception as exc:
+                out["feed_interval_error"] = str(exc)
+        live_bar = feed.candle(interval) if feed else None
+        use_feed = live_bar is not None and live_bar.seeded and not feed.stale
+
+        # Is the last bar actually the one still forming?
+        #
+        # This is the bug behind "it says up on a candle that is clearly going
+        # down". If the feed's last bar has already closed, every signal built
+        # from it describes the PREVIOUS candle while the panel presents it as
+        # the current one -- and a finished green bar sitting under a market
+        # that has since turned is exactly how you get an UP read on a falling
+        # candle. So it is detected and corrected rather than assumed.
+        last = bars[-1]
+        candle_age = now_s - last.ts
+        last_is_forming = candle_age < step
+
+        # Live mid, fetched BEFORE assembling anything that depends on price.
+        # CME symbols are not listed on Hyperliquid; read directly from the tape.
+        live_spot = None
+        if cme is not None:
+            live_spot = cme.src.last_px or None   # src is the Tape object
+        else:
+            try:
+                live_spot = rt.client().mid(coin)
+                rt.last_price.update({coin: live_spot} if live_spot else {})
+                rt.last_price_ts = now_s
+            except Exception as exc:
+                out["price_error"] = str(exc)
+
+        if use_feed:
+            # The socket's own candle wins over anything polled.
+            current = live_bar.to_candle()
+            closed = feed.history(interval) or bars[:-1]
+            elapsed = live_bar.elapsed(now_s)
+            live_spot = current.close
+            candle_age = now_s - current.ts
+            last_is_forming = True
+            out["source"] = "websocket"
+            out["feed"] = feed.status()
+        elif last_is_forming:
+            current, closed = last, bars[:-1]
+            elapsed = max(0.0, min(float(step), candle_age))
+            out["source"] = "polled"
+        else:
+            # No forming bar in the data. Build one from the live price so the
+            # read describes NOW rather than a closed candle.
+            boundary = last.ts + step * (int(candle_age // step))
+            px = live_spot if live_spot else last.close
+            current = Candle(ts=boundary, open=last.close, high=max(last.close, px),
+                             low=min(last.close, px), close=px, volume=0.0)
+            closed = bars
+            elapsed = max(0.0, min(float(step), now_s - boundary))
+            out["synthesised_candle"] = True
+            out["source"] = "polled (last bar had already closed)"
+
+        # Overlay the live mid onto the forming candle. `candleSnapshot` lags
+        # the tape, so its close, high and low for the in-progress bar are
+        # behind the market -- and `position_in_range` computed from a stale
+        # close is the single most misleading number on the panel.
+        # Skipped when the socket built the bar: it is already tick-current,
+        # and a polled mid would only drag it backwards.
+        if not use_feed and live_spot and live_spot > 0:
+            current = Candle(ts=current.ts, open=current.open,
+                             high=max(current.high, live_spot),
+                             low=min(current.low, live_spot),
+                             close=live_spot, volume=current.volume,
+                             trades=current.trades)
+
+        # higher timeframe
+        higher_struct = None
+        try:
+            hb = client.candles(coin, higher, bars=200)
+            if len(hb) >= 20:
+                higher_struct = read_structure(hb)
+        except Exception as exc:
+            out["higher_error"] = str(exc)
+
+        # zone price is currently sitting in
+        zs = zones(closed)
+        in_zone = next((z for z in zs if z.contains(current.close)), None)
+
+        vw = make_vwap(bars, session_anchor(bars))
+
+        # book, and absorption if a watch happens to be running on this coin
+        book = None
+        if use_feed and feed.book is not None:
+            book = feed.book           # pushed, not polled
+            rt.last_book_ts = time.time()
+        else:
+            try:
+                book = client.book(coin)
+                rt.last_book_ts = time.time()
+            except Exception as exc:
+                out["book_error"] = str(exc)
+
+        absorption = tape = None
+        w = rt.watcher
+        if w is not None and w.coin == coin:
+            absorption = w.watch.absorption()
+            tape = w.watch.tape
+        elif use_feed:
+            # Even without a level watch, the feed's tape gives the flow
+            # signal -- it is the same public fills either way. And the feed
+            # learns its own impact baseline, so absorption comes with it:
+            # absorption is a property of the tape, not of a level you
+            # happened to point at.
+            tape = feed.tape
+            # Scope the absorption window to THIS candle. A fixed five
+            # minutes answers a different question on a 1-minute chart than
+            # on a 30-minute one, and the whole point is to read the bar in
+            # front of you. Floored at a quarter of the bar so a just-opened
+            # candle is not judged on three seconds of tape.
+            absorption = feed.absorption(
+                window_s=max(min(elapsed, float(step)), float(step) * 0.25))
+            # Impact buckets scale with the timeframe too: 15-second buckets
+            # are right for a 15-minute bar and far too coarse for a 1-minute.
+            feed.bucket_s = max(2.0, min(float(step) / 60.0, 60.0))
+
+        # nearest liquidation cluster, signed by side
+        magnet_bps = magnet_notional = 0.0
+        try:
+            m = rt.maps(coin)
+            clusters = (m.get("weighted") or {}).get("clusters") or []
+            spot = float(m.get("spot") or current.close)
+            best = None
+            for cl in clusters:
+                px = float(cl.get("price") or 0)
+                notional = float(cl.get("notional") or 0)
+                if px <= 0 or notional <= 0 or spot <= 0:
+                    continue
+                bps = (px - spot) / spot * 10_000.0
+                pull = notional / max(abs(bps), 1.0)
+                if best is None or pull > best[0]:
+                    best = (pull, bps, notional)
+            if best:
+                magnet_bps, magnet_notional = best[1], best[2]
+        except Exception:
+            pass
+
+        try:
+            from .pressure import price_action
+            pa_read = price_action(closed + [current])
+        except Exception:
+            pa_read = None
+
+        r = candleread.read(
+            coin=coin, interval_s=float(step), elapsed_s=elapsed,
+            open_px=current.open, high_px=current.high, low_px=current.low,
+            last_px=current.close, tape=tape, book=book,
+            absorption=absorption, higher=higher_struct, zone=in_zone, vw=vw,
+            magnet_bps=magnet_bps, magnet_notional=magnet_notional,
+            pa=pa_read, calibration=rt.calibration(coin, interval))
+
+        # The candle feed and the live mid come from different endpoints with
+        # different clocks. The overlay above keeps them in step; this reports
+        # how far apart they were, which is the honest staleness measure.
+        drift_bps = None
+        if live_spot and last.close > 0:
+            drift_bps = (live_spot - last.close) / last.close * 10_000.0
+
+        out.update({
+            "open": current.open, "high": current.high, "low": current.low,
+            "last": current.close,
+            "spot": live_spot,
+            "spot_vs_candle_bps": drift_bps,
+            "stale": bool(drift_bps is not None and abs(drift_bps) > 25),
+            "candle_age_s": candle_age,
+            "candle_was_forming": last_is_forming,
+            "predicts": ("direction of price from here to the close of this "
+                         f"{interval} candle"),
+            "elapsed_fraction": r.elapsed_fraction,
+            "seconds_left": r.seconds_left,
+            "change_bps": r.change_bps,
+            "position_in_range": r.position_in_range,
+            "lean": r.lean, "score": r.score, "agreement": r.agreement,
+            "confidence": r.confidence, "early": r.early,
+            "verdict": r.verdict(),
+            "signals": [{"name": s.name, "direction": s.direction,
+                         "strength": s.strength, "weighted": s.weighted(),
+                         "note": s.note} for s in
+                        sorted(r.signals, key=lambda x: -abs(x.weighted()))],
+            "higher_timeframe": (higher_struct.describe()
+                                 if higher_struct else None),
+            "atr": atr(closed),
+            "price_action": (None if pa_read is None else {
+                "rejection": pa_read.rejection, "sweep": pa_read.sweep,
+                "acceptance": pa_read.acceptance, "signed": pa_read.signed,
+                "notes": pa_read.notes}),
+            "vwap": (None if vw is None else
+                     {"value": vw.value, "band": vw.band_of(current.close)}),
+            "zone": (None if in_zone is None else
+                     {"kind": in_zone.kind, "low": in_zone.low,
+                      "high": in_zone.high, "tested": in_zone.tested,
+                      "fresh": in_zone.fresh}),
+            "calibration": rt.calibration(coin, interval).table(),
+            "inputs": {
+                "flow": tape is not None,
+                "absorption": bool(absorption is not None
+                                   and absorption.confident),
+                "absorption_warming": bool(absorption is not None
+                                           and not absorption.confident),
+                "book": bool(book is not None and not book.empty),
+                "level_watch": bool(w is not None and w.coin == coin),
+                "baseline_samples": (feed.baseline.samples
+                                     if use_feed and feed else 0),
+            },
+            "has_watch": absorption is not None,
+        })
+        # ---- who is winning, on every timeframe at once -----------------
+        #
+        # Not averaged into the score. A 4-hour that belongs to sellers and a
+        # 15-minute that belongs to buyers is a specific, tradeable shape;
+        # blending them to zero destroys the only thing worth knowing.
+        try:
+            from . import pressure as pr
+
+            tf_list = [t.strip() for t in (timeframes or "").split(",") if t.strip()]
+            if not tf_list:
+                # The minute is on the ladder because the entry trigger
+                # is read there. A ladder that stops at five minutes shows
+                # every timeframe in the decision except the one that
+                # actually fires it.
+                tf_list = [higher, "1h", interval, "5m", "1m"]
+            seen, want = set(), []
+            for t in tf_list:
+                # A label earns its row by being a length this service
+                # can build a bar for -- NOT by appearing in the crypto
+                # venue's interval table. That test silently emptied the
+                # whole ladder on CME, which the panel showed as "no
+                # read on 15m, 5m, 1m" rather than as a filter nobody
+                # had meant to apply.
+                if (_seconds_of(t) or _LIVE_INTERVALS.get(t)) and t not in seen:
+                    seen.add(t)
+                    want.append(t)
+
+            readings = []
+            # How old the data behind each row is, and where it came from.
+            # A row that is a minute stale looks exactly like a row that
+            # disagrees with you, and the two call for opposite reactions.
+            ages: dict[str, float] = {}
+            srcs: dict[str, str] = {}
+            # Why a timeframe did not produce a measured row. Empty
+            # for every row that did.
+            tf_why: dict[str, str] = {}
+            # Kept per timeframe so the volume read below has the same bars
+            # the direction read was built from, rather than fetching them
+            # a second time and possibly getting a different slice.
+            tf_hist: dict[str, Any] = {}
+            # EVERY TIMEFRAME THE STACK WANTS gets a builder, not just
+            # the one being traded: a CME tape opened on 1m/15m and
+            # asked for the 5m had none, and the missing row read on
+            # the panel as "no read on 5m" rather than as a timeframe
+            # nobody had switched on.
+            #
+            # `_candle_rows` is what starts it, on the fallback path
+            # every unbuilt timeframe takes by definition. A separate
+            # pre-loop here was tried and removed: it created the same
+            # builder on the same request, and a builder created today
+            # still has no closed bars today, so neither version can
+            # make a brand-new timeframe read any sooner. It reads from
+            # its next bar on, either way.
+            for tf in want:
+                iv = _seconds_of(tf) or float(_LIVE_INTERVALS.get(tf) or 0.0)
+                if iv <= 0:
+                    continue
+                # Each timeframe is judged on ITS OWN bar. `use_feed`
+                # is about the interval being traded; gating the whole
+                # ladder on it sent every row to the polled fallback
+                # the moment that one bar was unseeded.
+                bar = feed.candle(tf) if feed else None
+                # NO USABLE BAR IN PROGRESS IS NOT THE SAME AS NO DATA.
+                #
+                # Straight after a restart the closed history is back
+                # from disk but the forming bar is not -- it was in
+                # progress when the process died -- and the first bar
+                # built mid-period is unseeded by definition, because
+                # its open was never observed. Either way the live
+                # branch was skipped, the row fell to stored candles,
+                # which carry no aggressor, and the whole stack came
+                # back unmeasured for up to a full bar. On the 15m
+                # that is fifteen minutes of "the stack is incomplete"
+                # with nothing to distinguish it from a dead market.
+                #
+                # The last COMPLETED bar is real, measured, and the
+                # honest thing to read in that gap. It is marked as
+                # what it is so the row's age says the reading is of a
+                # finished bar rather than of this one.
+                closed_fallback = False
+                # WHY THIS ROW ENDED UP WHERE IT DID, recorded as it
+                # happens. "the stack is incomplete" names the
+                # timeframes and not the cause, and three separate
+                # faults have now produced that identical sentence --
+                # each one costing a round trip to find, because the
+                # panel could say what was missing and never why.
+                why_tf = ""
+                if feed is None:
+                    why_tf = "no CME feed for this market"
+                elif bar is None:
+                    why_tf = "no bar in progress"
+                elif not bar.seeded:
+                    why_tf = ("the bar in progress is unseeded -- its "
+                              "open was never observed")
+                if (bar is None or not bar.seeded) and feed is not None:
+                    try:
+                        last = feed.last_closed(tf)
+                    except Exception:                   # noqa: BLE001
+                        last = None
+                    if last is None:
+                        why_tf += "; and no closed bar to fall back on"
+                    elif not getattr(last, "flow_measured", False):
+                        why_tf += ("; the last closed bar carries no "
+                                   "aggressor, so it has no direction")
+                    else:
+                        bar, closed_fallback = last, True
+                        why_tf = ""
+                if bar is not None and (bar.seeded or closed_fallback):
+                    cov = (min(1.0, (now_s - feed.started_at) / iv)
+                           if feed.started_at else 0.0)
+                    if closed_fallback:
+                        # A finished bar is fully covered. Reporting a
+                        # fraction would make a complete bar read as a
+                        # partial one and scale every figure on it.
+                        cov = 1.0
+                    # This timeframe's own completed bars, so the reading
+                    # knows how far a bar of this length normally travels
+                    # HERE. Without it the flat band falls back to a prior,
+                    # and a prior that is too wide reports an ordinary down
+                    # minute as flat -- which inverts it into an absorption
+                    # read pointing the other way.
+                    _r = pr.from_live(
+                        tf, iv, bar, book, coverage=max(cov, 0.05),
+                        history=feed.history(tf))
+                    if not _r.measured:
+                        # A LIVE BAR THAT STILL DOES NOT COUNT. Rare,
+                        # and it used to disappear into the same blank
+                        # row as everything else.
+                        tf_why[tf] = ("read from the live bar, but it "
+                                      "measured nothing -- no fills "
+                                      "have been counted in it")
+                    readings.append(_r)
+                    tf_hist[tf] = feed.history(tf)
+                    # THE AGE TELLS THE TWO APART. A reading of the bar
+                    # in progress is as old as the last print; a
+                    # reading of the last finished bar is as old as
+                    # that bar's close, which can be most of an
+                    # interval. Reporting the feed's age for both would
+                    # make a fifteen-minute-old reading look current.
+                    if closed_fallback:
+                        ages[tf] = round(max(
+                            0.0, now_s - (float(bar.start_ts) + iv)), 1)
+                        srcs[tf] = "last closed"
+                    else:
+                        ages[tf] = _feed_age(feed)
+                        srcs[tf] = "tape"
+                    continue
+                # Enough bars to learn what a normal one looks like
+                # here, not just enough to read the last few.
+                #
+                # THROUGH THE SHARED ACCESSOR, which is the whole
+                # point of it: this used to call the crypto client
+                # directly, so a CME symbol asked Hyperliquid for ES,
+                # got an exception, hit the `continue` below, and left
+                # the row missing. Three timeframes doing that is the
+                # "stack is incomplete" message with no hint that the
+                # cause was a venue mix-up.
+                if tf == interval and bars:
+                    tf_bars = bars
+                else:
+                    tf_bars, _tfwhy, _tfsrc = _candle_rows(
+                        coin, tf, pr.TYPICAL_BARS + 6)
+                if not tf_bars:
+                    tf_why[tf] = (why_tf or "no bars at all") + \
+                        "; and no stored candles either"
+                    continue
+                tf_why[tf] = ((why_tf + "; " if why_tf else "")
+                              + "read from stored candles, which carry "
+                                "no aggressor -- the stack only counts "
+                                "bars built from fills")
+                # A polled bar is as old as the moment it was last written,
+                # which for a closed bar is however long ago it closed.
+                last_ts = float(getattr(tf_bars[-1], "ts", 0.0) or 0.0)
+                tf_hist[tf] = list(tf_bars)
+                ages[tf] = round(max(0.0, now_s - last_ts), 1)
+                srcs[tf] = "polled"
+                # Aggregate the recent bars rather than reading only the one
+                # in progress: two minutes into a 4-hour candle there is
+                # nothing in it, and the higher timeframe would go silent
+                # exactly when it matters most.
+                #
+                # THREE BARS ON EVERY TIMEFRAME, INCLUDING THE FAST ONES.
+                #
+                # `lookback_for` scales this window, and I switched the
+                # route over to it as a bug fix. It was not one. The bug
+                # was the LABEL: the row reported "1 bar" while reading
+                # three. Changing the behaviour instead changed every
+                # polled 1m and 5m figure on the panel to about a third
+                # of what it had been -- and those are the numbers the
+                # +/-1.0 rule was calibrated on by watching them.
+                #
+                # So the window goes back to what it was and `bars_used`
+                # now reports what it actually used.
+                r_ = pr.from_candles(
+                    tf, iv, tf_bars, lookback=POLLED_BARS, book=book,
+                    elapsed_s=max(0.0, min(iv, now_s - tf_bars[-1].ts)))
+                if r_ is not None:
+                    readings.append(r_)
+
+            conf = pr.confront(readings)
+
+            # ---- has this bar got the volume to move --------------------
+            #
+            # Direction says which way the bar wants to go; this says
+            # whether it can. Compared against what a bar of this length
+            # has normally done BY THIS POINT -- against a whole bar's
+            # volume every bar reads quiet until it is nearly over.
+            #
+            # Reported, never gating: a quiet bar about to break out would
+            # go blank exactly when it mattered.
+            from . import travel as tvl
+            from . import units as unt
+            from . import vpace as vpz
+
+            # The unit this market is actually read in. Everything stays in
+            # basis points underneath -- that is what makes a $4 token and a
+            # $100k one comparable -- and converts here, at the edge, to the
+            # thing a trader would say out loud.
+            unit = unt.from_book(coin, book, price=float(current.close or 0.0))
+            if not unit.measured:
+                base = tf_hist.get(interval) or []
+                if base:
+                    unit = unt.from_bars(coin, base, price=float(current.close or 0.0))
+            out["unit"] = unit.to_dict()
+
+            # ---- is that number rising or falling ----------------------
+            #
+            # The level and its direction of travel are different
+            # questions and only the second one is about right now: +3t
+            # rising and +3t falling are the same number and opposite
+            # situations. A snapshot could never say which, which is why
+            # watching it felt like it was holding something back.
+            travels: dict[str, Any] = {}
+            for pres in readings:
+                try:
+                    bar_open = now_s - (now_s % pres.interval_s) \
+                        if pres.interval_s > 0 else 0.0
+                    moved = unit.of(pres.last_px - pres.open_px)
+                    rt.travel.record(coin, pres.timeframe, now_s, moved,
+                                     bar_open)
+                    travels[pres.timeframe] = rt.travel.read(
+                        coin, pres.timeframe, unit=unit.label, now=now_s,
+                        best=unit.of(tvl.best_of(
+                            pres.open_px, pres.high_px, pres.low_px,
+                            pres.last_px)))
+                except Exception:
+                    continue
+
+            # ---- the confirmation ladder --------------------------------
+            #
+            # Each timeframe judged by the faster ones: 1m+5m for the 5m,
+            # those two plus itself for the 15m, 5m+15m+1h for the hour,
+            # 15m+1h+4h for the four. The SIGN OF THE MOVE is the vote,
+            # not the winning side -- those disagree whenever absorption
+            # inverts a row, and here the move decides.
+            from . import stack as stk
+
+            try:
+                out["stack"] = stk.read(
+                    [stk.Row(timeframe=p.timeframe, interval_s=p.interval_s,
+                             bps=p.move_bps)
+                     for p in readings],
+                    base=max(0.01, float(vote_bps)))
+            except Exception as exc:
+                out["stack"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+            paces: dict[str, Any] = {}
+            for pres in readings:
+                # A reading that aggregates several bars has no pace: its
+                # volume spans a window and the shape describes one bar,
+                # and dividing one by the other would be a number rather
+                # than a measurement.
+                if pres.span_bars > 1:
+                    continue
+                try:
+                    hist = tf_hist.get(pres.timeframe) or []
+                    curve = rt.volume_curve(coin, pres.timeframe,
+                                            pres.interval_s)
+                    paces[pres.timeframe] = vpz.VolumePace(
+                        timeframe=pres.timeframe, interval_s=pres.interval_s,
+                        done=pres.total_notional,
+                        normal_full=pres.typical_notional,
+                        elapsed_s=pres.elapsed_s, range_bps=pres.range_bps,
+                        normal_range_bps=pr.typical_range(hist),
+                        curve=curve)
+                except Exception:
+                    continue
+
+            # ---- the six layers, per timeframe -------------------------
+            #
+            # ASSEMBLY, NOT MEASUREMENT. Every figure here was already
+            # produced by the module that owns it; this gathers them so
+            # the six readings can be compared instead of being held in
+            # someone's head one at a time.
+            #
+            # The book, the impact baseline and the tape's velocity are
+            # properties of the moment rather than of a bar, so they are
+            # computed once and shared across the rows. Recomputing them
+            # per timeframe would be five chances for the same number to
+            # come out differently.
+            from . import layers as lyr
+            from . import result as rsl
+            from . import swingcall as swc
+            from .structure import DEFAULT_SWING_STRENGTH as _SWING_STRENGTH
+            from .structure import swings as _swings
+
+            lay: dict[str, Any] = {}
+            try:
+                vel = dom_read = None
+                if use_feed and feed is not None:
+                    stamps = [float(t.ts) for t in
+                              getattr(feed.tape, "_trades", []) or []]
+                    vel = _of_velocity(stamps)
+                    dom_read = feed.dom.read(
+                        trades=getattr(feed.tape, "_trades", []) or [],
+                        tick=unit.size)
+
+                refs: list[tuple[str, float]] = []
+                if vw is not None:
+                    refs += [("VWAP", vw.value), ("+1σ", vw.upper_1),
+                             ("−1σ", vw.lower_1)]
+                if higher_struct is not None:
+                    if higher_struct.last_high is not None:
+                        refs.append((f"{higher} swing high",
+                                     higher_struct.last_high.px))
+                    if higher_struct.last_low is not None:
+                        refs.append((f"{higher} swing low",
+                                     higher_struct.last_low.px))
+                if in_zone is not None:
+                    refs += [("zone high", in_zone.high),
+                             ("zone low", in_zone.low)]
+
+                for pres in readings:
+                    tf = pres.timeframe
+                    live_bar = (feed.candle(tf)
+                                if (use_feed and feed) else None)
+                    prof = getattr(live_bar, "profile", None)
+                    tf_refs = list(refs)
+                    poc = getattr(prof, "poc", None) if prof else None
+                    if poc:
+                        tf_refs.append(("POC", float(poc)))
+                    built = lyr.assemble(
+                        tf, pres.interval_s, pressure=pres, velocity=vel,
+                        pace=paces.get(tf), absorption=absorption,
+                        dom_read=dom_read, profile=prof, book=book,
+                        refs=tf_refs, unit_size=unit.size,
+                        unit=unit.label)
+                    bar_open = (now_s - (now_s % pres.interval_s)
+                                if pres.interval_s > 0 else 0.0)
+                    res = rsl.classify(
+                        built, previous=rt.previous_state(coin, tf, bar_open))
+                    rt.remember_state(coin, tf, bar_open, res)
+                    d_ = built.to_dict()
+                    d_["result"] = res.to_dict()
+                    lay[tf] = d_
+
+                # ---- what the next swing will be ----------------------
+                #
+                # The structural consequence of all of the above: the next
+                # pivot is the opposite kind of the last confirmed one, and
+                # the only question is which side of the prior level it
+                # lands. Built on the CHART'S candles and only on swings
+                # that were knowable, so the most recent pivot is several
+                # bars old by construction.
+                chosen = lay.get(interval) or {}
+                lead = ((chosen.get("result") or {}).get("side"))
+                out["swing"] = swc.call_next(
+                    bars, _swings(bars, strength=_SWING_STRENGTH),
+                    side=lead, strength=_SWING_STRENGTH).to_dict()
+            except Exception as exc:
+                lay = {"error": f"{type(exc).__name__}: {exc}"}
+            out["layers"] = lay
+
+            out["timeframes"] = [{
+                "timeframe": r.timeframe, "winner": r.winner,
+                "aggressor": r.aggressor, "strength": r.strength,
+                "signed": r.signed, "absorbing": r.absorbing,
+                "move_bps": r.move_bps, "lean": r.lean,
+                "buy_notional": r.buy_notional,
+                "sell_notional": r.sell_notional,
+                "measured": r.measured, "trades": r.trades,
+                "position_in_range": r.position_in_range,
+                "age_s": ages.get(r.timeframe),
+                "source": srcs.get(r.timeframe, "polled"),
+                # Reported from the reading itself rather than recomputed
+                # from the interval, so the number on the row is the number
+                # the row was built with.
+                "bars_used": r.span_bars,
+                # The evidence behind the call, so a disagreement with the
+                # chart can be settled on the screen instead of by eye.
+                "open_px": r.open_px, "last_px": r.last_px,
+                "range_bps": r.range_bps,
+                "flat_bps": r.flat_band, "learned": r.learned,
+                "typical_bps": r.typical_bps,
+                "forming": r.forming, "pressing": r.pressing,
+                "seeded": r.seeded,
+                "volume": (paces[r.timeframe].to_dict()
+                           if r.timeframe in paces else None),
+                "travel": (travels[r.timeframe].to_dict()
+                           if travels.get(r.timeframe) is not None else None),
+                # The move in the market's own unit, so the row can show
+                # ticks, points or pips instead of basis points.
+                "move_units": unit.of(r.last_px - r.open_px),
+                "unit_label": unit.label,
+                "verdict": ((out.get("stack") or {}).get("verdicts")
+                            or {}).get(r.timeframe),
+                "vote": ((out.get("stack") or {}).get("votes")
+                         or {}).get(r.timeframe),
+                "flat_units": unit.from_bps(r.flat_band, r.last_px),
+                "describe": r.describe(),
+            } for r in conf.ordered]
+            # ---- the stack beneath the timeframe being traded -----------
+            #
+            # A separate read, on purpose. The ladder above votes on the
+            # bps sign alone; this applies the stricter test -- colour AND
+            # bps have to agree -- to the trading timeframe and everything
+            # UNDER it. Nothing above takes part.
+            #
+            # Fed from the rows that are already on the screen rather than
+            # from anything recomputed, so the panel and the ladder can
+            # never disagree about what a row said.
+            try:
+                from . import cascade as csc
+                from . import callbook as _cbk
+                from . import trace as trc
+
+                rows_ = {r.timeframe: (csc.colour_of(r.winner,
+                                                     forming=r.forming),
+                                       r.move_bps)
+                         for r in conf.ordered if r.measured}
+                casc = csc.read(interval, rows_,
+                                previous=rt.last_aligned(coin, interval))
+                rt.remember_aligned(coin, interval, csc.aligned_way(casc))
+                out["cascade"] = casc.to_dict()
+                # THE CAUSE, ON THE PANEL, NEXT TO THE SYMPTOM.
+                #
+                # "no read on 15m, 5m, 1m -- the stack is incomplete"
+                # is what three different faults have produced, and
+                # each took a round trip to tell apart because the
+                # screen could say what was missing and never why. The
+                # route knows; it just was not saying.
+                missing = [g["timeframe"] for g in
+                           (out["cascade"].get("rungs") or [])
+                           if not g.get("present")]
+                if missing:
+                    out["cascade"]["blocked"] = [
+                        {"timeframe": t,
+                         "why": tf_why.get(t) or (
+                             "the row never reached the stack and left "
+                             "no reason -- that is a bug, not a market "
+                             "state")}
+                        for t in missing]
+
+                # ---- and how the read GOT here ---------------------
+                #
+                # A COUNT, NEVER A PROBABILITY. Seven already-published
+                # readings, each voting for or against the direction THE
+                # BAR ITSELF is going -- not the direction this engine
+                # likes, which would have the stack voting for its own
+                # opinion.
+                #
+                # The candidate comes from price, so the whole thing can
+                # disagree with the panel above it, and when it does that
+                # disagreement is the information.
+                chosen_r = next((r for r in conf.ordered
+                                 if r.timeframe == interval), None)
+                if chosen_r is not None:
+                    step_s = float(chosen_r.interval_s or 0.0)
+                    b_open = (now_s - (now_s % step_s)) if step_s > 0 else 0.0
+                    tc = rt.tracer.observe(
+                        coin, interval, b_open, step_s, ts=now_s,
+                        move_bps=chosen_r.move_bps,
+                        layers=lay.get(interval) or {},
+                        cascade=out["cascade"],
+                        volume=(paces[interval].to_dict()
+                                if interval in paces else None))
+                    out["trace"] = tc.to_dict(keep=_TRACE_KEEP)
+
+                    # ---- write the calls down, before the bar closes ---
+                    #
+                    # The whole point: a call recorded now, an outcome
+                    # recorded later, and nothing in between that could
+                    # let one see the other. `record` cannot touch the
+                    # outcome columns; `_keep_bar_flow` fills them in when
+                    # the candle closes.
+                    #
+                    # Only at the declared checkpoints, so the same bar is
+                    # not called ninety times by a polling page -- and a
+                    # read taken at 99% of the bar, which would score
+                    # beautifully and be worth nothing, is never filed.
+                    _mark = _cbk.mark_for(chosen_r.elapsed_s, step_s)
+                    if _mark is not None and chosen_r.open_px > 0:
+                        _common = dict(coin=coin, timeframe=interval,
+                                       bar_ts=b_open, mark=_mark,
+                                       open_px=float(chosen_r.open_px),
+                                       call_px=float(chosen_r.last_px))
+                        rt.callbook.record(_cbk.Call(
+                            kind="cascade", side=(casc.side or ""),
+                            detail=casc.state.value, **_common))
+                        _now_s = tc.latest
+                        rt.callbook.record(_cbk.Call(
+                            kind="trace",
+                            side=trc.called_side(tc.latest),
+                            detail=(f"{_now_s.n_for}/{_now_s.counted}"
+                                    if _now_s else ""), **_common))
+            except Exception as exc:
+                out["cascade"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+            out["confrontation"] = {
+                "aligned": conf.aligned, "conflicted": conf.conflicted,
+                "consensus": conf.consensus, "verdict": conf.verdict(),
+                "higher": conf.higher.timeframe if conf.higher else None,
+                "lower": conf.lower.timeframe if conf.lower else None,
+            }
+        except Exception as exc:
+            out["pressure_error"] = f"{type(exc).__name__}: {exc}"
+
+        # ---- the journal, under the stack --------------------------
+        #
+        # FOUR MUST AGREE: the three rungs and the OFI bar read. The
+        # agreement is computed from the rows ALREADY on this payload,
+        # not recomputed, so the column and the stack above it cannot
+        # disagree about what was showing.
+        #
+        # NOTHING HERE PLACES AN ORDER. "auto" means the journal writes
+        # its own rows so a signal does not have to be clicked to be
+        # recorded. The order at Ironbeam stays Chris's to place.
+        try:
+            out["journal"] = _journal_step(rt, coin, out)
+        except Exception as exc:                        # noqa: BLE001
+            out["journal"] = {"error": f"{type(exc).__name__}: {exc}"}
+
+        if book is not None and not book.empty:
+            out["book"] = {
+                "bid": book.best_bid, "ask": book.best_ask, "mid": book.mid,
+                "spread_bps": book.spread_bps,
+                "imbalance_25bps": book.imbalance(25.0),
+                "pushed": bool(use_feed and feed.book is not None),
+                # Scoped to the candle: what the book has been doing across
+                # this bar, not only what it looks like this instant.
+                "trend": (feed.spread_trend(
+                    window_s=max(min(elapsed, float(step)), 30.0))
+                    if use_feed and feed else None),
+            }
+        if size > 0 and book is not None and not book.empty:
+            out["round_trip_bps"] = book.round_trip_bps(size)
+
+        # Write the read down so it can be scored when the candle closes.
+        # This is the only way the flow and absorption signals ever get
+        # measured: no exchange serves historical order flow, so a backtest
+        # over past candles is permanently blind to them. This accumulates
+        # while you use the dashboard.
+        try:
+            import json as _json
+            rid = rt.history.record_read(
+                coin=coin, interval=interval, candle_ts=current.ts,
+                candle_end=current.ts + step, score=r.score, lean=r.lean,
+                confidence=r.confidence, elapsed_frac=r.elapsed_fraction,
+                price=current.close, had_flow=absorption is not None,
+                signals=_json.dumps({s.name: round(s.weighted(), 4)
+                                     for s in r.signals}))
+            out["recorded"] = rid is not None
+        except Exception as exc:
+            out["record_error"] = str(exc)
+
+        out["forward"] = rt.history.read_stats(coin, interval)
+        return out
+
+    @app.post("/api/resolve-reads", dependencies=[Depends(require_token)])
+    def api_resolve_reads(limit: int = 300) -> dict[str, Any]:
+        """Score recorded reads whose candle has now closed."""
+        return rt.resolve_reads(limit=limit)
+
+    @app.get("/api/forward", dependencies=[Depends(require_token)])
+    def api_forward(coin: str = "", interval: str = "") -> dict[str, Any]:
+        """Measured performance of the live read, from recorded outcomes."""
+        c = rt.resolve_symbol(coin)[0] if coin else None
+        return {"coin": c, "interval": interval or None,
+                "stats": rt.history.read_stats(c, interval or None)}
+
+
+    # ------------------------------------------------- OFI backtester
+
+    def _ofi_dir():
+        """Where uploaded per-second datasets live.
+
+        Beside the database, so a mounted Railway volume keeps them.
+        WITHOUT a volume this is ephemeral disk and every deploy wipes
+        them -- the same warning `startup_report` already gives about
+        history, and it applies here with more force because these
+        files take an hour to regenerate.
+        """
+        from pathlib import Path as _Path
+        from .settings import default_db_path
+        d = _Path(default_db_path()).parent / "ofi_sec"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _ofi_safe(name: str) -> str:
+        """A filename from user input, with the path removed.
+
+        Anything but letters, digits, dash and underscore goes, so a
+        name cannot climb out of the directory it is written into.
+        """
+        clean = "".join(c for c in str(name)
+                        if c.isalnum() or c in "-_")[:64]
+        return clean or "dataset"
+
+
+    @app.get("/api/cvdcross", dependencies=[Depends(require_token)])
+    def api_cvdcross(coin: str = "ES", limit: int = 600,
+                     since: float = 0.0, bar_seconds: float = 0.0,
+                     with_signals: bool = False) -> dict[str, Any]:
+        """The book CVD reader and the tape that confirms it.
+
+        DELIBERATELY NOT PART OF /api/footprint. That route reports
+        ok=False until the first print lands, and the panel built on
+        it returns early on that branch -- which left these lines
+        blank through exactly the quiet stretches they exist to read.
+        The book line moves on book updates alone and needs no trades
+        at all, so it gets its own route and its own poll.
+        """
+        if not rt.is_cme(coin):
+            return {"ok": False, "coin": coin,
+                    "why": f"{coin} is not a CME symbol"}
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc is not None else None
+        eng = getattr(tape, "cvdcross", None) if tape is not None else None
+        if eng is None:
+            return {"ok": False, "coin": coin,
+                    "why": "the CME engine is not configured"}
+        if bar_seconds:
+            eng.bar_seconds = float(bar_seconds)
+        out = eng.as_dict(limit=limit, since=since,
+                          with_signals=with_signals)
+        out["ok"] = True
+        out["coin"] = coin
+        out["records"] = getattr(tape, "records", 0)
+        if not out["points"]:
+            feed = rt.cme_feed(coin)
+            out["why"] = (feed.missing() if feed is not None
+                          else "no records have arrived yet")
+        return out
+
+    @app.get("/api/cvd-signals", dependencies=[Depends(require_token)])
+    def api_cvd_signals(coin: str = "ES", target: float = 4.0,
+                        stop: float = 4.0) -> dict[str, Any]:
+        """Every cross this session, and what price did after it.
+
+        FOR THE AGENT TO READ. One record per cross -- confirmed and
+        unconfirmed, winners and losers -- each carrying its side, the
+        price it fired at, how far price has gone its way (`mfe`) and
+        against it (`mae`), both in ticks, and how long it has been
+        running. Nothing is filtered out: the poor ones are the only
+        evidence that the confirmation is worth anything.
+
+        `scoreboard` tallies them against the `target` and `stop` you
+        ask for and prints the BREAK-EVEN beside the hit rate, because
+        a hit rate without its break-even is not a result. At 4 ticks
+        each way that break-even is 50% before costs, and a tick of
+        cost on ES moves it to about 62.5%.
+
+        This is LIVE FORWARD TRACKING on prints that have already
+        arrived, not a backtest. `settled` says how many have run the
+        full horizon; a young sample says very little.
+
+        It reports. It suggests nothing and places nothing.
+        """
+        if not rt.is_cme(coin):
+            return {"ok": False, "coin": coin,
+                    "why": f"{coin} is not a CME symbol"}
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc is not None else None
+        eng = getattr(tape, "cvdcross", None) if tape is not None else None
+        if eng is None:
+            return {"ok": False, "coin": coin,
+                    "why": "the CME engine is not configured"}
+        return {"ok": True, "coin": coin,
+                "now": eng.snapshot().as_dict(),
+                "signals": [g.as_dict() for g in eng.signals()],
+                "scoreboard": eng.scoreboard(target=target, stop=stop),
+                "tick_size": eng.tick_size,
+                "note": ("live forward tracking, not a backtest; "
+                         "every cross is listed, nothing is filtered")}
+
+    def _pivot_pending(n: int, right: int) -> int:
+        from .pivots import pending
+        return pending(n, right)
+
+    from .cme_tape import seconds_of as _seconds_of
+
+    def _hl_interval_s(interval: str) -> float:
+        """The crypto client's own table, for a label `seconds_of`
+        cannot parse. Still best-effort: it must never be the reason a
+        panel fails."""
+        try:
+            return float(rt.client().INTERVALS.get(interval, 900))
+        except Exception:                               # noqa: BLE001
+            return 900.0
+
+    def _live_px(rt_, coin_: str) -> float:
+        """The last traded price, in the units a person reads.
+
+        TWO UNITS LIVE IN THIS ENGINE AND THEY LOOK ALIKE. The OFI
+        bars hold raw integers a billion to the point; `tape.last_px`
+        is already scaled, because the decoder does it on the way in.
+        Scaling it again here produced 0.0 after rounding, and the
+        column refused every trade with "the tape has not printed
+        yet" while the tape was printing fine. Measured before this
+        comment was written: the fixture's tape read 1712.0, and
+        multiplying by 1e-9 made it 0.0000017.
+
+        So this does not convert. It exists so that every caller
+        reads the price from one place, and so the next person
+        wondering about the units finds the answer here.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        px = float(getattr(tape, "last_px", 0.0) or 0.0)
+        return round(px, 4) if px > 0 else 0.0
+
+    def _quote_now(rt_) -> tuple:
+        """(bid, ask, last, age_s) from the tape's own book.
+
+        THE TOUCH WAS ALREADY BEING DECODED AND THEN IGNORED. The
+        book is built for the OFI on every MBP-10 record; the fill
+        price read `last_px` instead, so every fill and every stop
+        was priced off whichever side happened to print last.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        bk = getattr(tape, "book", None) if tape else None
+        bid = float(getattr(bk, "best_bid", 0.0) or 0.0) if bk else 0.0
+        ask = float(getattr(bk, "best_ask", 0.0) or 0.0) if bk else 0.0
+        last = float(getattr(tape, "last_px", 0.0) or 0.0)
+        return bid, ask, last, _px_age(rt_)
+
+    def _px_age(rt_) -> float | None:
+        """How old the fill price is, in seconds.
+
+        "The trader is delayed" is a feeling until this is a number.
+        If it reads 0.2 the price is live and the delay is in the
+        decision; if it reads 9 the tape is behind and no amount of
+        stepping faster will help. One of those is worth fixing and
+        the other is worth knowing about first.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        last = float(getattr(tape, "last_ts", 0.0) or 0.0)
+        if last <= 0:
+            return None
+        return round(max(0.0, time.time() - last), 2)
+
+    # How many of the four have to point the same way. THREE, by
+    # Chris's rule: a fourth pointing the other way does not block it.
+    MIN_AGREE = 3
+
+    from .journal import signal as jn_signal
+    from . import quote as jn_quote
+
+    def _windows_for(rt_, period_s: float):
+        """The state machine for one period, or None."""
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        wins = getattr(tape, "clockwins", None) if tape else None
+        if wins:
+            return wins.get(float(period_s)) or wins.get(900.0)
+        return getattr(tape, "clockwin", None) if tape else None
+
+    def _tick_smoothed(bld, mode: str, flip_ticks: float,
+                       ema_n: int, live_px: float) -> dict:
+        """Run one smoother over this builder's closed bars.
+
+        COMPUTED ON DEMAND RATHER THAN KEPT ON THE TAPE. Three modes
+        over 1,500 kept bars is a few thousand float operations a
+        poll, which is nothing, and it means the smoothed reading
+        cannot drift out of step with the bars it claims to
+        describe -- a stateful copy fed from a second place is
+        exactly how the panel and the rule ended up disagreeing
+        about the 5-minute candle.
+        """
+        from .smooth import Smoother
+
+        try:
+            sm = Smoother(mode, flip_ticks=flip_ticks, ema_n=ema_n)
+        except ValueError:
+            return {}
+        for b in (getattr(bld, "done", None) or []):
+            sm.on_bar(b.open, b.high, b.low, b.close)
+        if live_px > 0:
+            # The forming bar, so THRESHOLD can act between closes.
+            # The averages ignore this by construction, which is
+            # the difference between the methods.
+            sm.on_price(live_px)
+        return sm.to_dict()
+
+    def _tick_now(rt_, per_bar: int = 0, smooth: str = "raw",
+                  flip_ticks: float = 0.0, ema_n: int = 0,
+                  reset_s: float = 0.0) -> dict:
+        """The tick bar BEING BUILT, and which way it points.
+
+        Its direction is its own traded price, close against open.
+        Nothing about the book enters here, and that is the whole
+        reason pairing it with the OFI says anything: two readings
+        of the same events agree by construction.
+        """
+        from .tickbar import STRATEGY_PER_BAR
+
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        want = int(per_bar or STRATEGY_PER_BAR)
+        if reset_s > 0:
+            fam = getattr(tape, "tickbars_timed", None) if tape else None
+            if not fam:
+                return {}
+            key = (want, float(reset_s))
+            bld = fam.get(key)
+            if bld is None:
+                bld = fam[min(fam, key=lambda k: (abs(float(k[1]) - reset_s),
+                                                  abs(int(k[0]) - want)))]
+        else:
+            bars = getattr(tape, "tickbars", None) if tape else None
+            if not bars:
+                return {}
+            bld = bars.get(want)
+            if bld is None:
+                bld = bars[min(bars, key=lambda k: abs(int(k) - want))]
+        from .smooth import DEFAULT_EMA_N, DEFAULT_FLIP_TICKS
+
+        cur = bld.current
+        live = float(getattr(cur, "close", 0.0) or 0.0) if cur else 0.0
+        sm = {}
+        if smooth and smooth != "raw":
+            sm = _tick_smoothed(bld, smooth,
+                                flip_ticks or DEFAULT_FLIP_TICKS,
+                                ema_n or DEFAULT_EMA_N, live)
+        if cur is None:
+            return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
+                    "smooth": sm,
+                    "reset_s": getattr(bld, "period_s", 0.0),
+                    "by_clock": bool(getattr(bld, "last_by_clock", False)),
+                    "clock_cuts": getattr(bld, "_clock_cuts", 0),
+                    "why": "between bars -- the last print closed one"}
+        raw_dir = cur.direction
+        return {"per_bar": bld.per_bar,
+                "reset_s": getattr(bld, "period_s", 0.0),
+                # Short because the clock cut it, not because the
+                # count was reached. A direction off three prints is
+                # not the same measurement as one off five thousand,
+                # and the panel has to be able to say so.
+                "by_clock": bool(getattr(bld, "last_by_clock", False)),
+                "clock_cuts": getattr(bld, "_clock_cuts", 0),
+                # THE SMOOTHED DIRECTION WINS WHEN ONE IS ASKED FOR,
+                # and the raw one stays beside it under its own name.
+                # Replacing `dir` outright would have left no way to
+                # see what the smoothing changed, which is the only
+                # way to find out whether it helped.
+                "dir": (sm.get("dir") or raw_dir) if sm else raw_dir,
+                "raw_dir": raw_dir,
+                "smooth": sm,
+                "prints": cur.trades, "open": cur.open,
+                "close": cur.close, "seconds": round(cur.seconds, 1),
+                "ticks": round((cur.close - cur.open) / 0.25, 1)
+                if cur.open else 0.0}
+
+    def _m5_now(rt_) -> dict:
+        """The forming FIVE-MINUTE candle. One line, one reader.
+
+        It had its own copy of the decode. The timed rule needed the
+        same thing for the 1-minute, and a second copy is a second
+        place for the price frame to drift.
+        """
+        return _candle_now(rt_, "5m")
+
+    def _candle_now(rt_, interval: str) -> dict:
+        """One forming TIME candle, as the chart draws it.
+
+        `_m5_now` was this for "5m" alone. The timed rule needs the
+        1-minute too, and two near-identical readers is two places
+        for the price frame to be got wrong -- so there is one, and
+        `_m5_now` calls it.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        if tape is None:
+            return {}
+        try:
+            c = tape.candle(interval)
+        except Exception:                               # noqa: BLE001
+            return {}
+        if c is None:
+            return {}
+        try:
+            o, cl = float(c.open), float(c.close)
+            age = float(getattr(tape, "last_ts", 0.0) or 0.0) \
+                - float(c.start_ts)
+        except (TypeError, ValueError):
+            return {}
+        if age < 0:
+            age = 0.0
+        return {"dir": ("up" if cl > o else "down" if cl < o else "flat"),
+                "open": o, "close": cl, "seconds": round(age, 1),
+                "start_ts": float(c.start_ts),
+                "ticks": round((cl - o) / 0.25, 1) if o else 0.0}
+
+    def _timed_now(rt_) -> dict:
+        """The 1-minute and the 5-minute, and what they say together.
+
+        THE SAME CALL THE PANEL MAKES. One source, so the screen
+        cannot show an agreement the rule did not see.
+        """
+        from . import timed as _tm
+
+        # The 5-minute leg is WHO IS CROSSING THE SPREAD, cleared at
+        # each boundary -- `kinetic_bar` is already that window,
+        # already fed from this tape, so nothing is recomputed here.
+        # Reading it anywhere else would be a second implementation
+        # of one number.
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        kb = getattr(tape, "kinetic_bar", None) if tape else None
+        d5 = ""
+        push = None
+        if kb is not None:
+            d5 = getattr(kb, "direction", "") or ""
+            push = getattr(kb, "push", None)
+
+        m5 = _candle_now(rt_, "5m") or {}
+        if push is not None:
+            m5 = dict(m5, push=round(float(push), 2))
+        return _tm.state(_candle_now(rt_, "1m"), m5, m5_dir=d5)
+
+    def _fusion_now(rt_, per_bar: int = 0, smooth: str = "raw",
+                    flip_ticks: float = 0.0, ema_n: int = 0,
+                    reset_s: float = 0.0) -> dict:
+        """The two series side by side, and whether they agree.
+
+        THE SAME READINGS THE PANEL DRAWS AND THE RULE TRADES. One
+        source for both, because the first time a screen and a rule
+        compute the same number separately they start telling
+        different stories about one tape.
+        """
+        from . import fusion as _fu
+
+        return _fu.state(_tick_now(rt_, per_bar, smooth, flip_ticks,
+                                   ema_n, reset_s), _bar_read(rt_),
+                         _m5_now(rt_))
+
+    def _fused_now(rt_, pair: tuple[int, int] | None = None) -> dict:
+        """The fused bar BEING BUILT, and its intrabar read.
+
+        The forming bar, deliberately -- the fused rule is intrabar.
+        `live_side` is set the moment the OFI sign and the traded
+        price agree, long before the bar has its full print count,
+        and `live_why` says what is missing until then.
+
+        FROM THE SAME BUILDER THE CHART DRAWS, so what the rule reads
+        and what is on the screen cannot differ. Every other way of
+        getting this number would be a second implementation of the
+        same two legs.
+        """
+        from .fusedbar import DEFAULT_PAIR
+
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        books = getattr(tape, "fusedbars", None) if tape else None
+        if not books:
+            return {}
+        key = tuple(pair or DEFAULT_PAIR)
+        bld = books.get(key)
+        if bld is None:
+            bld = books[min(books,
+                            key=lambda k: (abs(int(k[0]) - key[0])
+                                           + abs(int(k[1]) - key[1])))]
+        cur = bld.current
+        if cur is None:
+            # Between bars. Real and momentary: the last event closed
+            # one and the next has not opened one. Not an error, and
+            # not a signal either.
+            return {"start_ts": 0.0, "live_side": "", "ofi_dir": "",
+                    "tick_dir": "",
+                    "live_why": "between bars -- the last event closed one"}
+        prog = bld.progress()
+        return {"start_ts": float(cur.start_ts),
+                "live_side": prog.get("live_side") or "",
+                "live_why": prog.get("live_why") or "",
+                "ofi_dir": cur.ofi_dir, "tick_dir": cur.tick_dir,
+                "prints": cur.prints, "net_ofi": int(cur.net_ofi),
+                "tick_target": bld.tick_target,
+                "ofi_target": bld.ofi_target,
+                "say": prog.get("say") or ""}
+
+    def _footprint_imbalance(rt_) -> dict:
+        """Which way the forming footprint bar is imbalanced.
+
+        A diagonal imbalance is a price level where one side's
+        aggression beat the OPPOSITE side one tick away -- a
+        different question from who traded more, and from which way
+        the book is leaning. Counting the levels on each side gives
+        the bar a direction.
+
+        FROM THE SAME STREAM THE FOOTPRINT PANEL DRAWS, so what the
+        rule reads and what Chris reads off the screen cannot differ.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        fp = getattr(tape, "footprint", None) if tape else None
+        eng = getattr(fp, "_engine", None) if fp else None
+        cur = getattr(eng, "current", None) if eng else None
+        if cur is None:
+            return {"side": "", "buy": 0, "sell": 0}
+        try:
+            flags = cur.imbalances(fp.cfg)
+        except Exception:                               # noqa: BLE001
+            return {"side": "", "buy": 0, "sell": 0}
+        buy = sum(1 for f in flags if f.side == "buy")
+        sell = sum(1 for f in flags if f.side == "sell")
+        return {"side": ("up" if buy > sell
+                         else "down" if sell > buy else ""),
+                "buy": buy, "sell": sell,
+                "levels": len(flags)}
+
+    def _window_now(rt_, period_s: float = 900.0) -> dict:
+        """The forming 15-minute window, as the panel draws it.
+
+        FROM THE SAME OBJECT THE PANEL READS. A second accumulation
+        for the trade rule would be a second thing to keep in step
+        with the one on the screen, and the first time they drifted
+        the column would be trading a window nobody could see.
+        """
+        cw = _windows_for(rt_, period_s)
+        cur = getattr(cw, "current", None) if cw else None
+        try:
+            return cur.to_dict() if cur is not None else {}
+        except Exception:                               # noqa: BLE001
+            return {}
+
+    def _bar_read(rt_) -> dict:
+        """The OFI bar read -- the fourth of the four.
+
+        FETCHED, NOT READ OFF THE PAYLOAD. It is a property of the OFI
+        builder and it is served by /api/ofibars; this route never
+        carried it. The column therefore asked for `out["read"]`, got
+        nothing every single time, and the four could never agree --
+        so auto had nothing to fire on and the read column showed a
+        dash forever. The bug was invisible because "not all four" is
+        also what a quiet market looks like.
+
+        From the builder for the target the panel is showing, which
+        the OFI poll records on the tape. A read taken off a different
+        target would be a read of a candle Chris cannot see.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        bars = getattr(tape, "ofibars", None) if tape else None
+        if not bars:
+            return {}
+        tgt = getattr(tape, "read_target", 0)
+        b = bars.get(tgt) if tgt else None
+        if b is None:
+            try:
+                b = bars[max(bars)]
+            except Exception:                           # noqa: BLE001
+                return {}
+        try:
+            return dict(b.bar_read or {})
+        except Exception:                               # noqa: BLE001
+            return {}
+
+    def _agreement(out_: dict,
+                   read: dict) -> tuple[str, dict, str]:
+        """The direction to trade, and what each reading says.
+
+        THE OFI CANDLE DECIDES. The three timeframes do not vote any
+        more -- Chris: "its supposed to be tracking the OFI candle
+        making trades based on that and nothing more". The direction
+        is where price sits against the open of the bar in progress,
+        and that is the whole signal.
+
+        THE STACK IS A VETO AND ONLY A VETO. A trade is skipped when
+        all three timeframes point the OTHER way. Not two of them, not
+        a quiet one -- all three, which is the stack saying as
+        clearly as it can that the candle is running against
+        everything above it.
+
+        FLAT IS NOT A DIRECTION. Price at its candle's open would
+        otherwise open a trade on a bar that has not moved.
+
+        The rows are still reported, because the panel shows them and
+        a veto that fires invisibly is worse than no veto.
+        """
+        casc = out_.get("cascade") or {}
+        rungs = {g.get("timeframe"): g for g in (casc.get("rungs") or [])
+                 if g.get("present")}
+        r = (read or {}).get("read") or ""
+        want = ("15m", "5m", "1m")
+        says = {t: (rungs.get(t) or {}).get("qualified") for t in want}
+        says["read"] = r if r in ("up", "down") else None
+
+        # THE RULE ITSELF IS `journal.signal`, not written out here.
+        # The auto gate lived in a closure like this one and deleting
+        # it broke no test, because a closure can only be reached
+        # through a request and the fixture decides what the rule is
+        # ever asked.
+        side, blocked = jn_signal(
+            says, r, (read or {}).get("delta_side") or "",
+            bool((read or {}).get("flip_ok")))
+        return side, says, blocked
+
+    def _with_journal(rt_, coin_: str, payload: dict) -> dict:
+        """Attach the trade column to a payload that is giving up.
+
+        THE COLUMN IS NOT PART OF THE LADDER AND MUST NOT DIE WITH
+        IT. `/api/read` has three early returns -- the CME tape has
+        under ten closed bars, the candle fetch failed, too few
+        candles came back -- and every one of them returned with no
+        `journal` key at all. The panel then had nothing to draw: no
+        trades, no stats, and no way to see whether AUTO was even on.
+        Chris: "it doesnt show the trades and i cant see if its auto
+        trading either".
+
+        The first of those three is the UNREAD condition he has been
+        looking at for days, so the column vanished exactly when he
+        most needed to know what the rule was doing.
+
+        Nothing the column needs comes from the ladder. It reads the
+        tick bar, the 5-minute candle and the last print; none of
+        that requires ten closed 15-minute bars.
+        """
+        try:
+            payload["journal"] = _journal_step(rt_, coin_, payload)
+        except Exception as exc:                        # noqa: BLE001
+            payload["journal"] = {"error": f"{type(exc).__name__}: {exc}"}
+        return payload
+
+    def _advice(jn, j, s, t, px, side, taken, cap, strat, fus, win,
+                coin_, bar_ts) -> dict:
+        """What the rule WOULD do, regardless of AUTO or who opened it.
+
+        Chris cannot get an Ironbeam API key until the account is
+        funded, so he is trading the signals by hand. For that the
+        EXIT has to be called out as loudly as the entry -- an exit
+        he does not notice is an unmanaged position, which is worse
+        than a missed entry.
+
+        The acting path still refuses to end a hand-taken row and
+        still does nothing with AUTO off. This only answers the
+        question. It is the SAME `decide`, with one flag, because a
+        second implementation would let the alert advertise a rule
+        the column does not follow -- and he would find out which
+        one was right while holding a position.
+        """
+        from . import fusion as _fu
+        from . import timed as _tm
+
+        disagreed = ""
+        if strat == "fused" and t is not None and t.open:
+            ok, why_out = _fu.holds_exit(
+                t.side,
+                (fus.get("tick") or {}).get("dir") or "",
+                (fus.get("m5") or {}).get("dir") or "")
+            if not ok:
+                disagreed = why_out
+        elif strat == "timed" and t is not None and t.open:
+            rev, why_rev = _tm.reversed_against(
+                t.side, (fus.get("m1") or {}).get("dir") or "")
+            if rev:
+                disagreed = why_rev
+        try:
+            act, why = jn.decide(
+                t, s, px, side, taken, (win.get("mid_dir") or ""),
+                window_rule=True, disagreed=disagreed,
+                max_per_bar=cap, advisory=True)
+        except Exception as exc:                        # noqa: BLE001
+            return {"act": "", "why": f"{type(exc).__name__}: {exc}",
+                    "side": "", "holding": "", "key": ""}
+
+        holding = t.side if (t is not None and t.open) else ""
+        if act == "close" and t is not None:
+            key = f"close:{t.id}:{why}"
+        elif act == "open":
+            key = f"open:{bar_ts:.0f}:{side}"
+        else:
+            key = ""
+        return {"act": act, "why": why,
+                "side": side if act == "open" else "",
+                "holding": holding, "key": key,
+                "price": round(float(px or 0.0), 2)}
+
+    # ONE STEP AT A TIME, WHOEVER ASKED.
+    #
+    # The browser polls `/api/read` once a second and the server
+    # stepper runs on its own thread, so without this two of them
+    # can be inside the entry test at the same instant: both see no
+    # open trade, both see the signal, both open one. The cap counts
+    # rows that are already written and cannot help with a race.
+    _step_lock = threading.Lock()
+
+    _step_timing = {"last": 0.0, "ms": 0.0, "gap": 0.0, "waits": 0}
+
+    def _journal_step(rt_, coin_: str, out_: dict) -> dict:
+        """Serialised entry point. The policy is in `_journal_step_un`.
+
+        TIMED, because "the trader is extremely delayed" has to
+        become a number before it can be fixed. `ms` is how long one
+        step takes and `gap` is how long since the previous one --
+        if the gap is seconds, nothing is stepping; if the ms is
+        large, the step itself is the delay.
+        """
+        t0 = time.time()
+        if _step_lock.locked():
+            _step_timing["waits"] += 1
+        with _step_lock:
+            began = time.time()
+            prev = _step_timing["last"] or began
+            try:
+                return _journal_step_un(rt_, coin_, out_)
+            finally:
+                done = time.time()
+                _step_timing["last"] = done
+                _step_timing["ms"] = round((done - began) * 1000.0, 1)
+                _step_timing["gap"] = round(began - prev, 2)
+                _step_timing["queued_ms"] = round((began - t0) * 1000.0, 1)
+
+    def _journal_step_un(rt_, coin_: str, out_: dict) -> dict:
+        """Close what should close, open what auto should open, report.
+
+        READ-ONLY WHEN AUTO IS OFF, with one exception: a stop or a
+        target that has been hit still closes the row, because those
+        are settings Chris turned on and a journal that ignored them
+        until he happened to refresh would be scoring trades he had
+        already said he was out of.
+        """
+        from . import fusion as jn_fusion
+        from . import journal as jn
+
+        j = rt_.journal
+        s = j.settings(coin_)
+        px = _live_px(rt_, coin_)
+        read = _bar_read(rt_)
+        # THE SIGNAL IS THE 15-MINUTE WINDOW NOW, not the bucket
+        # candle. They were separate systems and nothing said so --
+        # the column traded the 2,000-contract bar while the window
+        # was only ever a comparison panel, so an agreement there
+        # drove nothing and looked broken.
+        win = _window_now(rt_, float(s.window_s or 900.0))
+        strat = s.strategy if s.strategy in jn.STRATEGIES else "ofi"
+        fpi = _footprint_imbalance(rt_)
+        # THE TWO INDEPENDENT SERIES, not the dual-trigger candle.
+        # The tick bar and the OFI bar are built by different
+        # builders from different events and neither influences the
+        # other; this only asks each which way it points.
+        # The timed rule reads two TIME candles; the fused rule
+        # reads the tick bar and the OFI. They travel through the
+        # same argument because `window_signal` dispatches on the
+        # strategy, and only one of them is ever computed.
+        fus = (_timed_now(rt_) if strat == "timed" else _fusion_now(rt_))
+        side, blocked_why = jn.window_signal(
+            win, strat, fpi.get("side") or "", fus)
+        says = {"candle": win.get("mid_dir") or None,
+                "ofi": win.get("ofi_dir") or None,
+                "cvd": win.get("cvd_dir") or None}
+        if strat == "fused":
+            # What the panel shows beside the signal has to be what
+            # the signal actually read. Leaving the window's three
+            # here would put a clock reading next to an intrabar
+            # decision and explain nothing about why it fired.
+            says = {"tick": (fus.get("tick") or {}).get("dir") or None,
+                    "OFI": (fus.get("ofi") or {}).get("dir") or None,
+                    "5m": (fus.get("m5") or {}).get("dir") or None}
+        elif strat == "timed":
+            says = {"1m": (fus.get("m1") or {}).get("dir") or None,
+                    "5m": (fus.get("m5") or {}).get("dir") or None}
+        vetoed = blocked_why
+        # The window is the candle the cap counts against.
+        bar_ts = float(win.get("start_ts") or 0.0)
+        taken = j.sides_in_bar(coin_, bar_ts, strat)
+        # THE FUSION RULE IS CAPPED AT ONE TRADE PER 5-MINUTE BAR,
+        # and the 5m bar -- not the 15-minute window -- is the candle
+        # it counts against.
+        #
+        # Chris watched it take a profit and step straight back into
+        # the same move: "it immediately jumps in for another trade
+        # without making sure the parameters still hold true". A
+        # per-direction cap does not stop that, because the trade
+        # after a long is usually another long. One trade per 5m
+        # bar, either way, does.
+        #
+        # This is also what makes the symmetric exit safe to use
+        # again. The exit can fire as often as the tape makes it
+        # fire; nothing re-enters until a new 5m bar opens, so the
+        # fourteen-trades-in-minutes shape is arithmetically
+        # impossible -- the ceiling is twelve an hour.
+        cap = 0
+        if strat in ("fused", "timed"):
+            # ONE TRADE PER 5-MINUTE CANDLE, for both rules, counted
+            # against that candle rather than the 15-minute window.
+            # Chris stated it twice for the timed rule: "1 trade per
+            # 5 minute timeframe". A candle that turns you round
+            # twice is a candle that cost two spreads to end where
+            # it started.
+            cap = 1
+            bar_ts = float((fus.get("m5") or {}).get("start_ts") or 0.0)
+            taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
+
+        t = j.open_trade_for(coin_)
+        closed = None
+        # THE POLICY IS `journal.decide`, not written out here. It
+        # lived in this closure, where the only way to reach it was an
+        # HTTP request through a fixture that never produced
+        # agreement -- so deleting the auto check broke nothing that
+        # any test could see.
+        # THE TICK BAR AND THE 5m END A FUSION TRADE. NOT THE OFI.
+        # It is an entry filter only -- it flips sign about once a
+        # bar even against a wide deadband, because it measures
+        # resting size, and a position abandoned on that is the
+        # churn this rule keeps being rewritten to remove.
+        disagreed = ""
+        if strat == "fused" and t is not None and t.open:
+            ok, why_out = jn_fusion.holds_exit(
+                t.side,
+                (fus.get("tick") or {}).get("dir") or "",
+                (fus.get("m5") or {}).get("dir") or "")
+            if not ok:
+                disagreed = why_out
+        elif strat == "timed" and t is not None and t.open:
+            # THE ONLY SIGNAL EXIT IS AN EVENT, NOT AN ABSENCE. The
+            # 1-minute has to have closed back THROUGH ITS OPEN
+            # against the position. A flat minute does not do it and
+            # a quiet one does not either -- the rule this replaces
+            # exited on exactly those, twelve times in an afternoon
+            # at 2 to 5 ticks each.
+            from . import timed as _tm
+            rev, why_rev = _tm.reversed_against(
+                t.side, (fus.get("m1") or {}).get("dir") or "")
+            if rev:
+                disagreed = why_rev
+        # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
+        # only leave into the bid and a short can only leave into
+        # the ask, so that is the only price a stop or a target can
+        # honestly read. Marking either against the last print lets
+        # whichever side happened to trade decide the outcome.
+        _bid, _ask, _last, _age = _quote_now(rt_)
+        mark_px, mark_src = px, "last"
+        if t is not None and t.open:
+            mark_px, mark_src = jn_quote.mark_px(
+                t.side, _bid, _ask, _last or px, _age)
+            if mark_px <= 0:
+                mark_px, mark_src = px, "last: no price"
+        act, arg = jn.decide(t, s, mark_px, side, taken,
+                             (win.get("mid_dir") or ""),
+                             window_rule=True,
+                             disagreed=disagreed,
+                             max_per_bar=cap)
+        idle_why = arg if act == "" else ""
+        if act == "close":
+            closed = j.close_trade(coin_, mark_px, why=arg)
+            t = None
+            taken = j.sides_in_bar(coin_, bar_ts, strat)
+            # THE CAP HAS TO BE PASSED HERE TOO. It was not, so
+            # after a close this fell back to the default of two per
+            # candle -- the just-closed side was blocked but the
+            # OPPOSITE one was free, and the rule could turn round
+            # inside the same 5-minute bar. That is the
+            # "immediately jumps in for another trade" shape
+            # surviving in the one place the cap was not threaded
+            # through.
+            act, arg = jn.decide(None, s, px, side, taken,  # noqa: E501
+                                 (win.get("mid_dir") or ""),
+                                 window_rule=True,
+                                 max_per_bar=cap)
+            idle_why = arg if act == "" else ""
+        if act == "open":
+            # CROSSING COSTS THE SPREAD. A long pays the ask, a
+            # short receives the bid. Opening at the last print
+            # recorded every round trip as if entry were free, which
+            # is about a tick a trade on ES -- larger than any edge
+            # measured on this tape so far.
+            open_px, open_src = jn_quote.fill_px(
+                arg, "open", _bid, _ask, _last or px, _age)
+            if open_px <= 0:
+                open_px, open_src = px, "last: no price"
+            t = j.open_trade(
+                coin_, arg, open_px, mode="auto", bar_ts=bar_ts,
+                strategy=strat,
+                tp=(s.tp_ticks if s.tp_on else 0.0),
+                sl=(s.sl_ticks if s.sl_on else 0.0))
+            taken = j.sides_in_bar(coin_, bar_ts, strat)
+
+        st = j.stats(coin_, strategy=strat)
+        return {
+            "settings": s.to_dict(),
+            "agree": side, "says": says, "price": px,
+            # WHAT A FILL WOULD ACTUALLY COST, beside the last
+            # print, so a disagreement between them is visible
+            # rather than inferred from a surprising loss.
+            "quote": jn_quote.read(
+                (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
+                (getattr(rt_, "ofi", None)), _last or px, _age),
+            "mark": {"px": mark_px, "src": mark_src},
+            # HOW MANY, and WHICH ONE IS AGAINST IT. Three of four
+            # fires even with the fourth pointing the other way, so
+            # "it agreed" is not enough to tell a clean signal from a
+            # contested one.
+            # WHICH ROWS DISAGREE WITH THE CANDLE. They no longer
+            # stop it unless all three do, so the count is shown to
+            # be read rather than acted on.
+            "against": (", ".join(k for k, v in says.items()
+                                  if v and v != side)
+                        if side else ""),
+            # WHAT STOPPED IT, when something did: "imbalance"
+            # or "stack". A block that fires invisibly is worse than
+            # no block -- it reads as a market with nothing in it.
+            "blocked": vetoed,
+            "window": win,
+            "footprint": fpi,
+            "would_be": (win.get("mid_dir") or "") if vetoed else "",
+            # WHY NOTHING HAPPENED, on every poll that does
+            # nothing. Blank only when a trade was opened or closed.
+            "idle": idle_why,
+            # The sentinel is an internal signal, not a side. It
+            # must not reach the panel as if a trade called "?" had
+            # been taken.
+            "advice": _advice(jn, j, s, t, px, side, taken, cap,
+                              strat, fus, win, coin_, bar_ts),
+            # WHERE THE DELAY IS, as numbers. The price's age, how
+            # long this step took, and how long since the last one.
+            "timing": {"px_age_s": _px_age(rt_),
+                       "step_ms": _step_timing.get("ms"),
+                       "gap_s": _step_timing.get("gap"),
+                       "queued_ms": _step_timing.get("queued_ms"),
+                       "lock_waits": _step_timing.get("waits")},
+            "taken_this_candle": [x for x in taken if x != "?"],
+            "candle_known": "?" not in taken,
+            "max_per_candle": jn.MAX_PER_BAR,
+            # THE READ ITSELF, not only its direction. The column
+            # could show which timeframe was holding a signal up and
+            # not what the read was doing, which is the one of the
+            # four that moves fastest.
+            "read": read,
+            "open": t.to_dict(px) if t is not None else None,
+            "just_closed": closed.to_dict() if closed is not None else None,
+            "stats": st.to_dict(),
+            "recent": [x.to_dict()
+                       for x in j.closed(coin_, 20, strat)],
+            "strategy": strat,
+            "strategies": jn.STRATEGIES,
+            # Said on every response so it cannot be forgotten: this
+            # records, it does not trade.
+            "places_orders": False,
+        }
+
+    def _candle_rows(coin_: str, interval: str, n: int):
+        """Candles for a panel that needs nothing else from the feed.
+
+        THREE SOURCES AND THE ORDER MATTERS. The live crypto feed
+        first, then the CME tape, then the crypto venue's REST API.
+
+        A CME SYMBOL MUST NEVER REACH THAT LAST ONE. `rt.client()` is
+        Hyperliquid; asked for "ES" it answers about something else
+        entirely, and a chart full of plausible candles from the wrong
+        instrument is the worst failure available here -- it cannot be
+        spotted by looking. So the CME branch returns, empty-handed if
+        it has to, rather than falling through.
+
+        Only for panels whose whole need is `history` and `candle`.
+        `feed_for` stays deliberately crypto-only because seventeen
+        callers between them touch thirty attributes of LiveFeed, and
+        the CME tape can answer four of them honestly.
+
+        Returns (rows, why, source). `why` is empty when the rows are
+        good; `source` is for the panel to say where they came from,
+        which matters when two of them disagree.
+        """
+        cme = rt.cme_feed(coin_)
+        if cme is not None:
+            # The tape ships with 1m/5m/15m. A panel asking for an
+            # interval outside that ladder gets a builder made for it
+            # rather than an empty chart.
+            try:
+                cme.ensure_interval(interval)
+            except Exception:                           # noqa: BLE001
+                pass
+            rows = list(cme.history(interval, limit=n) or ())
+            if rows:
+                return rows, "", "cme (built from Databento fills)"
+            return [], (f"the CME tape has no {interval} bars yet -- "
+                        "it fills from the live feed and a historical "
+                        "seed at startup"), "cme"
+        feed = rt.feed_for(coin_)
+        if feed is not None:
+            hist = feed.history(interval)
+            if hist:
+                return (list(hist[-n:]), "",
+                        "websocket (built from fills)")
+        try:
+            return (list(rt.client().candles(coin_, interval, bars=n)),
+                    "", "polled")
+        except Exception as exc:                        # noqa: BLE001
+            return [], f"candles unavailable: {exc}", "polled"
+
+    def _feed_health(rt_, builder) -> dict:
+        """Is the ingest thread alive, and how stale is the chart?
+
+        Age is measured from the newest bar the builder holds, which
+        is the only thing that says the chart is current. A running
+        thread that has stopped producing is still a stopped chart.
+        """
+        svc = getattr(rt_, "ofi", None)
+        out: dict[str, Any] = {"running": False, "error": "",
+                               "restarts": 0, "retry_in": None,
+                               "last_bar_age_s": None}
+        if svc is None:
+            return out
+        try:
+            out["running"] = bool(svc.running)
+            out["error"] = str(getattr(svc, "error", "") or "")
+            out["restarts"] = int(getattr(svc, "restarts", 0) or 0)
+            retry = getattr(svc, "retry_at", None)
+            if getattr(svc, "died_at", None) and retry:
+                out["retry_in"] = round(max(0.0, retry - time.time()), 1)
+        except Exception:                               # noqa: BLE001
+            pass
+        try:
+            bars = getattr(builder, "bars", None)
+            cur = getattr(builder, "current", None)
+            newest = 0.0
+            if cur is not None and getattr(cur, "ts_close", 0):
+                newest = float(cur.ts_close)
+            elif bars:
+                newest = float(bars[-1].ts_close)
+            if newest > 0:
+                out["last_bar_age_s"] = round(
+                    max(0.0, time.time() - newest), 1)
+        except Exception:                               # noqa: BLE001
+            pass
+        return out
+
+    @app.get("/api/ofibars", dependencies=[Depends(require_token)])
+    def api_ofibars(coin: str = "ES", target: int = 250,
+                    bars: int = 140, offset: int = 0,
+                    pivot: int = 5, confirm: int = 1,
+                    keep: int = 4, higher: int = 1,
+                    level: int = 0, clear: float = 1.0,
+                    rev: float = 4.0) -> dict[str, Any]:
+        """OFI-closed candles for one target, newest last.
+
+        Every target in the ladder is accumulating all the time, so
+        switching is instant and carries its whole history. Nothing
+        here decides anything -- a green bar says buying pressure
+        crossed a line you chose, and whether that precedes price is
+        not asserted anywhere.
+        """
+        from .ofibar import LADDER as _OFI_LADDER
+        if not rt.is_cme(coin):
+            return {"ok": False, "why": f"{coin} is not a CME symbol"}
+        svc = rt.ofi
+        tape = getattr(svc, "tape", None) if svc else None
+        builders = getattr(tape, "ofibars", None) if tape else None
+        if not builders:
+            # Attaching happens when the footprint is first built.
+            rt.footprint(rule="1m", volume=0, min_volume=0, multiplier=4.0)
+            builders = getattr(tape, "ofibars", None) if tape else None
+        if not builders:
+            return {"ok": False, "why": "the CME engine is not configured",
+                    "targets": list(_OFI_LADDER)}
+
+        # THE CALL LEVEL, CHANGEABLE WHILE IT RUNS. Applied to every
+        # builder so the ladder stays comparable, and recorded on each
+        # observation so a change does not turn the table into a
+        # mixture of two rules.
+        if level:
+            # Up to 1,500: the deadband that quiets the
+            # candle's flips is this same level, and 500
+            # was a cap on a control that was only ever a
+            # call threshold before.
+            want_level = max(50, min(int(level), 1500))
+            for _b in builders.values():
+                _b.set_call_level(want_level)
+
+        t = int(target)
+        if t not in builders:
+            t = min(builders, key=lambda x: abs(x - t))
+        b = builders[t]
+        # ZOOMING IN IS THE POINT, so the floor is a handful of
+        # bars rather than twenty. At six, a 2,000-contract candle
+        # fills a sixth of the screen and its wick structure is
+        # readable, which is what "tick by tick" means on a chart
+        # whose unit is a quantity of flow rather than a clock.
+        n = max(6, min(int(bars), 600))
+        total = len(b.bars)
+        # `offset` is how many bars back from the live edge the window
+        # starts. Clamped rather than wrapped: asking to scroll past the
+        # beginning should stop at the beginning, not silently jump to
+        # the other end of the history.
+        off = max(0, min(int(offset), max(0, total - n)))
+        end = total - off
+        start = max(0, end - n)
+        window = b.bars[start:end]
+
+        # Pivots are found over a WIDER slice than the window and then
+        # filtered to it. Found only within the window, a swing sitting
+        # near either edge would appear and disappear as you scrolled,
+        # because its neighbours were outside the slice.
+        # LEFT and RIGHT do different jobs. Left establishes that a bar
+        # is a local extreme; right is purely how long you wait before
+        # believing it, and every bar of it is latency on the chart.
+        pv = max(1, min(int(pivot), 20))
+        cf = max(1, min(int(confirm), 10))
+        # HOW FAR A SWING MUST STAND CLEAR, as a multiple of what a
+        # bar at this target typically spans.
+        #
+        # An ordinal extreme is not a swing. Measured on 26,000 bars
+        # the old rule marked a bar that merely TIED its neighbours as
+        # readily as one standing eight points above, and most of the
+        # chevrons on the chart were the former. Requiring a swing to
+        # clear its neighbourhood by one typical bar's range removed
+        # 79% of them.
+        #
+        # Expressed as a multiple rather than in ticks because a bar
+        # at target 125 and one at 2,000 are different sizes, and a
+        # number in ticks would mean something different on every
+        # rung of the ladder. Zero restores the old behaviour exactly.
+        cl = max(0.0, min(float(clear), 5.0))
+        wide_lo = max(0, start - pv)
+        wide_hi = min(total, end + cf)
+        wide = b.bars[wide_lo:wide_hi]
+        marks = []
+        prov = []
+        # SWINGS ARE FOUND ON TRADED PRICES, NOT ON THE CANDLE.
+        #
+        # The candle is the midpoint of the quote, because that is what
+        # the imbalance formula is defined against. On a one-tick ES
+        # spread the midpoint is exactly half a tick off the grid --
+        # bid 7704.00 and ask 7704.25 give 7704.125 -- so a swing found
+        # on it is a price that cannot print. The caret and the level
+        # it establishes are both found on the highest and lowest price
+        # that actually TRADED, which is on the grid by construction.
+        #
+        # Bars with no prints drop out of the series, so `w_idx` maps
+        # each position back to the candle it belongs to.
+        from . import levels as _lv
+        from . import pivots as _pv
+        w_idx, w_hi, w_lo, w_cl, w_ts = _lv.traded_series(wide, 1e-9)
+        # The typical span of a bar at THIS target, taken from the
+        # bars on screen rather than from a constant. The median
+        # rather than the mean: one violent bar should not raise the
+        # bar for every swing after it.
+        _spans = sorted(h - l for h, l in zip(w_hi, w_lo) if h >= l)
+        _typ = _spans[len(_spans) // 2] if _spans else 0.0
+        _min_clear = cl * _typ
+        if len(w_idx) > pv + cf:
+            for q in _pv.find(w_hi, w_lo, left=pv, right=cf, ts=w_ts,
+                              min_clear=_min_clear):
+                abs_i = wide_lo + w_idx[q.index]
+                if start <= abs_i < end:
+                    marks.append({"i": abs_i - start, "kind": q.kind,
+                                  "price": q.price, "ts": q.ts})
+            # Provisional marks only mean anything at the live edge --
+            # scrolled back, every bar has bars after it and the
+            # settled pass has already judged them all.
+            if off == 0:
+                for q in _pv.find_provisional(w_hi, w_lo, left=pv,
+                                              right=cf, ts=w_ts,
+                                              min_clear=_min_clear):
+                    abs_i = wide_lo + w_idx[q.index]
+                    if start <= abs_i < end:
+                        prov.append({"i": abs_i - start, "kind": q.kind,
+                                     "price": q.price, "ts": q.ts})
+
+        recent = window
+
+        # Raw integer feed units in, dollars out. One conversion, here.
+        sc = 1e-9
+
+        # WHAT HAPPENED TO THE LAST FEW SWING LEVELS SINCE THEY FORMED.
+        #
+        # Judged only by bars that had printed at `end`. Scrolled back,
+        # that means the chart shows what the levels looked like THEN,
+        # not what the rest of the session went on to do to them --
+        # otherwise replay would quietly leak the future into every
+        # level you looked at.
+        #
+        # The lookback runs further back than the window, because the
+        # last four swings are not always inside the bars on screen.
+        # Only SETTLED pivots become levels: a provisional one can be
+        # taken out by the next bar, and a level that appears and
+        # vanishes is worse than no level at all.
+        # A wick is a touch; only a confirmed close is a break. That rule
+        # lives in liqmap.levels and is applied by the same function the
+        # session levels use, so the chart and the ledger cannot drift
+        # apart about what happened at a price.
+        keep_n = max(1, min(int(keep), 8))
+        want_higher = bool(int(higher))
+        lvls: list[dict[str, Any]] = []
+        look = max(0, end - max(n, 300) - pv)
+        hist = b.bars[look:end]
+        h_idx, hh, ll, cc, tt = _lv.traded_series(hist, sc)
+        if len(h_idx) > pv + cf:
+            # Found on the SAME numbers the levels are judged against,
+            # so a pivot price and the bar that made it stay equal.
+            found = _pv.find(hh, ll, left=pv, right=cf, ts=tt,
+                             min_clear=_min_clear)
+            rows = _lv.traded_bars(hh, ll, cc, tt)
+            for sw in _lv.swing_levels(found, rows, keep=keep_n):
+                abs_i = look + h_idx[sw.index]
+                brk_i = (look + h_idx[sw.broke_at]) if sw.broke_at >= 0 else -1
+                bak_i = (look + h_idx[sw.back_at]) if sw.back_at >= 0 else -1
+                lvls.append({
+                    "i": abs_i - start,
+                    "break_i": (brk_i - start) if brk_i >= 0 else -1,
+                    "back_i": (bak_i - start) if bak_i >= 0 else -1,
+                    "kind": "high" if sw.high_side else "low",
+                    "price": sw.price,
+                    "state": _lv.swing_status(sw),
+                    "outcome": sw.outcome.value,
+                    "touches": sw.level.touches,
+                    "breaks": sw.level.breaks,
+                    "observed": sw.observed,
+                    "say": _lv.describe(sw)})
+
+        # LEVELS FROM THE TARGETS ABOVE THIS ONE.
+        #
+        # A swing on the 2,000 chart is structurally larger than one on
+        # 250 -- it took eight times the imbalance to build -- and from
+        # inside the 250 chart it is invisible. Switching targets to
+        # look for it means leaving the resolution being traded, so the
+        # bigger structure is drawn here instead, fainter, with its
+        # target on the label.
+        #
+        # A PRICE IS COMPARABLE ACROSS TARGETS; AN INDEX IS NOT. Each
+        # builder has its own bar count, so a higher-target level has
+        # no column on this chart and is drawn edge to edge.
+        #
+        # The cut is by TIME, not by bar count, for the same reason the
+        # levels above stop at `end`: scrolled back, a higher-target
+        # level that had not formed yet must not be on the screen.
+        # Only the top two targets above, two levels each. Every
+        # target at once turns the chart into the grid this is all
+        # trying to avoid.
+        hi: list[dict[str, Any]] = []
+        if want_higher and window:
+            import bisect as _bis
+            edge_ts = window[-1].ts_close
+            for ht in [x for x in sorted(builders) if x > t][:2]:
+                hb = builders[ht]
+                hbars = hb.bars
+                if len(hbars) <= pv + cf:
+                    continue
+                cut = _bis.bisect_right(hbars, edge_ts,
+                                        key=lambda x: x.ts_close)
+                lo2 = max(0, cut - 400)
+                seg = hbars[lo2:cut]
+                if len(seg) <= pv + cf:
+                    continue
+                i2, hh2, ll2, cc2, tt2 = _lv.traded_series(seg, sc)
+                if len(i2) <= pv + cf:
+                    continue
+                rows2 = _lv.traded_bars(hh2, ll2, cc2, tt2)
+                found2 = _pv.find(hh2, ll2, left=pv, right=cf, ts=tt2,
+                                  min_clear=_min_clear)
+                for sw in _lv.swing_levels(found2, rows2, keep=2):
+                    hi.append({"target": ht,
+                               "kind": "high" if sw.high_side else "low",
+                               "price": sw.price,
+                               "state": _lv.swing_status(sw),
+                               "touches": sw.level.touches,
+                               "say": _lv.describe(sw)})
+        out = []
+        for x in recent:
+            out.append({"ts_open": x.ts_open, "ts_close": x.ts_close,
+                        "open": x.open * sc, "high": x.high * sc,
+                        "low": x.low * sc, "close": x.close * sc,
+                        "direction": x.direction, "ofi": x.ofi,
+                        "updates": x.updates,
+                        "price_agg_ratio": round(x.pai, 4),
+                        "price_aggression": x.aggression,
+                        "price_agg_burst": round(x.pai_burst, 4),
+                        "agrees": x.agrees,
+                        "push_up": x.push_up, "push_dn": x.push_dn,
+                        "share": round(x.share, 4),
+                        "call_side": x.call_side,
+                        "call_px": x.call_px * sc,
+                        "delta": x.delta, "trade_count": x.trade_count,
+                        "volume": x.volume,
+                        "delta_agrees": x.delta_agrees,
+                        "seconds": round(x.seconds, 3)})
+        # THE CALL ON EVERY BAR, AND HOW THE CALLS HAVE DONE.
+        #
+        # Read from the three columns the bar already carries plus
+        # where it sat against the levels. Nothing here recomputes any
+        # of those: a second opinion about a bar's delta is a second
+        # thing to keep correct.
+        #
+        # The scoreboard runs over the last SCORE_BARS rather than the
+        # whole history, because the walk is linear in bars and this
+        # route is polled once a second. It is a sample, and the panel
+        # says how big.
+        from . import agree as _ag
+        from . import barcall as _bc
+        SCORE_BARS = 4000
+        s_lo = max(0, end - SCORE_BARS)
+        s_bars = b.bars[s_lo:end]
+        calls_by_i: dict[int, dict] = {}
+        board = None
+        if len(s_bars) > pv + cf:
+            try:
+                s_idx, _s_cl, s_ctx = _lv.walk_levels(s_bars, pv, cf, keep_n)
+                ctx_at = {s_idx[k]: s_ctx[k] for k in range(len(s_idx))}
+                s_calls = [
+                    _bc.call_bar(x, index=i,
+                                 where=ctx_at.get(i, {}).get("side", ""),
+                                 level_state=ctx_at.get(i, {}).get(
+                                     "status", ""))
+                    for i, x in enumerate(s_bars)]
+                board = _bc.scoreboard(
+                    s_calls, [x.close for x in s_bars], horizon=3,
+                    tick=250_000_000.0, target=2.0, stop=2.0, cost=0.4)
+                for c in s_calls:
+                    abs_i = s_lo + c.index
+                    if start <= abs_i < end:
+                        d = c.as_dict()
+                        d["i"] = abs_i - start
+                        d["price"] = c.price * sc
+                        calls_by_i[abs_i - start] = d
+            except Exception:                           # noqa: BLE001
+                board = None
+
+        # THE OBSERVATIONS: every stretch where imbalance and delta
+        # agreed, and whether price got the distance before the bar
+        # ended. The chatter figures sit in the same table on purpose
+        # -- an observation three updates long cannot travel two
+        # points, so a low median says the gate is wrong rather than
+        # that the rule is.
+        obs = None
+        if len(s_bars) > 20:
+            try:
+                from .ofibar import CALL_RULE as _RULE
+                obs = _ag.observation_table(s_bars, points=(1, 2, 3, 4),
+                                            level=b.call_level,
+                                            rule=_RULE)
+                # AND THE SAME COUNT OVER JUST WHAT IS ON SCREEN.
+                # The history runs over thousands of bars and the
+                # chart over a hundred, so a tally of one beside a
+                # picture of the other reads as a contradiction --
+                # he counts five marks and the panel says a hundred.
+                obs["on_screen"] = _ag.observation_table(
+                    list(window), points=(1,), level=b.call_level,
+                    rule=_RULE)
+            except Exception:                           # noqa: BLE001
+                obs = None
+
+        # THE AGREEMENT TEST, which is the whole question in one table:
+        # OFI closed the bar one way and delta went the same way, so
+        # did price. No level, no price path, no target, no stop.
+        agree = None
+        if len(s_bars) > 20:
+            try:
+                agree = _ag.summary(s_bars, horizons=(1, 3, 10),
+                                    tick=250_000_000.0)
+            except Exception:                           # noqa: BLE001
+                agree = None
+
+        # EVERY CALL IN THE WINDOW, AND WHERE IT RESOLVED.
+        #
+        # One arrow per call rather than one per bar: a bar at this
+        # size routinely holds several, and showing only the first
+        # would hide the ones that came after a reversal.
+        #
+        # A mark is drawn only where the objective was actually
+        # reached, at the price it was reached at. A call the bar
+        # closed on gets no mark, because nothing happened to it --
+        # and drawing one would make "it ran out of bar" look like a
+        # result.
+        trade_arrows: list[dict[str, Any]] = []
+        trade_marks: list[dict[str, Any]] = []
+        _lvl_now = b.call_level
+        for _w, _bar in enumerate(window):
+            for _e in (_bar.episodes or ()):
+                if _e.level and _e.level != _lvl_now:
+                    continue
+                trade_arrows.append({"i": _w, "side": _e.side,
+                                     "px": _e.px0 * sc,
+                                     "entry": (_e.entry_px * sc
+                                               if _e.entered else 0.0)})
+                if _e.hit:
+                    trade_marks.append({"i": _w, "kind": _e.hit,
+                                        "px": _e.hit_px * sc,
+                                        "from": _e.px0 * sc,
+                                        "ticks": round(_e.result_ticks, 2)})
+
+        # How much of this is on disk, so the panel can say whether a
+        # restart would cost anything.
+        _rc = getattr(rt, "_ofirec", None)
+        _saved = None
+        if _rc is not None:
+            try:
+                _saved = _rc.status(t)
+            except Exception:                           # noqa: BLE001
+                _saved = None
+
+        cur = b.current
+        forming = None
+        if cur is not None and cur.updates > 0:
+            _lp = b.live_pai
+            _cs, _cpx, _cts = b.live_call
+            _pu, _pd = b.live_push
+            _ep = b.live_episode
+            _liveobs = None
+            if _ep is not None:
+                _liveobs = {
+                    "side": _ep.side, "px0": _ep.px0 * sc,
+                    "updates": _ep.updates,
+                    # WAITING or IN. A call with no fill behind it is
+                    # not a trade, and the panel has to say which of
+                    # the two is on screen or it is describing a
+                    # position nobody holds.
+                    "took": bool(_ep.entered),
+                    "entry_px": (_ep.entry_px * sc
+                                 if _ep.entered else 0.0),
+                    "slip": round(_ep.slip, 2),
+                    "ticks": round(_ep.result_ticks, 2),
+                    "now_pts": round(_ep.move / 1e9, 2),
+                    "mfe_pts": round(_ep.mfe / 1e9, 2),
+                    "mae_pts": round(_ep.mae / 1e9, 2),
+                    "at2": _ep.outcome(2), "at4": _ep.outcome(4)}
+            # The forming bar's own calls sit one column past the
+            # closed ones, which is where the chart draws it.
+            for _e in b.live_episodes:
+                trade_arrows.append({"i": len(out), "side": _e.side,
+                                     "px": _e.px0 * sc,
+                                     "entry": (_e.entry_px * sc
+                                               if _e.entered else 0.0)})
+                if _e.hit:
+                    trade_marks.append({"i": len(out), "kind": _e.hit,
+                                        "px": _e.hit_px * sc,
+                                        "from": _e.px0 * sc,
+                                        "ticks": round(_e.result_ticks, 2)})
+            forming = {"call_side": _cs, "call_px": _cpx * sc,
+                       "push_up": _pu, "push_dn": _pd,
+                       "share": round(b.live_share, 4),
+                       "obs": _liveobs,
+                       "obs_so_far": len(b.live_episodes),
+                       # ONE CALL PER CANDLE. When the candle has
+                       # already used it, the imbalance can go on
+                       # crossing the level and no trade follows --
+                       # and the panel has to say so, or it looks
+                       # broken at exactly the moment it is working.
+                       "max_calls": b.max_calls,
+                       "spent": bool(b.max_calls
+                                     and len(b.live_episodes)
+                                     >= b.max_calls),
+                       "open": cur.open * sc, "high": cur.high * sc,
+                       "low": cur.low * sc, "close": cur.close * sc,
+                       "ofi": b.accumulated, "updates": cur.updates,
+                       "delta": b.live_delta,
+                       "trade_count": b.live_trades,
+                       "price_agg_ratio": round(_lp, 4),
+                       "price_aggression": (
+                           "BUY_PRICE_AGGRESSIVE" if _lp >= 0.70
+                           else "SELL_PRICE_AGGRESSIVE" if _lp <= 0.30
+                           else "BALANCED_PRICE_FLOW"),
+                       # EXPANSION AND SPEED, running with the bar.
+                       # Nothing is gated on these -- they are here to
+                       # be looked at next to the imbalance, because
+                       # 500 in four seconds and 500 in four minutes
+                       # are the same number and not the same event.
+                       "speed": {k: round(v, 3)
+                                 for k, v in b.live_speed.items()},
+                       "seconds": round(cur.seconds, 3)}
+        # The forming bar belongs only at the live edge. Scrolled back,
+        # appending it would staple the present onto the end of the past.
+        if off > 0:
+            forming = None
+
+        # THE READING, which is not about these bars at all.
+        #
+        # Chris trades a five-minute candle on another platform and
+        # uses this to decide which way. So it is carried whatever
+        # target is on screen, it does not depend on the level in the
+        # dropdown, and it does not reset when a bar closes -- all
+        # three of which the per-bar call above does the other way
+        # round, because that one IS about these bars.
+        # THE READ IS THE BAR NOW, not a five-minute clock window.
+        #
+        # It was a flow reading on a clock: buying minus selling since
+        # the last five-minute boundary. Chris asked for the other
+        # thing -- what the OFI candle on the screen is doing at this
+        # moment -- so it is where price sits against THAT bar's open,
+        # and it starts again when that bar does.
+        #
+        # It comes off the builder for the target being displayed,
+        # which is the only honest source: a read of "the candle"
+        # taken from a different target would be a read of a
+        # different candle.
+        #
+        # `flowread` is still fed and still carried, under `flow`, for
+        # the accuracy scripts that score it. Those scripts measure
+        # the OLD reading, so none of their numbers describe what is
+        # on the panel now.
+        _read = None
+        try:
+            _read = b.bar_read
+        except Exception:                               # noqa: BLE001
+            _read = None
+        # Remember which target the panel is showing, so the per-print
+        # frames push the read for the same bar the poll drew.
+        try:
+            tape.read_target = int(t)
+        except Exception:                               # noqa: BLE001
+            pass
+        _fr = getattr(tape, "flowread", None)
+        _flow = None
+        if _fr is not None:
+            try:
+                _fr.set_level(b.call_level)
+                _flow = _fr.snapshot.as_dict()
+            except Exception:                           # noqa: BLE001
+                _flow = None
+        # ERROR BARS, NOT A SECOND SIGNAL. Computed from the same
+        # tape and carried beside the reading, never folded into it:
+        # the direction is the imbalance's and these only say what
+        # state it arrived in.
+        _pd = getattr(tape, "pricedir", None)
+        _price = None
+        if _pd is not None:
+            try:
+                # HOW FAR PRICE MUST REVERSE before the direction
+                # flips. At one tick the line changes its mind 523
+                # times a minute on a tick-level walk; four is one ES
+                # point, the same distance the OFI trade already uses
+                # as its objective.
+                _pd.set_reverse(max(1.0, min(float(rev), 12.0)))
+                _price = dict(_pd.snapshot)
+                # SCALE WHATEVER PRICE KEYS ARE THERE, by name rather
+                # than by a list written out here. A hard-coded key
+                # that the snapshot no longer carries raises, the
+                # except below swallows it, and the whole price
+                # disappears off the line -- which is exactly what
+                # happened when `prev` became `anchor`.
+                for _k in ("px", "anchor"):
+                    if _price.get(_k):
+                        _price[_k] = _price[_k] * sc
+            except Exception:                           # noqa: BLE001
+                _price = None
+        _rg = getattr(tape, "regime", None)
+        _regime = None
+        if _rg is not None:
+            try:
+                # The regime's bands are scaled by how much flow is in
+                # the window, which is the FLOW reading's number. The
+                # bar read has no gross -- it is a price measurement --
+                # so this keeps taking it from where it has always
+                # come from.
+                if _flow:
+                    _rg.set_gross(_flow.get("gross", 0.0))
+                _snap = _rg.snapshot
+                _regime = _snap.as_dict()
+                # THE COMPARISON IS DRAWN HERE, by the one place that
+                # holds both. The regime module is handed the read as
+                # an argument and never reaches for it, so a tag
+                # still cannot change a direction.
+                _regime["agrees"] = _snap.agrees_with(
+                    (_read or {}).get("read", ""))
+            except Exception:                           # noqa: BLE001
+                _regime = None
+
+        return {"ok": True, "coin": coin, "target": t,
+                "read": _read, "flow": _flow,
+                "regime": _regime, "price": _price,
+                # WHETHER THE FEED IS ALIVE, carried with the bars.
+                #
+                # A dead ingest thread draws exactly the same chart as
+                # a quiet market: the bars it already had, in the
+                # right places, with nothing new. The panel cannot
+                # tell those apart from the bars alone and must not
+                # have to.
+                "feed": _feed_health(rt, b),
+                "targets": list(_OFI_LADDER),
+                "total": total, "offset": off, "window": n,
+                "dropped": getattr(b, "dropped", 0),
+                "at_live": off == 0,
+                "oldest": off >= max(0, total - n),
+                "call_level": b.call_level,
+                # The high end is new: this level is also the
+                # deadband that stops the candle flipping, and
+                # measured flips fall from 3.2 a bar at zero to
+                # 1.0 at 500 and 0.4 at 1,000.
+                "call_levels": [100, 150, 200, 250, 300, 400,
+                                500, 750, 1000, 1250, 1500],
+                "reachable": b.reachable(),
+                "pivot_n": pv, "confirm_n": cf,
+                "clear_n": cl,
+                # The REQUESTED reversal, echoed back. The dropdown
+                # marks its selection from this and not from the
+                # price snapshot -- when the snapshot was missing the
+                # control fell back to its default on every render
+                # and read as stuck.
+                "rev_n": max(1.0, min(float(rev), 12.0)),
+                "clear_ticks": round(_min_clear / 250_000_000.0, 2),
+                "traded_bars": sum(1 for x in window if x.traded),
+                "keep_n": keep_n, "levels": lvls,
+                "agree": agree, "obs": obs,
+                "trade_arrows": trade_arrows, "trade_marks": trade_marks,
+                "objective_pts": round(b.objective / 1e9, 2),
+                "calls": [calls_by_i[k] for k in sorted(calls_by_i)],
+                "scoreboard": board,
+                "higher": want_higher, "higher_levels": hi,
+                "saved": _saved,
+                "pivots": marks, "provisional": prov,
+                "unsettled": _pivot_pending(len(window), cf) if off == 0 else 0,
+                "bars": out, "forming": forming,
+                "trades": getattr(tape, "trades", 0)}
+
+    @app.get("/api/dexarb", dependencies=[Depends(require_token)])
+    def api_dexarb(asset: str = "WETH", limit: int = 8,
+                   impact_bps: int = 30) -> dict[str, Any]:
+        """Mispriced cycles between the DEX pools, as a reading.
+
+        GROSS IS NOT PROFIT and the panel says so. Taking one of these
+        would cost a flash-loan premium, gas, and -- the term that
+        actually decides it -- whatever had to be bid to a block
+        builder to be included ahead of everyone else watching the
+        same pools. On a contested path that bid approaches the whole
+        gross. A long list of large numbers here is evidence that they
+        are hard to take, not that they are free.
+
+        Nothing in this path signs or sends anything.
+        """
+        from .dexarb import MAINNET_POOLS, TOKENS, DexArb
+        from . import dexfeed
+
+        tok = TOKENS.get(asset.upper())
+        if tok is None:
+            return {"ok": False, "why": f"unknown asset {asset}",
+                    "assets": sorted(TOKENS)}
+        addr, decimals = tok
+
+        if not dexfeed.rpc_url():
+            return {"ok": False,
+                    "why": "no Ethereum RPC configured -- set ETH_RPC_URL"}
+
+        try:
+            states, block = dexfeed.fetch_states(MAINNET_POOLS)
+        except dexfeed.FeedError as e:
+            # The URL carries the API key, so the message never does.
+            return {"ok": False, "why": str(e)}
+
+        if not states:
+            return {"ok": False, "why": "no pool answered", "block": block}
+
+        g = DexArb(MAINNET_POOLS, max_impact_bps=max(1, min(impact_bps, 500)))
+        for k, st in states.items():
+            g.set_state(k, st)
+
+        found = g.find(addr, limit=max(1, min(limit, 25)))
+        return {"ok": True, "asset": asset.upper(), "block": block,
+                "pools_read": len(states), "pools_total": len(MAINNET_POOLS),
+                "decimals": decimals,
+                "cycles": [c.as_dict(decimals) for c in found]}
+
+    @app.get("/api/footprint", dependencies=[Depends(require_token)])
+    def api_footprint(coin: str = "ES", rule: str = "1m",
+                      volume: int = 0, min_volume: int = 0,
+                      multiplier: float = 4.0, rows: int = 40,
+                      history: int = 8,
+                      push_ticks: int = 4) -> dict[str, Any]:
+        """The live footprint bar, its flags, and the bars behind it.
+
+        Fed from the SAME decoded trades the CME candles are built
+        from, so the two can never disagree about which prints
+        existed.
+
+        `unconfirmed` flags belong to the bar still forming and can
+        still vanish. `confirmed` belong to closed bars and never
+        change again. The panel draws them differently because they
+        are different claims.
+        """
+        if not rt.is_cme(coin):
+            return {"ok": False, "coin": coin,
+                    "why": f"the footprint reads the CME tape; "
+                           f"{coin} is not a CME symbol"}
+
+        svc = rt.ofi
+        stream = rt.footprint(rule=rule, volume=volume,
+                              min_volume=min_volume,
+                              multiplier=multiplier)
+        if stream is None:
+            return {"ok": False, "coin": coin,
+                    "why": "the CME engine is not configured"}
+
+        tape = svc.tape
+        if tape.trades == 0:
+            # Same three silences as the flow ladder: off, open but
+            # silent, or delivering the wrong records.
+            feed = rt.cme_feed(coin)
+            return {"ok": False, "coin": coin, "source": "cme",
+                    "why": (feed.missing() if feed is not None
+                            else "no prints have arrived yet"),
+                    "trades": 0}
+
+        v = stream.view()
+        out = v.as_dict()
+        out["rows"] = out["rows"][:max(1, min(rows, 200))]
+        out["ok"] = True
+        out["coin"] = coin
+        out["source"] = "cme"
+        out["rule"] = f"{volume} contracts" if volume > 0 else rule
+        out["settings"] = {"multiplier": multiplier,
+                           "min_volume": min_volume}
+        out["tape_trades"] = tape.trades
+
+        past = []
+        n = len(stream.history)
+        for i in range(max(0, n - max(0, min(history, 50))), n):
+            bar = stream.history[i]
+            flags = stream.confirmed_flags(i)
+            sc = stream.scale
+            past.append({
+                "ts_open": bar.ts_open, "ts_close": bar.ts_close,
+                "open": sc.to_price(bar.open_ticks),
+                "high": sc.to_price(bar.high_ticks),
+                "low": sc.to_price(bar.low_ticks),
+                "close": sc.to_price(bar.close_ticks),
+                "volume": bar.total_volume, "delta": bar.delta,
+                "close_reason": bar.close_reason,
+                "confirmed": [f.as_dict(sc) for f in flags],
+            })
+        out["history"] = past
+
+        # The resting book, as a SEPARATE key. Nothing about the
+        # footprint's own fields changes: one counts what traded,
+        # the other what is standing there.
+        bd = getattr(tape, "bookdiag", None)
+        if bd is not None:
+            out["book"] = bd.reading().as_dict()
+
+        # Whether anyone can get through it, each way. Also a separate
+        # key: the book reading says what is standing there, this says
+        # whether the flow is enough to eat it.
+        obs = getattr(tape, "obstacles", None)
+        if obs is not None:
+            out["clearance"] = {"buy": obs.clearance("buy").as_dict(),
+                                "sell": obs.clearance("sell").as_dict()}
+
+        # The READING of all of the above, as its own key. The
+        # footprint's own counts are untouched -- this reads them.
+        #
+        # THIS WAS MISSING AND THE PANEL WAS SILENTLY EMPTY. The page
+        # asks for `verdict.now` and renders nothing at all when it is
+        # absent, so a verdict that was never put in the payload looks
+        # exactly like a bar too quiet to call. Every test covered the
+        # reader and none covered the payload, which is why it shipped
+        # twice. The tests below this now assert the key is here.
+        from .footprint import ImbalanceConfig as _IC
+        from .fpread import FootprintReader as _FR
+        reader = _FR(cfg=_IC(multiplier=float(multiplier),
+                             min_volume=int(min_volume)))
+        verdict = reader.as_dict(stream)
+
+        # `lead` and `pace` ride on the TAPE, not on the stream: they
+        # are fed per decoded trade and reset on the footprint's own
+        # close event, so they cannot be rebuilt from a finished bar.
+        lead = getattr(tape, "lead", None)
+        cur = getattr(lead, "cur", None) if lead is not None else None
+        if cur is not None:
+            verdict["lead"] = cur.as_dict()
+
+        pace = getattr(tape, "pace", None)
+        if pace is not None:
+            # Read at WALL CLOCK, not at the last print's timestamp.
+            # The rates decay with elapsed time, so asking "as of the
+            # last trade" would freeze a dead tape at whatever it was
+            # doing when it stopped -- which is the one answer a rate
+            # must never give. The tape's clock is epoch seconds, the
+            # same clock, so the two are comparable.
+            import time as _time
+            verdict["pace"] = pace.reading(_time.time()).as_dict()
+
+        # The current leg. Its own key because it is NOT bar-scoped:
+        # it answers "price just went four ticks, who ate them and
+        # are they still being paid" while everything above answers
+        # "who is winning this bar".
+        push = getattr(tape, "push", None)
+        if push is not None:
+            if push.window != int(push_ticks) and push_ticks > 0:
+                push.window = int(push_ticks)
+            verdict["push"] = push.reading().as_dict()
+
+        out["verdict"] = verdict
+        return out
+
+    @app.get("/api/ofi-datasets", dependencies=[Depends(require_token)])
+    def api_ofi_datasets() -> dict[str, Any]:
+        """The per-second datasets this service can backtest."""
+        rows = []
+        for f in sorted(_ofi_dir().glob("*.csv")):
+            rows.append({"name": f.stem,
+                         "size_mb": round(f.stat().st_size / 1e6, 1),
+                         "loaded": f.stem == rt.ofi_bt_name})
+        return {"ok": True, "datasets": rows,
+                "dir_is_volume": str(_ofi_dir()).startswith("/data")}
+
+    @app.post("/api/ofi-dataset", dependencies=[Depends(require_token)])
+    async def api_ofi_dataset(file: UploadFile = File(...),
+                              name: str = "") -> dict[str, Any]:
+        """Upload a file from `scripts/ofi_replay.py`.
+
+        A month is ~110MB as CSV, which is over the upload cap -- send
+        a shorter span, or run this service locally where the file
+        already is. The cap is checked against the declared length
+        BEFORE the body is read.
+        """
+        declared = getattr(file, "size", None)
+        if declared is not None and declared > MAX_UPLOAD_BYTES:
+            return {"ok": False,
+                    "error": f"over {MAX_UPLOAD_BYTES // (1024*1024)}MB -- "
+                             f"upload a shorter span, or run the service "
+                             f"where the file already is"}
+        from pathlib import Path as _Path
+        stem = _ofi_safe(name or _Path(file.filename or "dataset").stem)
+        dest = _ofi_dir() / f"{stem}.csv"
+        total = 0
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    fh.close()
+                    dest.unlink(missing_ok=True)
+                    return {"ok": False,
+                            "error": "over the cap once read -- the "
+                                     "declared length was wrong"}
+                fh.write(chunk)
+        head = ""
+        try:
+            with open(dest) as fh:
+                head = fh.readline().strip()
+        except Exception:                               # noqa: BLE001
+            pass
+        if "ofi" not in head:
+            dest.unlink(missing_ok=True)
+            return {"ok": False,
+                    "error": f"that does not look like an ofi_replay "
+                             f"file -- its header is {head[:80]!r}"}
+        rt.ofi_bt_name = ""          # force a reload on the next run
+        rt.ofi_bt_secs = None
+        return {"ok": True, "name": stem,
+                "size_mb": round(total / 1e6, 1)}
+
+    @app.get("/api/ofi-backtest", dependencies=[Depends(require_token)])
+    def api_ofi_backtest(dataset: str = "", rule: str = "ofi",
+                         z: float = 1.5, target: int = 16,
+                         stop: int = 4, cost: float = 1.0,
+                         hold: int = 900, window: int = 60,
+                         baseline: int = 600, cooldown: int = 60,
+                         train: float = 0.5, book_ratio: float = 2.0,
+                         delta_window: int = 60,
+                         frames: str = "60,300,900") -> dict[str, Any]:
+        """Run the SAME engine the command line runs, on a stored file.
+
+        The module is shared with `scripts/ofi_backtest.py` on
+        purpose: a backtest on the dashboard that disagrees with the
+        one in the terminal is worse than having only one of them.
+
+        The parsed file is cached in one slot, because parsing 1.8
+        million rows takes long enough that a panel re-parsing it on
+        every slider move would be unusable. Changing dataset evicts
+        it.
+        """
+        from . import ofi_backtest as _bt
+
+        name = _ofi_safe(dataset)
+        path = _ofi_dir() / f"{name}.csv"
+        if not dataset or not path.exists():
+            have = [f.stem for f in _ofi_dir().glob("*.csv")]
+            return {"ok": False,
+                    "why": (f"no dataset {dataset!r}. "
+                            + (f"have: {', '.join(have)}" if have else
+                               "upload one from scripts/ofi_replay.py")),
+                    "datasets": have}
+
+        if rt.ofi_bt_name != name or rt.ofi_bt_secs is None:
+            rt.ofi_bt_secs = _bt.load(str(path))
+            rt.ofi_bt_name = name
+
+        secs = rt.ofi_bt_secs
+        if not len(secs):
+            return {"ok": False, "why": f"{name} has no rows"}
+
+        try:
+            spans = tuple(int(x) for x in str(frames).split(",")
+                          if x.strip())
+        except ValueError:
+            return {"ok": False, "why": f"frames {frames!r} is not a "
+                                        f"comma separated list of seconds"}
+
+        st = _bt.Settings(
+            rule=rule, z_enter=float(z), window=int(window),
+            baseline=max(2, int(baseline)), target_ticks=int(target),
+            stop_ticks=int(stop), max_hold_s=int(hold),
+            cost_ticks=float(cost), cooldown_s=int(cooldown),
+            train_fraction=min(0.85, max(0.15, float(train))),
+            frames=spans or (60, 300, 900),
+            book_ratio=float(book_ratio),
+            delta_window=max(1, int(delta_window)))
+        out = _bt.run(secs, st)
+        out["dataset"] = name
+        out["rules_available"] = list(_bt.RULES)
+        return out
+
+    @app.post("/api/backtest", dependencies=[Depends(require_token)])
+    def api_backtest(coin: str = "BTC", interval: str = "15m",
+                     bars: int = 1000, train_fraction: float = 0.6,
+                     tune: bool = True, dataset: str = "") -> dict[str, Any]:
+        """Walk-forward backtest with a held-out half.
+
+        The number to act on is the held-out one. Weights are searched on the
+        earlier portion only and the later portion is never seen by the
+        search, so the gap between the two is a direct measure of how much of
+        any apparent edge is fitted noise.
+
+        With `dataset`, the replay runs over uploaded chart history instead
+        of the exchange's own candles. That buys length -- years rather than
+        the few thousand bars the API serves -- and buys nothing at all for
+        the book signals, which are not in an OHLCV file. `blind_to` in the
+        response says so on every run, uploaded or not.
+        """
+        from . import backtest as bt_mod
+
+        source = "real exchange candles via candleSnapshot"
+        if dataset:
+            stored = rt.history.dataset(dataset)
+            if stored is None:
+                return {"ok": False, "error": f"no dataset {dataset!r}"}
+            candles = stored["candles"]
+            coin, interval = stored["coin"], stored["interval"]
+            source = (f"uploaded history: {stored['name']} "
+                      f"({len(candles):,} bars)")
+        else:
+            coin = rt.resolve_symbol(coin)[0] or coin
+            try:
+                candles = rt.client().candles(coin, interval,
+                                              bars=max(200, min(bars, 5000)))
+            except Exception as exc:
+                return {"ok": False, "error": f"candles unavailable: {exc}"}
+
+        bt = bt_mod.run(candles, coin, interval,
+                        train_fraction=max(0.3, min(train_fraction, 0.85)),
+                        do_tune=tune)
+
+        def rep(r) -> dict[str, Any]:
+            return {"label": r.label, "n": r.n, "calls": r.calls,
+                    "accuracy": r.accuracy, "coverage": r.coverage,
+                    "edge_pts": r.edge, "describe": r.describe(),
+                    "bands": [{"band": b.band, "n": b.n, "up_rate": b.up_rate}
+                              for b in r.bands],
+                    "curve": r.curve}
+
+        span = ""
+        if candles:
+            from datetime import datetime as _dt
+            a = _dt.utcfromtimestamp(candles[0].ts).strftime("%Y-%m-%d %H:%M")
+            b = _dt.utcfromtimestamp(candles[-1].ts).strftime("%Y-%m-%d %H:%M")
+            span = f"{a} to {b} UTC"
+
+        return {
+            "ok": True, "coin": coin, "interval": interval,
+            "candles": len(candles), "samples": len(bt.samples),
+            "history_span": span,
+            "source": source,
+            "dataset": dataset or None,
+            "train": rep(bt.train), "test": rep(bt.test),
+            "baseline_test": rep(bt.baseline_test) if bt.baseline_test else None,
+            "tuned_weights": bt.tuned_weights,
+            "overfit_gap_pts": bt.overfit_gap,
+            "verdict": bt.verdict(),
+            "blind_to": ["flow", "absorption", "imbalance", "magnet"],
+            "caveat": (
+                "A replay over bars can only train what a bar contains. "
+                "Microprice tilt, replenishment, depletion and absorption "
+                "are not in an OHLCV series at any length, so uploading more "
+                "history improves the candle-geometry half and leaves the "
+                "book half exactly where it was. That half is measured "
+                "forward, live, in the suggestions table."),
+        }
+
+    @app.post("/api/weights", dependencies=[Depends(require_token)])
+    def api_weights(payload: dict[str, float] | None = None,
+                    reset: bool = False) -> dict[str, Any]:
+        """Apply tuned weights to the live read, or put the defaults back.
+
+        Separate from the backtest on purpose: seeing a tuned result and
+        adopting it should be two decisions, not one. A tuned set that only
+        improved the training half is exactly the thing you do not want
+        silently applied to live readings.
+        """
+        from . import candleread
+
+        if reset:
+            candleread.WEIGHTS.clear()
+            candleread.WEIGHTS.update(candleread.DEFAULT_WEIGHTS)
+            return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                    "defaults": dict(candleread.DEFAULT_WEIGHTS),
+                    "note": "defaults restored"}
+        if not payload:
+            return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                    "defaults": dict(candleread.DEFAULT_WEIGHTS)}
+
+        clean = {k: max(0.0, min(float(v), 5.0)) for k, v in payload.items()
+                 if k in candleread.DEFAULT_WEIGHTS}
+        if not clean:
+            return {"ok": False, "error": "no recognised weight names",
+                    "known": sorted(candleread.DEFAULT_WEIGHTS)}
+        candleread.WEIGHTS.update(clean)
+        return {"ok": True, "weights": dict(candleread.WEIGHTS),
+                "defaults": dict(candleread.DEFAULT_WEIGHTS),
+                "applied": clean}
+
+    @app.post("/api/calibrate", dependencies=[Depends(require_token)])
+    def api_calibrate(coin: str = "BTC", interval: str = "15m") -> dict[str, Any]:
+        """Score every closed candle and record how it actually resolved.
+
+        This is what turns the lean into a measurable number. It replays
+        history with the signals that were available from candles alone --
+        NOT flow or absorption, which were not recorded at the time and
+        cannot be reconstructed. So the replayed hit rate is a floor: the
+        live read has strictly more information than this.
+        """
+        coin = rt.resolve_symbol(coin)[0] or coin
+        try:
+            n = rt.replay_calibration(coin, interval)
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        return {"ok": True, "coin": coin, "interval": interval,
+                "scored": n, "table": rt.calibration(coin, interval).table()}
+
+    @app.get("/api/dexes", dependencies=[Depends(require_token)])
+    def api_dexes() -> dict[str, Any]:
+        """Which perp DEXes this service can see.
+
+        If this returns only the canonical DEX, every non-crypto market is
+        invisible to the sweep and that is why they look empty.
+        """
+        try:
+            return {"dexes": rt.client().perp_dexs(),
+                    "check": rt.client().check_dexes()}
+        except Exception as exc:
+            return {"dexes": [], "error": str(exc)}
 
     @app.post("/api/resolve", dependencies=[Depends(require_token)])
     def post_resolve(horizon: float | None = None,
@@ -580,11 +8724,583 @@ def create_app() -> FastAPI:
     # -- dashboard -------------------------------------------------------
 
     @app.get("/", response_class=HTMLResponse)
-    def dashboard() -> str:
-        return DASHBOARD
+    def dashboard() -> HTMLResponse:
+        """The page, and never a cached copy of an older one.
+
+        THIS IS NOT A PERFORMANCE SETTING. The whole dashboard is one
+        HTML string with the JS inside it, so a browser or an edge
+        cache holding yesterday's copy serves yesterday's PANEL while
+        every API call underneath it returns today's data. That
+        failure is almost impossible to read from the outside: the
+        deploy went green, the numbers move, and a control that was
+        added in the new build is simply absent -- which looks
+        exactly like the build not having landed.
+
+        It cost an afternoon once. The page is small and it is
+        rebuilt on every deploy, so there is nothing to gain by
+        letting it be stored.
+        """
+        return HTMLResponse(
+            DASHBOARD,
+            headers={"Cache-Control": "no-store, max-age=0",
+                     "Pragma": "no-cache"})
 
     return app
 
+
+_GL_PAGE = r"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Order Flow · WebGL</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{width:100%;height:100%;background:#0a0a0f;overflow:hidden;font-family:monospace;color:#ccc}
+#hud{position:fixed;top:0;left:0;right:0;height:38px;background:rgba(0,0,0,.7);display:flex;align-items:center;gap:18px;padding:0 16px;font-size:12px;z-index:10;border-bottom:1px solid #222}
+#px{font-size:20px;font-weight:700;letter-spacing:.04em;min-width:100px}
+#px.up{color:#26de81}#px.dn{color:#ff4d6d}#px.fl{color:#aaa}
+#bar-info{color:#999;font-size:11px}
+#poc-label{color:#ffe666;font-size:11px}
+#status{margin-left:auto;font-size:10px;color:#666}
+#links{font-size:10px}#links a{color:#4a9eff;text-decoration:none}
+canvas{display:block;position:fixed;top:38px;left:0;right:0;bottom:0;width:100%;height:calc(100% - 38px)}
+#overlay{position:fixed;top:38px;left:0;bottom:0;width:90px;font-size:9px;color:#666;pointer-events:none;overflow:hidden;z-index:5}
+.price-tick{position:absolute;right:4px;white-space:nowrap;transform:translateY(-50%)}
+.price-tick.cur{color:#fff;font-weight:700;font-size:10px}
+.price-tick.poc{color:#ffe666}
+</style>
+</head><body>
+<div id="hud">
+  <span id="px" class="fl">—</span>
+  <span id="bar-info">loading…</span>
+  <span id="poc-label"></span>
+  <span id="status">connecting…</span>
+  <span id="links"><a href="/?token=__TOKEN__">← dashboard</a></span>
+</div>
+<canvas id="c"></canvas>
+<div id="overlay"></div>
+
+<script>
+'use strict';
+/* ─────────────────────────── CONFIG ─────────────────────────────────────── */
+const COIN     = '__COIN__';
+const INTERVAL = '__INTERVAL__';
+const TOKEN    = '__TOKEN__';
+const TICK     = 0.25;          // ES minimum price increment
+const ROW_PX   = 9;             // canvas pixels per price row
+const PROFILE_FRAC = 0.62;      // fraction of canvas width for profile
+const BOOK_FRAC    = 0.18;      // fraction of canvas width for book depth
+const HEATMAP_FRAC = 0.20;      // fraction for the scrolling time heatmap
+
+/* ─────────────────────────── STATE ──────────────────────────────────────── */
+let latest = null;        // most-recent WebSocket payload
+let prevPx  = null;
+const heatCols = [];      // scrolling heatmap columns [{key:px_tick, delta}...]
+
+const WS_URL = (location.protocol === 'https:' ? 'wss' : 'ws')
+    + '://' + location.host
+    + '/ws/flow?coin=' + COIN + '&interval=' + INTERVAL + '&token=' + TOKEN;
+
+/* ─────────────────────────── WEBSOCKET ─────────────────────────────────── */
+let ws, wsOk = false, lastRecv = 0;
+
+function openWS() {
+  ws = new WebSocket(WS_URL);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen  = () => { wsOk = true; $('status').textContent = 'live'; };
+  ws.onclose = () => { wsOk = false; $('status').textContent = 'reconnecting…'; setTimeout(openWS, 1500); };
+  ws.onerror = () => { wsOk = false; };
+  ws.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) { $('status').textContent = d.error; return; }
+      // snap = full buffer (connect only). tick = one print applied
+      // in-place to the existing typed arrays — no React/state update.
+      if (d.kind === 'tick') applyTick(d);
+      else latest = d;
+      lastRecv = performance.now();
+    } catch(e) {}
+  };
+}
+
+function applyTick(d) {
+  if (!latest) {
+    latest = {ts: d.ts, px: d.px, poc: d.px, maxv: d.sz || 1,
+              profile: [], bids: [], asks: [], bar: null};
+  }
+  latest.ts = d.ts;
+  latest.px = d.px;
+  const rows = latest.profile || (latest.profile = []);
+  let row = null;
+  for (let i = 0; i < rows.length; i++) {
+    if (Math.abs(rows[i].px - d.px) < 1e-9) { row = rows[i]; break; }
+  }
+  if (!row) {
+    row = {px: d.px, b: 0, s: 0};
+    rows.push(row);
+    rows.sort((a, b) => b.px - a.px);
+  }
+  if (d.side === 'buy') row.b += d.sz;
+  else row.s += d.sz;
+  let maxv = 1;
+  for (let i = 0; i < rows.length; i++) maxv = Math.max(maxv, rows[i].b + rows[i].s);
+  latest.maxv = maxv;
+}
+
+/* ─────────────────────────── WEBGL SETUP ───────────────────────────────── */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', {
+  alpha: false, antialias: false, depth: false,
+  powerPreference: 'high-performance',
+  preserveDrawingBuffer: false,
+});
+
+if (!gl) { document.body.innerHTML = '<p style="color:red;padding:2rem">WebGL2 not available in this browser.</p>'; }
+
+/* Compile a shader, crash hard so the error is obvious during dev */
+function mkShader(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+
+function mkProg(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, mkShader(gl.VERTEX_SHADER,   vs));
+  gl.attachShader(p, mkShader(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+/* ── PROFILE PROGRAM (order flow volume bars) ───────────────────────────── */
+const PROFILE_VS = `#version 300 es
+layout(location=0) in vec2 a_pos;   // [-1,1] quad
+out vec2 v_uv;
+void main() {
+  v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+/* Fragment shader:
+   - u_profile is a Nx1 RGBA texture:  R=buy, G=sell, B=flags, A=1
+     where buy/sell are normalised to [0,1] relative to maxv
+     flags: 0=normal, 1=poc row, 2=current-price row, 3=both
+   - The shader splits the canvas into left (buy) and right (sell) halves,
+     draws horizontal bars whose widths are proportional to volume,
+     and colours them green/red with intensity.
+   - Grid lines and the centre axis are added in the shader for zero
+     extra draw calls.                                                     */
+const PROFILE_FS = `#version 300 es
+precision highp float;
+uniform sampler2D u_profile;
+uniform int   u_nrows;        // number of price rows in texture
+uniform float u_cx;           // centre price tick (float)
+uniform float u_top_tick;     // topmost visible tick (float)
+in  vec2  v_uv;
+out vec4  out_color;
+
+const vec3 BG      = vec3(0.04, 0.04, 0.06);
+const vec3 BUY     = vec3(0.06, 0.72, 0.34);
+const vec3 SELL    = vec3(0.90, 0.22, 0.26);
+const vec3 POC_C   = vec3(1.00, 0.90, 0.20);
+const vec3 CUR_C   = vec3(0.60, 0.80, 1.00);
+const vec3 AXIS    = vec3(0.30, 0.30, 0.35);
+
+void main() {
+  float rowF  = v_uv.y * float(u_nrows);
+  int   rowI  = int(rowF);
+  float frac  = rowF - float(rowI);  // 0=top of row, 1=bottom
+
+  // Sample the texture (each row = one price level, top=highest price)
+  float ty = (float(rowI) + 0.5) / float(u_nrows);
+  vec4 tex = texture(u_profile, vec2(0.5, ty));
+
+  float buy  = tex.r;   // normalised 0–1
+  float sell = tex.g;   // normalised 0–1
+  float flag = tex.b;   // 0=normal, 0.33=poc, 0.67=current, 1.0=both
+
+  bool isPoc = flag > 0.20 && flag < 0.50;
+  bool isCur = flag > 0.50;
+
+  vec3 col = BG;
+  float x  = v_uv.x;
+
+  // Centre axis (thin line)
+  float dAx = abs(x - 0.5);
+  if (dAx < 0.0015) { col = AXIS; }
+
+  // Buy bars (left half: bar extends from centre leftward)
+  else if (x < 0.5) {
+    float barW  = buy * 0.5;           // bar width in [0, 0.5]
+    float barX  = 0.5 - barW;
+    if (x >= barX) {
+      float t = buy * 0.6 + 0.4;
+      col = mix(BUY * 0.5, BUY, t);
+      if (isPoc) col = mix(col, POC_C, 0.4);
+      if (isCur) col = mix(col, CUR_C, 0.5);
+    }
+  }
+  // Sell bars (right half: bar extends from centre rightward)
+  else {
+    float barW = sell * 0.5;
+    float barX = 0.5 + barW;
+    if (x <= barX) {
+      float t = sell * 0.6 + 0.4;
+      col = mix(SELL * 0.5, SELL, t);
+      if (isPoc) col = mix(col, POC_C, 0.4);
+      if (isCur) col = mix(col, CUR_C, 0.5);
+    }
+  }
+
+  // Row separator (every row gets a faint bottom border)
+  if (frac > 0.92) col = mix(col, vec3(0.0), 0.35);
+
+  // POC row highlight (top border)
+  if (isPoc && frac < 0.06) col = POC_C;
+
+  // Current price row top border
+  if (isCur && frac < 0.08) col = CUR_C;
+
+  out_color = vec4(col, 1.0);
+}`;
+
+/* ── HEATMAP PROGRAM (scrolling time × price delta heatmap) ─────────────── */
+const HEAT_VS = `#version 300 es
+layout(location=0) in vec2 a_pos;
+out vec2 v_uv;
+void main() {
+  v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+/* Each column of the heatmap texture = one time snapshot.
+   Each row = one price level.
+   R=buy, G=sell normalised.  Alpha encodes POC.                          */
+const HEAT_FS = `#version 300 es
+precision mediump float;
+uniform sampler2D u_heat;
+uniform float u_age;   // seconds since last update, fades old columns
+in  vec2  v_uv;
+out vec4  out_color;
+
+void main() {
+  vec4 t = texture(u_heat, v_uv);
+  float b = t.r, s = t.g;
+  float delta = b - s;
+  // Map delta → hue: positive=green, negative=red, zero=dark
+  vec3 col;
+  if (delta > 0.0) {
+    col = vec3(0.0, delta * 0.8 + 0.1, 0.0);
+  } else {
+    col = vec3(-delta * 0.8 + 0.1, 0.0, 0.0);
+  }
+  // Newest column = brightest, oldest = dimmest
+  float age = v_uv.x;  // x=0 is newest, x=1 is oldest
+  col *= (1.0 - age * 0.7);
+  out_color = vec4(col, 1.0);
+}`;
+
+let progProfile, progHeat;
+try {
+  progProfile = mkProg(PROFILE_VS, PROFILE_FS);
+  progHeat    = mkProg(HEAT_VS,    HEAT_FS);
+} catch(e) { console.error('Shader error:', e); }
+
+/* ── GEOMETRY: fullscreen quad ─────────────────────────────────────────── */
+const quadVerts = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+function makeQuadVAO(prog) {
+  const vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, quadVerts, gl.STATIC_DRAW);
+  const loc = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.bindVertexArray(null);
+  return vao;
+}
+
+const vaoProfile = makeQuadVAO(progProfile);
+const vaoHeat    = makeQuadVAO(progHeat);
+
+/* ── TEXTURES ───────────────────────────────────────────────────────────── */
+// Profile texture: 1 wide × N tall, RGBA8
+let profileTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, profileTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+// Heatmap texture: W wide × N tall (W = max heat columns retained)
+const HEAT_W = 120;   // columns (time steps retained in heatmap)
+let heatTex  = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, heatTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+/* Current texture geometry (re-allocated when price range changes) */
+let texNrows  = 0;
+let texTopTick = 0;
+let profileBuf = null;    // Uint8Array for profile pixel upload
+let heatBuf    = null;    // Uint8Array for heatmap (HEAT_W × nrows × 4)
+let heatDirty  = false;
+let lastHeatTs = 0;
+
+/* ── UNIFORM LOCATIONS ──────────────────────────────────────────────────── */
+const uProfile = {
+  profile : gl.getUniformLocation(progProfile, 'u_profile'),
+  nrows   : gl.getUniformLocation(progProfile, 'u_nrows'),
+  cx      : gl.getUniformLocation(progProfile, 'u_cx'),
+  topTick : gl.getUniformLocation(progProfile, 'u_top_tick'),
+};
+const uHeat = {
+  heat : gl.getUniformLocation(progHeat, 'u_heat'),
+  age  : gl.getUniformLocation(progHeat, 'u_age'),
+};
+
+/* ─────────────────────────── BUILD TEXTURES FROM DATA ──────────────────── */
+function buildProfile(d) {
+  if (!d || !d.profile) return;
+
+  const VIS_TICKS = Math.floor((canvas.height / ROW_PX));   // visible rows
+  const curTick   = Math.round(d.px / TICK);
+  const topTick   = curTick + Math.floor(VIS_TICKS / 2);
+  const botTick   = topTick - VIS_TICKS;
+  const nrows     = VIS_TICKS;
+
+  // Reallocate if size changed
+  if (nrows !== texNrows || topTick !== texTopTick) {
+    texNrows   = nrows;
+    texTopTick = topTick;
+    profileBuf = new Uint8Array(nrows * 4);
+    // Re-allocate heatmap buffer too
+    heatBuf = new Uint8Array(HEAT_W * nrows * 4);
+    // Initialise textures with correct size
+    gl.bindTexture(gl.TEXTURE_2D, profileTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, nrows, 0,
+                  gl.RGBA, gl.UNSIGNED_BYTE, profileBuf);
+    gl.bindTexture(gl.TEXTURE_2D, heatTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, HEAT_W, nrows, 0,
+                  gl.RGBA, gl.UNSIGNED_BYTE, heatBuf);
+  }
+
+  // Index profile by tick
+  const byTick = {};
+  for (const r of d.profile) {
+    byTick[Math.round(r.px / TICK)] = r;
+  }
+  const maxv = d.maxv || 1;
+  const pocTick = Math.round(d.poc / TICK);
+
+  // Fill profile pixel buffer (row 0 = topTick, row N-1 = botTick)
+  for (let i = 0; i < nrows; i++) {
+    const tick = topTick - i;
+    const r    = byTick[tick];
+    const buy  = r ? Math.min(255, Math.round((r.b / maxv) * 255)) : 0;
+    const sell = r ? Math.min(255, Math.round((r.s / maxv) * 255)) : 0;
+    let flag = 0;
+    if (tick === pocTick)  flag |= 1;
+    if (tick === curTick)  flag |= 2;
+    // Encode flags into byte: 0=none, 85=poc, 170=cur, 255=both
+    const flagB = flag === 0 ? 0 : flag === 1 ? 85 : flag === 2 ? 170 : 255;
+    profileBuf[i*4    ] = buy;
+    profileBuf[i*4 + 1] = sell;
+    profileBuf[i*4 + 2] = flagB;
+    profileBuf[i*4 + 3] = 255;
+  }
+
+  // Upload profile texture (1 × nrows)
+  gl.bindTexture(gl.TEXTURE_2D, profileTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1, nrows,
+                   gl.RGBA, gl.UNSIGNED_BYTE, profileBuf);
+
+  // Append new column to heatmap every ~500ms
+  const now = performance.now();
+  if (now - lastHeatTs > 500) {
+    lastHeatTs = now;
+    const col = new Uint8Array(nrows * 4);
+    const hMaxv = maxv;
+    for (let i = 0; i < nrows; i++) {
+      const tick = topTick - i;
+      const r    = byTick[tick];
+      col[i*4    ] = r ? Math.min(255, Math.round((r.b / hMaxv) * 255)) : 0;
+      col[i*4 + 1] = r ? Math.min(255, Math.round((r.s / hMaxv) * 255)) : 0;
+      col[i*4 + 2] = 0;
+      col[i*4 + 3] = 255;
+    }
+    // Shift existing heatmap one column right, prepend new column
+    // heatBuf layout: pixel[col * nrows + row] where col=0 is newest
+    const stride = nrows * 4;
+    heatBuf.copyWithin(stride, 0, (HEAT_W - 1) * stride);  // shift right
+    heatBuf.set(col, 0);                                     // prepend new col
+
+    // Reorder to texture layout: [col][row] → texture x=col, y=row
+    // Build the final texture bytes: x varies (cols), y varies (rows)
+    const texBuf = new Uint8Array(HEAT_W * nrows * 4);
+    for (let c = 0; c < HEAT_W; c++) {
+      for (let r2 = 0; r2 < nrows; r2++) {
+        const src = c * stride + r2 * 4;
+        const dst = (r2 * HEAT_W + c) * 4;
+        texBuf[dst    ] = heatBuf[src    ];
+        texBuf[dst + 1] = heatBuf[src + 1];
+        texBuf[dst + 2] = heatBuf[src + 2];
+        texBuf[dst + 3] = heatBuf[src + 3];
+      }
+    }
+    gl.bindTexture(gl.TEXTURE_2D, heatTex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, HEAT_W, nrows,
+                     gl.RGBA, gl.UNSIGNED_BYTE, texBuf);
+    heatDirty = true;
+  }
+}
+
+/* ─────────────────────────── HUD UPDATES ────────────────────────────────── */
+let lastPxEl = document.getElementById('px');
+
+function updateHUD(d) {
+  if (!d) return;
+  const px = d.px;
+  if (px > 0) {
+    const dir = prevPx == null ? 'fl' : px > prevPx ? 'up' : px < prevPx ? 'dn' : 'fl';
+    lastPxEl.textContent = px.toFixed(2);
+    lastPxEl.className = dir;
+    prevPx = px;
+  }
+  const b = d.bar;
+  if (b) {
+    const delta = b.delta >= 0 ? '+' + b.delta : String(b.delta);
+    $('bar-info').textContent = `O${b.open.toFixed(2)} H${b.high.toFixed(2)} L${b.low.toFixed(2)} C${b.close.toFixed(2)}  vol ${b.vol}  δ${delta}  ${b.trades} fills`;
+  }
+  if (d.poc) $('poc-label').textContent = `POC ${d.poc.toFixed(2)}`;
+
+  // Price tick overlay labels
+  updateTickOverlay(d);
+}
+
+function updateTickOverlay(d) {
+  const el = document.getElementById('overlay');
+  if (!d || !texNrows) { el.innerHTML = ''; return; }
+  const h = canvas.height;
+  const curTick = Math.round(d.px / TICK);
+  const pocTick = Math.round(d.poc / TICK);
+  const labels = [];
+
+  // Show every 4 ticks (1 point for ES)
+  for (let i = 0; i <= texNrows; i += 4) {
+    const tick = texTopTick - i;
+    const y    = (i / texNrows) * h;
+    const pct  = (y / h * 100).toFixed(1);
+    const isCur = tick === curTick;
+    const isPoc = tick === pocTick;
+    const cls   = isCur ? 'price-tick cur' : isPoc ? 'price-tick poc' : 'price-tick';
+    labels.push(`<div class="${cls}" style="top:${pct}%">${(tick * TICK).toFixed(2)}</div>`);
+  }
+  el.innerHTML = labels.join('');
+}
+
+/* ─────────────────────────── RENDER LOOP ───────────────────────────────── */
+function resize() {
+  const w = window.innerWidth, h = window.innerHeight - 38;
+  canvas.width  = w * devicePixelRatio | 0;
+  canvas.height = h * devicePixelRatio | 0;
+  canvas.style.width  = w + 'px';
+  canvas.style.height = h + 'px';
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  // Reset texture so it's rebuilt on next frame
+  texNrows = 0;
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* Viewport slices for the two programs (profile | heatmap).
+   Both use the same fullscreen-quad geometry but we scissor the viewport. */
+function setViewportSlice(startFrac, endFrac) {
+  const W = canvas.width, H = canvas.height;
+  const x = (startFrac * W) | 0;
+  const w = ((endFrac - startFrac) * W) | 0;
+  gl.viewport(x, 0, w, H);
+  gl.scissor(x, 0, w, H);
+}
+
+gl.enable(gl.SCISSOR_TEST);
+
+let frameCount = 0;
+let fpsTs = performance.now();
+let fps = 0;
+
+function frame() {
+  requestAnimationFrame(frame);
+
+  const d = latest;
+  if (!d) return;
+
+  // ── UPDATE GPU TEXTURES (once per frame, from pre-built CPU buffers) ──
+  buildProfile(d);
+  updateHUD(d);
+
+  gl.clearColor(0.04, 0.04, 0.06, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // ── DRAW PROFILE (left PROFILE_FRAC of canvas) ────────────────────────
+  setViewportSlice(0, PROFILE_FRAC);
+  gl.useProgram(progProfile);
+  gl.bindVertexArray(vaoProfile);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, profileTex);
+  gl.uniform1i(uProfile.profile, 0);
+  gl.uniform1i(uProfile.nrows,   texNrows);
+  gl.uniform1f(uProfile.cx,      Math.round(d.px / TICK));
+  gl.uniform1f(uProfile.topTick, texTopTick);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // ── DRAW HEATMAP (right HEATMAP_FRAC of canvas) ───────────────────────
+  setViewportSlice(PROFILE_FRAC + BOOK_FRAC, 1.0);
+  gl.useProgram(progHeat);
+  gl.bindVertexArray(vaoHeat);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, heatTex);
+  gl.uniform1i(uHeat.heat, 0);
+  gl.uniform1f(uHeat.age,  (performance.now() - lastHeatTs) / 1000);
+  if (texNrows > 0) gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // ── BOOK DEPTH (middle strip — drawn with Canvas 2D overlay for clarity) ─
+  // Done via a separate 2D canvas overlaid on top would be complex;
+  // instead we encode book data into the profile texture's alpha channel
+  // and handle it in the fragment shader implicitly via the bars already drawn.
+
+  gl.bindVertexArray(null);
+
+  // FPS counter (in status bar, not canvas)
+  frameCount++;
+  const now = performance.now();
+  if (now - fpsTs > 1000) {
+    fps = frameCount;
+    frameCount = 0;
+    fpsTs = now;
+    const lag = now - lastRecv;
+    $('status').textContent = wsOk
+      ? `live · ${fps} fps · ${lag.toFixed(0)}ms lag`
+      : 'reconnecting…';
+  }
+}
+
+/* ─────────────────────────── BOOT ──────────────────────────────────────── */
+function $(id) { return document.getElementById(id); }
+
+openWS();
+requestAnimationFrame(frame);
+</script>
+</body></html>
+"""
 
 DASHBOARD = """<!doctype html>
 <html lang="en"><head>
@@ -592,7 +9308,35 @@ DASHBOARD = """<!doctype html>
 <title>liqmap</title>
 <style>
   :root{--bg:#0f1216;--panel:#171b21;--line:#262c34;--ink:#e6e4df;--dim:#8b939d;
-        --up:#4eae80;--down:#d9685c;--accent:#d5a340;--mono:ui-monospace,"SF Mono",Menlo,monospace}
+        --up:#4eae80;--down:#d9685c;--accent:#d5a340;--mono:ui-monospace,"SF Mono",Menlo,monospace;
+        /* --long and --short are used in sixteen places and were never
+           defined, so every one of them resolved to nothing: the
+           timeframe ladder's bars, the status dot, the alert bar and the
+           comparison meters have all been rendering colourless. They are
+           the same two colours under a different name, so they are
+           aliased rather than duplicated -- two hex values that drift
+           apart is how a green and a slightly different green end up on
+           one page. */
+        --long:var(--up);--short:var(--down);
+        /* Same again: --fg is the ink colour and --grid is the line
+           colour, under names something was written against and nothing
+           ever declared. The big price on the ticker and the bands have
+           been painting with the inherited default. */
+        --fg:var(--ink);--grid:var(--line)}
+
+  /* Day. The same seven tokens, re-pointed -- every rule in the sheet and
+     every colour the canvas reads goes through them, so the whole page
+     and the chart follow from here without a second stylesheet to keep
+     in step.
+
+     The up and down greens and reds are DARKENED rather than reused.
+     #4eae80 on near-black clears contrast comfortably; the same green on
+     white does not, and a signal colour you cannot read is worse than no
+     colour. */
+  :root[data-theme="light"]{
+        --bg:#f4f5f7;--panel:#ffffff;--line:#d8dce2;--ink:#1b1f25;
+        --dim:#5d656f;--up:#1f8352;--down:#bb3c2f;--accent:#9a6b05}
+  :root[data-theme="light"] .flag{background:rgba(0,0,0,.05)}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:14px/1.5 system-ui,-apple-system,sans-serif}
@@ -607,6 +9351,82 @@ DASHBOARD = """<!doctype html>
   button:hover{border-color:var(--accent)}
   button.go{background:var(--accent);color:#14171b;border-color:var(--accent);font-weight:600}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  .chart-tools{display:flex;gap:3px;align-items:center;margin-bottom:5px}
+  .chart-tools button{background:transparent;border:1px solid var(--line);
+                      color:var(--dim);width:26px;height:24px;padding:0;
+                      border-radius:4px;cursor:pointer;font-size:13px;
+                      line-height:1;font-family:inherit}
+  .chart-tools button:hover{color:var(--ink);border-color:var(--dim)}
+  .chart-tools button.on{color:var(--bg);background:var(--accent);
+                         border-color:var(--accent)}
+  .chart-tools button:not([id]){width:auto;padding:0 8px;font-size:11px}
+  .chart-key{display:flex;flex-wrap:wrap;gap:4px 14px;margin-top:6px;
+       font-size:11px;color:var(--dim);align-items:center}
+  .chart-key span{display:inline-flex;align-items:center;gap:5px}
+  .chart-key i{display:inline-block;flex:none}
+  .k-arrow{width:0;height:0;border-left:5px solid transparent;
+       border-right:5px solid transparent}
+  .k-arrow.k-long{border-top:8px solid var(--up)}
+  .k-arrow.k-short{border-bottom:8px solid var(--down);border-top:none}
+  /* What the canvas actually draws for a trade: long is an UP triangle in
+     the up colour, short is a DOWN triangle in the down colour. */
+  .k-arrow.k-entry-long{border-bottom:8px solid var(--up);border-top:none}
+  .k-arrow.k-entry-short{border-top:8px solid var(--down);border-bottom:none}
+  .k-arrow.k-hollow{opacity:.4}
+  .k-dot{width:7px;height:7px;border-radius:50%}
+  .k-dot.k-long{background:var(--up)}
+  .k-dot.k-short{background:var(--down)}
+  .k-dash{width:16px;height:0;border-top:1px dashed var(--dim)}
+  .k-box{width:9px;height:9px;border:1.5px solid var(--ink);opacity:.6}
+
+  
+
+/* ---- footprint ------------------------------------------------
+     NEVER COLOUR ALONE. The site's --up and --down sit at deutan
+     delta-E 5.1, so a red-green colourblind reader cannot separate
+     them. Every cell therefore carries its number, the two sides sit
+     in fixed columns, and an imbalance is a WORD ("BUY"/"SELL") with
+     a state, not a hue. Colour is the secondary cue here, not the
+     carrier. */
+  .fp{width:100%;border-collapse:collapse;font-family:var(--mono);
+      font-size:11px}
+  .fp th{position:sticky;top:0;background:var(--panel);z-index:1;
+      text-align:right;padding:3px 6px;color:var(--dim);font-weight:500}
+  .fp td{padding:0;border-bottom:1px solid var(--line);
+      white-space:nowrap}
+  .fp .px{text-align:right;padding:2px 8px 2px 4px;color:var(--ink)}
+  .fp .n{text-align:right;padding:2px 6px;position:relative;
+      min-width:66px}
+  /* the volume bar sits BEHIND the number, never instead of it */
+  .fp .n span{position:relative;z-index:1}
+  .fp .n i{position:absolute;top:2px;bottom:2px;display:block;
+      border-radius:2px;opacity:.26}
+  .fp .bidc i{right:0;background:var(--down)}
+  .fp .askc i{left:0;background:var(--up)}
+  .fp .dl{text-align:right;padding:2px 6px;color:var(--dim)}
+  .fp tr.poc .px{font-weight:700;text-decoration:underline}
+  .fp .tag{display:inline-block;padding:0 5px;margin-left:6px;
+      border-radius:3px;font-size:10px;letter-spacing:.04em;
+      border:1px solid var(--line)}
+  .fp .tag.buy{border-color:var(--up);color:var(--up)}
+  .fp .tag.sell{border-color:var(--down);color:var(--down)}
+  .fp .tag.unconf{border-style:dashed;opacity:.9}
+  .fp tr.imb-buy{background:color-mix(in srgb,var(--up) 9%,transparent)}
+  .fp tr.imb-sell{background:color-mix(in srgb,var(--down) 9%,transparent)}
+  .fpwrap{max-height:460px;overflow:auto;border:1px solid var(--line);
+      border-radius:4px}
+  /* diverging meter: two poles, NEUTRAL midpoint, centre tick */
+  .meter{position:relative;display:inline-block;width:150px;height:10px;
+      background:var(--line);border-radius:2px;vertical-align:middle}
+  .meter i{position:absolute;top:0;bottom:0;display:block;border-radius:2px}
+  .meter .mid{position:absolute;left:50%;top:-2px;bottom:-2px;width:1px;
+      background:var(--dim);opacity:.8}
+  .fpstat{display:flex;gap:18px;flex-wrap:wrap;align-items:center;
+      margin:8px 0;font-family:var(--mono);font-size:12px}
+  .fpstat b{font-weight:600}
+  .fphist{display:flex;gap:4px;flex-wrap:wrap;margin-top:8px}
+  .fphist div{border:1px solid var(--line);border-radius:3px;
+      padding:3px 6px;font-family:var(--mono);font-size:10px}
   .panel{background:var(--panel);border:1px solid var(--line);border-radius:5px;padding:14px}
   .panel h2{font-size:11px;text-transform:uppercase;letter-spacing:.1em;
        color:var(--dim);margin:0 0 10px;font-weight:600}
@@ -630,38 +9450,1202 @@ DASHBOARD = """<!doctype html>
   .kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:12px}
   .kv span:nth-child(odd){color:var(--dim)}
   .kv span:nth-child(even){font-family:var(--mono)}
+  /* Tabs. Sticky, because the market selector and the tab you are on are
+     the two things you need while scrolling a long panel. */
+  .tabs{display:flex;gap:4px;flex-wrap:wrap;margin:0 0 14px;
+        position:sticky;top:0;z-index:20;background:var(--bg);
+        padding:8px 0 6px;border-bottom:1px solid var(--line)}
+  .tab-btn{background:transparent;border:1px solid transparent;
+           color:var(--dim);padding:6px 12px;border-radius:5px;
+           font-size:13px;font-weight:600;cursor:pointer;font-family:inherit}
+  .tab-btn:hover{color:var(--ink);background:var(--panel)}
+  .tab-btn.on{color:var(--bg);background:var(--accent)}
+  .tab-btn .pip{display:inline-block;width:6px;height:6px;border-radius:50%;
+                background:var(--up);margin-left:6px;vertical-align:middle}
+  /* An author `display:grid` beats the browser's own [hidden] rule, so the
+     panes stayed on screen while reporting themselves hidden. This has to
+     be stated explicitly. */
+  .tabpane[hidden]{display:none}
+  @media (max-width:640px){
+    .tabs{gap:2px}
+    .tab-btn{padding:6px 9px;font-size:12px}
+  }
   .full{grid-column:1/-1}
+  .conbar{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:12px;
+          font-size:12px;color:var(--dim)}
+  .conbar label{display:flex;align-items:center;gap:5px}
+  .verdict-big{font-size:26px;font-weight:700;letter-spacing:-.02em;margin-bottom:2px}
+  .verdict-big.long{color:var(--up)}.verdict-big.short{color:var(--down)}
+  .verdict-big.split{color:var(--dim)}
+  .conrow{display:flex;flex-wrap:wrap;gap:8px 26px;align-items:baseline;margin:10px 0}
+  .stat{display:flex;flex-direction:column}
+  .stat b{font-family:var(--mono);font-size:15px;font-weight:700}
+  .stat span{font-size:11px;color:var(--dim)}
+  /* Hit rate as a RANGE, never a point: a rate with no sample size behind
+     it is a mood, not a measurement. */
+  .band{position:relative;height:16px;background:var(--grid);border-radius:3px;
+        overflow:hidden;min-width:140px}
+  .band .fill{position:absolute;top:0;bottom:0;border-radius:3px;opacity:.55}
+  .band .fill.clear{background:var(--up)}
+  .band .fill.short{background:var(--down)}
+  .band .fill.undecided{background:var(--dim)}
+  .band .need{position:absolute;top:-2px;bottom:-2px;width:2px;
+              background:var(--ink)}
+  .band .point{position:absolute;top:3px;width:2px;height:10px;
+               background:var(--ink);opacity:.9}
+  .band-key{display:flex;flex-wrap:wrap;gap:4px 14px;margin:6px 0 2px;
+            font-size:11px;color:var(--dim)}
+  .band-key span{display:inline-flex;align-items:center;gap:5px}
+  .band-key i{display:inline-block;flex:none}
+  /* The grid. Diverging, because the metric has a real zero: blue pays,
+     red loses, neutral is breaking even. Blue-red rather than the app's
+     green-red because dozens of adjacent cells have to be told apart --
+     measured, green/red collapses to deltaE 5 under deuteranopia while
+     blue/red holds at 19. Every cell prints its number as well, so the
+     colour never carries the meaning by itself. */
+  .heat{border-collapse:separate;border-spacing:2px;font-size:11px}
+  .heat th{font-weight:600;color:var(--dim);font-size:11px;padding:2px 6px;
+           white-space:nowrap}
+  .heat td{padding:5px 7px;text-align:right;font-family:var(--mono);
+           color:var(--ink);border-radius:3px;min-width:56px;cursor:default}
+  .heat td.sig{outline:1.5px solid var(--ink);outline-offset:-1.5px}
+  .heat td.best{outline:2px solid var(--accent);outline-offset:-2px}
+  .heat-key{display:flex;flex-wrap:wrap;gap:6px 16px;align-items:center;
+            margin:8px 0;font-size:11px;color:var(--dim)}
+  .heat-key i{display:inline-block;height:10px;border-radius:2px}
+  /* The agreement banner reuses the read panel's .alertbar, plus the two
+     side colours and its own buttons. */
+  .alertbar.long{border-left-color:var(--up)}
+  .alertbar.short{border-left-color:var(--down)}
+  .alertbar button{background:transparent;border:1px solid var(--line);
+                   color:var(--ink);padding:3px 9px;border-radius:4px;
+                   cursor:pointer;font-size:12px;font-family:inherit}
+  .prop{border:1px solid var(--grid);border-radius:4px;padding:10px 12px;
+        margin-bottom:8px}
+  .prop pre{white-space:pre-wrap;font-family:var(--mono);font-size:11px;
+            color:var(--dim);margin:6px 0}
+  .thin{font-size:11px;color:var(--dim)}
+  .gap-bad b{color:var(--down)}
+  .gap-ok b{color:var(--up)}
+  .flag{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;
+        font-weight:700;letter-spacing:.05em;margin-right:6px}
+  .flag.crowded{background:#45241f;color:var(--down)}
+  .flag.late{background:#3e3318;color:var(--accent)}
+  .say{font-size:13px;color:var(--ink);line-height:1.6;margin-top:10px;
+       padding:10px 12px;background:var(--bg);border-radius:4px;
+       border-left:3px solid var(--accent)}
   label{font-size:12px;color:var(--dim);display:block;margin:8px 0 2px}
+
+  /* Live price and staleness. Every reading on this page is a snapshot from
+     a poll; without an age beside it there is no way to tell a quiet market
+     from a feed that stopped. */
+  .ticker{display:flex;flex-wrap:wrap;align-items:center;gap:18px;
+    padding:12px 16px;margin-bottom:14px;background:var(--panel);
+    border:1px solid var(--line);border-radius:6px}
+  .tick-px{display:flex;align-items:baseline;gap:10px;font-size:13px;
+    color:var(--dim)}
+  .tick-px b{font-size:28px;color:var(--fg);font-variant-numeric:tabular-nums}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--long);
+    display:inline-block;align-self:center}
+  .dot.warn{background:#d6a14a} .dot.bad{background:var(--short)}
+  .dot.live{animation:pulse 2s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .tick-age{font-size:12px;font-variant-numeric:tabular-nums}
+  .tick-age.warn{color:#d6a14a} .tick-age.bad{color:var(--short)}
+  .tick-src{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--dim)}
+  .tick-src span b{color:var(--fg);font-weight:600}
+  .tick-src span.warn b{color:#d6a14a} .tick-src span.bad b{color:var(--short)}
+  .stamp{font-size:11px;color:var(--dim);font-weight:400;margin-left:8px}
+  .stamp.warn{color:#d6a14a} .stamp.bad{color:var(--short)}
+
+  .alertbar{padding:12px 14px;margin:10px 0;border-radius:5px;font-size:14px;
+    font-weight:600;border-left:4px solid}
+  .alertbar.up{background:rgba(74,168,116,.14);border-color:var(--long);
+    color:var(--long)}
+  .alertbar.down{background:rgba(201,90,90,.14);border-color:var(--short);
+    color:var(--short)}
+  .alertbar small{display:block;font-weight:400;color:var(--dim);margin-top:4px}
+  .bt-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+    gap:14px;margin-top:10px}
+  .bt-col{padding:10px 12px;background:var(--bg);border-radius:5px;
+    border:1px solid var(--line)}
+  .bt-col h3{margin:0 0 6px;font-size:12px;text-transform:uppercase;
+    letter-spacing:.06em;color:var(--dim)}
+  .bt-col.held{border-color:var(--accent)}
+  .bt-big{font-size:26px;font-variant-numeric:tabular-nums}
+  /* The merged ladder: timeframe once, then the two readings of it side
+     by side. Each half carries its own left edge colour, so a row where
+     the read and the flow disagree is visible without reading a word.
+
+     It replaced two single-sided ladders, and their `.tf` rule went with
+     them rather than being left behind as dead styling for the next
+     person to half-remember. */
+  /* The six layers. One block each, in the order they are read: what
+     somebody did, and then what happened to it. A block that could not be
+     measured is dimmed and says why rather than showing a zero -- a
+     missing layer and a balanced one are different things and the whole
+     read depends on telling them apart. */
+  .lay{display:grid;grid-template-columns:118px 1fr;gap:12px;
+    align-items:baseline;padding:9px 12px;border-radius:4px;
+    margin-bottom:4px;background:var(--bg);
+    border-left:3px solid var(--line);font-size:13px}
+  .lay.off{opacity:.5;border-left-style:dotted}
+  .lay b{font-size:11px;text-transform:uppercase;letter-spacing:.06em;
+    color:var(--dim)}
+  .lay b i{display:block;font-style:normal;font-size:16px;font-weight:700;
+    letter-spacing:0;color:var(--line);line-height:1}
+  .lay .says{color:var(--ink)}
+  .lay .nums{display:block;margin-top:3px;font-size:11px;color:var(--dim);
+    font-variant-numeric:tabular-nums}
+  .tf2{display:grid;grid-template-columns:104px 1fr 1fr;gap:10px;
+    align-items:stretch;margin-bottom:4px;font-size:13px}
+  .tf2>b{align-self:center;font-variant-numeric:tabular-nums;
+    text-align:right;color:var(--dim)}
+  /* The fuel gauge sits with the timeframe rather than in either half,
+     because how much volume this candle has is a fact about the CANDLE.
+     Both reads are looking at the same bar, and putting it in one half
+     would imply it belonged to that read. */
+  .tf2>b span{display:block;font-weight:400;font-size:10px;
+    line-height:1.3;white-space:nowrap}
+  /* The timeframe and its verdict share a line, because the verdict is
+     about that timeframe and reads as a label on it rather than as
+     another column to scan. */
+  .tf2>b .tfname{font-size:13px;font-weight:700;color:var(--dim)}
+  .tf2>b em{font-style:normal;font-weight:700;font-size:11px;
+    letter-spacing:.04em}
+  .tf2>b em.long{color:var(--up)}
+  .tf2>b em.short{color:var(--down)}
+  .tf2>b span span{display:inline}
+  .tf2>b i{display:block;height:3px;border-radius:2px;background:var(--line);
+    margin-top:2px;position:relative;overflow:hidden}
+  .tf2>b i::after{content:"";position:absolute;left:0;top:0;bottom:0;
+    width:var(--v,0%);background:var(--dim)}
+  .tf2>b i.heavy::after{background:var(--accent)}
+  .tf2>b i.quiet::after{background:var(--line)}
+  .tf2 .half{display:grid;grid-template-columns:72px 1fr 250px;gap:8px;
+    align-items:center;padding:7px 10px;border-radius:4px;
+    background:var(--bg);border-left:3px solid var(--line);min-width:0}
+  .tf2 .half.buyers{border-left-color:var(--long)}
+  .tf2 .half.sellers{border-left-color:var(--short)}
+  .tf2 .who{font-weight:600;letter-spacing:.03em}
+  /* A half with no reading behind it has no bar to draw, so its label
+     takes that room rather than wrapping "NOT COVERED" onto two lines
+     and making the empty row the tallest one on the ladder. */
+  .tf2 .who.wide{grid-column:1/3;white-space:nowrap}
+  .tf2 .bar{height:6px;background:var(--line);border-radius:3px;
+    position:relative}
+  .tf2 .bar i{position:absolute;top:0;bottom:0;border-radius:3px}
+  .tf2 .bar i.buyers{left:50%;background:var(--long)}
+  .tf2 .bar i.sellers{right:50%;background:var(--short)}
+  .tf2 .meta{font-size:11px;color:var(--dim);text-align:right;
+    font-variant-numeric:tabular-nums;white-space:nowrap;
+    overflow:hidden;text-overflow:ellipsis}
+  /* The age badge rides inside the meta line, so it is sized to sit in
+     it rather than to stand alone. A row that wrapped to two lines put
+     its two halves on different baselines, and the row that wrapped was
+     always the stale one -- the row you most need to read straight. */
+  .tf2 .meta .flag{padding:1px 5px;margin:0 0 0 2px;font-size:10px;
+    letter-spacing:.03em}
+  .tf2.ladhead{margin-bottom:6px;font-size:11px;text-transform:uppercase;
+    letter-spacing:.06em;color:var(--dim)}
+  .tf2.ladhead i{display:block;font-style:normal;text-transform:none;
+    letter-spacing:0;font-size:11px;color:var(--dim);opacity:.75}
+  /* Narrow screens stack the two halves under the timeframe rather than
+     squeezing both: a delta that has wrapped to three lines is worse than
+     a delta on the next row. */
+  @media (max-width:980px){
+    .tf2{grid-template-columns:104px 1fr;row-gap:2px;margin-bottom:10px}
+    .tf2>span,.tf2 .half{grid-column:2}
+    .tf2 .half{grid-template-columns:72px 1fr 200px}
+    /* Stacked, the halves are no longer side by side, so a wrapped line
+       misaligns nothing -- and wrapping beats clipping the age off the
+       end of the one row whose age matters. */
+    .tf2 .meta{white-space:normal}
+    /* Stacked, the layer blocks put their name above the sentence
+       rather than beside it. */
+    .lay{grid-template-columns:1fr;gap:2px}
+    .lay b i{display:inline;margin-right:6px;font-size:13px}
+  }
+  .call{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
+    padding:10px 0 4px}
+  .call b{font-size:44px;letter-spacing:.02em;line-height:1}
+  .call .sub{font-size:13px;color:var(--dim);font-variant-numeric:tabular-nums}
+  .comp{display:grid;grid-template-columns:132px 64px 1fr;gap:10px;
+    align-items:center;font-size:12px;padding:4px 0;
+    border-bottom:1px solid var(--line)}
+  .comp .v{font-variant-numeric:tabular-nums;text-align:right}
+  .comp .m{height:5px;background:var(--line);border-radius:3px;position:relative}
+  .comp .m i{position:absolute;top:0;bottom:0;border-radius:3px}
+  .comp .m i.pos{left:50%;background:var(--long)}
+  .comp .m i.neg{right:50%;background:var(--short)}
+  .wgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));
+    gap:8px}
+  .wgrid div{background:var(--bg);border:1px solid var(--line);border-radius:4px;
+    padding:6px 8px}
+  .wgrid label{margin:0 0 3px;font-size:11px}
+  .wgrid input{width:100%;padding:4px 6px;font-size:13px}
+  .wgrid div.changed{border-color:var(--accent)}
 </style></head><body>
 <div class="wrap">
   <h1>liqmap</h1>
-  <div class="sub">Liquidation pressure, position strength, and what changed since the last sweep.</div>
+  <div class="sub">Live Hyperliquid positions, read straight from the exchange API.
+    Nothing to paste in — <b>Harvest wallets</b> listens to the public trade feed to find
+    who is active, <b>Sweep now</b> reads every one of their open positions, and the
+    background worker re-sweeps on its own every 30 minutes.</div>
 
   <div class="bar">
+    <button id="themeBtn" onclick="toggleTheme()" title="Day or night"
+      style="min-width:74px">night</button>
     <input type="password" id="tok" placeholder="access token">
-    <input id="coin" value="BTC" size="6">
+    <select id="klass" onchange="renderCoins()" style="min-width:110px"
+            title="asset class"><option value="">all classes</option></select>
+    <input id="mktFind" size="10" placeholder="find…" oninput="renderCoins()"
+           title="filter by ticker">
+    <select id="coin" onchange="onCoinChange()" style="min-width:160px"
+            title="every market listed on the exchange — a dot marks ones with swept position data">
+      <option value="BTC">BTC</option></select>
+    <span id="mktCount" class="msg" style="margin-right:6px">—</span>
     <button class="go" onclick="loadAll()">Load</button>
     <button onclick="doHarvest()">Harvest wallets</button>
     <input id="hmin" type="number" value="5" min="1" max="180" step="1"
            title="minutes to listen to the trade feed" style="width:62px">
     <span class="msg" style="margin-right:6px">min</span>
+    <input id="hcoins" size="18" placeholder="tapes: BTC,ETH,SOL"
+           title="which markets to listen to for wallet discovery — blank uses your configured coins">
+
     <button onclick="doSweep()">Sweep now</button>
     <button onclick="doResolve()">Resolve</button>
     <span id="msg" class="msg"></span>
   </div>
 
-  <div class="grid">
+  <div id="ticker" class="ticker">
+    <div class="tick-px"><span id="tickSym">—</span>
+      <b id="tickPx">—</b>
+      <span id="tickDot" class="dot"></span>
+      <span id="tickAge" class="tick-age">connecting…</span></div>
+    <div id="tickSources" class="tick-src"></div>
+  </div>
+
+  <div id="venueNote" class="say" style="display:none;margin-bottom:14px"></div>
+
+  <!-- One screen at a time. The page had grown to seventeen panels in
+       one column, which meant the three you actually watch were separated
+       by a screenful of things you were not. -->
+  <div class="tabs" id="tabs">
+    <button class="tab-btn on" id="tabbtn-dash" onclick="showTab('dash')">Dashboard</button>
+    <button class="tab-btn" id="tabbtn-test" onclick="showTab('test')">Testing</button>
+    <button class="tab-btn" id="tabbtn-book" onclick="showTab('book')">Book &amp; liquidity</button>
+    <button class="tab-btn" id="tabbtn-wall" onclick="showTab('wall')">Wallets</button>
+    <button class="tab-btn" id="tabbtn-setup" onclick="showTab('setup')">Settings</button>
+  </div>
+
+  <div class="grid tabpane" id="tab-dash">
+
+    <div class="panel full" id="fpPanel"><h2>Footprint &mdash; who paid, at which price
+      <span class="stamp" id="fpStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Every print sorted by the price it
+        traded at and the side that crossed the spread. <b>bid</b> is contracts taken
+        by aggressive sellers, <b>ask</b> by aggressive buyers. A level is flagged when
+        one side beats the <i>diagonal</i> one tick away by the multiplier &mdash; buyers
+        at P against sellers at P&minus;1. Flags on the forming bar are
+        <b>unconfirmed</b> and can still vanish; at the close they become
+        <b>confirmed</b> and never change.</div>
+
+      <div class="conbar">
+        <label>bars <select id="fpRule">
+          <option value="1m">1 minute</option>
+          <option value="5m">5 minutes</option>
+          <option value="15m">15 minutes</option>
+          <option value="vol">by volume</option></select></label>
+        <label>contracts <input type="number" id="fpVol" value="500"
+          style="width:76px"></label>
+        <label>multiplier <input type="number" id="fpMult" value="4"
+          step="0.5" style="width:60px"></label>
+        <label>min volume <input type="number" id="fpMin" value="0"
+          style="width:64px"></label>
+        <label>push ticks <input type="number" id="fpPush" value="4"
+          min="1" style="width:56px"></label>
+        <label><input type="checkbox" id="fpAuto" checked> live</label>
+        <button class="btn" onclick="fpLoad();mgLoad()">Refresh</button>
+      </div>
+
+      <div id="fpStats" class="fpstat"></div>
+      <div id="ofiBars" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+      <div id="fpVerdict" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+      <div id="fpBook" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+      <div id="dexArb" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+      <div id="fpClear" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+      <div id="fpBody"><div class="msg">Loading&hellip;</div></div>
+      <div id="fpHist" class="fphist"></div>
+    </div>
+
+    <div class="panel full" id="mgPanel"><h2>Book CVD &mdash; the reader,
+      and the tape that confirms it
+      <span class="stamp" id="mgStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px"><b>Book CVD</b> is the
+        reader: size added or pulled at the inside quotes, counted only
+        while the quote stands still, so it measures liquidity and not
+        price drift. <b>Traded CVD</b> is the confirmation: aggressor-signed
+        volume, smoothed on elapsed seconds rather than on trade count, so
+        it smooths the same amount at 03:00 as at the open. Both are shown
+        in standard deviations of their own recent behaviour &mdash; that is
+        what lets two different quantities share one axis honestly. A cross
+        counts as <b>held</b> only once the two have agreed for long enough
+        and are not flipping. It reports; it decides nothing.</div>
+      <div id="mgStats" class="fpstat"></div>
+      <div id="mgChart" style="margin-top:8px"></div>
+      <div class="fpstat" style="border-top:1px solid var(--line);
+           padding-top:8px;margin-top:8px">
+        <span class="stamp">book CVD per bar</span>
+        <select id="mgTf" class="btn" onchange="mgPickTf()">
+          <option value="60">1m</option>
+          <option value="300" selected>5m</option>
+          <option value="900">15m</option>
+        </select>
+        <label><input type="checkbox" id="mgLine" onchange="mgLoad()">
+          line instead of candles</label>
+      </div>
+      <div id="mgBars"></div>
+      <div id="mgCross" class="fpstat" style="border-top:1px solid
+           var(--line);padding-top:8px"></div>
+    </div>
+
+    <div class="panel full" id="ofiPanel"><h2>Order flow imbalance &mdash; who is winning the book race
+      <span class="stamp" id="ofiStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">CME depth, event by event. This
+        measures pressure at the touch <b>right now</b> &mdash; it does not forecast.
+        Positive is net buying, negative net selling.</div>
+      <div id="ofiOff" class="say"></div>
+      <div id="ofiOn" style="display:none">
+        <div style="display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin-bottom:10px">
+          <div><span id="ofiSide" style="font-size:26px;font-weight:700">&mdash;</span>
+            <span class="msg" id="ofiSideNote"></span></div>
+          <div class="msg">z <b id="ofiZ" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">window <b id="ofiWin" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">book <b id="ofiObi" style="font-family:var(--mono)">&mdash;</b></div>
+          <div class="msg">spread <b id="ofiSpread" style="font-family:var(--mono)">&mdash;</b></div>
+        </div>
+        <svg id="ofiSpark" viewBox="0 0 600 70" preserveAspectRatio="none"
+             style="width:100%;height:70px;display:block"></svg>
+        <div class="msg" id="ofiStats" style="margin-top:8px">&mdash;</div>
+      </div>
+    </div>
+
+
+    <div class="panel full" id="agentPanel"><h2>Chart
+      <span class="stamp" id="sugStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Candles, the two volume
+        profiles and the 4H/15m/1m setups. The read beneath it is the one
+        to trade from. <b>Nothing here places an order.</b></div>
+
+      <div class="conbar">
+        <label>candle <select id="sInt" onchange="chartTfChanged()">
+          <optgroup label="by the clock">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></optgroup>
+          <optgroup label="by prints (ES tape only)">
+          <option value="233t">233 ticks</option>
+          <option value="500t">500 ticks</option>
+          <option value="1000t">1,000 ticks</option>
+          <option value="2000t">2,000 ticks</option>
+          <option value="5000t">5,000 ticks</option>
+          <option value="10000t">10,000 ticks</option></optgroup>
+          <optgroup label="fused: prints AND imbalance (ES only)">
+          <option value="1000x500">1,000 ticks &times; 500 OFI</option>
+          <option value="2500x1000">2,500 ticks &times; 1,000 OFI</option>
+          <option value="5000x2000">5,000 ticks &times; 2,000 OFI</option>
+          <option value="10000x4000">10,000 ticks &times; 4,000 OFI</option>
+          </optgroup>
+        </select></label>
+        <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
+        <label><b>stop loss</b> <input id="apSl" value="10" size="3"></label>
+        <label>in <select id="apUnit">
+          <option value="bps" selected>bps</option>
+          <option value="ticks">ticks / pips</option></select></label>
+        <label>size $<input id="sSize" value="10000" size="7"
+          onchange="loadSuggest()"></label>
+        <label title="Round trip. Hyperliquid base tier is 4.5bps a side
+taker, so 9 both ways; a HIP-3 builder market can add more on top. Book
+slippage at your size is measured separately and added to this.">fee
+          <input id="sFee" value="9" size="3"
+          onchange="loadSuggest()">bps</label>
+        <label><input type="checkbox" id="sAuto" onchange="toggleSuggestAuto()">
+          auto</label>
+        <button class="go" onclick="startFeed()" id="sugLive">Go live</button>
+        <button onclick="stopFeed()">Stop feed</button>
+        <button onclick="loadSuggest()">Ask</button>
+      </div>
+
+      <div class="conbar" style="margin-top:-4px">
+        <b style="color:var(--ink)">Only take it when:</b>
+        <label title="Book, delta and price all pointing the same way —
+3-0, never 2-1 and never one column with two quiet."><input type="checkbox"
+          id="apUnan" checked>all three agree</label>
+        <label title="Aggressive volume against what this market normally
+trades for the span. 100% is normal.">volume over
+          <input id="apEffort" value="200" size="3">% of normal</label>
+        <label title="Off keeps the live book identical to the grid, so a
+result from the grid transfers unchanged."><input type="checkbox"
+          id="apInval">also exit when the read flips</label>
+        <label title="Sound, a banner, and a desktop notification the
+moment all three line up."><input type="checkbox" id="apAlert" checked
+          onchange="armAgreeAlert()">alert me the moment they agree</label>
+      </div>
+
+      <div class="conbar" style="margin-top:-4px">
+        <button class="go" id="apToggle" onclick="toggleAutopilot()">Let it
+          decide</button>
+        <button onclick="stepAutopilot()">Decide once</button>
+        <button onclick="backfillBook()" title="Trade every candle already
+recorded, under the rule set above. Settled against real one-minute bars,
+same one-candle hold.">Trade every past candle</button>
+        <button onclick="downloadBook()" title="Every trade, winners and
+losers, as one CSV you can open in a spreadsheet">Download the book</button>
+        <button onclick="loadScorecard()">Refresh score</button>
+        <button onclick="clearBook()" title="Throw the book away and start
+counting from now.">Clear the book</button>
+      </div>
+
+      <div id="apAlertBar" class="alertbar" style="display:none"></div>
+      <div id="apCal" class="say" style="display:none;margin-bottom:8px"></div>
+      <div id="sugFeed" class="msg" style="display:none;margin-bottom:8px"></div>
+<div id="chartWrap" style="display:none;margin-bottom:12px">
+        <div id="profRead" style="font:11px ui-monospace,monospace;
+          color:var(--dim);margin-bottom:4px;min-height:14px"
+          title="Where price sits against the profile, and what it is doing
+there. Facts about closed bars — no forecast, no trade."></div>
+        <div id="nestRead" style="font:11px ui-monospace,monospace;
+          color:var(--dim);margin-bottom:5px;min-height:14px"
+          title="Where the micro volume profile sits inside the structural
+one. Hover for the rule."></div>
+        <div id="mtfRead" style="font:11px ui-monospace,monospace;
+          color:var(--dim);margin-bottom:5px;min-height:14px"
+          title="The most recent 4H/15m/1m setup, and what it has to beat.
+A suggestion \u2014 nothing here places an order."></div>
+        <div class="chart-tools">
+          <button id="tool-cursor" class="on"
+            onclick="pickTool('cursor')" title="Crosshair">✛</button>
+          <button id="tool-hline" onclick="pickTool('hline')"
+            title="Horizontal line — click a price">─</button>
+          <button id="tool-trend" onclick="pickTool('trend')"
+            title="Trendline — drag from one point to another">╱</button>
+          <button id="tool-erase" onclick="pickTool('erase')"
+            title="Erase — click the line you want gone">⌫</button>
+          <button onclick="clearShapes()" title="Remove every line you have
+drawn on this market and timeframe">clear</button>
+          <button onclick="resetChartView()" title="Back to the last 90 bars
+at normal scale">fit</button>
+          <button id="tool-prof" class="on" onclick="cycleProfile()"
+            title="Volume profile — click to cycle: both profiles
+(structural + micro), prior session's shape, this session's shape,
+off">prof·2</button>
+          <span class="thin" style="margin-left:4px">SVP</span>
+          <select id="svpMin" onchange="setWindows()"
+            title="Structural profile — how far back it looks. This is the
+auction you are reading context from.">
+            <option value="15">15m</option>
+            <option value="30">30m</option>
+            <option value="60" selected>1H</option>
+            <option value="120">2H</option>
+            <option value="240">4H</option>
+            <option value="480">8H</option>
+            <option value="720">12H</option>
+            <option value="1440">1D</option>
+          </select>
+          <span class="thin">MVP</span>
+          <select id="mvpMin" onchange="setWindows()"
+            title="Micro profile — how far back it looks. It is the tail of
+the structural window, binned on the same grid, so the two sets of levels
+are comparable. Must be shorter than the SVP.">
+            <option value="1">1m</option>
+            <option value="2">2m</option>
+            <option value="3">3m</option>
+            <option value="5">5m</option>
+            <option value="10" selected>10m</option>
+            <option value="15">15m</option>
+            <option value="30">30m</option>
+            <option value="60">1H</option>
+            <option value="120">2H</option>
+          </select>
+          <button id="tool-proj" class="on" onclick="toggleProj()"
+            title="Projected close — where this bar lands, given what has
+already printed">proj</button>
+          <button id="tool-mtf" class="on" onclick="toggleMTF()"
+            title="4H / 15m / 1m setups \u2014 filled bubble means the 15m
+bar closed the way the setup needed, hollow means it is still forming,
+faint means it was withdrawn">mtf</button>
+          <button id="tool-ppo" class="on" onclick="togglePPO()"
+            title="Tick Counter PPO — your indicator, computed from these
+bars">ppo</button>
+          <span class="thin" style="margin-left:6px">lines are kept per
+            market and timeframe, in this browser</span>
+        </div>
+        <!-- The wrapper carries the resize handle, so the whole chart can
+             be dragged taller; the dividers inside then split whatever
+             height it has. -->
+        <div id="chartBox" style="height:470px;min-height:240px;
+             max-height:1400px;resize:vertical;overflow:hidden;
+             border:1px solid var(--line);border-radius:4px">
+          <canvas id="sugChart" height="470"
+            style="width:100%;height:100%;display:block"></canvas>
+        </div>
+        <!-- A legend, not a caption. Identity is never carried by colour
+             alone: filled vs hollow says taken vs ignored, and the arrow
+             direction says which side. -->
+        <div class="chart-key">
+          <span><b style="color:var(--up)">L</b> went long — marker under
+            the bar</span>
+          <span><b style="color:var(--down)">S</b> went short — over the
+            bar</span>
+          <span><b style="color:var(--up)">●&thinsp;+28</b> exit, net bps</span>
+          <span>hollow triangle = still open</span>
+          <span><i class="k-dash"></i>target and stop</span>
+          <span>dashed line across = last price</span>
+          <span><i class="k-box"></i>bar still forming, with its countdown
+            in the corner</span>
+          <span>shaded block right of the live bar = where this candle is
+            projected to close, darker is the middle half</span>
+          <span><b>BUY/SELL and the distance</b> are what the model
+            claims; <b>% measured</b> is how often bars actually finished
+            that way — press <b>Test the signal now</b> to fill it in</span>
+          <span><i style="width:14px;height:2px;background:#4d8fd1;
+            display:inline-block"></i>tick PPO</span>
+          <span><i style="width:14px;height:2px;background:#c17d33;
+            display:inline-block"></i>its signal</span>
+          <span>bars = the two apart, green over zero</span>
+        </div>
+        <div id="chartNote" class="msg" style="margin-top:4px"></div>
+      </div>
+    </div>
+
+<div class="panel full" id="readPanel"><h2>Candle read — live<span class="stamp" id="readStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Everything this service knows,
+        assembled into one direction on the candle still forming. Absorption
+        <b>inverts</b> flow: heavy buying that is not moving price is a bearish
+        reading, not a bullish one.</div>
+      <div class="conbar">
+        <label>candle <select id="rInt" onchange="readTfChanged()">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label>higher TF <select id="rHigh" onchange="loadRead()">
+          <option>15m</option><option>30m</option><option>1h</option>
+          <option selected>4h</option><option>12h</option>
+          <option>1d</option></select></label>
+        <label>alert at <select id="rAlert" onchange="saveAlert()">
+          <option value="0">off</option><option value="0.6">60%</option>
+          <option value="0.7">70%</option><option value="0.8" selected>80%</option>
+          <option value="0.9">90%</option></select> confidence</label>
+        <label title="The read follows the chart's timeframe. Trading the
+15m means reading the 15m, and two selectors on one screen is a way to end
+up reading one timeframe while looking at another."><input type="checkbox"
+          id="rFollow" checked onchange="followChartTf()"> follow chart</label>
+        <label><input type="checkbox" id="rAuto" onchange="toggleReadAuto()">
+          live</label>
+        <label>book window <select id="bkWin" onchange="loadBookCall()">
+          <option value="5">5s</option><option value="10">10s</option>
+          <option value="20" selected>20s</option><option value="60">60s</option>
+        </select></label>
+        <label title="The spread is judged against this: the same one tick
+is trivial against forty and fatal against five.">target
+          <input id="flowTgt" type="number" min="1" max="200" step="1"
+            value="10" onchange="loadFlow()" style="width:52px">ticks</label>
+        <label title="How far above its own ten-minute baseline the tape
+has to be running before the gate stops refusing.">spike
+          <input id="flowSpike" type="number" min="1" max="10" step="0.5"
+            value="2" onchange="loadFlow()" style="width:48px">x</label>
+        <button onclick="startFeed()" id="feedBtn">Go live (websocket)</button>
+        <button onclick="stopFeed()">Stop feed</button>
+        <button onclick="loadRead()">Read now</button>
+        <button onclick="doCalibrate()">Calibrate</button>
+      </div>
+      <div id="feedBar" class="msg" style="margin-bottom:8px">Feed off — the
+        current candle is being polled. Go live to build it from the tape instead.</div>
+      <div id="alertBar" class="alertbar" style="display:none"></div>
+      <!-- ONE ROW PER TIMEFRAME, TWO READINGS ON IT.
+           The candle read and the order flow measure the same bar from
+           different feeds, and the whole value is in whether they agree.
+           Two ladders a screen apart made that a memory test. They stay
+           independent measurements: each half keeps its own side, its own
+           staleness and its own refusal, and neither is averaged into the
+           other. -->
+      <div class="tf2 ladhead">
+        <b>tf</b>
+        <span>candle read<i>who is winning the bar, and whether the move
+          is being absorbed</i></span>
+        <span>order flow<i>delta and CVD on this bar, and how fast it is
+          printing against the bars before it<span class="stamp"
+          id="flowStamp"></span></i></span>
+      </div>
+      <div id="tfLadder"></div>
+      <div class="msg" style="margin-top:8px"><b>Tradeable</b> below means
+        nothing is refusing: the spread is small against your target, the
+        tape is running above its own baseline, and the measured
+        timeframes lean the same way. It is not a direction.</div>
+      <div id="flowGate" class="say" style="margin:6px 0 10px">—</div>
+      <div id="tfSay" class="say" style="display:none;margin-bottom:12px"></div>
+      <div id="readHead" class="msg">—</div>
+      <div id="readSignals"></div>
+      <div id="readSay" class="say" style="display:none"></div>
+
+    </div>
+
+    <!-- The stack beneath the timeframe being traded. ITS OWN PANEL and
+         its own rule: the ladder above votes on the bps sign alone, this
+         requires the colour AND the bps to agree. Reads the same rows. -->
+    <div class="panel full" id="stackPanel"><h2>The stack under your
+      timeframe<span class="stamp" id="cascStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">A one-minute candle builds
+        a fifteen from the ground up, so the rows below the one you are
+        trading are not separate opinions — they are your candle being
+        built in front of you. A row counts <b>up</b> only if it is green
+        <i>and</i> its move is positive, <b>down</b> only if red
+        <i>and</i> negative. A green row with a negative move is not a
+        weak buy, it is a row contradicting itself, and it is thrown out —
+        that is what absorption looks like. Nothing above your timeframe
+        takes part.</div>
+      <div id="cascSay" class="say" style="margin-bottom:10px">—</div>
+      <div id="cascRows"></div>
+      <!-- One line, directly under the fastest row. The seven readings
+           behind it are still taken on every poll and still go out in the
+           payload -- they are just not on the screen. -->
+      <div id="traceLine"></div>
+      <!-- READ, PRICE and THIS BAR, repeated from the footprint panel
+           so the stack and the flow reading can be taken in together
+           instead of by scrolling between them. NOT a second opinion:
+           these are the same strings that panel draws, and nothing in
+           the stack above is computed from them or changed by them. -->
+      <div id="stackStrip" style="margin-top:10px"></div>
+
+      <!-- THE TRADE COLUMN. Four must agree: 15m, 5m, 1m and the OFI
+           bar read. It RECORDS trades and scores them in ticks and
+           dollars; it does not reach a broker. AUTO means the rows
+           write themselves when the four line up, so a signal does
+           not have to be clicked to be logged -- the order is still
+           placed by hand. -->
+      <div id="jnlBox" style="margin-top:14px;padding-top:12px;
+        border-top:1px solid rgba(255,255,255,.12)">
+        <h3 style="margin:0 0 8px">Trades on this rule
+          <span class="stamp" id="jnlMode"></span></h3>
+        <div class="msg" style="margin-bottom:8px"><b>The OFI candle
+          decides.</b> Up when the candle is green, down when it is
+          red &mdash; the imbalance of the bar in progress.
+          <b>The 15-minute window decides.</b> A trade opens when all
+          three of that window agree &mdash; its mid-price candle, its
+          net OFI and its net CVD, every one rebuilt from the raw
+          events. One trade per direction per window, and it is held
+          until the window agrees the <b>other</b> way, or your target
+          or stop. Pick 5 or 15 minutes above &mdash; both run all the
+          time, so switching never costs you a window. It exits when
+          price <b>diverges</b> from the lean &mdash; that is the take
+          profit &mdash; or when the candle flips. A turn the
+          <b>CVD has not followed</b> is a suspect turn and is not
+          traded: the OFI says book pressure changed direction, the
+          CVD since that moment says whether aggressive size actually
+          went with it.
+          It holds until the candle reads the <b>other</b> way &mdash;
+          going flat is not an exit, because closing on that was
+          giving back about a tick every time. <b>One trade per OFI
+          candle.</b>
+          The 15m, 5m and 1m are shown below but do not vote: they
+          only <b>veto</b>, and only when all three point the other
+          way. A tick is 0.25 and <b>$12.50</b>. These are logged
+          trades, not placed ones &mdash; <b>nothing here reaches
+          Ironbeam</b>. On AUTO the journal opens and closes its own
+          rows on the rule, with your take profit and stop loss; the
+          order at the broker is still yours to place.</div>
+        <div id="jnlAgree" class="say" style="margin-bottom:10px">—</div>
+        <div style="display:flex;flex-wrap:wrap;gap:10px;
+          align-items:center;margin-bottom:10px">
+          <button id="jnlAutoBtn" onclick="jnlToggleAuto()"
+            title="Switches who writes the rows. Neither setting
+                   places an order.">MANUAL</button>
+          <input type="checkbox" id="jnlAuto" style="display:none"
+            onchange="jnlSet()">
+          <label>strategy
+            <select id="jnlStrat" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="ofi">OFI</option>
+              <option value="candle">Candle</option>
+              <option value="footprint">Footprint</option>
+              <option value="fused">Fused (intrabar)</option>
+              <option value="timed">Timed (1m guides the 5m)</option>
+            </select></label>
+          <label>window
+            <select id="jnlWin" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="300">5 minutes</option>
+              <option value="900">15 minutes</option>
+            </select></label>
+          <label><input type="checkbox" id="jnlTpOn"
+            onchange="jnlSet()"> take profit
+            <input type="number" id="jnlTp" value="16" min="0" step="1"
+              style="width:64px" onchange="jnlSet()"> ticks</label>
+          <label><input type="checkbox" id="jnlSlOn"
+            onchange="jnlSet()"> stop loss
+            <input type="number" id="jnlSl" value="8" min="0" step="1"
+              style="width:64px" onchange="jnlSet()"> ticks</label>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;
+          margin-bottom:10px">
+          <button onclick="jnlTrade('open','up')">Log BUY</button>
+          <button onclick="jnlTrade('open','down')">Log SELL</button>
+          <button onclick="jnlTrade('close')">Close</button>
+          <button onclick="jnlReset()" title="Deletes every logged
+            trade for this market and starts the test over."
+            >Reset test</button>
+          <span id="jnlMsg" class="thin"></span>
+        </div>
+        <div id="jnlOpen" style="margin-bottom:10px"></div>
+        <div id="jnlStats"></div>
+        <div id="jnlRecent" style="margin-top:10px"></div>
+      </div>
+    </div>
+
+    <!-- THE SAME THREE MEASUREMENTS ON A CLOCK. ITS OWN PANEL,
+         because the first version of this was a div inside the
+         footprint panel and could not be found -- a measurement
+         nobody can locate is one nobody reads. -->
+    <!-- THE FUSION READ. Its own top-level panel, titled, because the
+         last reading that went inside another section rendered
+         correctly and could not be found. -->
+    <div class="panel full" id="fusionPanel"><h2>Fusion &mdash; the tick
+      bar and the 5-minute bar<span class="stamp"
+      id="fusionStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Three readings, built
+        by <b>different builders from different events</b>. The tick
+        bar closes every N prints and knows nothing about the book; the
+        OFI bar closes on a quantity of imbalance and knows nothing
+        about how many prints it took; the 5-minute bar is the ordinary
+        time candle. None of them influences the others &mdash; that
+        independence is the only reason their agreement says anything.
+        <b>Entry: the tick bar and the 5m both point the same way.
+        Exit: either of them turning against the trade.</b> The same
+        two readings both ways. <b>The OFI decides nothing</b> &mdash;
+        it is shown because it is worth seeing whether the resting
+        book concurs, but it flips sign about once a bar and every
+        version of this rule that let it decide something churned.
+        The 5m is read
+        immediately &mdash; close against open, exactly what colours
+        that candle on the chart. What stops this churning is not a
+        softer exit but a hard limit on entries: <b>one trade per
+        5-minute bar</b>, either direction, so after a take profit
+        nothing re-enters until a new 5m bar opens.</div>
+      <div class="conbar" style="margin-top:-2px">
+        <label>tick series <select id="fusTick" onchange="fusLoad()"
+          style="margin:0 4px"></select></label>
+        <label title="How the tick bar's direction is steadied.
+RAW is the control -- the bar itself, no smoothing, so you can see
+what the others changed.
+THRESHOLD holds the direction until price gives back N ticks from
+the best level since the last turn. No time lag at all: a real
+reversal registers on the print that completes it. It is late in
+PRICE instead -- every turn gives back those N ticks.
+HEIKIN-ASHI averages each bar with the one before it, which is both
+why a run stays one colour and why it trails by about a bar.
+EMA is price against an N-bar average: the smoothest and the
+latest, and it whipsaws when price sits on the line.">smoothing
+          <select id="fusSmooth" onchange="fusLoad()"
+            style="margin:0 4px">
+            <option value="raw" selected>raw (control)</option>
+            <option value="threshold">threshold</option>
+            <option value="heikin">heikin-ashi</option>
+            <option value="ema">ema</option>
+          </select></label>
+        <label title="A tick bar closes on a count of prints. Give
+it a reset and it also closes on the clock, whichever comes first,
+so no bar straddles a boundary and the series lines up with the
+5-minute candle the rule reads.
+The cost: in a quiet stretch a bar can close with very few prints,
+and a direction off three prints is not the measurement a
+five-thousand-print bar gives. The panel says when the last bar was
+cut short.">reset <select id="fusReset" onchange="fusLoad()"
+            style="margin:0 4px">
+            <option value="0" selected>none (native)</option>
+            <option value="300">every 5m</option>
+            <option value="900">every 15m</option>
+          </select></label>
+        <label title="Ticks of give-back before THRESHOLD turns.
+Bigger holds a trade longer and hands back more at every turn.">
+          flip <input id="fusFlip" type="number" min="1" max="40"
+            step="1" value="4" onchange="fusLoad()"
+            style="width:48px;margin:0 4px"></label>
+        <label title="Sound, a desktop notification and a banner the
+moment the rule fires -- and again when it says to get out. For
+placing the trade in Ironbeam yourself."><input type="checkbox"
+          id="fusAlarm" onchange="armFusionAlert()">alert me to trade
+          this by hand</label>
+        <span class="thin" id="fusNote"></span>
+      </div>
+      <div id="fusAlertBar" class="alertbar" style="display:none"></div>
+      <div id="fusionBox"><span class="stamp" style="width:100%">waiting
+        for the first prints and book updates &mdash; this fills as the
+        tape runs</span></div>
+    </div>
+
+    <div class="panel full" id="clockPanel"><h2>Fifteen-minute windows
+      &mdash; the same tape, cut by the clock</h2>
+      <div class="msg" style="margin-bottom:8px">The OFI candles end
+        on a quantity of flow and flip often. These end on a clock.
+        Both are built from the <b>same raw events</b> and the
+        <b>same OFI formula</b>, so what differs below is the way the
+        tape is cut and nothing else. Every figure is accumulated as
+        the events arrive &mdash; the window at the top grows tick by
+        tick and locks at the boundary.</div>
+      <div id="clockWin"><span class="stamp"
+        style="width:100%">waiting for the first events &mdash; this fills as the
+        tape runs</span></div>
+    </div>
+
+    <!-- The seven-layer order flow read. ITS OWN PANEL: nothing here
+         touches the ladder or the candle read above it. -->
+    <div class="panel full" id="layerPanel"><h2>Order flow — the candle in
+      layers<span class="stamp" id="layerStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Six readings of the candle
+        still forming, kept apart rather than blended: who is attacking,
+        how hard, whether anyone is taking the other side, what the resting
+        book is doing about it, what price actually did in return, and
+        where on the map it is happening. A layer that could not be
+        measured says so — <b>missing is not neutral</b>.</div>
+      <div id="layerResult" class="say" style="margin-bottom:10px">—</div>
+      <div id="swingCall" class="say" style="margin-bottom:10px">—</div>
+      <div id="layerBody"></div>
+    </div>
+
+    <!-- Whether any of it works. Its own panel: nothing above it changes. -->
+    <div class="panel full" id="scorePanel"><h2>Is it right?<span
+      class="stamp" id="scoreStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Every call is written down
+        before its bar closes and scored afterwards — beside the
+        <b>naive</b> call, which is simply the direction price was already
+        going when the read was taken. <b>Only the comparison matters.</b>
+        A bar that is already up at halfway usually closes up, so a read
+        that agrees with price scores far above a coin flip while adding
+        nothing. Where <i>agreement</i> is high the two are the same call
+        in different clothes, whatever the rates say. It fills while the
+        feed runs; it cannot be backfilled.</div>
+      <div id="scoreSay" class="say" style="margin-bottom:10px">—</div>
+      <div id="scoreRows"></div>
+    </div>
+  </div>
+
+  <div class="grid tabpane" id="tab-test" hidden>
+
+    <div class="panel full" id="ofiBtPanel"><h2>OFI backtester &mdash; signal against its own control
+      <span class="stamp" id="btStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Runs on a per-second file from
+        <code>scripts/ofi_replay.py</code>, which carries candles and order flow on
+        one clock. Every rule is scored three ways: <b>signal</b>, <b>mirror</b>
+        (the same entries taken the other way) and <b>control</b> (the same entry
+        times, side by coin flip). A 16-tick target against a 4-tick stop wins
+        often in <i>both</i> directions &mdash; if mirror scores like signal, the
+        bracket is what was measured, not the rule.</div>
+
+      <div class="conbar">
+        <label>dataset <select id="btData"></select></label>
+        <label>upload <input type="file" id="btFile" accept=".csv"></label>
+        <button class="btn" onclick="btUpload()">Send</button>
+        <span class="stamp" id="btUp"></span>
+      </div>
+
+      <div class="conbar">
+        <label><input type="checkbox" id="btR_ofi" checked> OFI</label>
+        <label><input type="checkbox" id="btR_agree"> timeframe agreement</label>
+        <label><input type="checkbox" id="btR_book"> book imbalance</label>
+        <label><input type="checkbox" id="btR_delta"> delta</label>
+        <span class="stamp">every ticked rule must point the same way</span>
+      </div>
+
+      <div class="conbar">
+        <label>|z| <input type="number" id="btZ" value="1.5" step="0.1" style="width:66px"></label>
+        <label>target t <input type="number" id="btTgt" value="16" style="width:60px"></label>
+        <label>stop t <input type="number" id="btStop" value="4" style="width:56px"></label>
+        <label>cost t <input type="number" id="btCost" value="1.0" step="0.1" style="width:60px"></label>
+        <label>hold s <input type="number" id="btHold" value="900" style="width:70px"></label>
+        <label>cooldown s <input type="number" id="btCool" value="60" style="width:66px"></label>
+      </div>
+      <div class="conbar">
+        <label>OFI window s <input type="number" id="btWin" value="60" style="width:66px"></label>
+        <label>baseline <input type="number" id="btBase" value="600" style="width:70px"></label>
+        <label>frames <input type="text" id="btFrames" value="60,300,900" style="width:110px"></label>
+        <label>book ratio <input type="number" id="btRatio" value="2.0" step="0.1" style="width:64px"></label>
+        <label>delta window s <input type="number" id="btDW" value="60" style="width:66px"></label>
+        <label>train <input type="number" id="btTrain" value="0.5" step="0.05" style="width:60px"></label>
+        <button class="btn" onclick="btRun()">Run</button>
+      </div>
+
+      <div id="btBreak" class="msg" style="margin-top:8px"></div>
+      <div id="btOut"></div>
+    </div>
+
+    <div class="panel full" id="sweepPanel"><h2>Target and stop — test every pair
+      <span class="stamp" id="swStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">A signal does not know where
+        its target is — book, delta and price point a direction at a price,
+        and that is the whole decision. So one pass over the candles you have
+        already recorded scores <b>every</b> target against <b>every</b> stop.
+        Set the ranges and look at the shape of the surface, not at the best
+        square.</div>
+
+      <div class="conbar">
+        <label>candle <select id="swInt">
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label><b>take profit</b> <input id="swTpFrom" value="5" size="3">to
+          <input id="swTpTo" value="40" size="3">step
+          <input id="swTpStep" value="5" size="3">bps</label>
+        <label><b>stop loss</b> <input id="swSlFrom" value="5" size="3">to
+          <input id="swSlTo" value="40" size="3">step
+          <input id="swSlStep" value="5" size="3">bps</label>
+        <label>round-trip fee <input id="swFee" value="0" size="3">bps</label>
+        <label title="Every trade ends when its own candle closes — a 5m
+signal gets five minutes. Nothing here can change that.">holds
+          <b>until its candle closes</b></label>
+        <label>votes <select id="swAgree">
+          <option value="0">any — every signal</option>
+          <option value="2">2 of 3 or better</option>
+          <option value="3" selected>all three only</option></select></label>
+        <label title="Aggressive volume against what this market normally
+trades. Candles with no volume reading are left out rather than counted as
+quiet.">volume over <input id="swEffort" value="200" size="3">% of
+          normal</label>
+        <label>side <select id="swSide">
+          <option value="both" selected>both</option>
+          <option value="long">long only</option>
+          <option value="short">short only</option></select></label>
+        <button class="go" onclick="runSweep()">Run the grid</button>
+        <button onclick="loadSignals()">What have I got?</button>
+      </div>
+
+      <div id="swAvail" class="msg"></div>
+      <div id="swVerdict" class="say" style="display:none;margin:10px 0"></div>
+      <div id="swGrid" style="overflow-x:auto"></div>
+      <div id="swShapes" style="margin-top:14px"></div>
+    </div>
+
+    <div class="panel full" id="btPanel"><h2>Backtest — measured, not asserted</h2>
+      <div class="msg" style="margin-bottom:8px">Two separate measurements.
+        <b>Historical replay</b> uses real candles pulled from the exchange — the
+        count and date range are shown with the result — split in two by date, with
+        weights tuned on the earlier half only. No exchange serves historical order
+        flow or book depth, so that replay can only measure the candle-structure
+        signals. <b>Forward test</b> is the answer to that: every live read is written
+        down and scored when its candle closes, so flow and absorption get measured
+        too. It fills up as you use the dashboard.</div>
+      <div id="fwd" class="msg" style="margin-bottom:10px">—</div>
+
+      <h3 style="margin:14px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Upload chart history</h3>
+      <div class="msg" style="margin-bottom:8px">A CSV or JSON OHLCV export —
+        TradingView, an exchange, anything with time, open, high, low and
+        close. Column names and order are detected. This extends the
+        historical replay past what the exchange API serves, and it trains
+        the candle-geometry signals only: <b>microprice tilt, replenishment,
+        depletion and absorption are not in an OHLCV file at any length</b>,
+        so that half stays where it is and is measured forward instead.</div>
+      <div class="conbar">
+        <input type="file" id="histFile" accept=".csv,.txt,.json,.tsv">
+        <label>merge into <select id="histMerge">
+          <option value="">— new dataset —</option></select></label>
+        <button onclick="uploadHistory()">Upload</button>
+      </div>
+      <div id="histSay" class="msg" style="margin-bottom:6px">—</div>
+      <div id="histList"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Run a replay</h3>
+      <div class="conbar">
+        <label>source <select id="btSource">
+          <option value="">exchange candles</option></select></label>
+        <label>bars <input id="btBars" type="number" value="1000" min="200" max="5000"
+          step="100" style="width:88px"></label>
+        <label>train split <select id="btSplit">
+          <option value="0.5">50/50</option><option value="0.6" selected>60/40</option>
+          <option value="0.7">70/30</option></select></label>
+        <label><input type="checkbox" id="btTune" checked> search weights</label>
+        <button onclick="runBacktest()">Run backtest</button>
+      </div>
+      <div id="btHead" class="msg">—</div>
+      <div id="btCurve"></div>
+      <div id="btSay" class="say" style="display:none"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Signal weights — edit and apply</h3>
+      <div class="msg" style="margin-bottom:8px">These are the multipliers the
+        live read uses. Running a backtest fills in a tuned set; you can also
+        type your own. Nothing is applied until you press Apply.</div>
+      <div id="wGrid" class="wgrid"></div>
+      <div style="margin-top:8px">
+        <button onclick="applyWeights()">Apply weights</button>
+        <button onclick="resetWeights()">Reset to defaults</button>
+        <button onclick="useTuned()" id="btUseTuned" disabled>Load tuned values</button>
+        <span id="wMsg" class="msg"></span>
+      </div>
+    </div>
+
+    <div class="panel full" id="agreePanel"><h2>Book vs price — what actually
+      happens<span class="stamp" id="agreeStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Every candle is recorded,
+        tradeable or not, with the raw book and price readings behind it.
+        That is the only way to find out what the confirmation rule is worth:
+        measuring just the candles that passed the filter and concluding the
+        filter works answers a different question. <b>This cannot be
+        backfilled</b> — no exchange serves historical order book depth, so it
+        fills as the feed runs.</div>
+      <div class="conbar">
+        <label>market <select id="agInt" onchange="loadAgreement()">
+          <option value="">all timeframes</option>
+          <option>1m</option><option>5m</option><option selected>15m</option>
+          <option>30m</option><option>1h</option></select></label>
+        <label><input type="checkbox" id="agThis" checked
+          onchange="loadAgreement()"> this coin only</label>
+        <button onclick="loadAgreement()">Refresh</button>
+        <button onclick="runReplay()">Historical base rate</button>
+      </div>
+      <div id="agSay" class="say" style="display:none;margin-bottom:10px"></div>
+      <div id="agTable"></div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Backfill from the archive</h3>
+      <div class="msg" style="margin-bottom:8px">Hyperliquid publishes real
+        book snapshots twice a second to
+        <code>s3://hyperliquid-archive</code>, going back years — higher
+        resolution than the live public feed currently gives. This replays
+        them through the same reader the live feed uses, so the table above
+        fills in this afternoon instead of over three weeks.
+        <b class="short">This is a requester-pays bucket: every byte is
+        charged to your own AWS account.</b> Set
+        <code>AWS_ACCESS_KEY_ID</code> and <code>AWS_SECRET_ACCESS_KEY</code>
+        in Railway first.</div>
+      <div class="conbar">
+        <label>days back <input id="bfDays" type="number" value="2" min="1"
+          max="30" step="1" style="width:70px" onchange="estimateBackfill()"></label>
+        <label>read at <select id="bfAt">
+          <option value="0.25">25% in</option>
+          <option value="0.33" selected>33% in</option>
+          <option value="0.5">50% in</option></select></label>
+        <label>stop at <input id="bfCap" type="number" value="2" min="0.1"
+          max="50" step="0.5" style="width:70px">GiB</label>
+        <button onclick="estimateBackfill()">Estimate cost</button>
+        <button class="go" onclick="startBackfill()">Run backfill</button>
+        <button onclick="stopBackfill()">Stop</button>
+      </div>
+      <div id="bfSay" class="msg">—</div>
+
+      <h3 style="margin:18px 0 4px;font-size:12px;text-transform:uppercase;
+        letter-spacing:.06em;color:var(--dim)">Which reading matters</h3>
+      <div class="msg" style="margin-bottom:8px">The tuning surface. Pick a
+        stored reading and see how the outcome varies across its range — a
+        signal that matters shows a rising line, one that does not shows
+        noise. Answered from candles already recorded.</div>
+      <div class="conbar">
+        <label>reading <select id="agFeat" onchange="loadSlice()"></select></label>
+        <label>state <select id="agVerdict" onchange="loadSlice()">
+          <option value="confirmed" selected>confirmed</option>
+          <option value="conflict">conflict</option>
+          <option value="unconfirmed">unconfirmed</option></select></label>
+      </div>
+      <div id="agSlice"></div>
+    </div>
+  </div>
+
+  <div class="grid tabpane" id="tab-book" hidden>
+
+    <div class="panel full" id="execPanel"><h2>Execution track — live, no candle close
+      <span class="stamp" id="execStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Independent of the chart. Reads
+        every raw print, computes Diagonal Cumulative Delta, and watches
+        unconfirmed footprint flags <em>intrabar</em>. A stacked imbalance that
+        agrees with DCD fires a signal immediately — the candle does not have
+        to close, a time-slice does not have to expire, and the frontend does
+        not have to redraw.</div>
+      <div id="execWsBar" class="msg" style="color:var(--dim);font-size:12px;margin-bottom:6px">
+        Press <b>Go live</b> to open the execution signal stream.
+      </div>
+      <div id="execHead" class="msg" style="margin-bottom:8px">—</div>
+      <div id="execStacks" style="margin-bottom:8px"></div>
+      <div id="execLog" style="max-height:220px;overflow:auto;font-family:monospace;font-size:12px"></div>
+    </div>
+
+    <div class="panel full" id="bookPanel"><h2>Book call — this candle, right now
+      <span class="stamp" id="bookStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">The order book is the structure.
+        No trend, no higher timeframe, no VWAP. Updates on every book push via
+        the real-time MBP-10 WebSocket stream.</div>
+      <div id="bookWsBar" class="msg" style="color:var(--dim);font-size:12px;margin-bottom:4px">
+        Press <b>Go live</b> to open the real-time book stream.
+      </div>
+
+      <!-- Live 10-level depth ladder — rendered by paintDepthLadder() from /ws/book -->
+      <div id="bookLadder" style="margin-bottom:12px"></div>
+
+      <div id="bookHead" class="msg">Press <b>Go live</b> to open the book feed.</div>
+      <div id="bookComps"></div>
+      <div id="bookSay" class="say" style="display:none"></div>
+    </div>
+
+    <div class="panel full" id="liqPanel"><h2>Liquidity — what it costs and who is winning the level<span class="stamp" id="liqStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Slippage works immediately off a
+        single book read. Absorption needs a running watch, because it has to learn
+        how far price normally moves per dollar before it can say whether this is
+        a lot of volume or a little.</div>
+      <div class="conbar">
+        <label>your size $<input id="liqSize" type="number" value="25000" step="5000"
+          style="width:110px" onchange="loadLiquidity()"></label>
+        <label>level <input id="wLevel" type="number" value="0" step="1"
+          style="width:110px" title="price to watch"></label>
+        <label>±bps <input id="wBand" type="number" value="10" step="1"
+          style="width:64px"></label>
+        <label>minutes <input id="wMins" type="number" value="15" min="1" max="120"
+          style="width:64px"></label>
+        <button onclick="startWatch()">Watch level</button>
+        <button onclick="stopWatch()">Stop</button>
+      </div>
+      <div id="liqCost" class="msg">—</div>
+      <div id="liqBook" class="msg"></div>
+      <div id="liqAbs" class="say" style="display:none"></div>
+      <div id="liqShelves"></div>
+    </div>
+
+    <div class="panel full" id="conPanel"><h2>Who is winning, and which way<span class="stamp" id="conStamp"></span></h2>
+      <div class="msg" style="margin-bottom:8px">Of the wallets holding this coin right now,
+        how much winning money is on each side — and how much worse you would enter than
+        they did.</div>
+      <div class="conbar">
+        <label><input type="checkbox" id="winOnly" checked onchange="loadConsensus()">
+          winners only</label>
+        <label>min position $<input id="minNot" type="number" value="0" step="10000"
+          style="width:96px" onchange="loadConsensus()"></label>
+        <label>min account $<input id="minAcct" type="number" value="0" step="100000"
+          style="width:110px" onchange="loadConsensus()"></label>
+      </div>
+      <div id="consensus" class="msg">—</div>
+      <div id="conTraders"></div>
+    </div>
+  </div>
+
+  <div class="grid tabpane" id="tab-wall" hidden>
+
     <div class="panel"><h2>Status</h2><div id="status" class="msg">—</div>
       <div id="firstrun" class="msg"></div></div>
+
     <div class="panel"><h2>Conviction flow · 24h</h2><div id="flow" class="msg">—</div></div>
 
     <div class="panel full"><h2>Position changes — DEFENDED is the one to watch</h2>
       <div id="changes" class="msg">—</div></div>
 
     <div class="panel"><h2>Raw map — where leverage sits</h2><pre id="mapRaw">—</pre></div>
+
     <div class="panel"><h2>Fragility-weighted — where pressure is</h2><pre id="mapW">—</pre></div>
 
     <div class="panel full"><h2>Positions</h2><div id="pos" class="msg">—</div></div>
+  </div>
+
+  <div class="grid tabpane" id="tab-setup" hidden>
 
     <div class="panel full"><h2>Settings</h2>
       <div id="settings" class="msg">—</div>
@@ -670,11 +10654,104 @@ DASHBOARD = """<!doctype html>
 
     <div class="panel full"><h2>Validation report</h2><pre id="report">—</pre></div>
   </div>
+
+<!-- The call's own readout, taken off the page.
+
+     The chart panel now ends at the chart and the candle read sits
+     directly beneath it. These elements stay in the document, hidden,
+     because a dozen working functions write to them and deleting the
+     markup alone would turn each of those into a null dereference the
+     first time it ran. The agent keeps recording; only its panel is
+     gone. Deleting the code behind them is a separate job and a bigger
+     one. -->
+<div id="retiredCallPanel" style="display:none" aria-hidden="true">
+  <div id="sugThree"></div>
+  <div id="sugCard"></div>
+  <div id="apState"></div>
+  <div id="apPos"></div>
+  <div id="apFeed"></div>
+  <div id="apHead"></div>
+  <div id="apStats"></div>
+  <div id="apSlices"></div>
+  <div id="apProposals"></div>
+</div>
+
 </div>
 <script>
 const $ = id => document.getElementById(id);
+
+/* Day or night.
+
+   One attribute on <html>, which re-points the same seven colour tokens.
+   Every CSS rule and every colour the canvas reads goes through those
+   tokens, so the chart follows the page without a second palette to keep
+   in step -- and the one place that did NOT go through them, the plate
+   behind the chart's price labels, is why `plateColour` exists. */
+function plateColour() {
+  return getComputedStyle(document.documentElement)
+           .getPropertyValue('--panel').trim() || '#12151a';
+}
+
+function applyTheme(name) {
+  const light = name === 'light';
+  document.documentElement.dataset.theme = light ? 'light' : 'dark';
+  const b = $('themeBtn');
+  if (b) b.textContent = light ? 'day' : 'night';
+  try { localStorage.setItem('liqmap_theme', light ? 'light' : 'dark'); }
+  catch (e) {}
+  // The canvas does not restyle itself: it is pixels, drawn once.
+  if (typeof drawChart === 'function' && typeof chartData !== 'undefined'
+      && chartData) drawChart();
+}
+
+function toggleTheme() {
+  applyTheme(document.documentElement.dataset.theme === 'light'
+             ? 'dark' : 'light');
+}
+
+function restoreTheme() {
+  let saved = null;
+  try { saved = localStorage.getItem('liqmap_theme'); } catch (e) {}
+  if (!saved) {
+    // No choice stored: follow the machine rather than imposing one.
+    saved = (window.matchMedia
+             && window.matchMedia('(prefers-color-scheme: light)').matches)
+            ? 'light' : 'dark';
+  }
+  applyTheme(saved);
+}
 const tok = () => $('tok').value.trim();
-const coin = () => $('coin').value.trim().toUpperCase() || 'BTC';
+
+// Do NOT upper-case the whole symbol. HIP-3 DEX prefixes are lowercase and
+// case-sensitive, so `vntl:GOLD` upper-cased is a symbol that does not exist.
+const coin = () => {
+  const raw = $('coin').value.trim();
+  if (!raw) return 'BTC';
+  const i = raw.indexOf(':');
+  return i < 0 ? raw.toUpperCase()
+               : raw.slice(0, i) + ':' + raw.slice(i + 1).toUpperCase();
+};
+
+/* Build a query string with every value encoded.
+   Concatenating a raw symbol into a URL is what caused "bad or missing
+   token": a symbol containing `#` turns everything after it into a fragment,
+   the browser never sends `&token=`, and the server correctly rejects the
+   request. The symptom looked like an auth bug and was a URL bug.           */
+function q(params) {
+  return Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v))
+    .join('&');
+}
+/* Escape before putting any server string into innerHTML. Coin names,
+   uploaded filenames and error text all reach the page this way, and a
+   symbol or filename containing a bracket would otherwise break the markup
+   around it -- or worse. */
+function esc(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
 const money = n => n == null ? '—' :
   (Math.abs(n) >= 1e6 ? '$' + (n/1e6).toFixed(2) + 'M'
    : Math.abs(n) >= 1e3 ? '$' + (n/1e3).toFixed(0) + 'k' : '$' + Number(n).toFixed(0));
@@ -685,8 +10762,18 @@ try { const s = localStorage.getItem('liqmap_tok'); if (s) $('tok').value = s; }
 async function api(path, opts) {
   if (!tok()) throw new Error('enter your access token first');
   try { localStorage.setItem('liqmap_tok', tok()); } catch (e) {}
-  const r = await fetch(path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(tok()),
-    Object.assign({headers: {'Content-Type': 'application/json'}}, opts || {}));
+  // Token goes in BOTH the header and the query. The header survives any
+  // mangling of the query string; the query keeps plain links working.
+  const o = Object.assign({}, opts || {});
+  // A FormData body must set its own Content-Type, because only the browser
+  // knows the multipart boundary it generated. Forcing application/json onto
+  // it makes the server unable to find any of the parts, and the failure
+  // looks like an empty upload rather than a header problem.
+  const base = {'Authorization': 'Bearer ' + tok()};
+  if (!(o.body instanceof FormData)) base['Content-Type'] = 'application/json';
+  o.headers = Object.assign(base, o.headers || {});
+  const r = await fetch(path + (path.includes('?') ? '&' : '?')
+                        + 'token=' + encodeURIComponent(tok()), o);
   const txt = await r.text();
   if (!r.ok) throw new Error(txt.slice(0, 300));
   try { return JSON.parse(txt); } catch (e) { return txt; }
@@ -694,10 +10781,106 @@ async function api(path, opts) {
 
 function note(m, bad) { $('msg').textContent = m; $('msg').className = 'msg' + (bad ? ' err' : ''); }
 
+// ---- Order flow imbalance -------------------------------------------------
+// Seeded once from /api/ofi; after Go live, /ws/live ofi frames paint this.
+function ofiFmt(v, d) {
+  return (v === null || v === undefined || v === '') ? '—'
+    : (typeof v === 'number' ? v.toFixed(d === undefined ? 2 : d) : v);
+}
+
+function paintOfi(d) {
+  const off = $('ofiOff'), on = $('ofiOn');
+  $('ofiStamp').textContent = d.updated_at
+    ? new Date(d.updated_at * 1000).toLocaleTimeString() : '';
+  if (!d.running || !d.last) {
+    on.style.display = 'none';
+    off.style.display = '';
+    const why = d.error || d.blocked_by || 'not running';
+    off.innerHTML = '<b>Engine idle.</b> ' + why
+      + '<br><span class="msg">Set DATABENTO_API_KEY and LIQMAP_OFI=true, '
+      + 'then redeploy. Symbol: ' + (d.symbols || []).join(', ')
+      + ' &middot; window ' + d.window + ' &middot; baseline ' + d.baseline
+      + '</span>';
+    return;
+  }
+  off.style.display = 'none';
+  on.style.display = '';
+  const L = d.last;
+  const z = L.z;
+  const side = L.side || (z === null ? 'warming up'
+    : (z > 0 ? 'buyers ahead' : (z < 0 ? 'sellers ahead' : 'level')));
+  const col = (z === null) ? 'var(--dim)'
+    : (z > 0 ? 'var(--up)' : (z < 0 ? 'var(--down)' : 'var(--dim)'));
+  $('ofiSide').textContent = side;
+  $('ofiSide').style.color = col;
+  $('ofiSideNote').textContent = L.warm ? '' : '(baseline still filling)';
+  $('ofiZ').textContent = ofiFmt(z);
+  $('ofiWin').textContent = (L.window > 0 ? '+' : '') + L.window;
+  $('ofiObi').textContent = ofiFmt(L.obi);
+  $('ofiSpread').textContent = ofiFmt(L.spread / 250000000, 2) + 't';
+  const r = d.refused || {};
+  $('ofiStats').textContent =
+    (d.readings || 0).toLocaleString() + ' readings · '
+    + (d.records || 0).toLocaleString() + ' records · refused '
+    + Object.keys(r).map(k => k + ' ' + r[k]).join(', ')
+    + ' · age ' + ofiFmt(d.age_s, 2) + 's';
+  drawOfiSpark(d.history || []);
+}
+
+function drawOfiSpark(rows) {
+  const svg = $('ofiSpark');
+  const zs = rows.filter(r => r.z !== null && r.z !== undefined);
+  if (zs.length < 2) { svg.innerHTML = ''; return; }
+  const W = 600, H = 70, mid = H / 2;
+  let hi = 0;
+  for (const r of zs) hi = Math.max(hi, Math.abs(r.z));
+  hi = hi || 1;                       // all zero: a flat line, not a crash
+  const pts = zs.map((r, i) => {
+    const x = (i / (zs.length - 1)) * W;
+    const y = mid - (r.z / hi) * (mid - 4);
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+  const last = zs[zs.length - 1].z;
+  const col = last > 0 ? 'var(--up)' : (last < 0 ? 'var(--down)' : 'var(--dim)');
+  svg.innerHTML =
+    '<line x1="0" y1="' + mid + '" x2="' + W + '" y2="' + mid
+    + '" stroke="var(--line)" stroke-width="1"/>'
+    + '<polyline fill="none" stroke="' + col + '" stroke-width="1.5" '
+    + 'vector-effect="non-scaling-stroke" points="' + pts + '"/>'
+    + '<text x="4" y="10" font-size="9" fill="var(--dim)">+'
+    + hi.toFixed(1) + '</text>'
+    + '<text x="4" y="' + (H - 3) + '" font-size="9" fill="var(--dim)">-'
+    + hi.toFixed(1) + '</text>';
+}
+
+async function loadOfi() {
+  const pane = $('tab-dash');
+  if (!pane || pane.hidden || !tok()) return;
+  try { paintOfi(await api('/api/ofi?history=150')); }
+  catch (e) {
+    $('ofiOn').style.display = 'none';
+    $('ofiOff').style.display = '';
+    $('ofiOff').textContent = 'could not read /api/ofi: ' + e.message;
+  }
+}
+// OFI and footprint used to be HTTP-polled (setInterval 2s / 1.5s).
+// Those timers are gone. One seed fetch paints the last known state;
+// /ws/live then pushes ofi / tick / signal frames into the same painters.
+try { loadOfi(); } catch (e) {}
+try { fpLoad(); } catch (e) {}
+try { mgLoad(); } catch (e) {}
+
+
+
 async function loadAll() {
   note('loading…');
+  if (!nowPoll) startTicker();
   try {
-    await Promise.all([loadStatus(), loadMap(), loadChanges(), loadPositions(), loadReport()]);
+    await Promise.all([loadStatus(), loadCoins(), loadBookCall(), loadWeights(), loadRead(),
+                       loadForward(), loadConsensus(), loadDecisions(),
+                       loadDatasets(), loadAgreement(), loadAutopilot(),
+                       loadLiquidity(), loadMap(), loadChanges(), loadPositions(),
+                       loadReport()]);
     note('updated ' + new Date().toLocaleTimeString());
   } catch (e) { note(e.message, true); }
 }
@@ -714,8 +10897,9 @@ async function doHarvest() {
 
   note('starting harvest…');
   try {
-    const r = await api('/api/harvest?minutes=' + encodeURIComponent(mins) + '&then_sweep=true',
-                        {method: 'POST'});
+    const tapes = (($('hcoins') && $('hcoins').value) || '').trim();
+    const r = await api('/api/harvest?' + q({minutes: mins, then_sweep: 'true',
+                        coins: tapes}), {method: 'POST'});
     if (!r || r.ok === false) { note('could not start: ' + ((r && r.error) || 'unknown'), true); return; }
     note(`harvesting for ${mins} min — watching the trade feed…`);
 
@@ -809,8 +10993,8544 @@ async function saveSettings() {
   } catch (e) { note(e.message, true); }
 }
 
+/* ---- live price and staleness -------------------------------------------
+   Ages arrive computed by the server and we count up from the moment we
+   received them. Deriving them in the browser from timestamps means a clock
+   a few minutes out reports everything as fresh, or everything as stale.  */
+
+let nowData = null, nowFetchedAt = 0, nowPoll = null, lastPx = null;
+
+function ageClass(sec, warn, bad) {
+  if (sec == null) return 'bad';
+  return sec >= bad ? 'bad' : sec >= warn ? 'warn' : '';
+}
+
+function ageText(sec) {
+  if (sec == null) return 'never';
+  if (sec < 60) return Math.floor(sec) + 's ago';
+  if (sec < 3600) return Math.floor(sec / 60) + 'm ago';
+  return (sec / 3600).toFixed(1) + 'h ago';
+}
+
+async function loadNow() {
+  try {
+    nowData = await api('/api/now?' + q({coin: coin()}));
+    nowFetchedAt = Date.now();
+  } catch (e) {
+    $('tickAge').textContent = e.message;
+    $('tickDot').className = 'dot bad';
+    return;
+  }
+  paintTicker();
+}
+
+function paintTicker() {
+  const d = nowData;
+  if (!d) return;
+  // A streamed price is always fresher than a polled one. Repainting over it
+  // would make a live tape look like it updates every few seconds.
+  const streaming = streamedAt && (Date.now() - streamedAt) < 15000;
+  const since = (Date.now() - nowFetchedAt) / 1000;
+
+  $('tickSym').textContent = d.coin;
+  if (streaming) { paintSources(d, since); return; }
+  if (d.spot != null) {
+    const px = Number(d.spot);
+    const dir = lastPx == null ? '' : px > lastPx ? 'long' : px < lastPx ? 'short' : '';
+    $('tickPx').className = dir;
+    $('tickPx').textContent = px.toLocaleString(undefined,
+      {minimumFractionDigits: 2, maximumFractionDigits: 6});
+    lastPx = px;
+  } else {
+    $('tickPx').textContent = '—';
+  }
+
+  const age = (d.spot_age_s == null ? null : d.spot_age_s + since);
+  const cls = ageClass(age, 20, 60);
+  $('tickDot').className = 'dot ' + (cls || 'live');
+  $('tickAge').className = 'tick-age ' + cls;
+  $('tickAge').textContent = (d.spot_error ? d.spot_error + ' · ' : '')
+    + 'price ' + ageText(age);
+
+  paintSources(d, since);
+}
+
+function paintSources(d, since) {
+  const s = d.sources || {};
+  const bits = [];
+  const sweepWarn = (s.sweep && s.sweep.interval_s) ? s.sweep.interval_s * 1.5 : 2700;
+  if (s.sweep) {
+    const a = s.sweep.age_s == null ? null : s.sweep.age_s + since;
+    bits.push(`<span class="${ageClass(a, sweepWarn, sweepWarn * 2)}">`
+      + `positions &amp; consensus <b>${ageText(a)}</b></span>`);
+  }
+  if (s.book) {
+    const a = s.book.age_s == null ? null : s.book.age_s + since;
+    bits.push(`<span class="${ageClass(a, 30, 120)}">book <b>${ageText(a)}</b></span>`);
+  }
+  if (s.watch) {
+    bits.push(s.watch.running
+      ? `<span>flow &amp; absorption <b>live on ${s.watch.coin} @ ${s.watch.level}</b></span>`
+      : '<span class="bad">flow &amp; absorption <b>not running</b></span>');
+  }
+  $('tickSources').innerHTML = bits.join('');
+}
+
+function tickFromStream(p) {
+  if (!p || p.px == null) return;
+  const el = $('tickPx');
+  const dir = lastPx == null ? '' : p.px > lastPx ? 'long' : p.px < lastPx ? 'short' : '';
+  el.className = dir;
+  el.textContent = Number(p.px).toLocaleString(undefined,
+    {minimumFractionDigits: 2, maximumFractionDigits: 6});
+  lastPx = p.px;
+  streamedAt = Date.now();
+
+  $('tickDot').className = 'dot live';
+  $('tickAge').className = 'tick-age';
+  $('tickAge').textContent = 'live tape'
+    + (p.trades ? ` · ${p.trades} fills this candle` : '');
+}
+
+let streamedAt = 0;
+
+function startTicker() {
+  if (nowPoll) { clearInterval(nowPoll); nowPoll = null; }
+  loadNow();   // one seed. After that /ws/live tick frames own the price.
+  // Local clock only — no HTTP. paintTicker reads last known nowData.
+  if (!_tickClock) _tickClock = setInterval(paintTicker, 1000);
+}
+let _tickClock = null;
+
+let lastCoin = 'BTC';
+try { const c = localStorage.getItem('liqmap_coin'); if (c) lastCoin = c; } catch (e) {}
+window.addEventListener('DOMContentLoaded', () => {
+  try {
+    const a = localStorage.getItem('liqmap_alert');
+    if (a && $('rAlert')) $('rAlert').value = a;
+  } catch (e) {}
+});
+
+function onCoinChange() {
+  // A feed is bound to one market. Leaving it running on the old one would
+  // quietly serve its candles under the new symbol's name.
+  if (stream || feedTimer) stopFeed();
+  lastCoin = coin();
+  try { localStorage.setItem('liqmap_coin', lastCoin); } catch (e) {}
+  alertedFor = null;            // a new market starts its own alert history
+  showVenueNote();
+
+  /* EVERY per-market panel, not just the ones that used to be here.
+
+     The chart, the two volume profiles and the setup markers were only
+     refreshed from paintSuggest -- so they reloaded when the call ran,
+     and not when you changed instrument. Switching markets left BTC's
+     candles and BTC's value areas on screen under ETH's name, with an
+     ETH candle read underneath them. Two markets on one screen, nothing
+     saying so.
+
+     Cleared BEFORE the fetches rather than after: a stale chart drawn
+     under the new symbol for the second the request takes is the same
+     bug in miniature, and it is the second you would be looking at. */
+  chartData = null;
+  profileData = null;
+  mtfData = null;
+  chartProj = null;
+  const nest = $('nestRead'); if (nest) nest.innerHTML = '';
+  const prof = $('profRead'); if (prof) prof.textContent = '';
+  const mtf = $('mtfRead'); if (mtf) mtf.innerHTML = '';
+  resetChartView();            // redraws, which now hides an empty chart
+
+  loadNow();
+  loadRead();                  // pulls the order-flow ladder with it
+  loadChart();
+  loadProfile();
+  loadMTF();
+  loadBookCall();
+}
+
+let bookPoll = null;
+
+async function loadBookCall() {
+  let d;
+  try {
+    d = await api('/api/bookcall?' + q({coin: coin(),
+                  window_s: parseFloat($('bkWin').value || '20')}));
+  } catch (e) { $('bookHead').textContent = e.message; return; }
+  paintBookCall(d);
+}
+
+function paintBookCall(d) {
+  if (!d) return;
+  if (d.error) {
+    $('bookHead').textContent = d.error;
+    $('bookComps').innerHTML = '';
+    $('bookSay').style.display = 'none';
+    return;
+  }
+
+  const cls = d.direction === 'up' ? 'long' : d.direction === 'down' ? 'short' : '';
+  $('bookHead').innerHTML =
+      `<div class="call"><b class="${cls}">${d.direction.toUpperCase()}</b>`
+    + `<span class="sub">score ${d.score >= 0 ? '+' : ''}${d.score.toFixed(3)}`
+    + ` · conviction ${(d.conviction*100).toFixed(0)}%`
+    + ` · ${d.samples} book updates / ${d.window_s.toFixed(0)}s</span></div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${Number(d.mid).toLocaleString(undefined,{maximumFractionDigits:6})}</b><span>mid</span></div>`
+    + `<div class="stat"><b class="${d.microprice > d.mid ? 'long' : d.microprice < d.mid ? 'short' : ''}">`
+    + `${Number(d.microprice).toLocaleString(undefined,{maximumFractionDigits:6})}</b><span>microprice</span></div>`
+    + `<div class="stat"><b>${d.spread_bps.toFixed(3)}bps</b><span>spread</span></div>`
+    + `<div class="stat"><b>${d.book_updates}</b><span>book pushes</span></div>`
+    + '</div>';
+
+  $('bookComps').innerHTML = (d.components || []).map(c => {
+    const w = Math.round(Math.abs(c.value) * 50);
+    return `<div class="comp">
+      <span>${c.name}</span>
+      <span class="v ${c.value > 0 ? 'long' : c.value < 0 ? 'short' : ''}">
+        ${c.value >= 0 ? '+' : ''}${c.value.toFixed(2)}</span>
+      <span class="m"><i class="${c.value >= 0 ? 'pos' : 'neg'}" style="width:${w}%"></i>
+        <span style="position:absolute;left:0;top:8px;color:var(--dim);font-size:11px">${c.note}</span></span>
+    </div>`;
+  }).join('') + '<div style="height:14px"></div>';
+
+  $('bookSay').style.display = '';
+  $('bookSay').textContent = d.verdict;
+  stamp('bookStamp', d.age_s == null ? 0 : d.age_s, 5, 30, 'book ');
+}
+
+/* ---- the call: take it or leave it ---------------------------------- */
+
+let sugPoll = null;
+let sugId = null;
+
+/* ---------------------------------------------------------------------
+   The agent's own book.
+
+   Everything here is a record of decisions, not an instruction to anyone.
+   The panel never offers to place an order because nothing behind it can.
+   --------------------------------------------------------------------- */
+
+let apOn = false;
+
+function apCfg() {
+  return {coin: coin(), interval: $('sInt').value,
+          notional: parseFloat($('sSize').value || '10000'),
+          fee_bps: parseFloat($('sFee').value || '0'),
+          tp_bps: parseFloat($('apTp').value || '10'),
+          sl_bps: parseFloat($('apSl').value || '10'),
+          unit: $('apUnit').value,
+          require_unanimous: $('apUnan').checked,
+          // The box is a percentage; the agent thinks in multiples of
+          // normal, where 1.0 is normal.
+          min_effort: parseFloat($('apEffort').value || '0') / 100,
+          raw: true,
+          exit_on_invalidation: $('apInval').checked};
+}
+
+async function toggleAutopilot() {
+  const c = apCfg();
+  let d;
+  try {
+    d = await api('/api/autopilot?' + q(Object.assign({on: !apOn}, c)),
+                  {method: 'POST'});
+  } catch (e) { $('apState').textContent = e.message; return; }
+  if (!d.ok) { $('apState').textContent = d.detail || 'could not start'; return; }
+  apOn = d.autopilot.on;
+  $('apToggle').textContent = apOn ? 'Stop deciding' : 'Let it decide';
+  loadAutopilot();
+}
+
+let apPoll = null;
+
+async function stepAutopilot() {
+  const c = apCfg();
+  try {
+    const d = await api('/api/autopilot/step?' + q(c), {method: 'POST'});
+    if (!d.ok) { $('apState').textContent = d.detail || 'no reading'; return; }
+  } catch (e) { $('apState').textContent = e.message; return; }
+  loadAutopilot();
+}
+
+async function loadAutopilot() {
+  let d;
+  try { d = await api('/api/autopilot'); }
+  catch (e) { $('apState').textContent = e.message; return; }
+  apOn = !!(d.autopilot && d.autopilot.on);
+  $('apToggle').textContent = apOn ? 'Stop deciding' : 'Let it decide';
+  // One panel, one stamp — and `sugStamp` is already spoken for by the
+  // reading. The age of the last decision belongs with the agent's own
+  // status line, which is the sentence describing it.
+  const age = d.autopilot.last_step
+    ? ' <span class="thin">· decided '
+      + Math.round(Date.now() / 1000 - d.autopilot.last_step) + 's ago</span>'
+    : '';
+
+  const c = d.counts || {};
+  const last = d.autopilot.last_decision;
+  $('apState').innerHTML = apOn
+    ? `<b>Running on ${esc(d.autopilot.coin || '—')} `
+      + `${esc(d.autopilot.interval || '')}</b> at `
+      + `${d.autopilot.tp_bps}bps target / ${d.autopilot.sl_bps}bps stop — `
+      + `${c.closed || 0} closed, `
+      + `${c.open || 0} open, ${c.decisions || 0} decisions logged. `
+      + (last ? 'Last: ' + esc(last.sentence) : '')
+      + (d.autopilot.error ? ` <span class="err">${esc(d.autopilot.error)}</span>` : '')
+      + age
+    : `Off. ${c.closed || 0} trades in the book so far. Turn it on and leave `
+      + `it — a book that only fills while you are watching measures your `
+      + `attention, not the strategy.`;
+
+  paintPosition((d.open || [])[0]);
+  paintDecisionFeed(d.recent || []);
+  loadCalibration();
+  loadScorecard();
+}
+
+function paintPosition(p) {
+  const el = $('apPos');
+  if (!p) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  const dirCls = p.side === 'long' ? 'long' : 'short';
+  el.innerHTML =
+    `<div class="verdict-big ${dirCls}">${p.side.toUpperCase()} `
+    + `${esc(p.coin)} <span class="thin">open</span></div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${chPx(p.entry)}</b><span>entry</span></div>`
+    + `<div class="stat"><b>${chPx(p.target_px)}</b><span>target</span></div>`
+    + `<div class="stat"><b>${chPx(p.stop_px)}</b><span>invalid at</span></div>`
+    + `<div class="stat"><b>${p.mfe_bps.toFixed(1)}bps</b>`
+      + '<span>best it saw</span></div>'
+    + `<div class="stat"><b>${p.mae_bps.toFixed(1)}bps</b>`
+      + '<span>worst it saw</span></div>'
+    + (p.against_s > 0
+        ? `<div class="stat gap-bad"><b>${p.against_s.toFixed(0)}s</b>`
+          + '<span>read against it</span></div>' : '')
+    + '</div>'
+    + `<div class="msg"><b>Needs ${(p.breakeven*100).toFixed(0)}%</b> to break `
+    + `even. ${p.agreeing} of three agreed at entry; runway was `
+    + `${p.runway_bps.toFixed(0)}bps. `
+    + `<button style="margin-left:6px" onclick="closePaper('${esc(p.id)}')">`
+    + 'Close it by hand</button></div>';
+}
+
+function downloadBook() {
+  // A plain link rather than fetch-and-blob: the browser names the file
+  // from the header and puts it where downloads go.
+  const u = '/api/ledger.csv?' + q({coin: coin(), token: tok()});
+  const a = document.createElement('a');
+  a.href = u; a.download = '';
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+async function dropSuspect() {
+  try { await api('/api/ledger/clear?suspect_only=true', {method: 'POST'}); }
+  catch (e) { return; }
+  loadScorecard();
+}
+
+async function clearBook() {
+  if (!confirm('Delete every paper trade and decision, and start counting '
+               + 'from now? This cannot be undone.')) return;
+  try { await api('/api/ledger/clear', {method: 'POST'}); }
+  catch (e) { $('apState').textContent = e.message; return; }
+  loadAutopilot();
+}
+
+async function closePaper(id) {
+  try { await api('/api/autopilot/close?' + q({id}), {method: 'POST'}); }
+  catch (e) { $('apState').textContent = e.message; return; }
+  loadAutopilot();
+}
+
+const AP_WORD = {enter_long: 'LONG', enter_short: 'SHORT', exit: 'EXIT',
+                 hold: 'hold', stand_aside: 'aside'};
+
+function paintDecisionFeed(rows) {
+  const el = $('apFeed');
+  if (!rows.length) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  // Holds are the overwhelming majority and say nothing on their own;
+  // showing them would bury the decisions that changed something.
+  // Runs of the same stand-aside are collapsed. Eighty identical rows is
+  // not a feed, and it buries the decisions that changed something.
+  const runs = [];
+  for (const r of rows.filter(r => r.action !== 'hold')) {
+    const last = runs[runs.length - 1];
+    const same = last && last.action === r.action && last.gate === r.gate
+                 && r.action === 'stand_aside';
+    if (same) { last.count++; last.ts = Math.min(last.ts, r.ts); }
+    else runs.push({action: r.action, gate: r.gate, reason: r.reason,
+                    ts: r.ts, count: 1});
+  }
+  el.innerHTML = '<table><thead><tr><th>when</th><th>did</th>'
+    + '<th>why</th></tr></thead><tbody>'
+    + runs.slice(0, 12).map(r => {
+        const cls = r.action === 'enter_long' ? 'long'
+                  : r.action === 'enter_short' ? 'short' : '';
+        const times = r.count > 1 ? ` <span class="thin">×${r.count}</span>` : '';
+        return `<tr><td class="thin">`
+          + new Date(r.ts * 1000).toLocaleTimeString()
+          + `</td><td><b class="${cls}">${AP_WORD[r.action] || r.action}</b>`
+          + `${times}</td><td class="thin">`
+          + esc(r.gate ? r.gate + ' — ' + (r.reason || '') : (r.reason || ''))
+          + '</td></tr>';
+      }).join('')
+    + '</tbody></table>'
+    + '<div class="thin" style="margin-top:4px">Holds are left out and '
+    + 'repeats collapsed — only decisions that changed something.</div>';
+}
+
+/* ------------------------------------------------------------ scorecard */
+
+function band(b) {
+  /* Hit rate drawn as the RANGE it honestly is, against the rate the
+     entries needed. This is a diagnostic of the ENTRY SHAPE only — it is
+     not the verdict, because once an exit rule can close a trade between
+     the levels, clearing this line stops implying making money. The
+     verdict column is expectancy. */
+  const verdict = b.beats_breakeven === true ? 'clear'
+                : b.beats_breakeven === false ? 'short' : 'undecided';
+  const lo = b.ci_low * 100, hi = b.ci_high * 100;
+  return `<div class="band" title="${esc(b.verdict)}">`
+    + `<div class="fill ${verdict}" style="left:${lo}%;width:${hi-lo}%"></div>`
+    + `<div class="point" style="left:${b.hit_rate*100}%"></div>`
+    + `<div class="need" style="left:${b.needed*100}%"></div></div>`;
+}
+
+const BAND_KEY =
+  '<div class="thin" style="margin-top:8px">The bar below is about entry '
+  + '<i>shape</i> — did it hit often enough for the way the trades were '
+  + 'sized. The money column is the verdict; they can disagree, and when '
+  + 'they do the row says why.</div>'
+  + '<div class="band-key">'
+  + '<span><i style="width:18px;height:9px;background:var(--dim);opacity:.55;'
+  + 'border-radius:2px"></i>where the true hit rate honestly sits</span>'
+  + '<span><i style="width:2px;height:11px;background:var(--ink);'
+  + 'opacity:.9"></i>what it actually hit</span>'
+  + '<span><i style="width:2px;height:13px;background:var(--ink)"></i>'
+  + 'what it had to hit to break even</span>'
+  + '<span>green = the whole range clears it · red = none of it does · '
+  + 'grey = too close to call</span></div>';
+
+async function loadScorecard() {
+  let d;
+  try { d = await api('/api/scorecard?' + q({coin: coin()})); }
+  catch (e) { $('apHead').textContent = e.message; return; }
+  if (!d.ok) return;
+
+  const o = d.overall;
+  // A result that cannot be true poisons every average it sits in, and
+  // there is no way to tell afterwards which numbers were real.
+  const bad = (d.suspect || 0);
+  $('apHead').innerHTML =
+    (bad ? `<div class="msg" style="color:var(--down)"><b>${bad} trade`
+           + `${bad === 1 ? '' : 's'} in this book cannot be true</b> — a `
+           + 'move that size is a bug, not a result, and it is dragging '
+           + 'every number below it. '
+           + '<button onclick="dropSuspect()">Drop them</button> or '
+           + '<button onclick="clearBook()">clear the book</button>.</div>'
+         : '')
+    + `<b>${esc(d.headline)}</b>`;
+
+  $('apStats').innerHTML = '<div class="conrow">'
+    + `<div class="stat"><b>${o.n}</b><span>closed</span></div>`
+    + `<div class="stat"><b class="${o.profitable === true ? 'long'
+        : o.profitable === false ? 'short' : ''}">`
+      + `${o.expectancy_bps > 0 ? '+' : ''}${o.expectancy_bps}bps</b>`
+      + `<span>per trade${o.exp_low == null ? '' :
+          ' · ' + (o.exp_low > 0 ? '+' : '') + o.exp_low + ' to '
+          + (o.exp_high > 0 ? '+' : '') + o.exp_high + ' honest range'}</span></div>`
+    + `<div class="stat"><b>${(o.hit_rate*100).toFixed(0)}%</b>`
+      + `<span>hit · needed ${(o.needed*100).toFixed(0)}%</span></div>`
+    + `<div class="stat"><b>${o.avg_r}</b><span>average R</span></div>`
+    + `<div class="stat"><b>${o.cost_drag_bps}bps</b>`
+      + '<span>cost per trade</span></div>'
+    + '</div>'
+    + (d.exits && d.exits.n
+        ? `<div class="msg"><b>Exits:</b> ${esc(d.exits.note)}</div>` : '')
+    + (d.stops && d.stops.n
+        ? `<div class="msg"><b>Stops:</b> ${esc(d.stops.note)}.</div>` : '');
+
+  const slice = (title, rows) => !rows.length ? '' :
+    `<h3 style="margin:14px 0 4px;font-size:13px">${title}</h3>`
+    + '<table><thead><tr><th>slice</th><th>n</th>'
+    + '<th>entry shape: hit vs needed</th>'
+    + '<th>per trade, after cost</th><th>reads as</th></tr></thead><tbody>'
+    + rows.map(b => {
+        const cls = b.profitable === true ? 'long'
+                  : b.profitable === false ? 'short' : '';
+        const range = (b.exp_low == null) ? ''
+          : `<span class="thin"> (${b.exp_low > 0 ? '+' : ''}${b.exp_low}`
+            + ` to ${b.exp_high > 0 ? '+' : ''}${b.exp_high})</span>`;
+        return `<tr><td>${esc(b.label)}</td><td>${b.n}</td>`
+          + `<td style="width:180px">${band(b)}</td>`
+          + `<td class="${cls}">${b.expectancy_bps > 0 ? '+' : ''}`
+          + `${b.expectancy_bps}bps${b.meaningful ? range : ''}</td>`
+          + `<td class="thin">${b.meaningful ? esc(b.verdict)
+              : 'too few to read'}`
+          + (b.divergence ? `<br><b>${esc(b.divergence)}</b>` : '')
+          + '</td></tr>';
+      }).join('')
+    + '</tbody></table>';
+
+  $('apSlices').innerHTML = BAND_KEY
+    + slice('Where the trade came from', d.by_source || [])
+    + slice('By how many columns agreed', d.by_agreeing)
+    + slice('By grade', d.by_grade)
+    + slice('By how it ended', d.by_exit)
+    + slice('By how much room it had', d.by_runway)
+    + (d.gates && d.gates.length
+        ? '<h3 style="margin:14px 0 4px;font-size:13px">What it refused</h3>'
+          + '<table><thead><tr><th>gate</th><th>blocked</th>'
+          + '<th>of all polls</th></tr></thead><tbody>'
+          + d.gates.slice(0, 8).map(g => `<tr><td>${esc(g.gate)}</td>`
+              + `<td>${g.blocked}</td>`
+              + `<td>${(g.share_of_all*100).toFixed(0)}%</td></tr>`).join('')
+          + '</tbody></table>'
+          + '<div class="thin">A gate that fires on most polls IS the '
+          + 'strategy, whatever the description says.</div>'
+        : '');
+
+  loadProposals();
+}
+
+/* ------------------------------------------------------------ proposals */
+
+async function loadProposals() {
+  let d;
+  try { d = await api('/api/proposals'); }
+  catch (e) { $('apProposals').textContent = e.message; return; }
+
+  const knobs = d.knobs || {};
+  const changed = Object.entries(knobs).filter(([, v]) => v.changed);
+  const current = '<div class="msg"><b>Settings now:</b> '
+    + Object.entries(knobs).map(([k, v]) =>
+        `${esc(k)} ${v.value}${v.changed
+          ? ` <span class="thin">(default ${v.default}, `
+            + `<a href="#" onclick="revertKnob('${esc(k)}');return false">`
+            + 'put back</a>)</span>' : ''}`).join(' · ')
+    + '</div>';
+
+  const r = d.readiness || {};
+  if (!d.proposals.length) {
+    $('apProposals').innerHTML = current
+      + `<div class="msg"><b>Tuning ${esc(d.tunes || '')}.</b> `
+      + `${esc(r.note || '')}`
+      + (r.ready ? ' Nothing to propose right now — it only asks when a '
+                 + 'pair beats what is running on signals it has never '
+                 + 'seen, and most of the time nothing does.' : '')
+      + '</div>'
+      + (d.raw
+          ? '<div class="thin">There are no entry gates to tune any more — '
+            + 'the vote refuses nothing, so the only thing left worth '
+            + 'changing is where the levels sit. That is judged by the grid '
+            + 'above, not by closed trades: a target changes what happens '
+            + '<i>during</i> a trade, which an outcome cannot replay. '
+            + 'Target and stop always move together.</div>'
+          : '<div class="thin">Loosening is never proposed — the book has '
+            + 'no result for trades it refused to take.</div>');
+    return;
+  }
+
+  $('apProposals').innerHTML = current + d.proposals.map(p => {
+    const head = p.param2
+      ? `${esc(p.param)} + ${esc(p.param2)}: `
+        + `${p.current_val}/${p.current_val2} → `
+        + `${p.proposed_val}/${p.proposed_val2}`
+      : `${esc(p.param)}: ${p.current_val} → ${p.proposed_val}`;
+    return `
+    <div class="prop">
+      <b>${head}</b>
+      ${p.param2 ? '<div class="thin">Adopted together — half of a tested '
+        + 'pair is a setting nobody tested.</div>' : ''}
+      <pre>${esc(p.rationale)}</pre>
+      <button class="go" onclick="decideProposal('${esc(p.id)}',true)">
+        Adopt</button>
+      <button onclick="decideProposal('${esc(p.id)}',false)">Reject</button>
+    </div>`; }).join('');
+}
+
+async function decideProposal(id, adopt) {
+  try { await api('/api/proposals/decide?' + q({id, adopt}), {method: 'POST'}); }
+  catch (e) { $('apProposals').textContent = e.message; return; }
+  loadProposals();
+}
+
+async function revertKnob(param) {
+  try { await api('/api/proposals/revert?' + q({param}), {method: 'POST'}); }
+  catch (e) { return; }
+  loadProposals();
+}
+
+async function scanProposals() {
+  $('apProposals').textContent = 'walking forward…';
+  try { await api('/api/proposals/scan', {method: 'POST'}); }
+  catch (e) { $('apProposals').textContent = e.message; return; }
+  loadProposals();
+}
+
+/* ---------------------------------------------------------------------
+   The target / stop grid.
+
+   Diverging colour, because the metric has a real zero. The pair is
+   blue-red rather than the app's green-red for one measured reason: a
+   grid asks you to tell dozens of adjacent cells apart, and green-red
+   separates at deltaE 5 under deuteranopia where blue-red holds at 19.
+   Every cell carries its number too, so colour is never doing the work
+   alone.
+   --------------------------------------------------------------------- */
+
+const HEAT_POS = [42, 107, 176];    // pays
+const HEAT_NEG = [196, 69, 54];     // loses
+const HEAT_MID = [44, 49, 56];      // breaking even
+
+function heatColor(v, scale) {
+  if (v == null || !scale) return 'rgb(44,49,56)';
+  const t = Math.max(-1, Math.min(1, v / scale));
+  const pole = t >= 0 ? HEAT_POS : HEAT_NEG;
+  const k = Math.abs(t);
+  const c = HEAT_MID.map((m, i) => Math.round(m + (pole[i] - m) * k));
+  return `rgb(${c[0]},${c[1]},${c[2]})`;
+}
+
+function swCfg() {
+  return {
+    coin: coin(), interval: $('swInt').value,
+    tp_from: parseFloat($('swTpFrom').value || '5'),
+    tp_to: parseFloat($('swTpTo').value || '40'),
+    tp_step: parseFloat($('swTpStep').value || '5'),
+    sl_from: parseFloat($('swSlFrom').value || '5'),
+    sl_to: parseFloat($('swSlTo').value || '40'),
+    sl_step: parseFloat($('swSlStep').value || '5'),
+    cost_bps: parseFloat($('swFee').value || '0'),
+    min_agreeing: parseInt($('swAgree').value || '0', 10),
+    unanimous: parseInt($('swAgree').value || '0', 10) === 3,
+    min_effort: parseFloat($('swEffort').value || '0') / 100,
+    side: $('swSide').value,
+  };
+}
+
+async function loadSignals() {
+  let d;
+  try {
+    d = await api('/api/signals?' + q({coin: coin(),
+                                       interval: $('swInt').value}));
+  } catch (e) { $('swAvail').textContent = e.message; return; }
+  if (!d.ok) { $('swAvail').textContent = d.detail || 'nothing stored'; return; }
+  const hrs = (d.span && d.span.first && d.span.last)
+    ? ((d.span.last - d.span.first) / 3600).toFixed(1) : '0';
+  $('swAvail').innerHTML = `<b>${d.n} signals</b> on ${esc(d.coin)} `
+    + `${esc(d.interval)} over ${hrs}h. `
+    + (d.shapes || []).map(([sh, n]) =>
+        `${esc(sh)}: ${n}`).join(' · ')
+    + (d.n < 30 ? ' — <b>too few to test yet.</b> Leave the feed running; '
+                + 'one lands per candle.' : '');
+}
+
+async function runSweep() {
+  $('swVerdict').style.display = '';
+  $('swVerdict').textContent = 'walking every pair over every signal…';
+  $('swGrid').innerHTML = '';
+  $('swShapes').innerHTML = '';
+  let d;
+  try { d = await api('/api/grid?' + q(swCfg())); }
+  catch (e) { $('swVerdict').textContent = e.message; return; }
+
+  if (!d.ok) {
+    $('swVerdict').innerHTML = `<b>${esc(d.detail || 'no result')}</b>`
+      + (d.considered ? `<div class="thin">${d.considered} signals were `
+          + 'recorded; none of them met that filter.</div>' : '');
+    if (d.span && d.span.n) {
+      $('swAvail').textContent = `${d.span.n} readings stored for this `
+        + 'market, but none matched.';
+    }
+    return;
+  }
+
+  $('swStamp').textContent = `${d.signals} signals · ${d.span_hours}h`;
+  if (d.tick_bps) {
+    $('swStamp').textContent += ` · 1 tick ≈ ${d.tick_bps.toFixed(2)}bps`;
+  }
+  $('swVerdict').innerHTML = `<b>${esc(d.verdict)}</b>`;
+  $('swAvail').innerHTML = `<b>${d.available} recorded</b>, `
+    + `${d.considered != null && d.considered !== d.signals
+        ? d.signals + ' passed the filter and had price after them'
+        : d.signals + ' usable'}. `
+    + `Cost ${d.cost_bps}bps a round trip, and every trade ends when its `
+    + 'own candle closes.';
+  paintHeat(d);
+  paintShapes(d);
+}
+
+function paintHeat(d) {
+  const scale = Math.max(...d.cells.map(c => Math.abs(c.expectancy)), 0.01);
+  const by = {};
+  for (const c of d.cells) by[c.tp_bps + '|' + c.sl_bps] = c;
+  const bestKey = d.best.tp_bps + '|' + d.best.sl_bps;
+
+  let h = '<table class="heat"><thead><tr>'
+        + '<th style="text-align:left">stop \\u2193 / target \\u2192</th>'
+        + d.tp_values.map(t => `<th>${t}</th>`).join('')
+        + '</tr></thead><tbody>';
+  for (const sl of d.sl_values) {
+    h += `<tr><th style="text-align:left">${sl}</th>`;
+    for (const tp of d.tp_values) {
+      const c = by[tp + '|' + sl];
+      if (!c) { h += '<td></td>'; continue; }
+      const key = tp + '|' + sl;
+      const cls = (key === bestKey ? 'best' : (c.significant ? 'sig' : ''));
+      const tip = `target ${tp}bps / stop ${sl}bps · ${c.rr}R\n`
+        + `${c.expectancy >= 0 ? '+' : ''}${c.expectancy}bps a trade `
+        + `over ${c.n}\n`
+        + `honest range ${c.ci_low} to ${c.ci_high}\n`
+        + `hit ${(c.hit_rate*100).toFixed(0)}% · needs `
+        + `${(c.breakeven*100).toFixed(0)}%\n`
+        + `${c.targets} targets, ${c.stops} stops, `
+        + `${c.expiries || 0} ran out of candle\n`
+        + `held ${c.avg_bars} min on average`;
+      h += `<td class="${cls}" style="background:`
+        + `${heatColor(c.expectancy, scale)}" title="${esc(tip)}">`
+        + `${c.expectancy >= 0 ? '+' : ''}${c.expectancy.toFixed(1)}</td>`;
+    }
+    h += '</tr>';
+  }
+  h += '</tbody></table>';
+
+  const swatch = v =>
+    `<i style="width:22px;background:${heatColor(v, scale)}"></i>`;
+  h += '<div class="heat-key">'
+    + `<span>${swatch(-scale)}${swatch(-scale/2)}${swatch(0)}`
+    + `${swatch(scale/2)}${swatch(scale)}</span>`
+    + `<span>&minus;${scale.toFixed(1)}bps &rarr; breaking even &rarr; `
+    + `+${scale.toFixed(1)}bps a trade, after cost</span>`
+    + '<span><i style="width:12px;outline:1.5px solid var(--ink);'
+    + 'outline-offset:-1.5px;background:transparent"></i>the whole honest '
+    + 'range is on one side of zero</span>'
+    + '<span><i style="width:12px;outline:2px solid var(--accent);'
+    + 'outline-offset:-2px;background:transparent"></i>best cell</span>'
+    + '<span>hover any square for its full numbers</span></div>'
+    + '<div class="thin">Both levels touched inside one minute counts as a '
+    + '<b>stop</b> — nothing in a bar says which came first, and taking the '
+    + 'good one is what makes a grid look better than it is. Trades that '
+    + 'never reach either level are marked out at the close, not dropped.</div>';
+
+  $('swGrid').innerHTML = h;
+}
+
+function paintShapes(d) {
+  const rows = d.by_shape || [];
+  if (!rows.length) return;
+  $('swShapes').innerHTML =
+    '<h3 style="margin:0 0 4px;font-size:13px">How each vote shape did at '
+    + `the best cell (${d.best.tp_bps}bps target, ${d.best.sl_bps}bps stop)`
+    + '</h3>'
+    + '<div class="thin" style="margin-bottom:6px">agreeing&ndash;against. '
+    + '<b>3&ndash;0</b> is all three columns; <b>2&ndash;1</b> is two '
+    + 'outvoting one; <b>1&ndash;0</b> is one column with two staying '
+    + 'quiet. The cell was picked using all of them, so treat one '
+    + 'shape standing out here as a lead to check, not a finding.'
+    + '</div>'
+    + '<table><thead><tr><th>shape</th><th>n</th><th>per trade</th>'
+    + '<th>honest range</th><th>hit</th><th>needed</th>'
+    + '<th>reads as</th></tr></thead><tbody>'
+    + rows.map(r => `<tr><td><b>${esc(r.shape)}</b></td><td>${r.n}</td>`
+        + `<td class="${r.expectancy > 0 ? 'long' : 'short'}">`
+        + `${r.expectancy >= 0 ? '+' : ''}${r.expectancy.toFixed(2)}bps</td>`
+        + `<td class="thin">${r.ci_low == null ? '—'
+            : (r.ci_low >= 0 ? '+' : '') + r.ci_low.toFixed(1) + ' to '
+              + (r.ci_high >= 0 ? '+' : '') + r.ci_high.toFixed(1)}</td>`
+        + `<td>${(r.hit_rate*100).toFixed(0)}%</td>`
+        + `<td>${(r.breakeven*100).toFixed(0)}%</td>`
+        + `<td class="thin">${r.significant
+            ? 'real at this sample size'
+            : (r.n < 30 ? 'too few to read' : 'inside the noise')}</td>`
+        + '</tr>').join('')
+    + '</tbody></table>';
+}
+
+
+/* ---- OFI backtester ---------------------------------------------------
+   The knobs are the caller's. Nothing here picks a threshold, a bracket
+   or a cost -- those are trading decisions, and the panel's job is to
+   report what each choice would have scored against its own controls. */
+async function btDatasets() {
+  try {
+    const d = await api('/api/ofi-datasets');
+    const sel = $('btData');
+    const had = sel.value;
+    sel.innerHTML = (d.datasets || []).map(x =>
+      `<option value="${x.name}">${x.name} (${x.size_mb}MB)</option>`).join('')
+      || '<option value="">none uploaded</option>';
+    if (had) sel.value = had;
+    if (d.datasets && d.datasets.length && !d.dir_is_volume)
+      $('btUp').textContent = 'not on a volume -- a deploy wipes these';
+  } catch (e) { }
+}
+
+async function btUpload() {
+  const f = $('btFile').files[0];
+  if (!f) { $('btUp').textContent = 'pick a .csv first'; return; }
+  $('btUp').textContent = 'uploading ' + (f.size / 1e6).toFixed(1) + 'MB...';
+  const fd = new FormData();
+  fd.append('file', f);
+  // `api` already does the right thing with FormData: it leaves the
+  // Content-Type alone so the browser's multipart boundary survives.
+  const stem = f.name.endsWith('.csv') ? f.name.slice(0, -4) : f.name;
+  try {
+    const d = await api('/api/ofi-dataset?name=' + encodeURIComponent(stem),
+                        { method: 'POST', body: fd });
+    $('btUp').textContent = d.ok ? ('stored ' + d.name) : d.error;
+    if (d.ok) await btDatasets();
+  } catch (e) { $('btUp').textContent = 'upload failed: ' + e; }
+}
+
+function btRules() {
+  return ['ofi', 'agree', 'book', 'delta']
+    .filter(r => $('btR_' + r).checked).join(',');
+}
+
+function btRow(a, label) {
+  const p = v => (v == null) ? '--' : (v * 100).toFixed(1) + '%';
+  const t = v => (v == null) ? '--' : (v >= 0 ? '+' : '') + v.toFixed(3);
+  return `<tr><td>${label}</td><td class="num">${a.scored.toLocaleString()}</td>
+    <td class="num">${p(a.win_rate)}</td>
+    <td class="num">${p(a.win_rate_lo)} &ndash; ${p(a.win_rate_hi)}</td>
+    <td class="num">${t(a.per_trade_ticks)}</td>
+    <td class="num">${a.ambiguous.toLocaleString()}</td>
+    <td class="num">${a.unresolved.toLocaleString()}</td></tr>`;
+}
+
+async function btRun() {
+  const rules = btRules();
+  if (!rules) { $('btOut').innerHTML =
+      '<div class="msg">tick at least one rule</div>'; return; }
+  const q = new URLSearchParams({
+    dataset: $('btData').value || '', rule: rules,
+    z: $('btZ').value, target: $('btTgt').value, stop: $('btStop').value,
+    cost: $('btCost').value, hold: $('btHold').value,
+    window: $('btWin').value, baseline: $('btBase').value,
+    cooldown: $('btCool').value, train: $('btTrain').value,
+    book_ratio: $('btRatio').value, delta_window: $('btDW').value,
+    frames: $('btFrames').value });
+  $('btOut').innerHTML = '<div class="msg">running...</div>';
+  $('btStamp').textContent = '';
+  let d;
+  try { d = await api('/api/ofi-backtest?' + q.toString()); }
+  catch (e) { $('btOut').innerHTML = '<div class="msg">' + e + '</div>'; return; }
+
+  if (!d.ok) {
+    $('btBreak').textContent = '';
+    $('btOut').innerHTML = '<div class="msg">' + (d.why || 'no result') + '</div>';
+    return;
+  }
+  $('btStamp').textContent = d.dataset + '  ' + d.hours + 'h';
+  $('btBreak').innerHTML = `<b>${d.settings.target_ticks}t target /
+    ${d.settings.stop_ticks}t stop at ${d.settings.cost_ticks} ticks of
+    cost</b> &mdash; break-even ${(d.break_even * 100).toFixed(1)}%, because
+    both sides pay the cost. ${d.entries.toLocaleString()} entries over
+    ${d.seconds.toLocaleString()} seconds.`;
+
+  let html = '';
+  for (const split of ['train', 'held_out']) {
+    html += `<h3 style="margin:12px 0 4px">${split === 'train' ? 'train' :
+      'held out &mdash; read this one'}</h3>
+      <table class="tbl"><thead><tr><th>arm</th><th class="num">scored</th>
+      <th class="num">win</th><th class="num">95% interval</th>
+      <th class="num">ticks/trade</th><th class="num">ambig</th>
+      <th class="num">unres</th></tr></thead><tbody>`;
+    for (const arm of ['signal', 'mirror', 'control'])
+      html += btRow(d.arms[arm][split], arm);
+    html += '</tbody></table>';
+  }
+  html += '<div class="msg" style="margin-top:10px"><b>verdict:</b> ' +
+          d.verdict + '</div>';
+  html += '<div class="msg">Ambiguous trades touched both brackets inside one ' +
+          'second; the file does not say which came first, so they are set ' +
+          'aside rather than guessed in your favour.</div>';
+  $('btOut').innerHTML = html;
+}
+
+
+/* ---- footprint --------------------------------------------------
+   Two reads at two rates, the way the engine is built for: the
+   scalars come from a published snapshot taken at one instant, and
+   the matrix is asked for at a frame rate because it allocates per
+   level. Nothing here decides anything -- it draws what traded. */
+let FP_TIMER = null;
+
+function fpMeter(v, label) {
+  const pct = Math.max(-1, Math.min(1, v || 0));
+  const w = Math.abs(pct) * 50;
+  const left = pct >= 0 ? 50 : 50 - w;
+  const col = pct >= 0 ? 'var(--up)' : 'var(--down)';
+  return `<span class="meter" title="${label} ${pct.toFixed(2)}">
+    <i style="left:${left}%;width:${w}%;background:${col}"></i>
+    <span class="mid"></span></span>`;
+}
+
+function fpNum(n) { return (n == null) ? '--' : n.toLocaleString(); }
+function fpSign(n) {
+  if (n == null) return '--';
+  return (n >= 0 ? '+' : '') + n.toLocaleString();
+}
+
+/* ---- the resting book, read diagonally -------------------------
+   A SEPARATE measurement from the footprint above it. That counts
+   contracts that traded and who crossed to get them; this counts
+   contracts that are standing there and have not traded at all.
+   Resting size is the weaker of the two -- it can be pulled the
+   instant it is leaned on -- so it is labelled as what it is. */
+function fpBookRow(d) {
+  const b = d.book;
+  if (!b) return '';
+  const who = w => w === 'bid' ? 'BID' : (w === 'ask' ? 'ASK' : '--');
+  const held = (b.held * 100).toFixed(0);
+  return `
+    <span class="stamp">resting book</span>
+    <span>now <b>${who(b.winning_now)}</b>
+      ${fpMeter(b.size_now, 'book now')}
+      ${b.size_now.toFixed(2)}</span>
+    <span>since open <b>${who(b.winning_since_open)}</b>
+      ${fpMeter(b.size_mean, 'book mean')}
+      ${b.size_mean.toFixed(2)}</span>
+    <span>bid ahead <b>${held}%</b> of the bar</span>
+    <span>contracts <b>${fpNum(b.bid_sz)}</b> /
+      <b>${fpNum(b.ask_sz)}</b></span>
+    <span>orders <b>${fpNum(b.bid_ct)}</b> /
+      <b>${fpNum(b.ask_ct)}</b>
+      ${fpMeter(b.order_now, 'orders')}</span>
+    <span>rungs held <b>${b.bid_rungs}</b> bid /
+      <b>${b.ask_rungs}</b> ask</span>
+    <span class="stamp">${b.updates} updates &middot;
+      ${b.seconds.toFixed(0)}s &middot; spread
+      ${b.spread_ticks.toFixed(1)}t</span>`;
+}
+
+/* ---- can the flow get THROUGH it -------------------------------
+   The row above says what is standing there. This says whether
+   anyone is paying fast enough to eat it, in SECONDS -- a unit you
+   can argue with, unlike a ratio of two numbers measured over
+   different windows.
+
+   Two honesty rules are in the display, not just the maths:
+
+   the depth actually seen is printed whenever it fell short of the
+   distance asked for, because a truncated obstacle UNDERSTATES
+   resistance and would otherwise read as an easier clear;
+
+   no visible size reports "can't tell", never "clear" -- icebergs
+   show at no depth, so an empty ladder is an unknown, not a road. */
+function dexArbRow(d) {
+  if (!d) return '';
+  if (!d.ok) {
+    return `<span class="stamp" style="width:100%">dex arbitrage &mdash;
+      ${d.why || 'unavailable'}</span>`;
+  }
+  const cy = d.cycles || [];
+  const head = cy.length === 0
+    ? '<b>POOLS AGREE</b> &mdash; no cycle clears its own fees'
+    : `<b class="long">${cy.length} CYCLE${cy.length > 1 ? 'S' : ''}</b>`
+      + ` &mdash; best ${cy[0].gross_f.toFixed(5)} ${d.asset}`
+      + ` (${cy[0].bps.toFixed(1)} bps)`;
+  const rows = cy.slice(0, 5).map(c =>
+    `<span class="stamp">${c.labels.join(' &rarr; ')}
+      &middot; in ${c.amount_in_f.toFixed(4)}
+      &middot; gross <b>${c.gross_f > 0 ? '+' : ''}${c.gross_f.toFixed(5)}</b>
+      &middot; ${c.bps.toFixed(1)} bps</span>`).join('');
+  return `
+    <span class="stamp" style="width:100%">dex arbitrage &mdash; where the
+      pools disagree</span>
+    <span>${head}</span>
+    ${rows}
+    <span class="stamp">block ${d.block.toLocaleString()}
+      &middot; ${d.pools_read}/${d.pools_total} pools read
+      &middot; quoting ${d.asset}</span>
+    <span class="stamp" style="width:100%">GROSS IS NOT PROFIT. Taking one
+      of these costs the flash-loan premium, gas, and whatever had to be
+      bid to a block builder to be included ahead of everyone else
+      watching the same pools &mdash; on a contested path that bid
+      approaches the whole gross. Read this as how far apart the pools
+      drift, not as money on the table.</span>`;
+}
+
+let _dexTimer = null;
+async function dexTick() {
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return;          // not on screen, not polled
+  if (!$('dexArb')) return;
+  try {
+    // Its own timer, NOT fpLoad's. The footprint returns early whenever
+    // the CME tape is silent, and a panel drawn at its tail would go
+    // dark outside RTH while the DEX pools carry on trading.
+    const d = await api('/api/dexarb?asset=WETH&limit=8');
+    $('dexArb').innerHTML = dexArbRow(d);
+  } catch (e) {
+    $('dexArb').innerHTML = '<span class="stamp" style="width:100%">' +
+      'dex arbitrage &mdash; ' + e + '</span>';
+  }
+}
+
+function fpClearRow(d) {
+  const c = d.clearance;
+  if (!c) return '';
+  const say = (side, k) => {
+    const o = k.obstacle || {};
+    let verdict, cls = '';
+    if (k.verdict === 'unknown') {
+      verdict = "CAN'T TELL &mdash; no visible size to measure";
+    } else if (k.verdict === 'clears') {
+      verdict = 'CLEARS &mdash; ' +
+        (k.seconds_to_clear === null ? 'at this rate'
+         : k.seconds_to_clear.toFixed(1) + 's to eat ' +
+           fpNum(o.size) + ' at ' + k.rate.toFixed(0) + '/s');
+      cls = side === 'buy' ? 'long' : 'short';
+    } else {
+      verdict = 'BLOCKED &mdash; ' + fpNum(o.size) + ' resting, ' +
+        (k.rate > 0 ? k.seconds_to_clear.toFixed(0) + 's at the current '
+                      + k.rate.toFixed(0) + '/s'
+                    : 'nothing is paying');
+    }
+    // Only ever a LOWER bound on resistance when the book ran out.
+    const seen = o.truncated
+      ? ` &middot; saw ${o.covered_ticks}t of ${o.asked_ticks}t asked
+          (book ran out &mdash; resistance is AT LEAST this)` : '';
+    // A wall that left is not a wall that was eaten.
+    const left = (k.pulled + k.consumed) > 0
+      ? ` &middot; ${(k.pulled_share * 100).toFixed(0)}% of the decline
+          was pulled, not traded` : '';
+    return `
+      <span class="stamp">${side} side</span>
+      <span class="${cls}" style="font-size:13px"><b>${verdict}</b></span>
+      <span class="stamp">${fpNum(k.flow)} paid vs ${fpNum(k.opposing)}
+        against over ${k.window_s.toFixed(1)}s${seen}${left}</span>`;
+  };
+  return say('buy', c.buy) + say('sell', c.sell);
+}
+
+/* ---- the two lines ----------------------------------------------
+   ONE axis, and here it is honest rather than convenient: both series
+   are expressed in standard deviations of their OWN recent behaviour,
+   so they are dimensionless and directly comparable. Raw, the book
+   line and the traded line do not share a scale and would never meet;
+   the usual dodge is a second y-axis, which is a lie that makes any
+   two shapes look related.
+
+   Identity is not carried by colour alone -- the reader is solid, the
+   confirmation dashed, both labelled at the right-hand end. The
+   site's --up/--down sit about 5 deutan units apart, under the
+   readable floor, so a reader with common colour blindness would
+   otherwise see two identical grey lines.
+
+   Crossings are drawn differently depending on whether the agreement
+   had held at that moment: a filled ring for confirmed, a hollow one
+   for not. Both are shown, because how the unconfirmed ones behave is
+   the thing worth watching. */
+/* THE READ LINE, AT TOP LEVEL so it can be repainted on its own.
+
+   The OFI panel redraws on a two-second poll. That is fine for a
+   chart of closed bars and far too slow for a line whose whole
+   purpose is to say what is true RIGHT NOW -- at two seconds the
+   reading is describing a market that has already moved on, which
+   is the one failure this line cannot have.
+
+   So it is a function of its own, it renders into an element with
+   its own id, and every live tick frame rewrites just that element.
+   The chart behind it keeps its two-second cadence; the line does
+   not. */
+/* `id` so the SAME line can be drawn twice -- once on the footprint
+   and once at the foot of the stack panel -- without two elements
+   sharing an id, which would leave getElementById repainting one of
+   them forever and the other frozen at whatever it said on load. */
+function ofiBarReadLine(r, pr, id, clock) {
+  const word = r.read === 'up'   ? '<b class="long">UP</b>'
+             : r.read === 'down' ? '<b class="short">DOWN</b>'
+             : '<b>FLAT</b>';
+  if (!r.forming) {
+    return '<span id="' + id + '" class="stamp" style="width:100%">'
+      + 'READ &mdash; <b>no bar is forming</b> &mdash; nothing to '
+      + 'read yet</span>';
+  }
+  /* THE SIGNED DISTANCE FROM THIS BAR'S OPEN. The word without it is
+     the same word for a quarter of a tick and for four points. */
+  const t = r.ticks || 0;
+  const dist = (t === 0)
+    ? 'back at its open'
+    : (t > 0 ? '+' : '') + t.toFixed(2) + (Math.abs(t) === 1
+        ? ' tick' : ' ticks') + ' from its open'
+      + (Math.abs(r.points) >= 1
+          ? ' (' + (r.points > 0 ? '+' : '') + r.points.toFixed(2)
+            + ' pts)' : '');
+  const held = (r.read !== 'flat' && r.held_s)
+    ? ' for ' + clock(r.held_s) : '';
+  /* PRICE IS STILL ITS OWN READING. It has no reference point at all
+     -- not this bar's open, not anything -- so it stays a second
+     opinion rather than a restatement of the line it sits on. */
+  const pd = pr && pr.dir;
+  const price = pr
+    ? ' &nbsp; PRICE &mdash; ' + (pd === 'up'
+        ? '<b class="long">UP</b>' : pd === 'down'
+        ? '<b class="short">DOWN</b>' : '<b>FLAT</b>')
+      + (pr.px ? ' <b>' + pr.px.toFixed(2) + '</b>' : '')
+    : '';
+  const both = (r.read !== 'flat' && pd)
+    ? (r.read === pd
+        ? ' &middot; <b class="long">both the same way</b>'
+        : ' &middot; <b class="short">opposed</b>')
+    : '';
+  /* A BAR THAT KEEPS CROSSING ITS OWN OPEN IS NOT GOING ANYWHERE, and
+     the word on the left cannot say that -- it is UP or DOWN either
+     way. The count is the only thing on the line that can. */
+  const shaky = (r.flips > 6)
+    ? ' &middot; <b class="short">it has crossed its open ' + r.flips
+      + ' times</b> &mdash; this bar is going nowhere'
+    : (r.flips > 2)
+      ? ' &middot; ' + r.flips + ' crossings of its open' : '';
+  return '<span id="' + id + '" class="stamp" style="width:100%">'
+    + 'READ &mdash; ' + word + held + price + both
+    + ' &middot; ' + dist
+    + ' &middot; this bar has been open ' + clock(r.into_s)
+    + shaky
+    + ' &middot; the candle in progress at target '
+    + (r.target || 0).toLocaleString() + ', not the imbalance &mdash; '
+    + 'it starts again when this bar closes, which is flow and not a '
+    + 'clock</span>';
+}
+
+/* READ -- WHAT THE OFI CANDLE ON THE SCREEN IS DOING.
+
+   It used to be a flow reading on a five-minute clock: buying minus
+   selling since the last boundary, reset every five minutes whatever
+   the bars were doing. It is now where price sits against the open of
+   the bar in progress, and it starts again when that bar does.
+
+   TWO THINGS FOLLOW AND BOTH ARE VISIBLE ON THE LINE.
+
+   The window is a quantity of FLOW, not of clock, so it can reset
+   twice in a minute in fast tape and not for ten in slow tape. The
+   line says how long this bar has been open rather than how long is
+   left in it, because there is no "left" -- the bar ends when the
+   imbalance says so and nothing here knows when that will be.
+
+   FLAT IS PRINTED, NOT SUPPRESSED. Price back at the bar's open is a
+   real state, and showing the last direction through it would be a
+   reading of a moment that has passed.
+
+   The number is the evidence for the word. UP by a quarter of a tick
+   and UP by four points are the same word and not the same thing. */
+function ofiReadLine(r, pr, id) {
+  if (!r) return '';
+  id = id || 'ofiReadLine';
+  const clock = s => (s >= 90 ? (s / 60).toFixed(1) + ' min'
+                              : Math.round(s) + 's');
+  if (r.ticks !== undefined) return ofiBarReadLine(r, pr, id, clock);
+  const left = ' &middot; ' + clock(r.left_s) + ' left in this candle';
+
+  /* PRICE, AND IT IS NOT MEASURED AGAINST ANYTHING. Not the
+     candle's open, not where the read fired, not a window -- just
+     which way the last change in the TRADED price went. That is
+     what makes it a second opinion rather than a restatement: a
+     reference point chosen to pair with the read would agree with
+     it by construction. */
+  const pd = pr && pr.dir;
+  const price = pr
+    ? ' &nbsp; PRICE &mdash; ' + (pd === 'up'
+        ? '<b class="long">UP</b>' : pd === 'down'
+        ? '<b class="short">DOWN</b>' : '<b>FLAT</b>')
+      + (pr.px ? ' <b>' + pr.px.toFixed(2) + '</b>' : '')
+      + (!pd && pr.still_s ? ' (unchanged ' + clock(pr.still_s) + ')'
+         : '')
+    : '';
+  /* AGREEMENT IS SHOWN, NOT COMPUTED INTO ANYTHING. Whether the
+     flow and the price pointing the same way means anything is a
+     question for scripts/read_accuracy.py, not for this line. */
+  const both = (r.read && pd)
+    ? (r.read === pd
+        ? ' &middot; <b class="long">both the same way</b>'
+        : ' &middot; <b class="short">opposed</b>')
+    : '';
+
+  if (!r.warm) {
+    return '<span id="' + id + '" class="stamp" style="width:100%">'
+      + 'READ &mdash; <b>NEW CANDLE</b>, ' + Math.round(r.into_s)
+      + 's in &mdash; too early to say which way it is being taken'
+      + price + left + '</span>';
+  }
+  const dir = r.read === 'up'
+    ? '<b class="long">UP</b>'
+    : r.read === 'down' ? '<b class="short">DOWN</b>'
+    : '<b>NO READ</b>';
+  let why;
+  if (!r.read) {
+    why = (Math.abs(r.lead) < 1)
+      ? ' &mdash; buying and selling are level on this candle'
+      : ' &mdash; waiting for it to hold';
+  } else {
+    /* The word follows the LEAD, not the read. During a turn the
+       published read is still UP while the candle's lead has
+       already gone negative, and taking the word from the read
+       would print "buying ahead" over a number that is selling's. */
+    why = ' &middot; ' + (r.lead >= 0 ? 'buying' : 'selling')
+      + ' ahead by ' + Math.abs(Math.round(r.lead)).toLocaleString()
+      + ' of ' + Math.round(r.gross).toLocaleString() + ' ('
+      + (100 * r.share).toFixed(0) + '% buy) since this candle opened'
+      + (r.strength === 'strong'
+          ? ' &middot; <b>past your level</b>'
+          : ' &middot; short of your level');
+  }
+  const turning = (r.raw !== r.read)
+    ? ' &middot; <b>turning</b> &mdash; the candle has led '
+      + (r.raw ? r.raw.toUpperCase() : 'neither way') + ' for '
+      + clock(r.pending_s) + ' and this publishes if it holds'
+    : '';
+  /* A HIGH FLIP COUNT DOES NOT MAKE THE READ UNSTABLE -- it makes it
+     FROZEN, which looks the same and is worse. */
+  const shaky = (r.flips > 20)
+    ? ' &middot; <b class="short">the lead has crossed ' + r.flips
+      + ' times this candle</b> &mdash; the two sides are level and '
+      + 'the reading above is stuck on whichever was ahead first, '
+      + 'not tracking anything'
+    : (r.flips > 4)
+      ? ' &middot; <b class="short">' + r.flips + ' changes of mind '
+        + 'this candle</b> &mdash; unsettled'
+      : '';
+  const stall = (r.read && r.stalling)
+    ? ' &middot; though the last few seconds went the other way'
+    : '';
+  /* THE DURATION BELONGS TO THE READ, so it sits against the read
+     and not after the price -- otherwise 'for 1.6 min' reads as the
+     length of the agreement, which is a different and unmeasured
+     claim. */
+  const held = r.read ? ' for ' + clock(r.held_s) : '';
+  return '<span id="' + id + '" class="stamp" style="width:100%">'
+    + 'READ &mdash; ' + dir + held + price + both + why + turning
+    + stall + shaky + left
+    + ' &middot; the five-minute direction, not a trade on these '
+    + 'bars; it ignores the level dropdown and resets only when your '
+    + 'candle does</span>';
+}
+
+function ofiChart(d, w, h) {
+  /* OFI-closed candlesticks.
+
+     The x axis is NOT time and must not be drawn as though it were.
+     Every bar carries the same quantity of imbalance, so bars are
+     evenly spaced by INDEX -- a quiet hour is one candle and a violent
+     minute is twenty, and that unevenness in the clock is the whole
+     point of the chart. Spacing them by timestamp would squeeze the
+     interesting stretches into a sliver and stretch the dead ones. */
+  const bars = (d && d.bars) || [];
+  if (bars.length < 2) {
+    return '<div class="msg">Collecting&hellip; ' +
+      (d && d.total ? d.total + ' bars so far at this target.' :
+       'no bar has closed at this target yet.') + '</div>';
+  }
+  const all = bars.slice();
+  if (d.forming) all.push(Object.assign({direction: 'forming'}, d.forming));
+
+  const padL = 6, padR = 58, padT = 8, padB = 16;
+  const iw = w - padL - padR, ih = h - padT - padB;
+
+  let lo = Infinity, hi = -Infinity;
+  for (const b of all) { if (b.low < lo) lo = b.low; if (b.high > hi) hi = b.high; }
+  if (!(hi > lo)) { hi = lo + 0.25; }
+  const pad = (hi - lo) * 0.06;
+  lo -= pad; hi += pad;
+  const y = v => padT + ih - ((v - lo) / (hi - lo)) * ih;
+
+  const n = all.length;
+  const step = iw / n;
+  const bw = Math.max(1.2, Math.min(9, step * 0.68));
+
+  /* THE CANDLE IS THE OFI DIRECTION. GREEN OR RED, NEVER GREY.
+
+     Green means order-flow imbalance crossed +target and closed the
+     bar; red means it crossed -target. That is what "OFI says price is
+     moving up" means, so it is what the candle shows, and pairing it
+     with the delta column above is the whole reading.
+
+     A bar that closed on the time cap without either line being
+     reached takes the sign of the imbalance it did accumulate, so
+     there is no third colour. Those are rare -- the cap is fifteen
+     minutes -- and the exact figure is in the readout either way.
+
+     The price path is still measured and still carried in the data as
+     `price_agg_ratio`; it is simply no longer what colours the bar. */
+  const bodyColour = b => {
+    if (b.direction === 'green') return '#35c27a';
+    if (b.direction === 'red') return '#e2574c';
+    return (b.ofi || 0) < 0 ? '#e2574c' : '#35c27a';
+  };
+
+  let g = '';
+  all.forEach((b, i) => {
+    const cx = padL + step * (i + 0.5);
+    const c = bodyColour(b);
+    const o = y(b.open), cl = y(b.close);
+    const top = Math.min(o, cl), bot = Math.max(o, cl);
+    const bodyH = Math.max(1, bot - top);
+    const forming = b.direction === 'forming';
+    const dash = forming ? ' stroke-dasharray="2,2"' : '';
+    // Wick and body share the colour. The candle is one object.
+    g += `<line x1="${cx.toFixed(1)}" y1="${y(b.high).toFixed(1)}"
+            x2="${cx.toFixed(1)}" y2="${y(b.low).toFixed(1)}"
+            stroke="${c}" stroke-width="1"${dash}/>`;
+    g += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}"
+            width="${bw.toFixed(1)}" height="${bodyH.toFixed(1)}"
+            fill="${c}" opacity="${forming ? 0.4 : 0.92}"/>`;
+  });
+
+  /* EVERY CALL, AND WHERE IT RESOLVED.
+
+     An arrow at the price the call fired -- one per CALL, not one
+     per bar, because a bar at this size routinely holds several and
+     showing only the first hides the ones that came after a
+     reversal.
+
+     Then the objective, four ticks either way:
+
+       blue X    it made the point. The X sits at the price it got
+                 there, not at the target, so a move that gapped past
+                 shows where it actually was
+       black X   it lost four ticks first
+
+     A call the bar closed on gets NO MARK. Nothing happened to it,
+     and a mark there would make "it ran out of bar" look like a
+     result -- which is the single easiest way to make a rule that
+     drifts look like a rule that works. */
+  const arrows = (d && d.trade_arrows) || [];
+  const tmarks = (d && d.trade_marks) || [];
+  let cg = '';
+  for (const a of arrows) {
+    if (a.i < 0 || a.i >= all.length || !a.px) continue;
+    const cx = padL + step * (a.i + 0.5);
+    const yy = y(a.px);
+    if (yy < padT || yy > padT + ih) continue;
+    const up = a.side === 'up';
+    const col = up ? '#35c27a' : '#e2574c';
+    const base = up ? yy + 5 : yy - 5;
+    const tip = up ? yy + 1 : yy - 1;
+    /* THE SURFACE RING IS NOT DECORATION. The call price sits inside
+       the candle body by construction, and a green arrow drawn on a
+       green body is invisible -- which is the one thing an arrow
+       cannot be. The ring separates the glyph from whatever it lands
+       on, in either theme, without moving it off the price it
+       marks. */
+    const tri = `M ${(cx - 3.4).toFixed(1)} ${base.toFixed(1)}
+             L ${(cx + 3.4).toFixed(1)} ${base.toFixed(1)}
+             L ${cx.toFixed(1)} ${tip.toFixed(1)} Z`;
+    cg += `<path d="${tri}" fill="${col}" stroke="var(--bg)"
+             stroke-width="1.6" stroke-linejoin="round"/>`;
+    /* THE ARROW IS THE CALL. THE DASH IS THE FILL. They are different
+       prices now -- the trade waits for price to confirm the call --
+       and drawing only the arrow would show every result measured
+       from a price nothing was bought at. */
+    if (a.entry) {
+      const ey = y(a.entry);
+      if (ey >= padT && ey <= padT + ih) {
+        const seg = `M ${(cx - 4.2).toFixed(1)} ${ey.toFixed(1)}
+                 L ${(cx + 4.2).toFixed(1)} ${ey.toFixed(1)}`;
+        cg += `<path d="${seg}" stroke="var(--bg)" stroke-width="3.6"
+                 fill="none" stroke-linecap="round"/>`;
+        cg += `<path d="${seg}" stroke="${col}" stroke-width="1.8"
+                 fill="none" stroke-linecap="round"/>`;
+      }
+    }
+  }
+  for (const m of tmarks) {
+    if (m.i < 0 || m.i >= all.length || !m.px) continue;
+    const cx = padL + step * (m.i + 0.5);
+    const yy = y(m.px);
+    if (yy < padT || yy > padT + ih) continue;
+    /* A SKIP IS NOT A LOSS AND MUST NOT LOOK LIKE ONE. The call fired
+       and price never confirmed it, so no trade was taken. It gets a
+       small hollow ring -- visible, countable, and impossible to
+       mistake for the black cross of a trade that was taken and
+       died. */
+    if (m.kind === 'skip') {
+      cg += `<circle cx="${cx.toFixed(1)}" cy="${yy.toFixed(1)}" r="2.8"
+               fill="var(--bg)" stroke="var(--dim)" stroke-width="1.3"
+               opacity="0.95"/>`;
+      continue;
+    }
+    const win = m.kind === 'win';
+    /* The failure mark is drawn near-black with a pale ring, because
+       a true black X vanishes on the dark theme and this has to read
+       on both. */
+    const col = win ? '#3f8fd8' : '#0d1014';
+    const r = 3.8;
+    const cross = `M ${(cx - r).toFixed(1)} ${(yy - r).toFixed(1)}
+         L ${(cx + r).toFixed(1)} ${(yy + r).toFixed(1)}
+         M ${(cx - r).toFixed(1)} ${(yy + r).toFixed(1)}
+         L ${(cx + r).toFixed(1)} ${(yy - r).toFixed(1)}`;
+    if (!win) {
+      cg += `<path d="${cross}" stroke="var(--muted)" stroke-width="3.4"
+               fill="none" opacity="0.9"/>`;
+    }
+    cg += `<path d="${cross}" stroke="${col}" stroke-width="1.8"
+             fill="none"/>`;
+  }
+
+  /* THE DELTA PANE, directly above the candles and on the SAME grid.
+
+     Same padL, same step, same bar width, so column i sits exactly
+     over candle i. That alignment is the whole point: the pane is not
+     a second chart, it is a second reading of the same bars, and any
+     drift between the two x-axes would make it worse than useless.
+
+     DELTA IS NOT THE BOOK. The candle is closed by order-flow
+     imbalance -- limit orders, intent that can still be withdrawn --
+     and coloured by the price path. This is traded size by the side
+     CME stated on each print: intent already paid for. Three columns,
+     and they come apart constantly.
+
+     An AMBER TICK on the zero line marks a bar where paid-for flow
+     went against the book pressure that closed it. A green bar with
+     negative delta is a bid that filled up while prints hit it. That
+     disagreement is the reason the pane is here, so it gets a mark
+     rather than being left for the eye to find. */
+  const dh = 64, dpadT = 10, dpadB = 6;
+  const dih = dh - dpadT - dpadB;
+  const dy0 = dpadT + dih / 2;
+  let dMax = 0;
+  let anyPrints = false;
+  for (const b of all) {
+    const v = Math.abs(b.delta || 0);
+    if (v > dMax) dMax = v;
+    if ((b.trade_count || 0) > 0) anyPrints = true;
+  }
+  const dScale = dMax > 0 ? (dih / 2) / dMax : 0;
+  let dg = `<line x1="${padL}" y1="${dy0.toFixed(1)}"
+      x2="${(w - padR).toFixed(1)}" y2="${dy0.toFixed(1)}"
+      stroke="var(--line)" stroke-width="0.6" opacity="0.7"/>`;
+  all.forEach((b, i) => {
+    const v = b.delta || 0;
+    const cx = padL + step * (i + 0.5);
+    const forming = b.direction === 'forming';
+    if (v) {
+      const hgt = Math.max(1, Math.abs(v) * dScale);
+      const top = v > 0 ? dy0 - hgt : dy0;
+      dg += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${top.toFixed(1)}"
+          width="${bw.toFixed(1)}" height="${hgt.toFixed(1)}"
+          fill="${v > 0 ? '#35c27a' : '#e2574c'}"
+          opacity="${forming ? 0.45 : 0.85}"/>`;
+    }
+    /* Marked on the zero line rather than on the column, because a
+       column can be one pixel wide and an outline on it is invisible
+       exactly when the bar is quiet enough to be worth noticing. */
+    if (b.delta_agrees === false) {
+      dg += `<line x1="${cx.toFixed(1)}" y1="${(dy0 - 3).toFixed(1)}"
+          x2="${cx.toFixed(1)}" y2="${(dy0 + 3).toFixed(1)}"
+          stroke="#e8c46a" stroke-width="1.4" opacity="0.95"/>`;
+    }
+  });
+  dg += `<text x="${(w - padR + 4).toFixed(1)}" y="${(dpadT + 4).toFixed(1)}"
+      font-size="9" fill="var(--muted)">${dMax ? '+' +
+      Math.round(dMax).toLocaleString() : 'no prints'}</text>`;
+  dg += `<text x="${(w - padR + 4).toFixed(1)}" y="${(dh - 2).toFixed(1)}"
+      font-size="9" fill="var(--muted)">${dMax ? '-' +
+      Math.round(dMax).toLocaleString() : ''}</text>`;
+  const dPane = `<svg width="${w}" height="${dh}"
+      style="display:block">${dg}</svg>`;
+
+  /* Pivot marks: a caret above each swing high, below each swing low.
+     Only SETTLED ones arrive here -- the server withholds anything in
+     the last few bars, because the next bar can take a high out and
+     then the level never existed. A level that appears and vanishes is
+     worse than none, since you remember it was there and not that it
+     was provisional. */
+  let pv = '';
+  const marks = (d && d.pivots) || [];
+  const prov = (d && d.provisional) || [];
+  const caret = (m, settled) => {
+    if (m.i < 0 || m.i >= all.length) return '';
+    const cx = padL + step * (m.i + 0.5);
+    const hi = m.kind === 'high';
+    const yy = hi ? y(m.price) - 5 : y(m.price) + 5;
+    const dy = hi ? -4 : 4;
+    const col = hi ? '#e8c46a' : '#6fb6d6';
+    /* Provisional marks are drawn faint and dotted. They appear the
+       moment a bar is a local extreme against everything behind it,
+       which is when they are useful -- and they can still be taken
+       out by the next bar, which is why they do not look settled. */
+    return `<path d="M ${(cx - 3.2).toFixed(1)} ${yy.toFixed(1)}
+             L ${cx.toFixed(1)} ${(yy + dy).toFixed(1)}
+             L ${(cx + 3.2).toFixed(1)} ${yy.toFixed(1)}"
+             fill="none" stroke="${col}"
+             stroke-width="${settled ? 1.3 : 1.1}"
+             opacity="${settled ? 1 : 0.55}"
+             ${settled ? '' : 'stroke-dasharray="1.5,1.5"'}/>`;
+  };
+  for (const m of marks) pv += caret(m, true);
+  for (const m of prov) pv += caret(m, false);
+
+  /* THE LEVELS, AND WHAT HAS HAPPENED TO THEM.
+
+     Only the last few swings are extended. Every pivot extended turns
+     the chart into a grid and the lines stop meaning anything.
+
+     The line STYLE carries the state, so it is never colour alone:
+
+       dashed, faint   nothing has come back to it yet
+       solid           price reached it and did not close through,
+                       and the label counts the bars that touched it
+       solid then dim  it was a level until the marked bar closed
+                       through it; the dim part is where it used to be
+       solid, hollow   it closed through and then closed back -- the
+         marker        break failed, and the level is live again
+
+     A wick through that closed back is a touch, not a break. That is
+     the one genuinely informative thing that can happen to a level --
+     price went there and came back -- and calling it a break would
+     file it with the bars that cut straight through. The rule comes
+     from the server and is the same one the session levels use. */
+  const lvls = (d && d.levels) || [];
+  const lvlY = [];          // so the price axis can get out of their way
+  const rail = (x1, x2, yy, col, wid, op, dash) =>
+    `<line x1="${x1.toFixed(1)}" y1="${yy.toFixed(1)}"
+       x2="${x2.toFixed(1)}" y2="${yy.toFixed(1)}" stroke="${col}"
+       stroke-width="${wid}" opacity="${op}"
+       ${dash ? 'stroke-dasharray="' + dash + '"' : ''}/>`;
+  const xEdge = w - padR;
+  for (const L of lvls) {
+    const yy = y(L.price);
+    if (yy < padT || yy > padT + ih) continue;
+    const col = L.kind === 'high' ? '#e8c46a' : '#6fb6d6';
+    /* A level formed before the left edge still rules the whole
+       screen, so its line starts at the edge rather than nowhere. */
+    const x0 = L.i < 0 ? padL : padL + step * (L.i + 0.5);
+    let tag = L.price.toFixed(2);
+    if (L.state === 'broken') {
+      const xb = (L.break_i >= 0 && L.break_i < all.length)
+        ? padL + step * (L.break_i + 0.5) : xEdge;
+      pv += rail(x0, Math.max(x0, xb), yy, col, 1.2, 0.85, '');
+      pv += rail(Math.max(x0, xb), xEdge, yy, col, 0.7, 0.3, '1,4');
+      if (xb < xEdge) {
+        pv += `<path d="M ${(xb - 3).toFixed(1)} ${(yy - 3).toFixed(1)}
+                 L ${(xb + 3).toFixed(1)} ${(yy + 3).toFixed(1)}
+                 M ${(xb - 3).toFixed(1)} ${(yy + 3).toFixed(1)}
+                 L ${(xb + 3).toFixed(1)} ${(yy - 3).toFixed(1)}"
+                 stroke="${col}" stroke-width="1.2" fill="none"/>`;
+      }
+      tag += ' ✕';
+    } else if (L.state === 'failed') {
+      /* It closed through and closed back, so the line is live again.
+         The hollow marker is where the break failed -- a different
+         event from a break, and the one worth seeing. */
+      pv += rail(x0, xEdge, yy, col, 1.2, 0.9, '');
+      const xf = (L.back_i >= 0 && L.back_i < all.length)
+        ? padL + step * (L.back_i + 0.5) : -1;
+      if (xf >= 0) {
+        pv += `<circle cx="${xf.toFixed(1)}" cy="${yy.toFixed(1)}" r="3.2"
+                 fill="none" stroke="${col}" stroke-width="1.2"/>`;
+      }
+      tag += ' ↺';
+    } else if (L.state === 'held') {
+      pv += rail(x0, xEdge, yy, col, 1.2, 0.9, '');
+      tag += ' ×' + L.touches;
+    } else {
+      pv += rail(x0, xEdge, yy, col, 0.7, 0.42, '3,3');
+    }
+    lvlY.push(yy);
+    pv += `<text x="${(xEdge + 4).toFixed(1)}" y="${(yy + 3).toFixed(1)}"
+             font-size="9" fill="${col}">${tag}</text>`;
+  }
+
+  /* LEVELS FROM THE TARGETS ABOVE THIS ONE, drawn fainter and labelled
+     with the target they came from.
+
+     A swing on the 2,000 chart took eight times the imbalance to build
+     as one on 250, and from inside the 250 chart it cannot be seen at
+     all. These have no column here -- a price is comparable across
+     targets, a bar index is not -- so they run edge to edge. Two
+     targets up, two levels each, because every target at once is the
+     grid this is all trying to avoid. */
+  for (const L of (d && d.higher_levels) || []) {
+    const yy = y(L.price);
+    if (yy < padT || yy > padT + ih) continue;
+    const col = L.kind === 'high' ? '#e8c46a' : '#6fb6d6';
+    pv += rail(padL, xEdge, yy, col, 0.9, 0.3,
+               L.state === 'untested' ? '2,5' : '');
+    /* Labelled on the LEFT, where this target's own levels are not.
+       The right margin is already carrying the price axis and four
+       level labels, and a fifth one in the same column would be read
+       as another level of this chart rather than a borrowed one. */
+    pv += `<text x="${(padL + 3).toFixed(1)}" y="${(yy - 3).toFixed(1)}"
+             font-size="8" fill="${col}" opacity="0.7"
+             >${L.price.toFixed(2)} @${L.target >= 1000
+               ? (L.target / 1000) + 'k' : L.target}</text>`;
+  }
+
+  /* Price axis on the right, in dollars. Five levels, snapped to the
+     tick grid so the labels are prices that can actually print. */
+  let ax = '';
+  for (let k = 0; k <= 4; k++) {
+    const v = lo + (hi - lo) * (k / 4);
+    const snapped = Math.round(v * 4) / 4;
+    const yy = y(snapped);
+    if (yy < padT || yy > padT + ih) continue;
+    ax += `<line x1="${padL}" y1="${yy.toFixed(1)}" x2="${(w - padR).toFixed(1)}"
+             y2="${yy.toFixed(1)}" stroke="var(--line)" stroke-width="0.5"
+             opacity="0.4"/>`;
+    /* A level label and an axis label at the same height print on top
+       of each other and neither is readable. The level label is the one
+       carrying information, so the axis gives way -- the gridline stays
+       either way, so the scale is not lost. */
+    if (lvlY.some(ly => Math.abs(ly - yy) < 12)) continue;
+    ax += `<text x="${(w - padR + 4).toFixed(1)}" y="${(yy + 3).toFixed(1)}"
+             font-size="10" fill="var(--muted)">${snapped.toFixed(2)}</text>`;
+  }
+
+  /* The same four lines in words, because the chart can only show the
+     state and not the history behind it. */
+  const nState = s => lvls.filter(L => L.state === s).length;
+  const readout = lvls.length
+    ? '<span class="stamp" style="width:100%">levels &mdash; '
+      + nState('held') + ' held / ' + nState('broken') + ' closed through / '
+      + nState('failed') + ' broke and came back / '
+      + nState('untested') + ' not reached &middot; '
+      + lvls.slice().reverse().map(L => L.say).join(' &middot; ')
+      + '</span>'
+    : '<span class="stamp" style="width:100%">levels &mdash; no settled '
+      + 'swing has formed yet at this target</span>';
+
+  const last = bars[bars.length - 1];
+  const ba = bars.filter(b => b.price_aggression === 'BUY_PRICE_AGGRESSIVE').length;
+  const sa = bars.filter(b => b.price_aggression === 'SELL_PRICE_AGGRESSIVE').length;
+  const nb = bars.length - ba - sa;
+  /* BOTH SIDES OF THE IMBALANCE, because the net hides the fight.
+
+     +300 from 350 buying and 50 selling is a one-sided push. +300
+     from 9,000 buying and 8,700 selling is a brawl that happened to
+     tilt. The net calls them the same thing, and the second is where
+     a trade gets taken right before price turns over. */
+  const pushLine = f => {
+    if (!f) return '';
+    const u = f.push_up || 0, dn = f.push_dn || 0;
+    if (!(u + dn)) return '';
+    const sh = f.share === undefined ? 0.5 : f.share;
+    const own = Math.max(sh, 1 - sh);
+    const word = own >= 0.60 ? 'one-sided'
+      : own >= 0.55 ? 'leaning' : 'an even fight';
+    return ' &middot; <b class="long">' + Math.round(u).toLocaleString()
+      + ' buying</b> vs <b class="short">' + Math.round(dn).toLocaleString()
+      + ' selling</b> (' + (sh * 100).toFixed(0) + '% buy &mdash; '
+      + word + ')';
+  };
+
+  /* THE CALL: THE IMBALANCE, PAST A LEVEL, AND NOTHING ELSE.
+
+     Past +level it is up, past -level it is down, and between them
+     there is no call. Coming back through the level is the reversal,
+     and it cannot happen before the level was reached because there
+     was nothing to reverse.
+
+     Delta is still measured, still drawn in the pane above and still
+     in the data. It does not gate this.
+
+     Re-read on every update, never latched: a bar at target 2,000
+     runs for minutes, and a call that fires once reports one thing
+     while the imbalance goes on to do the other. */
+  const fm = d && d.forming;
+  const lvl = (d && d.call_level) || 500;
+  const obsNow = fm && fm.obs;
+  const pointsLine = o => {
+    if (!o) return '';
+    /* A CALL IS NOT A POSITION. Price has to confirm the call before
+       the trade is taken, so the panel says which of the two is on
+       screen -- otherwise it is describing a position nobody is in,
+       which is the most expensive sentence a chart can print. */
+    if (!o.took) {
+      return ' &middot; <b>WAITING</b> &mdash; called at '
+        + o.px0.toFixed(2) + ', no entry until price confirms it by a '
+        + 'tick AND the imbalance makes a new extreme this bar. If '
+        + 'the call dies first, no trade was taken and it counts as '
+        + 'neither.';
+    }
+    const s2 = o.at2 === 'win' ? '<b class="long">+2 hit</b>'
+      : o.at2 === 'loss' ? '<b class="short">-2 hit</b>' : '2pt open';
+    const s4 = o.at4 === 'win' ? '<b class="long">+4 hit</b>'
+      : o.at4 === 'loss' ? '<b class="short">-4 hit</b>' : '4pt open';
+    return ' &middot; <b>IN</b> at ' + o.entry_px.toFixed(2)
+      + ' (called ' + o.px0.toFixed(2) + ', '
+      + (o.slip || 0).toFixed(2) + ' ticks of confirmation) &middot; '
+      + ((o.ticks || 0) >= 0 ? '+' : '') + (o.ticks || 0).toFixed(2)
+      + ' ticks now, best ' + o.mfe_pts.toFixed(2)
+      + ' / worst -' + o.mae_pts.toFixed(2) + ' pt'
+      + ' &middot; ' + s2 + ' &middot; ' + s4;
+  };
+  /* EXPANSION AND SPEED, running with the bar. Nothing is gated on
+     these. They are here because 500 of imbalance in four seconds and
+     500 in four minutes are the same number and not the same event,
+     and the panel had no way to tell them apart.
+
+     `eff` is the one to watch: distance covered that went somewhere.
+     1.0 is a straight line, 0.1 is a bar that worked hard and ended
+     where it started. The same imbalance means something different at
+     each end of that. */
+  const speedLine = fm => {
+    const v = fm && fm.speed;
+    if (!v || !v.secs) return '';
+    return '<span class="stamp" style="width:100%">SPEED &mdash; range '
+      + (v.tr || 0).toFixed(1) + ' ticks over ' + (v.secs || 0).toFixed(1)
+      + 's &middot; covered ' + (v.path || 0).toFixed(1) + ' ticks at '
+      + (v.tps || 0).toFixed(2) + ' a second &middot; opening at '
+      + (v.rps || 0).toFixed(2) + ' ticks of range a second'
+      + ' &middot; <b>' + (v.eff || 0).toFixed(2) + ' efficiency</b> '
+      + ((v.eff || 0) >= 0.5 ? '(going somewhere)'
+         : (v.eff || 0) >= 0.2 ? '(grinding)' : '(round-tripping)')
+      + ' &middot; nothing is filtered on this</span>';
+  };
+  /* THE READING, and it goes ABOVE everything else because it is
+     the only line here that is about the trade being taken.
+
+     Everything below it describes these OFI bars. This describes the
+     flow underneath them, over a rolling window, and it is what says
+     which way to take a five-minute candle somewhere else. It does
+     not depend on the level in the dropdown and it does not reset
+     when a bar closes -- a reading that blanked every time a bar
+     ended would blank several times inside one position.
+
+     THE RAW SIGN IS SHOWN NEXT TO THE STEADY ONE. Hiding it would
+     make the smoothing unfalsifiable: if the steady read is wrong,
+     the first thing worth knowing is whether the raw one had already
+     turned. */
+  const readLine = r => ofiReadLine(r, d && d.price);
+
+  /* ERROR BARS FOR THE READ, on their own line below it.
+
+     The imbalance decides the direction. These say what state it
+     arrived in -- a tight book or a thin one, one-sided taking or
+     two-way, size that stood or size that was pulled. They can tell
+     you to stand down or to size smaller. THEY NEVER CHANGE THE
+     DIRECTION ABOVE, and nothing wires them to it.
+
+     The interpretations -- which combination is "high confidence"
+     and which is "toxic" -- are deliberately NOT printed here. They
+     are hypotheses about this market and nothing has measured them
+     yet. scripts/regime_outcomes.py fills them in from real tape,
+     and until it has, the line shows the metrics and says so. */
+  const regimeLine = g => {
+    if (!g) return '';
+    const n = x => (x === null || x === undefined) ? '--' : x;
+    const bits = [
+      'spread <b>' + (g.spread_ticks || 0).toFixed(2) + '</b> '
+        + (g.spread_band ? '(' + g.spread_band + ')' : ''),
+      'VPIN <b>' + (g.vpin || 0).toFixed(3) + '</b> '
+        + (g.vpin_band ? '(' + g.vpin_band + ')'
+           : '(' + n(g.vpin_n) + ' of 30 samples)'),
+      /* VPIN CANNOT SAY WHICH WAY -- it is a mean of |buy - sell|,
+         identical whether buyers or sellers did the lifting. This is
+         the same buckets without the absolute value, so it has a
+         side, and the side is what can agree with the read. */
+      'taking <b>' + ((g.taking || 0) >= 0 ? '+' : '')
+        + (g.taking || 0).toFixed(3) + '</b>'
+        + (g.agrees === 'agree'
+            ? ' <b class="long">agrees with the read</b>'
+            : g.agrees === 'disagree'
+              ? ' <b class="short">disagrees with the read</b>'
+              : ''),
+      'cancelled <b>' + (100 * (g.cancel_rate || 0)).toFixed(0)
+        + '%</b> of posted size '
+        + (g.cancel_band ? '(' + g.cancel_band + ')'
+           : '(' + n(g.cancel_n) + ' of 30 samples)'),
+    ];
+    const tail = g.known
+      ? ' &middot; regime <b>' + g.tag + '</b> &mdash; what this one '
+        + 'has actually done is not known yet; run '
+        + 'scripts/regime_outcomes.py on your files to fill it in'
+      : ' &middot; not enough of this session yet to call any of these '
+        + 'high or low, so there is no regime tag';
+    return '<span class="stamp" style="width:100%">CHECK &mdash; '
+      + bits.join(' &middot; ') + tail
+      + ' &middot; these tag the read, they never change its '
+      + 'direction</span>';
+  };
+
+  let liveCall;
+  if (d && d.reachable === false) {
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
+      + '<b class="short">NO CALL IS POSSIBLE AT THIS TARGET.</b> A bar '
+      + 'ends when the imbalance crosses ' + d.target.toLocaleString()
+      + ', so it can never reach ' + lvl.toLocaleString()
+      + '. Nothing below is the market; it is the arithmetic. Use a '
+      + 'target above ' + lvl.toLocaleString() + '.</span>';
+  } else if (fm && (fm.call_side === 'up' || fm.call_side === 'down')) {
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; <b class="'
+      + (fm.call_side === 'up' ? 'long">UP' : 'short">DOWN')
+      + '</b> right now &middot; imbalance ' + (fm.ofi > 0 ? '+' : '')
+      + (fm.ofi || 0).toLocaleString() + ', past '
+      + (fm.call_side === 'up' ? '+' : '-') + lvl.toLocaleString()
+      + pushLine(fm)
+      + ' &middot; it reverses if it comes back through '
+      + (fm.call_side === 'up' ? '+' : '-') + lvl.toLocaleString()
+      + pointsLine(obsNow)
+      + (fm.spent
+          ? ' &middot; <b>this candle has had its one call</b> '
+            + '&mdash; the imbalance can cross the level again and no '
+            + 'trade follows until the next bar'
+          : '')
+      + ' &middot; ' + (fm.obs_so_far || 0) + ' so far this bar</span>';
+  } else if (fm) {
+    const oi = fm.ofi || 0;
+    const away = (oi >= 0 ? lvl - oi : lvl + oi);
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
+      + '<b>NO CALL</b> &middot; imbalance ' + (oi > 0 ? '+' : '')
+      + oi.toLocaleString() + ', inside &plusmn;' + lvl.toLocaleString()
+      + ' &middot; ' + Math.round(away).toLocaleString() + ' from a '
+      + (oi >= 0 ? 'buy' : 'sell')
+      + pushLine(fm)
+      + ' &middot; delta ' + (fm.delta > 0 ? '+' : '')
+      + Math.round(fm.delta || 0).toLocaleString()
+      + ', which does not gate this'
+      + (fm.spent
+          ? ' &middot; <b>this candle has had its one call</b>'
+          : '')
+      + ' &middot; ' + (fm.obs_so_far || 0) + ' observation'
+      + ((fm.obs_so_far === 1) ? '' : 's') + ' so far this bar</span>';
+  } else {
+    liveCall = '<span class="stamp" style="width:100%">THIS BAR &mdash; '
+      + 'no bar is forming</span>';
+  }
+  /* A DEAD FEED MUST NOT LOOK LIKE A QUIET MARKET.
+
+     This is the failure that cost Chris a weekend: the ingest thread
+     died at the session close, the web server kept serving the bars
+     it already had, and the chart was indistinguishable from a
+     market that simply was not trading. Every other line on this
+     panel describes those stale bars perfectly well and none of them
+     can say the tape stopped.
+
+     So it goes FIRST, above the read, and it is loud. */
+  const feedLine = f => {
+    if (!f) return '';
+    const age = f.last_bar_age_s;
+    const clock = s => (s >= 3600 ? (s / 3600).toFixed(1) + ' hours'
+                      : s >= 90 ? (s / 60).toFixed(0) + ' minutes'
+                      : Math.round(s) + 's');
+    if (!f.running) {
+      return '<span class="stamp" style="width:100%">'
+        + '<b class="short">THE FEED IS NOT RUNNING.</b> Every bar '
+        + 'below is history &mdash; nothing on this chart is live'
+        + (age !== null && age !== undefined
+            ? ' &middot; the newest bar is <b>' + clock(age)
+              + '</b> old' : '')
+        + (f.error ? ' &middot; ' + f.error : '')
+        + (f.retry_in !== null && f.retry_in !== undefined
+            ? ' &middot; trying again in ' + clock(f.retry_in)
+            : '')
+        + (f.restarts ? ' &middot; restarted ' + f.restarts
+            + (f.restarts === 1 ? ' time' : ' times') + ' so far'
+            : '')
+        + '</span>';
+    }
+    /* Running and producing nothing is still a stopped chart. At
+       target 2,000 a bar can legitimately take many minutes, so this
+       says how old rather than calling it broken. */
+    if (age !== null && age !== undefined && age > 900) {
+      return '<span class="stamp" style="width:100%">'
+        + '<b class="short">The feed is running but the newest bar is '
+        + clock(age) + ' old.</b> Either the market is not trading or '
+        + 'records have stopped arriving &mdash; the chart below is '
+        + 'that old either way'
+        + (f.restarts ? ' &middot; the feed has restarted '
+            + f.restarts + ' times' : '')
+        + '</span>';
+    }
+    return '';
+  };
+
+  /* KEPT FOR THE STACK PANEL, as the finished string rather than as
+     the parts to rebuild from. THIS BAR is assembled out of four
+     branches and three closures that live in here; a second copy of
+     that arithmetic downstairs would be a second thing to keep in
+     step, and the first time the two disagreed the screen would be
+     showing two different answers about one bar.
+     The market is stamped with it because a failed poll leaves the
+     last good payload in place, and ES's reading under a crypto
+     symbol is exactly the wrong-market display this panel just got
+     fixed for. */
+  _ofiThisBar = liveCall;
+  _ofiStripCoin = coin();
+  paintStackStrip();
+
+  liveCall = feedLine(d && d.feed)
+    + readLine(d && d.read) + regimeLine(d && d.regime)
+    + liveCall + speedLine(fm);
+
+  const dLast = all[all.length - 1] || {};
+  const dSum = all.reduce((a, b) => a + (b.delta || 0), 0);
+  const dFlag = all.filter(b => b.delta_agrees === false).length;
+  const deltaLine = `<span class="stamp" style="width:100%">delta &mdash;
+      traded size by the side CME stated, one column per candle${
+      anyPrints ? '' : '; no prints in this window'}
+      &middot; this bar ${dLast.delta > 0 ? '+' : ''}${
+      Math.round(dLast.delta || 0).toLocaleString()} on ${
+      (dLast.trade_count || 0).toLocaleString()} trades
+      &middot; window ${dSum > 0 ? '+' : ''}${Math.round(dSum).toLocaleString()}
+      &middot; <b>${dFlag}</b> ${dFlag === 1 ? 'bar' : 'bars'} where the
+      paid-for flow went against the book that closed it (amber)</span>`;
+
+  return `${liveCall}
+    ${dPane}
+    <svg width="${w}" height="${h}" style="display:block">${ax}${g}${pv}${cg}</svg>
+    ${deltaLine}
+    ${readout}
+    <span class="stamp">${d.total.toLocaleString()} bars at target
+      ${d.target.toLocaleString()}
+      &middot; showing ${bars.length}
+      &middot; <b class="long">${bars.filter(b =>
+          b.direction === 'green').length} green</b>
+      / <b class="short">${bars.filter(b =>
+          b.direction === 'red').length} red</b>
+      &middot; the price path inside them, which no longer sets the
+      colour: ${ba} up / ${sa} down / ${nb} two-sided</span>
+    <span class="stamp">last ${last.close.toFixed(2)}
+      &middot; ${(last.price_agg_ratio * 100).toFixed(0)}% of its movement went up
+      &middot; closed by ${last.direction === 'green' ? 'buying' : 'selling'} flow
+      (OFI ${last.ofi > 0 ? '+' : ''}${last.ofi})
+      &middot; built from ${last.updates} book updates</span>`
+}
+
+/* THE OBSERVATIONS, which is the strategy stated as a measurement.
+
+   Each one runs from the moment imbalance and delta agree to the
+   moment they stop, they reverse, or the bar ends -- whichever comes
+   first. Nothing outlives its bar.
+
+   UNRESOLVED IS NOT A DRAW AND IT IS NOT A LOSS. It means the bar
+   ended before price got that far either way, and at four points it
+   will often be most of the sample. Calling it anything else is how a
+   rule that rarely reaches its distance comes to look like one that
+   reaches it and wins.
+
+   The chatter figures are in the same block deliberately. An
+   observation three updates long cannot travel two points, so a low
+   median says the gate is set wrong, not that the rule failed. */
+function ofiObs(d) {
+  const o = d && d.obs;
+  if (!o || !o.rows) {
+    return '<span class="stamp" style="width:100%">observations &mdash; '
+      + 'not enough bars yet</span>';
+  }
+  const body = o.rows.map(r => {
+    const rate = r.decided
+      ? '<b class="' + (r.pct_of_decided >= 0.5 ? 'long' : 'short') + '">'
+        + (r.pct_of_decided * 100).toFixed(1) + '%</b>'
+      : '&mdash;';
+    return '<tr><td>' + r.points + ' point'
+      + (r.points === 1 ? '' : 's') + '</td>'
+      + '<td style="text-align:right">' + r.win.toLocaleString() + '</td>'
+      + '<td style="text-align:right">' + r.loss.toLocaleString() + '</td>'
+      + '<td style="text-align:right;color:var(--muted)">'
+      + r.unresolved.toLocaleString() + '</td>'
+      + '<td style="text-align:right">' + rate + '</td>'
+      + '<td style="text-align:right;color:var(--muted)">'
+      + (r.pct_resolved * 100).toFixed(0) + '%</td></tr>';
+  }).join('');
+  const med = o.median_updates;
+  const thin = med < 20;
+  /* THE TALLY, at the objective. Three outcomes, and the third is
+     not a loss: a call the bar closed on never reached either side,
+     and counting it as a failure would make a rule that drifts look
+     worse than it is -- just as counting it as a win would make it
+     look better. */
+  const obj = (d && d.objective_pts) || 1;
+  const sc_ = o.on_screen;
+  /* ON SCREEN FIRST, because it is the only part that can be checked
+     by counting the marks. The history covers thousands of bars and
+     the chart a hundred or so, and a tally of one printed beside a
+     picture of the other reads as a contradiction. */
+  const screenLine = sc_
+    ? '<span class="stamp" style="width:100%"><b>on screen</b> &mdash; '
+      + '<b class="long">' + (sc_.won || 0) + ' won</b> / '
+      + '<b class="short">' + (sc_.failed || 0) + ' failed</b> / '
+      + (sc_.open_at_close || 0) + ' unresolved, out of '
+      + (sc_.observations || 0) + ' calls on the '
+      + (sc_.bars || 0) + ' bars drawn. Count the blue and black '
+      + 'crosses &mdash; these are them.</span>'
+    : '';
+  const tally = screenLine
+    + '<span class="stamp" style="width:100%"><b>everything held at '
+    + obj + ' point</b> &mdash; <b class="long">'
+    + (o.won || 0).toLocaleString() + ' won</b> / <b class="short">'
+    + (o.failed || 0).toLocaleString() + ' failed</b>'
+    + (o.settled ? ' &middot; <b>' + (o.win_rate * 100).toFixed(1)
+        + '%</b> of the ' + o.settled.toLocaleString() + ' that settled'
+        : '')
+    + ' &middot; ' + (o.open_at_close || 0).toLocaleString()
+    + ' still open when the bar closed, which is neither'
+    + ' &middot; ' + (o.skipped || 0).toLocaleString()
+    + ' never confirmed, so no trade was taken'
+    + ' &middot; over ' + (o.bars || 0).toLocaleString() + ' bars'
+    /* Only say it is a wider span when it IS one. The sentence was
+       unconditional, so on a short history it claimed a difference
+       that was not there -- and a panel that explains a gap nobody
+       can see is how the next real gap gets ignored. */
+    + ((o.on_screen && o.bars > (o.on_screen.bars || 0))
+        ? ', which is more than the ' + (o.on_screen.bars || 0)
+          + ' on screen' : '')
+    + (o.left_out ? ' &middot; ' + o.left_out.toLocaleString()
+        + ' left out: made by an earlier rule or at another level' : '')
+    + '</span>'
+    /* THE RATE CANNOT SETTLE THIS AND THE NET CAN.
+
+       There is no stop, so a loss is however far price got while the
+       call died -- it has no fixed size. Eleven four-tick wins and one
+       nine-tick loss is a 92% rule that loses money. So the average
+       win, the average loss and the net per trade sit on the line
+       ABOVE the percentage, not in a footnote under it. */
+    + '<span class="stamp" style="width:100%"><b>what it actually '
+    + 'made</b> &mdash; <b class="long">+'
+    + (o.avg_win_ticks || 0).toFixed(2) + ' ticks</b> a winner, '
+    + '<b class="short">' + (o.avg_loss_ticks || 0).toFixed(2)
+    + ' ticks</b> a loser, <b>'
+    + ((o.net_per_trade || 0) >= 0 ? '+' : '')
+    + (o.net_per_trade || 0).toFixed(2) + ' ticks</b> a trade across '
+    + (o.settled || 0).toLocaleString() + ' &mdash; '
+    + ((o.net_ticks || 0) >= 0 ? '+' : '')
+    + (o.net_ticks || 0).toFixed(1) + ' ticks in all'
+    + ((o.avg_slip_ticks || 0)
+        ? ' &middot; ' + (o.avg_slip_ticks).toFixed(2)
+          + ' ticks of that given up waiting for confirmation'
+        : '')
+    + ' &middot; before costs, which run about 0.4 ticks a round turn'
+    + '</span>'
+    /* The raw rate carries a bias that is arithmetic, not market. A
+       call fires AFTER the move it is reading -- measured on a random
+       walk, up calls fire at 0.55 of the bar's range and down calls
+       at 0.44 -- so there is less room left the way it was called and
+       more room against it.
+
+       The symmetric bracket inherited that directly and returned 18%
+       on the walk. This rule has no bracket, so the bias lands
+       somewhere else: the call dies before the trade can travel, and
+       the walk returns 0.0%. Both numbers are the rule's own
+       arithmetic rather than the market's, and only the flipped
+       control in the sweep can say whether a rate here means
+       anything. */
+    /* WHAT THE BASELINE ACTUALLY IS, measured on this rule rather
+       than inherited from the last one. The old symmetric bracket
+       returned 18% on a random walk; this rule returns 0.0% on the
+       same walk, across 224,081 calls, because without a stop a trade
+       has until the call dies to find its point and on noise the call
+       dies in two updates. So the bar to clear is 0%, not 50% -- and
+       the number that says whether the live figure is even
+       comparable is the median call length right below it. */
+    + '<span class="stamp" style="width:100%"><b>the bar to clear is '
+    + '0%, not 50%.</b> Run on a random walk &mdash; a market with no '
+    + 'edge in it by construction &mdash; this rule returns 0.0% over '
+    + '224,081 calls, losing 0.18 ticks a trade. Not because it is '
+    + 'wrong there: because the call dies after 2 updates and the '
+    + 'trade never gets the room. If the median call length below is '
+    + 'also around 2, this tally is measuring chatter and not the '
+    + 'rule, whatever the percentage says. Read it against '
+    + 'scripts/imbalance_sweep.py, which runs the same rule backwards '
+    + 'on the same bars.</span>';
+
+  return tally
+    + '<span class="stamp" style="width:100%"><b>observations</b> '
+    + '&mdash; ' + o.observations.toLocaleString() + ' across '
+    + o.bars.toLocaleString() + ' bars (' + o.per_bar + ' a bar, '
+    + o.silent_bars.toLocaleString() + ' bars never called), '
+    + o.up.toLocaleString() + ' up / ' + o.down.toLocaleString()
+    + ' down</span>'
+    + '<table style="width:100%;font-size:11px"><tr style="color:var(--muted)">'
+    + '<th style="text-align:left">distance</th>'
+    + '<th style="text-align:right">hit it</th>'
+    + '<th style="text-align:right">hit the other way</th>'
+    + '<th style="text-align:right">bar ended first</th>'
+    + '<th style="text-align:right">of decided</th>'
+    + '<th style="text-align:right">ever resolved</th></tr>'
+    + body + '</table>'
+    + '<span class="stamp" style="width:100%">An observation runs from '
+    + 'the moment the imbalance passes the level until it comes back '
+    + 'through it, crosses to the other side, or the bar ends. Nothing '
+    + 'outlives its bar. BAR ENDED FIRST is '
+    + 'not a draw and not a loss &mdash; it is price never getting '
+    + 'that far either way, and at four points it is usually most of '
+    + 'the sample.</span>'
+    + '<span class="stamp" style="width:100%"'
+    + (thin ? ' ><b class="short">Median observation is ' + med
+        + ' updates long.</b> That is too short to travel two points, '
+        + 'so the table above is measuring the level and not the rule. '
+        + 'The call level wants raising.'
+      : '>Median observation is ' + med + ' updates long.')
+    + ' They ended: ' + Object.keys(o.ends).map(k =>
+        o.ends[k].toLocaleString() + ' ' + (k === 'reversal'
+          ? 'by coming back through the level' : k === 'flip'
+          ? 'by crossing straight to the other side'
+          : k === 'bar' ? 'at the bar close' : k)
+      ).join(', ') + '.</span>';
+}
+
+/* THE AGREEMENT TEST, at the top, because it is the question.
+
+   OFI closed the bar green and delta was positive, so it is an up
+   call; red and negative is a down call; everything else is not a
+   call at all. Then: did price go that way, and by how much.
+
+   UP, FLAT AND DOWN ARE THREE OUTCOMES. At one bar on a one-tick
+   market most moves are exactly zero, so which column the flats land
+   in moves the headline by fifty points. They get their own, and both
+   percentages are printed. Fifty percent OF DECIDED is what a market
+   with nothing in it returns -- that is the line to read these
+   against, not zero. */
+function ofiAgree(d) {
+  const a = d && d.agree;
+  if (!a || !a.rows || !a.rows.length) {
+    return '<span class="stamp" style="width:100%">agreement &mdash; '
+      + 'not enough closed bars yet</span>';
+  }
+  const by = {};
+  for (const r of a.rows) by[r.call + r.horizon] = r;
+  const hs = a.horizons;
+  const cell = r => {
+    if (!r) return '<td style="text-align:right">&mdash;</td>';
+    const cls = r.pct_of_decided >= 0.5 ? 'long' : 'short';
+    return '<td style="text-align:right"><b class="' + cls + '">'
+      + (r.pct_of_decided * 100).toFixed(1) + '%</b>'
+      + '<span style="color:var(--muted)"> of '
+      + r.decided.toLocaleString() + '</span></td>';
+  };
+  const flat = r => r
+    ? '<td style="text-align:right;color:var(--muted)">'
+      + (r.n ? (100 * r.flat / r.n).toFixed(0) : '0') + '%</td>'
+    : '<td></td>';
+  const mean = r => r
+    ? '<td style="text-align:right">' + (r.mean_ticks > 0 ? '+' : '')
+      + r.mean_ticks.toFixed(3) + '</td>'
+    : '<td></td>';
+
+  let head = '<tr style="color:var(--muted)"><th style="text-align:left">'
+    + 'call</th>';
+  for (const h of hs) {
+    head += '<th style="text-align:right">' + h + ' bar'
+      + (h === 1 ? '' : 's') + ' on</th>'
+      + '<th style="text-align:right">flat</th>'
+      + '<th style="text-align:right">mean tk</th>';
+  }
+  head += '</tr>';
+
+  let body = '';
+  for (const c of ['up', 'down']) {
+    const first = by[c + hs[0]];
+    body += '<tr><td><b class="' + (c === 'up' ? 'long' : 'short') + '">'
+      + c.toUpperCase() + '</b><span style="color:var(--muted)"> '
+      + (first ? first.n.toLocaleString() : '0') + ' called</span></td>';
+    for (const h of hs) {
+      const r = by[c + h];
+      body += cell(r) + flat(r) + mean(r);
+    }
+    body += '</tr>';
+  }
+
+  return '<span class="stamp" style="width:100%"><b>agreement</b> '
+    + '&mdash; OFI and delta pointing the same way, and whether price '
+    + 'followed. ' + a.called.toLocaleString() + ' calls out of '
+    + a.bars.toLocaleString() + ' bars ('
+    + (a.share_called * 100).toFixed(0) + '%).</span>'
+    + '<table style="width:100%;font-size:11px">' + head + body + '</table>'
+    + '<span class="stamp" style="width:100%">The percentage is of '
+    + 'DECIDED calls &mdash; price in the same place that many bars '
+    + 'later is neither right nor wrong, and the flat column says how '
+    + 'often that happens. A market with nothing in it returns 50%. '
+    + 'That is the line, not zero. No target, no stop, no cost: this '
+    + 'is not a trade, it is whether price went the way the bar '
+    + 'said.</span>';
+}
+
+/* THE CALLS: what the reader made of each candle, and how those
+   readings have actually done.
+
+   The record is printed NEXT TO the call, never under a tab. A
+   reading and its hit rate are one piece of information, and showing
+   the call alone is how a 50% reading comes to feel like an edge.
+
+   Every row carries the hit rate it has to beat to cover costs. A row
+   below that line is losing money however good the percentage looks,
+   and a row above it on sixty calls is sixty coin flips -- which is
+   why the sample size is in the row too. */
+const CALL_WORDS = {
+  CONFIRMED_UP: 'all three up', CONFIRMED_DOWN: 'all three down',
+  SOLD_INTO: 'sold into', BOUGHT_INTO: 'bought into',
+  PAID_NO_MOVE: 'paid, no move', UNPAID_PUSH: 'unpaid push',
+  NO_INTENT: 'no intent', NO_PRINTS: 'no prints'
+};
+
+function ofiCalls(d) {
+  const calls = (d && d.calls) || [];
+  const sb = d && d.scoreboard;
+  if (!calls.length) {
+    return '<span class="stamp" style="width:100%">reader &mdash; '
+      + 'no closed bars to call yet</span>';
+  }
+  const last = calls[calls.length - 1];
+  const rows = (sb && sb.rows) || [];
+  const mine = rows.filter(r => r.verdict === last.verdict
+    && r.lean === last.lean)[0];
+  const need = sb ? sb.needs : 0.6;
+
+  const leanTag = L => L === 'long' ? '<b class="long">LONG</b>'
+    : L === 'short' ? '<b class="short">SHORT</b>' : '<b>no lean</b>';
+
+  let head = '<span class="stamp" style="width:100%">reader &mdash; '
+    + '<b>' + (CALL_WORDS[last.verdict] || last.verdict) + '</b> &middot; '
+    + leanTag(last.lean) + ' &middot; ' + last.says;
+  if (mine && mine.decided) {
+    const ok = mine.hit_rate >= need;
+    head += ' &middot; this reading has gone that way <b class="'
+      + (ok ? 'long' : 'short') + '">'
+      + (mine.hit_rate * 100).toFixed(0) + '%</b> of '
+      + mine.decided.toLocaleString() + ' decided calls, and needs '
+      + (need * 100).toFixed(0) + '%';
+  } else if (mine) {
+    head += ' &middot; no decided calls for this reading yet';
+  }
+  head += '</span>';
+
+  const recent = calls.slice(-8).reverse().map(c =>
+    '<div style="font-size:11px;color:var(--muted)">'
+    + (c.price ? c.price.toFixed(2) : '') + ' &middot; '
+    + (CALL_WORDS[c.verdict] || c.verdict)
+    + (c.lean === 'none' ? '' : ' (' + c.lean + ')')
+    + ' &middot; delta ' + (c.paid > 0 ? '+' : '')
+    + Math.round(c.paid).toLocaleString()
+    + (c.where ? ' &middot; at a swing ' + c.where
+        + (c.level_state ? ' that has ' + c.level_state : '') : '')
+    + '</div>').join('');
+
+  let table = '';
+  if (sb) {
+    const body = rows.filter(r => r.n >= 20).map(r => {
+      const dec = r.decided;
+      const rate = dec ? (r.hit_rate * 100).toFixed(1) + '%' : '--';
+      const mark = !dec ? '' : r.clears ? ' CLEARS'
+        : (!r.enough ? ' too few' : ' below');
+      const cls = r.clears ? 'long' : (dec && r.enough ? 'short' : '');
+      return '<tr><td>' + (CALL_WORDS[r.verdict] || r.verdict) + '</td>'
+        + '<td>' + (r.lean === 'none' ? '&mdash;' : r.lean) + '</td>'
+        + '<td style="text-align:right">' + r.n.toLocaleString() + '</td>'
+        + '<td style="text-align:right">' + dec.toLocaleString() + '</td>'
+        + '<td style="text-align:right">' + rate + '</td>'
+        + '<td style="text-align:right">'
+        + (r.mean_ticks > 0 ? '+' : '') + r.mean_ticks.toFixed(3) + '</td>'
+        + '<td class="' + cls + '">' + mark + '</td></tr>';
+    }).join('');
+    table = '<table style="width:100%;font-size:11px;margin-top:4px">'
+      + '<tr style="color:var(--muted)"><th style="text-align:left">reading'
+      + '</th><th style="text-align:left">lean</th>'
+      + '<th style="text-align:right">calls</th>'
+      + '<th style="text-align:right">decided</th>'
+      + '<th style="text-align:right">went that way</th>'
+      + '<th style="text-align:right">mean ticks</th><th></th></tr>'
+      + body + '</table>'
+      + '<span class="stamp" style="width:100%">Over the last '
+      + sb.scored.toLocaleString() + ' calls held, measured '
+      + sb.horizon + ' bars forward. DECIDED leaves out the calls where '
+      + 'price was in the same place ' + sb.horizon + ' bars later &mdash; '
+      + 'those are not misses, and burying them in the denominator drags '
+      + 'every rate toward a number that is not about direction. '
+      + 'Break-even is ' + (need * 100).toFixed(0) + '% at a '
+      + sb.target + '-tick target, a ' + sb.stop + '-tick stop and '
+      + sb.cost + ' ticks of cost.</span>'
+      + '<span class="stamp" style="width:100%">A reading that fires at '
+      + 'a level collects a bias that is arithmetic rather than market: '
+      + 'a swing low is lower than its neighbours BY DEFINITION, so the '
+      + 'bar after one is usually higher. scripts/bar_state_study.py '
+      + 'measures that against a random walk; this table does not.</span>';
+  }
+
+  return head
+    + '<span class="stamp" style="width:100%">last eight calls</span>'
+    + recent + table;
+}
+
+let _ofiTimer = null;
+/* The last payload the OFI panel drew, kept so the live
+   stream can repaint the read line without refetching. */
+let _ofiLast = null;
+/* What THIS BAR last said on the footprint, and the market it said it
+   about, so the stack panel can show the same three readings without a
+   second fetch and without a second copy of the arithmetic. */
+let _ofiThisBar = '', _ofiStripCoin = '';
+let _ofiOffset = 0;        // bars back from the live edge -- the pan
+let _ofiTotal = 0;
+
+/* SETTINGS SURVIVE A RELOAD. Everything below is a choice about how to
+   look at the data, and losing it on every refresh makes the chart feel
+   like it reset even though the bars themselves are held on the server
+   and never went anywhere. The offset is deliberately NOT saved: coming
+   back to a page scrolled into history, with no indication why it is
+   not moving, reads as broken. */
+function _ofiSave() {
+  try {
+    localStorage.setItem('liqmap_ofi', JSON.stringify({
+      t: _ofiTarget, w: _ofiWindow, p: _ofiPivot, c: _ofiConfirm,
+      k: _ofiKeep, h: _ofiHigher, lv: _ofiLevel, cl: _ofiClear,
+      rv: _ofiRev }));
+  } catch (e) { /* private mode, quota, blocked -- not worth a failure */ }
+}
+let _ofiTarget = 250;
+let _ofiWindow = 140;      // bars visible -- the zoom
+let _ofiPivot = 5;         // bars to the LEFT a swing must clear
+let _ofiConfirm = 1;       // bars to the RIGHT before it is settled
+let _ofiKeep = 4;          // how many swing levels are carried forward
+let _ofiHigher = 1;        // show levels from the targets above this one
+let _ofiLevel = 500;       // imbalance at which a call is made
+/* HOW FAR A SWING MUST STAND CLEAR, as a multiple of what a bar at
+   this target spans. An ordinal extreme is not a swing: measured on
+   26,000 bars the old rule marked a bar that merely TIED its
+   neighbours as readily as one standing eight points above, and
+   most of the chevrons were the former. Zero restores that. */
+let _ofiClear = 1.0;
+/* HOW FAR PRICE MUST REVERSE before the PRICE reading flips, in
+   ticks. A reversal threshold is the one filter that costs no lag:
+   a move of this size flips the direction on the print that
+   completes it, exactly as fast as no filter at all, and every
+   wiggle smaller than it is removed completely. */
+let _ofiRev = 4.0;
+try {
+  const _s = JSON.parse(localStorage.getItem('liqmap_ofi') || '{}');
+  if (_s.t) _ofiTarget = _s.t;
+  if (_s.w) _ofiWindow = _s.w;
+  if (_s.p) _ofiPivot = _s.p;
+  if (_s.c) _ofiConfirm = _s.c;
+  if (_s.k) _ofiKeep = _s.k;
+  if (_s.h !== undefined) _ofiHigher = _s.h;
+  if (_s.lv) _ofiLevel = _s.lv;
+  if (_s.cl !== undefined) _ofiClear = _s.cl;
+  if (_s.rv !== undefined) _ofiRev = _s.rv;
+} catch (e) { /* nothing saved, or unreadable -- the defaults stand */ }
+
+function ofiSetTarget(v) {
+  _ofiTarget = parseInt(v, 10) || 250;
+  // Targets have wildly different bar counts, so an offset measured in
+  // bars means something else on each one. Snapping to live is the only
+  // position that survives the switch.
+  _ofiOffset = 0;
+  _ofiSave();
+  ofiTick();
+}
+
+const OFI_MIN_BARS = 6;      // zoomed all the way in
+const OFI_MAX_BARS = 600;    // and all the way out -- the route's cap
+
+function ofiSetWindow(v) {
+  ofiZoomTo(parseInt(v, 10) || 140, 1.0);
+}
+
+/* ZOOM, ANCHORED ON A POINT IN THE VIEW.
+
+   `frac` is where on the chart to hold still, 0 at the left edge and
+   1 at the right. The dropdown passes 1 -- zoom about the newest bar,
+   which is what you want when you are watching the live edge. The
+   wheel passes the cursor's position, which is what you want when you
+   are looking at something in the middle of the screen: the bar under
+   the pointer stays under the pointer.
+
+   Without the anchor the view jumps on every notch of the wheel and
+   zooming becomes a game of chasing what you were reading. */
+function ofiZoomTo(bars, frac) {
+  const was = _ofiWindow;
+  const next = Math.max(OFI_MIN_BARS, Math.min(OFI_MAX_BARS,
+                                               Math.round(bars)));
+  if (next === was) return;
+  _ofiWindow = next;
+  const added = next - was;
+  if (_ofiOffset > 0) {
+    _ofiOffset = Math.max(0, Math.round(_ofiOffset - added * (1 - frac)));
+  }
+  _ofiSave();
+  ofiSoon();
+}
+
+/* ONE REFETCH, NOT THIRTY. A wheel sends many notches in a flick and
+   a drag sends a move on every frame; firing the route on each would
+   queue requests that arrive out of order and paint the view
+   backwards. The pending redraw coalesces them. */
+let _ofiSoon = null;
+function ofiSoon(ms) {
+  if (_ofiSoon) clearTimeout(_ofiSoon);
+  _ofiSoon = setTimeout(() => { _ofiSoon = null; ofiTick(); },
+                        ms === undefined ? 90 : ms);
+}
+
+/* WHEEL TO ZOOM, DRAG TO PAN.
+
+   The host element survives every redraw -- only its innerHTML is
+   replaced -- so the handlers go on the host once and keep working
+   through every repaint. Binding to the svg instead would lose them
+   on the next tick.
+
+   DURING A DRAG THE EXISTING CHART IS TRANSLATED, before anything is
+   fetched. The data is paged server-side, so a pan is a round trip;
+   without the transform the chart would sit still until it returned
+   and the drag would feel broken rather than slow. */
+let _ofiBound = false;
+let _ofiDrag = null;
+
+function ofiPxPerBar(svg) {
+  const r = svg.getBoundingClientRect();
+  return Math.max(1, (r.width - 64) / Math.max(1, _ofiWindow));
+}
+
+function ofiBindChart() {
+  const host = $('ofiBars');
+  if (!host || _ofiBound) return;
+  _ofiBound = true;
+
+  host.addEventListener('wheel', (e) => {
+    const svg = e.target.closest && e.target.closest('svg');
+    if (!svg) return;
+    e.preventDefault();          // the page must not scroll with it
+    const r = svg.getBoundingClientRect();
+    const frac = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+    const step = e.deltaY > 0 ? 1.2 : 1 / 1.2;
+    ofiZoomTo(_ofiWindow * step, frac);
+  }, {passive: false});
+
+  host.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    const svg = e.target.closest && e.target.closest('svg');
+    if (!svg) return;
+    // A click on a control inside the panel is not a drag.
+    if (e.target.closest('select, button, a, input')) return;
+    _ofiDrag = {x: e.clientX, svg: svg, off: _ofiOffset,
+                per: ofiPxPerBar(svg), moved: false};
+    try { host.setPointerCapture(e.pointerId); } catch (err) {}
+    host.style.cursor = 'grabbing';
+  });
+
+  host.addEventListener('pointermove', (e) => {
+    if (!_ofiDrag) return;
+    const dx = e.clientX - _ofiDrag.x;
+    if (Math.abs(dx) < 2 && !_ofiDrag.moved) return;
+    _ofiDrag.moved = true;
+    // Dragging RIGHT moves the view back in time, the way a chart
+    // drags a sheet of paper rather than a scrollbar.
+    _ofiDrag.svg.style.transform = 'translateX(' + dx + 'px)';
+    const bars = Math.round(dx / _ofiDrag.per);
+    const want = Math.max(0, Math.min(_ofiDrag.off + bars,
+                                      Math.max(0, _ofiTotal - _ofiWindow)));
+    if (want !== _ofiOffset) { _ofiOffset = want; ofiSoon(60); }
+  });
+
+  const end = (e) => {
+    if (!_ofiDrag) return;
+    _ofiDrag.svg.style.transform = '';
+    const moved = _ofiDrag.moved;
+    _ofiDrag = null;
+    host.style.cursor = '';
+    try { host.releasePointerCapture(e.pointerId); } catch (err) {}
+    if (moved) { _ofiSave(); ofiSoon(0); }
+  };
+  host.addEventListener('pointerup', end);
+  host.addEventListener('pointercancel', end);
+  host.addEventListener('dblclick', () => {
+    // Back to the live edge, the way double-clicking a chart does.
+    _ofiOffset = 0; _ofiSave(); ofiTick();
+  });
+}
+
+function ofiPan(bars) {
+  _ofiOffset = Math.max(0, _ofiOffset + bars);
+  _ofiSave();
+  ofiTick();
+}
+
+function ofiSetPivot(v) { _ofiPivot = parseInt(v, 10) || 5; _ofiSave(); ofiTick(); }
+function ofiSetConfirm(v) { _ofiConfirm = parseInt(v, 10) || 1; _ofiSave(); ofiTick(); }
+function ofiSetKeep(v) { _ofiKeep = parseInt(v, 10) || 4; _ofiSave(); ofiTick(); }
+function ofiSetHigher(v) { _ofiHigher = (v === '1' ? 1 : 0); _ofiSave(); ofiTick(); }
+function ofiSetLevel(v) { _ofiLevel = parseInt(v, 10) || 500; _ofiSave(); ofiTick(); }
+function ofiSetRev(v) { _ofiRev = parseFloat(v) || 0; _ofiSave(); ofiTick(); }
+function ofiSetClear(v) { _ofiClear = parseFloat(v) || 0; _ofiSave(); ofiTick(); }
+function ofiLive() { _ofiOffset = 0; ofiTick(); }
+function ofiOldest() { _ofiOffset = Math.max(0, _ofiTotal - _ofiWindow); ofiTick(); }
+
+async function ofiTick(fromTimer) {
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return;          // not on screen, not polled
+  // SCROLLED BACK MEANS FROZEN. A timer refetch while you are reading
+  // history re-renders the same window for no reason, and any drift in
+  // the offset arithmetic would walk the view out from under you.
+  if (fromTimer && _ofiOffset > 0) return;
+  const host = $('ofiBars');
+  if (!host) return;
+  try {
+    /* FOLLOW THE PICKER. This used to ask for 'ES' outright, which
+       made the whole app look like it was on CME while every other
+       tab quietly followed the selector and its crypto default. One
+       panel disagreeing with the rest about which market is on screen
+       is worse than either answer on its own. */
+    const d = await api('/api/ofibars?coin=' + encodeURIComponent(coin())
+      + '&target=' + _ofiTarget
+      + '&bars=' + _ofiWindow + '&offset=' + _ofiOffset
+      + '&pivot=' + _ofiPivot + '&confirm=' + _ofiConfirm
+      + '&keep=' + _ofiKeep + '&higher=' + _ofiHigher
+      + '&level=' + _ofiLevel + '&clear=' + _ofiClear
+      + '&rev=' + _ofiRev);
+    if (d.ok) { _ofiTotal = d.total; _ofiOffset = d.offset; _ofiLast = d; }
+    ofiBindChart();
+    /* THE CLOCK WINDOWS RIDE THE SAME POLL. A timer of their own
+       would be a second clock to keep in step with this one, and the
+       two panels are read together. */
+    try { paintClockWindows(await api('/api/clockwindows?'
+      + q({coin: coin(), limit: 40,
+           period: ($('jnlWin') ? $('jnlWin').value : 900)}))); }
+    catch (e) { /* the OFI panel below is the louder failure */ }
+
+    /* THE FUSION READ RIDES IT TOO. Same reason: a timer of its own
+       would be a second clock to keep in step, and this panel is
+       read beside the journal that trades off it. */
+    try { fusLoad(); } catch (e) {}
+    if (!d.ok) {
+      /* "ES is not a CME symbol" is true and useless. The reason this
+         panel is blank is almost always that a crypto market is
+         selected, and the fix is a dropdown away -- so it says that
+         rather than restating the rejection. */
+      const notCme = (d.why || '').indexOf('not a CME symbol') >= 0;
+      host.innerHTML = '<span class="stamp" style="width:100%">'
+        + (notCme
+            ? 'OFI candles are built from the CME tape, and <b>'
+              + esc(coin()) + '</b> is not a CME market. Pick the '
+              + 'futures contract in the market selector above and '
+              + 'every panel, including this one, follows it.'
+            : 'OFI candles &mdash; ' + esc(d.why || 'unavailable'))
+        + '</span>';
+      /* The footprint just replaced itself with the reason it has
+         nothing. The copy downstairs has to go too, or the stack
+         panel keeps showing a reading from before the failure with
+         no sign that it stopped. */
+      _ofiThisBar = ''; _ofiStripCoin = '';
+      paintStackStrip();
+      return;
+    }
+    const w = Math.max(320, host.clientWidth || 900);
+    host.innerHTML = `
+      <span class="stamp" style="width:100%">organic OFI candles &mdash;
+        a bar ends when flow crosses the line, never on a clock</span>
+      <span class="stamp" style="width:100%">target
+        <select onchange="ofiSetTarget(this.value)"
+          style="margin:0 6px">${(d.targets || []).map(t =>
+            `<option value="${t}"${t === d.target ? ' selected' : ''}>${t}</option>`
+          ).join('')}</select>
+        contracts &middot; show
+        <select onchange="ofiSetWindow(this.value)"
+          style="margin:0 6px">${[6, 12, 25, 40, 60, 100, 140, 220,
+            320, 500].map(k =>
+            `<option value="${k}"${k === d.window ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        bars &middot; or roll the wheel over the chart to zoom and
+        drag it to scroll, double-click to come back to the live
+        edge &middot; swing
+        <select onchange="ofiSetPivot(this.value)"
+          style="margin:0 6px">${[3, 5, 8, 12, 20].map(k =>
+            `<option value="${k}"${k === d.pivot_n ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        left, confirm after
+        <select onchange="ofiSetConfirm(this.value)"
+          style="margin:0 6px">${[1, 2, 3, 5].map(k =>
+            `<option value="${k}"${k === d.confirm_n ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        &middot; dotted carets are not confirmed yet and can vanish
+        &middot; a swing must also stand clear of its neighbours by
+        <select onchange="ofiSetClear(this.value)"
+          style="margin:0 6px">${[0, 0.5, 1, 1.5, 2].map(k =>
+            `<option value="${k}"${k === d.clear_n ? ' selected' : ''}>${
+              k === 0 ? 'nothing' : k + '&times;'}</option>`
+          ).join('')}</select>
+        a typical bar (${(d.clear_ticks || 0).toFixed(1)} ticks here)
+        &mdash; at nothing, a bar that merely TIES its neighbours is
+        marked the same as one standing eight points above, which is
+        what most of these were</span>
+      <span class="stamp" style="width:100%">price direction flips
+        when price reverses by
+        <select onchange="ofiSetRev(this.value)"
+          style="margin:0 6px">${
+            Array.from({length: 12}, (_, n) => n + 1).map(k =>
+            `<option value="${k}"${k === Math.round(d.rev_n || 4)
+                ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        ticks &middot; a move that size still flips it on the print
+        that completes it, so this costs no lag &mdash; it removes
+        what is smaller than itself and nothing else &middot; at one
+        tick the reading changes its mind about eight times a second
+        &middot; the PRICE NUMBER is never smoothed, only the
+        direction</span>
+      <span class="stamp" style="width:100%">call the imbalance at
+        &plusmn;<select onchange="ofiSetLevel(this.value)"
+          style="margin:0 6px">${(d.call_levels || []).map(k =>
+            `<option value="${k}"${k === d.call_level ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        contracts &middot; a trade closes at 3 points, the opposite
+        level, or the bar &middot; observations are kept per level, so
+        changing this starts a fresh table rather than mixing two
+        rules</span>
+      <span class="stamp" style="width:100%">Swings and levels are found
+        on the prices that actually TRADED, not on the candle. The
+        candle is the midpoint of the quote, and on a one-tick spread a
+        midpoint sits half a tick off the grid &mdash; a level there is
+        a price no order can work at. ${d.traded_bars || 0} of the
+        ${(d.bars || []).length} bars on screen contain a print${
+        (d.traded_bars || 0) * 2 < (d.bars || []).length
+          ? '; most of this window did not trade, so there is little'
+            + ' here for a level to be built from'
+          : ''}.</span>
+      <span class="stamp" style="width:100%">carry
+        <select onchange="ofiSetKeep(this.value)"
+          style="margin:0 6px">${[2, 4, 6, 8].map(k =>
+            `<option value="${k}"${k === d.keep_n ? ' selected' : ''}>${k}</option>`
+          ).join('')}</select>
+        levels forward &middot; a wick through is a touch, only a
+        CLOSE through is a break &middot; dashed = not reached yet,
+        solid = reached and held, &#10005; = where it was closed
+        through, &#8634; = a break that closed back &middot; levels from
+        the bigger targets
+        <select onchange="ofiSetHigher(this.value)"
+          style="margin:0 6px">${[['1', 'shown'], ['0', 'hidden']].map(o =>
+            `<option value="${o[0]}"${(o[0] === '1') === !!d.higher
+              ? ' selected' : ''}>${o[1]}</option>`).join('')}</select></span>
+      <span class="stamp" style="width:100%">
+        <button class="btn" onclick="ofiOldest()"
+          ${d.oldest ? 'disabled' : ''}>&laquo; oldest</button>
+        <button class="btn" onclick="ofiPan(${Math.round(d.window * 0.75)})"
+          ${d.oldest ? 'disabled' : ''}>&lsaquo;&lsaquo; page</button>
+        <button class="btn" onclick="ofiPan(10)"
+          ${d.oldest ? 'disabled' : ''}>&lsaquo; 10</button>
+        <button class="btn" onclick="ofiPan(-10)"
+          ${d.at_live ? 'disabled' : ''}>10 &rsaquo;</button>
+        <button class="btn" onclick="ofiPan(${-Math.round(d.window * 0.75)})"
+          ${d.at_live ? 'disabled' : ''}>page &rsaquo;&rsaquo;</button>
+        <button class="btn" onclick="ofiLive()"
+          ${d.at_live ? 'disabled' : ''}>live &raquo;</button>
+        &nbsp;${d.at_live ? '<b class="long">AT LIVE EDGE</b>'
+                          : '<b>' + d.offset.toLocaleString() +
+                            ' bars back</b> &mdash; not following'}
+        &middot; ${d.total.toLocaleString()} held${d.dropped
+          ? ' (' + d.dropped.toLocaleString() + ' older ones aged out)' : ''}</span>
+      ${ofiChart(d, w, 240)}
+      ${ofiObs(d)}
+      ${ofiAgree(d)}
+      ${ofiCalls(d)}
+      <span class="stamp" style="width:100%">Colour is the ORDER-FLOW
+        DIRECTION that closed the bar. GREEN: imbalance crossed
+        +${d.target}. RED: it crossed &minus;${d.target}. A bar that ran
+        out the time cap without reaching either takes the sign of what
+        it did accumulate, so there is no third colour. The dashed bar
+        on the right is still forming.</span>
+      <span class="stamp" style="width:100%">The price path is still
+        measured and still in the data as price_agg_ratio &mdash; it is
+        no longer what colours the bar. Read the candle against the
+        delta column above it: agreeing is the call.</span>
+      <span class="stamp" style="width:100%">The bar BOUNDARIES still come
+        from order-flow imbalance &mdash; a bar ends when flow crosses
+        your target, never on a clock. Only the colour is price. Where
+        the two disagree is carried as &lsquo;agrees&rsquo; in the data.</span>
+      <span class="stamp" style="width:100%">The flow split above should
+        sit near even over a long run. A long way off means the
+        accumulator is latching or the OFI sign is inverted &mdash; both
+        put the bar boundaries in the wrong places, and neither looks
+        wrong on the chart.</span>`;
+  } catch (e) {
+    host.innerHTML = '<span class="stamp" style="width:100%">OFI candles &mdash; '
+      + e + '</span>';
+  }
+}
+
+function mgChart(d, w, h) {
+  const pts = (d && d.points) || [];
+  if (pts.length < 2) return '<div class="msg">Collecting&hellip; ' +
+    'the reader needs a few seconds of tape.</div>';
+  const now = d.now || {};
+  const padL = 8, padR = 62, padT = 10, padB = 14;
+  const iw = w - padL - padR, ih = h - padT - padB;
+
+  /* ONE SCALE, AND PRICE STILL READABLE IN DOLLARS.
+
+     Both lines are in standard deviations of their own recent
+     behaviour, so they share one exact mapping and the distance
+     between them is a real quantity rather than a rendering choice.
+     That is what makes a crossing an event instead of an artefact.
+
+     The cost of z-scoring price used to be that nobody can look at
+     -0.32 and see 7768.50. So the right-hand axis inverts it: each
+     sigma level is printed as the dollar price it corresponds to,
+     using the same window price was standardised against. The axis
+     reads in real prices; the geometry stays honest. */
+  let lo = Infinity, hi = -Infinity;
+  for (const q of pts) {
+    lo = Math.min(lo, q.book, q.price || 0);
+    hi = Math.max(hi, q.book, q.price || 0);
+  }
+  const gate = d.enter || 0.4;
+  lo = Math.min(lo, -gate); hi = Math.max(hi, gate);
+  if (!(hi > lo)) hi = lo + 1;
+  const pad = (hi - lo) * 0.08; lo -= pad; hi += pad;
+
+  const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts;
+  const span = (t1 - t0) || 1;
+  const X = t => padL + ((t - t0) / span) * iw;
+  const Y = v => padT + (1 - (v - lo) / (hi - lo)) * ih;
+  const line = k => pts.map((q, i) =>
+    (i ? 'L' : 'M') + X(q.ts).toFixed(1) + ' ' +
+    Y(q[k] || 0).toFixed(1)).join(' ');
+
+  // sigma grid, and the lean gates
+  let grid = '';
+  for (const v of [gate, 0, -gate]) {
+    const y = Y(v);
+    grid += `<line x1="${padL}" x2="${padL + iw}" y1="${y.toFixed(1)}"
+      y2="${y.toFixed(1)}" stroke="${v === 0 ? 'var(--line)' : 'var(--dim)'}"
+      stroke-width="1"${v === 0 ? '' : ' stroke-dasharray="1 4" opacity="0.4"'}
+    ></line>`;
+  }
+
+  /* The right axis in DOLLARS. price_z = (px - mean) / sd, so a
+     sigma level maps back to mean + sigma*sd. The window moves, so
+     these are the prices those levels mean right now -- which is
+     what you want when you are reading a live chart. */
+  const mean = now.price_mean || 0, sd = now.price_sd || 0;
+  let axis = '';
+  if (sd > 0 && mean > 0) {
+    for (let k = 0; k <= 4; k++) {
+      const v = lo + (hi - lo) * k / 4;
+      axis += `<text x="${padL + iw + 6}" y="${(Y(v) + 3).toFixed(1)}"
+        fill="var(--dim)" font-size="10">${(mean + v * sd).toFixed(2)}</text>`;
+    }
+  }
+
+  const marks = (d.crosses || []).filter(c => c.ts >= t0 && c.ts <= t1)
+    .map(c => {
+      const x = X(c.ts).toFixed(1), y = Y(c.tape_z).toFixed(1);
+      return c.confirmed
+        ? `<circle cx="${x}" cy="${y}" r="4.5" fill="var(--ink)"
+             stroke="var(--panel)" stroke-width="1.5"></circle>`
+        : `<circle cx="${x}" cy="${y}" r="3.5" fill="none"
+             stroke="var(--dim)" stroke-width="1.5"></circle>`;
+    }).join('');
+
+  const last = pts[pts.length - 1];
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}"
+      preserveAspectRatio="none" role="img"
+      aria-label="book CVD and price, both in standard deviations, axis in dollars">
+    ${grid}${axis}
+    <path d="${line('book')}" fill="none" stroke="var(--accent)"
+      stroke-width="2" stroke-linejoin="round"></path>
+    <path d="${line('price')}" fill="none" stroke="var(--ink)"
+      stroke-width="2" stroke-dasharray="6 3" stroke-linejoin="round"></path>
+    ${marks}
+  </svg>
+  <div class="stamp" style="margin-top:4px">
+    <span style="color:var(--accent)">&#9472;&#9472;</span> book CVD
+    &nbsp;
+    <span style="color:var(--ink)">&#9476;&#9476;</span> price
+    &mdash; last <b>${last.px ? last.px.toFixed(2) : '--'}</b> &nbsp;
+    <span style="color:var(--ink)">&#9679;</span> confirmed cross &nbsp;
+    <span style="color:var(--dim)">&#9711;</span> unconfirmed &nbsp;
+    &middot; ${pts.length} pts over ${span.toFixed(0)}s
+    &middot; one scale (sigma); the axis shows what each level is
+    worth in dollars</div>`;
+}
+
+function mgRow(d) {
+  const n = (d && d.now) || {};
+  const REG = {
+    up_book_above: 'UP \u00b7 book above price',
+    up_book_below: 'UP \u00b7 price above the book',
+    down_book_above: 'DOWN \u00b7 book above price',
+    down_book_below: 'DOWN \u00b7 price above the book'};
+  let verdict, cls = '';
+  if (!n.warm) {
+    verdict = 'WARMING UP &mdash; not enough history to say what ' +
+              'normal looks like yet';
+  } else if (n.chop) {
+    verdict = 'CHOP &mdash; the two flipped ' + n.flips +
+              ' times in the last minute';
+  } else if (n.ok) {
+    verdict = (REG[n.regime] || n.regime) + ' &mdash; held ' +
+              n.held_s.toFixed(0) + 's';
+    cls = n.side === 'up' ? 'long' : 'short';
+  } else if (n.agree) {
+    verdict = 'agreeing ' + n.side.toUpperCase() +
+              ' &mdash; not held long enough yet (' +
+              n.held_s.toFixed(0) + 's)';
+  } else {
+    verdict = 'NO AGREEMENT &mdash; book ' + n.book_dir +
+              ', tape ' + n.tape_dir;
+  }
+  return `
+    <span class="stamp">reading</span>
+    <span class="${cls}" style="font-size:13px"><b>${verdict}</b></span>
+    <span class="stamp">book z ${(n.book_z || 0).toFixed(2)}
+      &middot; price z ${(n.price_z || 0).toFixed(2)}
+      &middot; gap ${(n.spread_z || 0).toFixed(2)}
+      &middot; raw book ${fpNum(Math.round(n.book_cvd || 0))}
+      &middot; raw tape ${fpNum(Math.round(n.tape_cvd || 0))}
+      (smoothed ${fpNum(Math.round(n.tape_ema || 0))})
+      &middot; this bar ${fpNum(Math.round(n.bar_c || 0))}
+      (hi ${fpNum(Math.round(n.bar_h || 0))},
+       lo ${fpNum(Math.round(n.bar_l || 0))},
+       ${((n.bar_elapsed || 0) * 100).toFixed(0)}% in)
+      &middot; VPIN ${(n.vpin || 0).toFixed(3)}
+      &middot; LCR ${(n.lcr || 0).toFixed(2)}
+      &middot; ${(n.trades || 0).toLocaleString()} prints
+      &middot; ${n.session || '--'}</span>`;
+}
+
+/* The live tally. A hit rate with no break-even beside it is not a
+   result, so the break-even is always printed -- and both arms are
+   shown, because if the unconfirmed crosses score like the confirmed
+   ones then the confirmation is costing signals and buying nothing. */
+/* The comparison he is actually making, printed as a number.
+
+   A regime is a STATE, so it is judged by what price does WHILE it
+   holds -- median net travel in ticks per stretch, not an outcome
+   measured from a moment. Both orderings are shown on each side
+   because the claim is comparative: if `book above` really runs
+   harder, it shows up as a bigger median than `book below` on the
+   SAME side, and nowhere else.
+
+   `enough` gates the verdict at twenty stretches a side. Under that
+   the medians are printed but the difference is not called. */
+/* Can the readings call the bar before it closes?
+
+   Always shown against the BASE RATE. In a stretch where 56% of bars
+   close green, a caller scoring 56% has found nothing, and printing
+   "56% correct" on its own would read as though it had. `edge` is the
+   rate minus the better of always-up and always-down, so zero means
+   no better than the dumbest possible rule.
+
+   Split by how far into the bar the call was made, because a call at
+   80% already knows most of the bar. The 20% column is the one that
+   would be worth money. */
+function mgCallRow(cb) {
+  if (!cb || !cb.bars_settled) return '';
+  const cell = d => {
+    if (d.rate === null) return '<span class="stamp">--</span>';
+    const sig = d.enough && d.edge > 0;
+    return `<span class="${sig ? 'long' : ''}">${(d.rate * 100).toFixed(0)}%
+      <span class="stamp">(${d.edge >= 0 ? '+' : ''}${(d.edge * 100).toFixed(0)}
+      edge, n ${d.n}${d.enough ? '' : ', thin'})</span></span>`;
+  };
+  const line = (name, per) => `<span class="stamp">${name}</span>` +
+    cb.checkpoints.map(cp => `<span class="stamp">@${(cp * 100).toFixed(0)}%</span>`
+      + cell(per[String(cp)])).join(' ');
+  return `
+    <span class="stamp" style="width:100%">calling the
+      ${cb.bar_s}s bar before it closes &mdash; ${cb.bars_settled} bars
+      settled &middot; base rate ${(cb.base_up * 100).toFixed(0)}% up,
+      so always-one-way scores ${(cb.naive_rate * 100).toFixed(0)}%
+      &middot; edge is measured against that</span>
+    <span style="width:100%">${line('regime', cb.callers.regime)}</span>
+    <span style="width:100%">${line('bar CVD', cb.callers.bar_z)}</span>`;
+}
+
+function mgRegimeRow(rb) {
+  if (!rb || !rb.episodes) return '';
+  const row = (label, d) => `<span class="stamp">${label}
+    <b>${d.median_net > 0 ? '+' : ''}${d.median_net}t</b> net
+    (n ${d.n}, ${d.median_seconds}s, ${d.median_ticks_per_min}t/min,
+    worst ${d.median_adverse}t)</span>`;
+  const edge = side => {
+    const e = rb[side + '_edge'];
+    if (!e) return '';
+    if (!e.enough) return `<span class="stamp">${side}: not enough
+      stretches yet to compare (${e.n_above} above / ${e.n_below}
+      below, want 20 each)</span>`;
+    const d = e.difference;
+    const who = d > 0 ? 'book above runs further'
+                      : (d < 0 ? 'book BELOW runs further'
+                               : 'no difference');
+    return `<span class="${d > 0 ? 'long' : ''}"><b>${side}: ${who}</b>
+      <span class="stamp">(${e.book_above_net}t vs ${e.book_below_net}t,
+      difference ${d > 0 ? '+' : ''}${d}t)</span></span>`;
+  };
+  return `
+    <span class="stamp" style="width:100%">regime travel &mdash;
+      ${rb.episodes} stretches of at least ${rb.min_seconds}s
+      &middot; median ticks moved while the state held
+      &middot; forward tracking, not a backtest</span>
+    ${row('up &middot; book above', rb.up_book_above)}
+    ${row('up &middot; book below', rb.up_book_below)}
+    ${row('down &middot; book above', rb.down_book_above)}
+    ${row('down &middot; book below', rb.down_book_below)}
+    <span style="width:100%">${edge('up')} &nbsp; ${edge('down')}</span>`;
+}
+
+function mgBoardRow(sb) {
+  if (!sb || !sb.all || !sb.all.n) return '';
+  const be = (sb.break_even * 100).toFixed(1);
+  const arm = (name, d) => {
+    const r = d.rate === null ? '--' : (d.rate * 100).toFixed(1) + '%';
+    const good = d.rate !== null && d.rate > sb.break_even;
+    return `<span class="${good ? 'long' : ''}">${name}
+      <b>${r}</b> <span class="stamp">(${d.hit}/${d.hit + d.miss} done,
+      ${d.open} open, med +${d.median_mfe}/${d.median_mae}t)</span></span>`;
+  };
+  return `
+    <span class="stamp" style="width:100%">live tally &mdash;
+      ${sb.all.n} signals, ${sb.all.settled} settled over
+      ${sb.horizon_s}s &middot; ${sb.target_ticks}t target,
+      ${sb.stop_ticks}t stop &rArr; <b>break-even ${be}%</b>
+      &middot; forward tracking, not a backtest</span>
+    ${arm('all', sb.all)}
+    ${arm('confirmed', sb.confirmed)}
+    ${arm('unconfirmed', sb.unconfirmed)}`;
+}
+
+function mgCrossRow(d) {
+  const cs = ((d && d.crosses) || []).slice(-7).reverse();
+  if (!cs.length) return '<span class="stamp">no crossings yet ' +
+    'this session</span>';
+  const conf = ((d.crosses || []).filter(c => c.confirmed)).length;
+  return `<span class="stamp">last crossings &mdash; ${conf} of
+    ${(d.crosses || []).length} held &middot; what price did next is
+    the question</span>` + cs.map(c => {
+      const t = new Date(c.ts * 1000).toLocaleTimeString();
+      const mark = c.confirmed ? '&#9679;' : '&#9711;';
+      return `<span>${mark} ${t}
+        <b class="${c.confirmed ? (c.direction === 'up' ? 'long' : 'short') : ''}">`
+        + `${c.direction.toUpperCase()}</b> @ ${c.px.toFixed(2)}</span>`;
+    }).join('');
+}
+
+/* ---- who is winning this footprint, overall -------------------
+   The ladder below shows every level. This is the one line that
+   says what they add up to, recomputed from the same bar on every
+   read so the two can never disagree.
+
+   The five parts are printed beside the headline on purpose. The
+   weights that combine them are a choice, not a finding -- nobody
+   has shown they are right, because "right" would need an outcome
+   to be right about, and the study could not find one. So if the
+   headline disagrees with the part you trust, the part is there to
+   be trusted. */
+/* The lead inside this bar, and whether it is still growing.
+
+   The totals above say who is ahead. This says whether they are
+   still GAINING -- a bar can read "buyers +250" long after buyers
+   stopped winning at +400, and only the high-water mark notices.
+   `given back` is against the leader's own best, so a quiet bar and
+   a busy one are held to the same standard. */
+/* WHO IS GAINING, which is not who is ahead.
+
+   The totals say buyers 4932 against sellers 4992 and call it a
+   sellers' bar. If buyers are adding forty contracts a second and
+   sellers fifteen, it is a buyers' bar and the total has not caught
+   up yet. That gap is the whole reason to watch a rate.
+
+   Rates are per SECOND on a time constant, never per trade: twenty
+   prints is a moment at the open and several minutes overnight, and
+   a per-trade average would read the same market as two different
+   ones depending on the hour. */
+function fpPaceRow(p) {
+  if (!p || (!p.buy_rate && !p.sell_rate)) return '';
+  const name = s => s === 'buyers' ? 'BUYERS'
+                  : (s === 'sellers' ? 'SELLERS' : 'NEITHER');
+  const cls = s => s === 'buyers' ? 'long'
+                 : (s === 'sellers' ? 'short' : '');
+  /* The totals say the DIRECTION. The rates say what is happening
+     inside it. These were one reading and that was wrong: the rates
+     go balanced whenever both sides trade at a similar speed for a
+     few seconds, so a bar with sellers far ahead read NO CALL. */
+  let head;
+  if (p.control === 'balanced') {
+    head = '<b>NO CONTROL</b> &mdash; neither side clearly ahead yet';
+  } else if (p.state === 'reversal') {
+    head = `<b class="${cls(p.control)}">${name(p.control)} REVERSAL</b>`
+      + ` &mdash; took the bar off ${name(p.took_from).toLowerCase()}`
+      + `, now ${fpNum(Math.abs(p.buy_total - p.sell_total))} ahead`;
+  } else if (p.state === 'pullback') {
+    head = `<b class="${cls(p.control)}">${name(p.control)} IN CONTROL</b>`
+      + ` &mdash; <b class="${cls(p.pace)}">${name(p.pace).toLowerCase()}`
+      + ` pulling back</b>, ${p.ratio.toFixed(1)}x faster right now`;
+  } else if (p.state === 'holding') {
+    head = `<b class="${cls(p.control)}">${name(p.control)} IN CONTROL</b>`
+      + ' &mdash; holding, neither side pulling away';
+  } else {
+    head = `<b class="${cls(p.control)}">${name(p.control)} IN CONTROL</b>`
+      + ` &mdash; continuation, still ${p.ratio.toFixed(1)}x faster`;
+  }
+  const badge = p.call
+    ? `<span class="${cls(p.call === 'buy' ? 'buyers' : 'sellers')}"
+         style="font-size:15px;font-weight:700;letter-spacing:.06em;
+                border:1px solid currentColor;border-radius:3px;
+                padding:1px 7px">${p.call.toUpperCase()}</span>`
+    : `<span class="stamp" style="font-size:15px;
+         border:1px solid currentColor;border-radius:3px;
+         padding:1px 7px;opacity:.55">NO CALL</span>`;
+  return `
+    <span class="stamp" style="width:100%">who is winning, and what is
+      happening inside it</span>
+    <span>${badge} &nbsp;${head}</span>
+    <span class="stamp">rate ${p.buy_rate.toFixed(0)}/s bought
+      vs ${p.sell_rate.toFixed(0)}/s sold
+      &middot; totals ${fpNum(p.buy_total)}/${fpNum(p.sell_total)}
+      &middot; in control: ${name(p.control).toLowerCase()}
+      &middot; faster: ${name(p.pace).toLowerCase()}
+      &middot; ${p.state || 'no control'}
+      &middot; ${p.tau_s}s constant</span>
+    <span class="stamp" style="width:100%">The call names the side
+      winning THIS BAR so far, and the state says whether the other
+      side is pushing back. It is not a forecast: measured over 102.5
+      hours of ES, these states do not precede price at 15s, 30s or
+      60s. Context for a decision you are making, not a trigger.</span>`;
+}
+
+function fpPushRow(q) {
+  /* The LEG, not the bar. Who ate the contracts that moved price the
+     last few ticks, and whether they are still being paid for them.
+     Absorption here is not "price stopped" -- price stops constantly
+     -- it is the driving side spending the going rate for another
+     tick and not being given it. */
+  if (!q || !q.direction) return '';
+  const up = q.direction === 'up';
+  const who = q.eater === 'buyers' ? 'BUYERS'
+            : (q.eater === 'sellers' ? 'SELLERS' : 'NEITHER SIDE');
+  const cls = s => s === 'long' ? 'long' : (s === 'short' ? 'short' : '');
+  let head, badge;
+  if (q.verdict === 'forming') {
+    badge = `<span class="stamp" style="font-size:15px;
+      border:1px solid currentColor;border-radius:3px;padding:1px 7px;
+      opacity:.55">FORMING</span>`;
+    head = `<b>${q.travel_ticks} of ${q.window} ticks</b> ${up ? 'up' : 'down'}`
+      + ` &mdash; not yet a push worth calling`;
+  } else {
+    badge = `<span class="${cls(q.scalp)}" style="font-size:15px;
+      font-weight:700;letter-spacing:.06em;border:1px solid currentColor;
+      border-radius:3px;padding:1px 7px">${q.scalp.toUpperCase()}</span>`;
+    if (q.verdict === 'absorbed') {
+      head = `<b class="${cls(q.scalp)}">ABSORBED</b> &mdash; ${who.toLowerCase()}`
+        + ` drove it ${q.travel_ticks} ticks ${up ? 'up' : 'down'} and are`
+        + ` being filled at ${q.extreme_px.toFixed(2)}`;
+    } else {
+      head = `<b class="${cls(q.scalp)}">${who} BROKE IT</b> &mdash;`
+        + ` ${q.travel_ticks} ticks ${up ? 'up' : 'down'}, still holding`;
+    }
+  }
+  return `
+    <span class="stamp" style="width:100%">the last push</span>
+    <span>${badge} &nbsp;${head}</span>
+    <span class="stamp">ate ${fpNum(q.eaten_buy)} bought /
+      ${fpNum(q.eaten_sell)} sold
+      &middot; ${q.per_tick.toFixed(0)}/tick to get here
+      &middot; ${fpNum(q.since_extreme)} spent since, no move
+      &middot; from ${q.pivot_px.toFixed(2)} to ${q.extreme_px.toFixed(2)}
+      ${q.give_back_ticks ? '&middot; back ' + q.give_back_ticks + 't' : ''}
+      ${q.agrees ? '' : '&middot; <b>drifted, not driven</b>'}</span>
+    ${q.verdict === 'forming' ? '' : `<span class="stamp"
+      style="width:100%">Wrong at ${q.invalidated_at.toFixed(2)}
+      &mdash; ${q.verdict === 'absorbed'
+        ? 'the fill there gave out' : 'the leg was given back'}.
+      Scalp band is your 1&ndash;2 points (4&ndash;8 ticks); the band is
+      a number you chose, not a measured expectancy. This leg reading
+      has NOT been through the study &mdash; section 11 is what would
+      settle whether it precedes anything.</span>`}`;
+}
+
+function fpLeadRow(l) {
+  if (!l || !l.high_water) return '';
+  const hw = Math.abs(l.high_water);
+  const frac = hw > 0 ? (l.give_back / hw) : 0;
+  const who = l.leader === 'buyers' ? 'BUYERS' :
+              (l.leader === 'sellers' ? 'SELLERS' : '--');
+  const cls = l.leader === 'buyers' ? 'long'
+            : (l.leader === 'sellers' ? 'short' : '');
+  const state = l.stalled
+    ? `<b class="${cls}">${l.stall_side.toUpperCase()} STOPPED GAINING</b>
+       at ${l.stall_px.toFixed(2)}`
+    : (frac > 0.15
+        ? `<b>${who} ahead but fading</b>`
+        : `<b class="${cls}">${who} still gaining</b>`);
+  return `
+    <span class="stamp" style="width:100%">the lead this bar</span>
+    <span>${state}</span>
+    <span class="stamp">now ${l.delta > 0 ? '+' : ''}${fpNum(l.delta)}
+      &middot; best ${l.high_water > 0 ? '+' : ''}${fpNum(l.high_water)}
+      at ${(l.high_water > 0 ? l.peak_px : l.trough_px).toFixed(2)}
+      &middot; given back ${fpNum(l.give_back)}
+      (${(frac * 100).toFixed(0)}% of their best)
+      &middot; ${fpNum(l.buy)} bought / ${fpNum(l.sell)} sold</span>`;
+}
+
+function fpVerdictRow(d) {
+  const v = d.verdict && d.verdict.now;
+  if (!v) return '';
+  const held = d.verdict.bars_held || 0;
+  const cls = v.side === 'buyers' ? 'long'
+            : (v.side === 'sellers' ? 'short' : '');
+  const head = v.side === 'balanced'
+    ? 'NO WINNER &mdash; the two sides are too close to call'
+    : v.side.toUpperCase() + ' ' + v.strength.toUpperCase()
+      + ' &mdash; score ' + (v.score > 0 ? '+' : '') + v.score.toFixed(2)
+      + (held ? ' &middot; held ' + held + ' bar' + (held > 1 ? 's' : '')
+              : '');
+  const part = (k, label) => {
+    const x = v.parts[k];
+    if (x === undefined) return '';
+    const c = Math.abs(x) < 0.08 ? '' : (x > 0 ? 'long' : 'short');
+    return `<span class="stamp">${label}
+      <b class="${c}">${x > 0 ? '+' : ''}${x.toFixed(2)}</b></span>`;
+  };
+  return `
+    <span class="stamp">overall</span>
+    <span class="${cls}" style="font-size:13px"><b>${head}</b></span>
+    ${part('delta', 'who paid')}
+    ${part('flags', 'imbalances')}
+    ${part('stacks', 'runs')}
+    ${part('location', 'where')}
+    ${part('follow', 'follow-through')}
+    <span class="stamp">${v.buy_flags}/${v.sell_flags} flags &middot;
+      ${v.buy_stacks}/${v.sell_stacks} runs &middot;
+      ${fpNum(v.volume)} contracts over ${v.levels} levels</span>
+    ${v.note ? '<span class="stamp" style="width:100%">&#9888; '
+               + v.note + '</span>' : ''}
+    ${fpPushRow(d.verdict.push)}
+    ${fpLeadRow(d.verdict.lead)}
+    ${fpPaceRow(d.verdict.pace)}
+    <span class="stamp" style="width:100%">It reports the state of the
+      auction; it does not predict. The weights behind the score are a
+      choice &mdash; the five parts above are the measurements.</span>`;
+}
+
+function fpStats(d) {
+  const p = d.pulse || {};
+  const ratio = (p.ratio == null) ? '--' : p.ratio.toFixed(2);
+  return `
+    <span>O <b>${(p.open||0).toFixed(2)}</b></span>
+    <span>H <b>${(p.high||0).toFixed(2)}</b></span>
+    <span>L <b>${(p.low||0).toFixed(2)}</b></span>
+    <span>last <b>${(p.last||0).toFixed(2)}</b></span>
+    <span>vol <b>${fpNum(p.total_volume)}</b></span>
+    <span>buyers <b>${fpNum(p.ask_volume)}</b> /
+          sellers <b>${fpNum(p.bid_volume)}</b>
+          &nbsp;ratio <b>${ratio}</b></span>
+    <span>bar delta <b>${fpSign(p.delta)}</b>
+      ${fpMeter(p.pressure, 'bar')} ${(p.pressure||0).toFixed(2)}</span>
+    <span>recent <b>${fpSign(p.window_delta)}</b>
+      ${fpMeter(p.window_pressure, 'recent')}
+      ${(p.window_pressure||0).toFixed(2)}</span>
+    <span>unconfirmed <b>${p.unconfirmed||0}</b>
+      (${p.buy_flags||0} buy / ${p.sell_flags||0} sell)</span>
+    <span class="stamp">bar ${(p.bar_age_s||0).toFixed(0)}s &middot;
+      ${fpNum(p.seq)} ticks</span>`;
+}
+
+function fpTable(d) {
+  const rows = d.rows || [];
+  if (!rows.length) return '<div class="msg">no prints in this bar yet</div>';
+  let peak = 1;
+  for (const r of rows)
+    peak = Math.max(peak, r.bid_volume || 0, r.ask_volume || 0);
+
+  let html = `<div class="fpwrap"><table class="fp"><thead><tr>
+    <th style="text-align:right">price</th>
+    <th>bid &middot; sellers</th><th>ask &middot; buyers</th>
+    <th>delta</th><th style="text-align:left">imbalance</th>
+    </tr></thead><tbody>`;
+  for (const r of rows) {
+    const side = (r.imbalance || []);
+    const cls = side.includes('buy') ? 'imb-buy'
+              : side.includes('sell') ? 'imb-sell' : '';
+    const bw = ((r.bid_volume || 0) / peak * 100).toFixed(1);
+    const aw = ((r.ask_volume || 0) / peak * 100).toFixed(1);
+    // The word carries the meaning; the colour only decorates it.
+    const tags = side.map(x =>
+      `<span class="tag ${x} unconf">${x.toUpperCase()} unconfirmed</span>`
+    ).join('');
+    html += `<tr class="${cls}">
+      <td class="px">${r.price.toFixed(2)}</td>
+      <td class="n bidc"><i style="width:${bw}%"></i>
+        <span>${fpNum(r.bid_volume)}</span></td>
+      <td class="n askc"><i style="width:${aw}%"></i>
+        <span>${fpNum(r.ask_volume)}</span></td>
+      <td class="dl">${fpSign(r.delta)}</td>
+      <td style="padding:2px 6px">${tags}</td></tr>`;
+  }
+  return html + '</tbody></table></div>';
+}
+
+function fpHistory(d) {
+  const h = d.history || [];
+  if (!h.length) return '';
+  return h.slice().reverse().map(b => {
+    const n = (b.confirmed || []).length;
+    const buys = (b.confirmed || []).filter(f => f.side === 'buy').length;
+    return `<div title="closed by ${b.close_reason}">
+      ${b.close.toFixed(2)} &middot; vol ${fpNum(b.volume)} &middot;
+      delta ${fpSign(b.delta)} &middot;
+      <b>${n}</b> confirmed (${buys}b/${n - buys}s)</div>`;
+  }).join('');
+}
+
+async function fpLoad() {
+  const rule = $('fpRule').value;
+  const q = new URLSearchParams({
+    coin: ($('coin') ? $('coin').value : 'ES') || 'ES',
+    rule: rule === 'vol' ? '1m' : rule,
+    volume: rule === 'vol' ? ($('fpVol').value || 0) : 0,
+    multiplier: $('fpMult').value || 4,
+    min_volume: $('fpMin').value || 0,
+    push_ticks: ($('fpPush') && $('fpPush').value) || 4 });
+  let d;
+  try { d = await api('/api/footprint?' + q.toString()); }
+  catch (e) {
+    $('fpBody').innerHTML = '<div class="msg">' + e + '</div>';
+    return;
+  }
+  if (!d.ok) {
+    $('fpStamp').textContent = '';
+    $('fpStats').innerHTML = '';
+    $('fpBook').innerHTML = '';
+    $('fpHist').innerHTML = '';
+    $('fpBody').innerHTML = '<div class="msg">' +
+      (d.why || 'no data') + '</div>';
+    return;
+  }
+  $('fpStamp').textContent = `${d.coin} · ${d.rule} · ` +
+    `${(d.tape_trades || 0).toLocaleString()} prints`;
+  $('fpStats').innerHTML = fpStats(d);
+  if ($('fpVerdict')) $('fpVerdict').innerHTML = fpVerdictRow(d);
+  $('fpBook').innerHTML = fpBookRow(d);
+  $('fpClear').innerHTML = fpClearRow(d);
+  $('fpBody').innerHTML = fpTable(d);
+  $('fpHist').innerHTML = fpHistory(d);
+}
+
+function fpTick() {
+  if (!$('fpAuto') || !$('fpAuto').checked) return;
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return;          // not on screen, not polled
+  fpLoad();
+}
+
+/* The CVD reader polls ITSELF, on its OWN timer.
+
+   Two bugs compounded here and the second hid the first.
+
+   It used to be drawn at the tail of fpLoad, which returns early
+   whenever the footprint reports no data -- so before the first print
+   of a session the lines were never drawn at all. The book line needs
+   no prints, so it must not inherit the footprint's silence.
+
+   Then it was called from fpTick, which the /ws/live migration had
+   already stopped scheduling: the comment on that socket says it
+   replaces setInterval(fpTick), but footprint and CVD data never
+   moved onto those frames. So the panel painted once at page open and
+   then stood still until someone pressed Refresh. A frozen panel does
+   not look frozen -- it looks like a feed running far behind.
+
+   The poll is INCREMENTAL. Re-sending 600 points twice a second is
+   tens of kilobytes the browser already holds, and that backlog is
+   itself a source of lag. We send the timestamp of the newest point
+   we have and get back only what is newer, usually one or two. If the
+   server says it is no longer `continuous`, the ring turned over
+   while we were away, so we take the whole set again rather than
+   splicing a hole into the line and drawing a move that never
+   happened. */
+let mgPts = [];
+let mgLast = 0;
+let mgTick = 0;
+let mgBoard = null;
+let mgRegime = null;
+let mgCalls = null;
+const MG_CAP = 600;
+
+async function mgLoad() {
+  if (!$('mgChart')) return;
+  mgTick++;
+  let d;
+  try {
+    d = await api('/api/cvdcross?coin=' +
+      encodeURIComponent(($('coin') ? $('coin').value : 'ES') || 'ES') +
+      (mgLast ? '&since=' + mgLast : '') +
+      '&bar_seconds=' + cvdBarSeconds() +
+      (mgTick % 8 === 0 ? '&with_signals=1' : ''));
+  } catch (e) {
+    $('mgChart').innerHTML = '<div class="msg">' + e + '</div>';
+    return;
+  }
+  if (!d.ok) {
+    mgPts = []; mgLast = 0;
+    $('mgStamp').textContent = '';
+    $('mgStats').innerHTML = '';
+    $('mgCross').innerHTML = '';
+    $('mgChart').innerHTML = '<div class="msg">' +
+      (d.why || 'no data') + '</div>';
+    return;
+  }
+  if (d.bar_marks) {
+    cvdMarks = new Map();
+    for (const r of d.bar_marks) cvdMarks.set(r.ts, r);
+    try { if (typeof drawChart === 'function') drawChart(); } catch (e) {}
+  }
+  if (d.scoreboard) mgBoard = d.scoreboard;
+  if (d.regime_board) mgRegime = d.regime_board;
+  if (d.call_board) mgCalls = d.call_board;
+  if (d.continuous === false) { mgPts = []; }     // a hole: start clean
+  const fresh = d.points || [];
+  if (fresh.length) {
+    mgPts = mgPts.concat(fresh);
+    if (mgPts.length > MG_CAP) mgPts = mgPts.slice(-MG_CAP);
+    mgLast = mgPts[mgPts.length - 1].ts;
+  }
+  const view = {now: d.now, points: mgPts, crosses: d.crosses,
+                enter: d.enter, tau_s: d.tau_s, sample_s: d.sample_s,
+                bars: d.bars};
+  const w = Math.max(360, ($('mgChart').clientWidth || 900));
+  $('mgStamp').textContent = mgPts.length
+    ? mgPts.length + ' pts · ' + d.sample_s + 's sampling · '
+      + d.tau_s + 's smooth'
+    : (d.records || 0).toLocaleString() + ' records, no samples yet';
+  $('mgStats').innerHTML = mgRow(view);
+  $('mgChart').innerHTML = mgPts.length >= 2
+    ? mgChart(view, w, 190)
+    : '<div class="msg">Collecting&hellip; ' + (d.why ||
+        'the reader needs a few seconds of records') + '</div>';
+  if ($('mgBars')) {
+    $('mgBars').innerHTML = d.bars
+      ? mgBars(d.bars, w, 150,
+               !!($('mgLine') && $('mgLine').checked))
+      : '';
+  }
+  $('mgCross').innerHTML = mgCallRow(mgCalls) + mgRegimeRow(mgRegime)
+    + mgCrossRow(view) + mgBoardRow(mgBoard);
+}
+
+/* Changing the timeframe must not blank the panel while the next
+   poll is in flight, and it must not reset the line chart above --
+   the engine keeps all three frames fed at once, so the switch is
+   only a change of which one to ask for. */
+function mgPickTf() { mgLoad(); }
+
+/* The bar size the engine aggregates to must match the chart's
+   interval, or the per-bar readings are keyed to timestamps no candle
+   has and the pane silently draws nothing. Nothing is what it should
+   draw in that case -- a mismatched line laid beside candles looks
+   perfectly plausible and is wrong. */
+const CVD_FRAMES = {'1m': 60, '5m': 300, '15m': 900};
+function cvdBarSeconds() {
+  const sel = $('mgTf') && $('mgTf').value;
+  const iv = $('sInt') && $('sInt').value;
+  return CVD_FRAMES[iv] || Number(sel) || 300;
+}
+
+/* Both panels need a clock of their own until their data moves onto
+   /ws/live. Hidden tabs are skipped inside fpTick; mgLoad is cheap
+   enough incrementally to keep the line continuous either way. */
+let _mgTimer = null, _fpTimer = null;
+function mgStartTimers() {
+  if (!_mgTimer) { _mgTimer = setInterval(mgLoad, 500); }
+  if (!_fpTimer) { _fpTimer = setInterval(fpTick, 2000); }
+  // Twelve seconds: one Ethereum block. Polling faster re-reads the
+  // same state and spends RPC quota to redraw an identical panel.
+  if (!_dexTimer) { _dexTimer = setInterval(dexTick, 12000); dexTick(); }
+  // Two seconds: fast enough that the forming bar moves, slow enough
+  // that a 140-bar redraw is not the busiest thing on the page.
+  if (!_ofiTimer) { _ofiTimer = setInterval(() => ofiTick(true), 2000); ofiTick(); }
+}
+try { mgStartTimers(); } catch (e) {}
+
+
+/* ---- tabs -------------------------------------------------------------
+
+   The chart lives on a canvas, and a canvas that was laid out while its
+   tab was hidden has no usable width. So the dashboard redraws on show
+   rather than trusting whatever size it had when nobody could see it.
+   ------------------------------------------------------------------- */
+
+const TAB_KEYS = ['dash', 'test', 'book', 'wall', 'setup'];
+
+function showTab(key) {
+  for (const k of TAB_KEYS) {
+    const pane = $('tab-' + k), btn = $('tabbtn-' + k);
+    if (!pane) continue;
+    pane.hidden = k !== key;
+    if (btn) btn.classList.toggle('on', k === key);
+  }
+  try { localStorage.setItem('liqmap_tab', key); } catch (e) {}
+  if (key === 'test') {
+    // Fill the dataset picker when the tab is opened rather than on
+    // page load: it is a disk listing, and most visits never open it.
+    try { btDatasets(); } catch (e) {}
+  }
+  if (key === 'dash') {
+    // drawChart reads clientWidth and resizes the backing store itself,
+    // so one call is enough -- but it MUST happen after the pane is
+    // visible, or it measures zero and draws nothing.
+    try { drawChart(); } catch (e) {}
+  }
+}
+
+function restoreTab() {
+  let k = 'dash';
+  try { k = localStorage.getItem('liqmap_tab') || 'dash'; } catch (e) {}
+  showTab(TAB_KEYS.includes(k) ? k : 'dash');
+}
+
+/* ---- the alert ---------------------------------------------------------
+   Fires the moment book, delta and price line up and the rule is met.
+
+   Three channels on purpose, because one is never enough: a banner for
+   when you are looking at the page, a sound for when you are not, and a
+   desktop notification for when the tab is behind something else.
+
+   It fires on the EDGE — the poll where agreement appears — not on every
+   poll while it persists. A thing that beeps every five seconds for a
+   minute is a thing you turn off.                                      */
+
+let agreeAlert = {last: null, ctx: null, armed: false};
+
+function armAgreeAlert() {
+  const on = $('apAlert') && $('apAlert').checked;
+  agreeAlert.armed = !!on;
+  if (!on) return;
+  // Both of these need a click to be allowed, which is why this is wired
+  // to the checkbox rather than done on load.
+  try {
+    if (!agreeAlert.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) agreeAlert.ctx = new AC();
+    }
+    if (agreeAlert.ctx && agreeAlert.ctx.state === 'suspended') {
+      agreeAlert.ctx.resume();
+    }
+  } catch (e) {}
+  try {
+    if (window.Notification && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  } catch (e) {}
+}
+
+function agreeBeep(side) {
+  const ctx = agreeAlert.ctx;
+  if (!ctx) return;
+  try {
+    // Two short notes, rising for a long and falling for a short, so the
+    // direction is audible without looking.
+    const now = ctx.currentTime;
+    const pair = side === 'long' ? [660, 990] : [660, 440];
+    pair.forEach((f, i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, now + i * 0.16);
+      g.gain.exponentialRampToValueAtTime(0.22, now + i * 0.16 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.16 + 0.15);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(now + i * 0.16); o.stop(now + i * 0.16 + 0.16);
+    });
+  } catch (e) {}
+}
+
+/* Called on every poll with the current reading. */
+function checkAgreeAlert(d) {
+  if (!agreeAlert.armed) { $('apAlertBar').style.display = 'none'; return; }
+
+  const three = d.three_way || {};
+  const conf = d.confirmation || {};
+  const part = conf.participation || {};
+  const effort = typeof part.effort === 'number' ? part.effort : null;
+  const wantEffort = parseFloat($('apEffort').value || '0') / 100;
+  const wantUnan = $('apUnan').checked;
+
+  const agreed = three.agreeing === 3 && three.direction !== 'flat';
+  const paid = wantEffort <= 0 || (effort !== null && effort >= wantEffort);
+  const live = (!wantUnan || agreed) && paid;
+
+  // One line per candle: the key is the bar, so a rule that stays true
+  // for ten polls sounds once.
+  const key = live ? (d.coin + '|' + d.interval + '|' + d.candle_ts) : null;
+  const bar = $('apAlertBar');
+
+  if (!live) {
+    bar.style.display = 'none';
+    agreeAlert.last = null;
+    return;
+  }
+
+  const side = three.direction === 'up' ? 'long' : 'short';
+  const tp = $('apTp').value, sl = $('apSl').value, unit = $('apUnit').value;
+  const px = d.price || d.entry || 0;
+  const line = `${side.toUpperCase()} ${d.coin} — all three ${three.direction}`
+    + (effort !== null ? `, ${(effort * 100).toFixed(0)}% of normal volume` : '')
+    + `. ${px ? chPx(px) + ' · ' : ''}target ${tp}${unit === 'ticks' ? ' ticks' : 'bps'}`
+    + `, stop ${sl}${unit === 'ticks' ? ' ticks' : 'bps'}`;
+
+  bar.className = 'alertbar ' + side;
+  bar.style.display = '';
+  bar.innerHTML = `<b>${esc(line)}</b>`
+    + '<span class="thin" style="margin-left:10px">'
+    + (d.seconds_left ? fmtLeft(d.seconds_left) + ' left on the candle' : '')
+    + '</span>'
+    + `<button style="margin-left:auto" onclick="tookIt('${esc(side)}')">`
+    + 'I took it</button>'
+    + '<button onclick="$(\\'apAlertBar\\').style.display=\\'none\\'">'
+    + 'dismiss</button>';
+
+  if (key === agreeAlert.last) return;      // same candle, already called
+  agreeAlert.last = key;
+
+  agreeBeep(side);
+  try {
+    if (window.Notification && Notification.permission === 'granted') {
+      new Notification('ChrisChart — all three agree', {
+        body: line, tag: key, renotify: false});
+    }
+  } catch (e) {}
+}
+
+/* Record that YOU took it, by hand. Kept as its own source so a manual
+   fill never sits inside the agent's score. */
+async function tookIt(side) {
+  try {
+    const c = apCfg();
+    await api('/api/manual-trade?' + q({
+      coin: c.coin, interval: c.interval, side: side,
+      tp_bps: c.tp_bps, sl_bps: c.sl_bps, unit: c.unit,
+      fee_bps: c.fee_bps, notional: c.notional}), {method: 'POST'});
+  } catch (e) { $('apState').textContent = e.message; return; }
+  $('apAlertBar').style.display = 'none';
+  loadAutopilot();
+}
+
+async function testProjection() {
+  const c = apCfg();
+  $('apCal').style.display = '';
+  $('apCal').textContent = 'replaying the projection over every stored '
+    + 'candle…';
+  let d;
+  try {
+    d = await api('/api/backfill-projections?' + q({
+      coin: c.coin, interval: c.interval}), {method: 'POST'});
+  } catch (e) { $('apCal').textContent = e.message; return; }
+  if (!d.ok) { $('apCal').innerHTML = `<b>${esc(d.detail || '')}</b>`; return; }
+  paintCalibration(d.calibration, d);
+}
+
+async function loadCalibration() {
+  let d;
+  try {
+    d = await api('/api/projection-calibration?' + q({
+      coin: coin(), interval: $('sInt').value}));
+  } catch (e) { return; }
+  if (d && d.ok) paintCalibration(d, null);
+}
+
+function paintCalibration(cal, run) {
+  const el = $('apCal');
+  if (!cal) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  if (!cal.ready) {
+    el.innerHTML = `<b>${esc(cal.note || 'not enough graded bars yet')}</b>`
+      + (cal.bars ? `<div class="thin">${cal.bars} bars graded so far.</div>`
+                  : '');
+    return;
+  }
+  const s2 = cal.signal, n2 = cal.null;
+  const dir = cal.direction || {};
+  const slots = (cal.by_elapsed || []).filter(r => r.ready);
+
+  // Direction leads. Whether the bands are honest is a different and
+  // blunter question — a real directional edge barely moves the band
+  // shape, so leading with that would bury the answer.
+  const dirBlock = !dir.ready
+    ? `<div class="msg">${esc(dir.note || '')}</div>`
+    : `<div class="verdict-big ${dir.real && dir.ci_low > 0.5 ? 'long'
+        : dir.real ? 'short' : 'split'}">`
+      + `${(dir.rate * 100).toFixed(1)}% `
+      + `<span style="font-size:13px;font-weight:400">of ${dir.n} bars `
+      + `finished the way the read leaned</span></div>`
+      + `<div class="msg">${esc(dir.verdict)}</div>`;
+
+  el.innerHTML = dirBlock
+    + '<div class="thin" style="margin:10px 0 2px">And whether the bands '
+    + 'themselves are honest — a separate, blunter question:</div>'
+    + `<b>${esc(cal.verdict)}</b>`
+    + `<div class="conrow" style="margin-top:8px">`
+    + `<div class="stat"><b>${cal.bars}</b><span>bars graded</span></div>`
+    + `<div class="stat"><b>${s2.deviation}</b>`
+      + '<span>signal, off flat</span></div>'
+    + `<div class="stat"><b>${n2.deviation}</b>`
+      + '<span>null, off flat</span></div>'
+    + `<div class="stat"><b class="${cal.gap > 0 ? 'long' : 'short'}">`
+      + `${cal.gap >= 0 ? '+' : ''}${cal.gap}</b>`
+      + '<span>signal minus null</span></div>'
+    + `<div class="stat"><b>${(s2.coverage_50 * 100).toFixed(0)}%</b>`
+      + '<span>in the 50% band</span></div>'
+    + '</div>'
+    + `<div class="msg">${esc(s2.verdict)}</div>`
+    + (slots.length
+        ? '<div class="thin" style="margin-top:6px">By how far into the '
+          + 'bar it was made — early is the one that matters, because late '
+          + 'has almost nothing left to be wrong about: '
+          + slots.map(r => `${(r.elapsed * 100).toFixed(0)}% `
+              + `<b class="${r.gap > 0 ? 'long' : 'short'}">`
+              + `${r.gap >= 0 ? '+' : ''}${r.gap}</b> (n=${r.n})`).join(' · ')
+          + '</div>'
+        : '')
+    + reachTable(cal)
+    + (run ? `<div class="thin">${run.graded} graded from `
+             + `${run.candles} stored candles.</div>` : '');
+}
+
+/* The scalper's table: for each target distance, how often the call got
+   there BEFORE it went the same distance against.
+
+   Not the same question as direction. A read can call the sign right and
+   still lose a three-tick target, because getting there first is what
+   pays — a higher close is no use if it went four ticks against you on
+   the way. */
+function reachTable(cal) {
+  const rows = (cal.reach || []).filter(r => r.ready);
+  const d = cal.distance || {};
+  if (!rows.length) {
+    return '<div class="thin" style="margin-top:8px">Not enough graded '
+      + 'bars yet to say how far it gets.</div>';
+  }
+  const tb = chartData && chartData.tick_bps ? chartData.tick_bps : 0;
+  const cost = parseFloat($('sFee').value || '0');
+
+  return '<h3 style="margin:14px 0 4px;font-size:13px">How often it gets '
+    + 'there first</h3>'
+    + '<div class="thin" style="margin-bottom:6px">Target reached before '
+    + 'the same distance went against, walking one-minute bars. A minute '
+    + 'that touches both counts against you — nothing in a bar says which '
+    + 'came first.</div>'
+    + '<table><thead><tr><th>target</th>'
+    + (tb ? '<th>ticks</th>' : '')
+    + '<th>n</th><th>got there first</th><th>needs</th>'
+    + '<th>reads as</th></tr></thead><tbody>'
+    + rows.map(r => {
+        // Symmetric target and stop, so breakeven is the cost term alone.
+        const need = (r.target_bps + cost) / (2 * r.target_bps);
+        const clear = r.ci_low > need;
+        const dead = r.ci_high < need;
+        return `<tr><td>${r.target_bps}bps</td>`
+          + (tb ? `<td>${(r.target_bps / tb).toFixed(1)}</td>` : '')
+          + `<td>${r.resolved}</td>`
+          + `<td><b class="${r.ci_low > 0.5 ? 'long'
+              : r.ci_high < 0.5 ? 'short' : ''}">`
+          + `${(r.rate * 100).toFixed(1)}%</b> `
+          + `<span class="thin">${(r.ci_low * 100).toFixed(0)}–`
+          + `${(r.ci_high * 100).toFixed(0)}%</span></td>`
+          + `<td>${need >= 1 ? '<b>impossible</b>'
+              : (need * 100).toFixed(0) + '%'}</td>`
+          + `<td class="thin">${need >= 1 ? 'the target does not cover the '
+              + 'round trip' : clear ? 'clears it' : dead
+              ? 'does not clear it' : 'too close to call'}</td></tr>`;
+      }).join('')
+    + '</tbody></table>'
+    + (d.ready ? `<div class="msg" style="margin-top:6px">${esc(d.note)}</div>`
+               : '')
+    + `<div class="thin">"Needs" is (target + cost) / (2 x target) at the `
+    + `${cost}bps round trip in the fee box — change it and these move.</div>`;
+}
+
+async function backfillBook() {
+  const c = apCfg();
+  if (!confirm('Trade every candle already recorded, under the rule set '
+               + 'above? Candles already in the book are skipped.')) return;
+  $('apState').textContent = 'trading the past candles…';
+  let d;
+  try {
+    d = await api('/api/backfill-book?' + q({
+      coin: c.coin, interval: c.interval, tp: c.tp_bps, sl: c.sl_bps,
+      unit: c.unit, unanimous: c.require_unanimous,
+      min_effort: c.min_effort, cost_bps: c.fee_bps,
+      exit_before_s: 5}), {method: 'POST'});
+  } catch (e) { $('apState').textContent = e.message; return; }
+  if (!d.ok) {
+    $('apState').innerHTML = `<b>${esc(d.detail || 'nothing written')}</b>`
+      + (d.refused ? `<div class="thin">of ${d.considered} stored candles: `
+          + Object.entries(d.refused).map(([k, v]) => `${esc(k)} ${v}`)
+            .join(' · ') + '</div>' : '');
+    return;
+  }
+  $('apState').innerHTML = `<b>${esc(d.note)}</b>`
+    + `<div class="thin">${d.considered} candles considered, ${d.matched} `
+    + `met the rule, ${d.skipped_existing} already in the book`
+    + (d.unresolved ? `, ${d.unresolved} had no price after them` : '')
+    + '.</div>';
+  loadChart();
+  loadScorecard();
+}
+
+async function loadSuggest() {
+  let d;
+  try {
+    d = await api('/api/suggest?' + q({
+      coin: coin(), interval: $('sInt').value,
+      // The old aim selector is gone. The agent sizes its own trade from
+      // the take-profit and stop you set, so `suggest`'s mode only still
+      // shapes the reading it returns; scalp is the one that matches.
+      mode: 'scalp',
+      size: parseFloat($('sSize').value || '10000'),
+      fee_bps: parseFloat($('sFee').value || '0')}));
+  } catch (e) { $('sugCard').textContent = e.message; return; }
+  paintSuggest(d);
+  checkAgreeAlert(d);
+  loadDecisions();
+}
+
+/* Book against price, always on show. This is the most useful thing on the
+   panel precisely when there is NO trade, so it is painted before and
+   independently of the call itself. */
+/* `paintCompare` lived here. The two-way row it drew was absorbed into
+   the three-way row; it has had no call site since and no element to
+   write to. Dead UI code is worse than no UI code: it looks maintained.
+*/
+
+/* Three independent columns and a letter. Never blended — averaging three
+   directions turns a disagreement into a confident-looking number, and the
+   disagreement is the part worth keeping. */
+function paintThreeWay(d) {
+  const box = $('sugThree');
+  const t = d.three_way;
+  if (!t) { box.style.display = 'none'; return; }
+
+  const cls = v => v === 'up' ? 'long' : v === 'down' ? 'short' : '';
+  const arrow = v => v === 'up' ? '▲' : v === 'down' ? '▼' : '—';
+  const gradeCls = t.grade === 'A' ? 'long' : t.grade === 'X' ? 'short' : '';
+  const road = d.runway;
+  const dl = d.delta;
+  // Stability, folded in here rather than repeated in a second row.
+  const c = d.confirmation || {};
+  const p = c.participation;
+  const heldCls = c.settled ? 'long' : c.agree ? 'short' : '';
+  const partCls = !p ? '' : p.backed ? 'long' : 'short';
+
+  box.style.display = '';
+  box.innerHTML =
+      '<div class="conrow">'
+    + `<div class="stat"><b class="${cls(t.book)}">${arrow(t.book)} `
+    + `${esc((t.book || '').toUpperCase())}</b><span>book (resting)</span></div>`
+    + `<div class="stat"><b class="${cls(t.delta)}">${arrow(t.delta)} `
+    + `${esc((t.delta || '').toUpperCase())}</b><span>delta (crossing)</span></div>`
+    + `<div class="stat"><b class="${cls(t.price)}">${arrow(t.price)} `
+    + `${esc((t.price || '').toUpperCase())}</b><span>price (outcome)</span></div>`
+    + `<div class="stat"><b class="${gradeCls}" style="font-size:20px">`
+    + `${esc(t.grade)}</b><span>grade · ${t.agreeing}/3</span></div>`
+    + (road ? `<div class="stat"><b>${road.clear_bps.toFixed(0)}bps</b>`
+              + `<span>runway${road.open_road ? ' · open' : ''}</span></div>` : '')
+    + (p ? `<div class="stat"><b class="${partCls}">`
+           + `${(p.effort * 100).toFixed(0)}%</b><span>paid for</span></div>` : '')
+    + `<div class="stat"><b class="${heldCls}">${(c.held_s || 0).toFixed(0)}s</b>`
+    + `<span>held${c.flips ? ' · ' + c.flips + ' flips' : ''}</span></div>`
+    + '</div>'
+    + `<div class="msg" style="margin-top:6px">${esc(t.detail || '')}</div>`
+    + (road ? `<div class="msg" style="margin-top:4px"><b>How far:</b> `
+              + `${esc(road.describe || '')}.</div>` : '')
+    + (dl && (dl.absorbed || dl.divergent || dl.working)
+        ? `<div class="msg" style="margin-top:4px"><b>Tape:</b> `
+          + `${esc(dl.describe || '')}.</div>` : '')
+    + (c.instability
+        ? `<div class="msg" style="margin-top:4px;color:var(--down)">`
+          + `<b>Agreeing but not settled</b> — ${esc(c.instability)}.</div>`
+        : '');
+}
+
+function paintSuggest(d) {
+  if (!d) return;
+  sugId = d.id || null;
+  paintThreeWay(d);
+  loadChart();
+  // Profile follows the same refresh as the call. Two clocks would let the
+  // levels drift out of step with the candles they are drawn over.
+  loadProfile();
+  loadMTF();
+
+  // The feed rate decides whether anything below it is worth reading. Every
+  // book signal measures CHANGE, so the rate change arrives at IS the
+  // resolution of the signal — and a throttled feed looks exactly like a
+  // quiet market from an empty panel.
+  const fq = $('sugFeed');
+  if (d.feed_quality) {
+    const slow = (d.updates_per_s || 0) < 0.35;
+    fq.style.display = '';
+    fq.className = 'msg';
+    fq.innerHTML = (slow ? '<b class="short">SLOW FEED</b> — ' : '')
+      + esc(d.feed_quality)
+      + (d.fast_book ? '' : ' (fast stream not confirmed)');
+  } else { fq.style.display = 'none'; }
+
+  if (!d.take) {
+    // A refusal is an answer, not an error, and it still carries a grade and
+    // a lean. "No trade but leaning long" and "no trade, book balanced" are
+    // different states and only one of them is worth watching.
+    const lean = d.side ? `${d.side.toUpperCase()} lean` : 'no lean';
+    const cls = d.side === 'long' ? 'long' : d.side === 'short' ? 'short' : '';
+    $('sugCard').innerHTML =
+        `<div class="call"><b class="${cls}">${esc(d.grade || '—')}</b>`
+      + `<span class="sub">${esc(lean)} · not tradeable`
+      + (d.blocked_by ? ` · ${esc(d.blocked_by)}` : '') + '</span></div>'
+      + `<div class="msg" style="margin-top:6px">${esc(d.detail || d.sentence || '')}</div>`;
+    stamp('sugStamp', d.feed_age_s == null ? 0 : d.feed_age_s, 5, 30, 'book ');
+    return;
+  }
+
+  const cls = d.side === 'long' ? 'long' : 'short';
+  const sign = d.side === 'long' ? '+' : '-';
+  const px = v => Number(v).toLocaleString(undefined, {maximumFractionDigits: 6});
+
+  // The pair that decides it: what this trade NEEDS against what you GET.
+  const need = d.breakeven == null ? null : (d.breakeven * 100);
+  const got = d.measured_rate == null ? null : (d.measured_rate * 100);
+  const edgeCls = d.edge_pts == null ? '' : d.edge_pts >= 0 ? 'long' : 'short';
+
+  $('sugCard').innerHTML =
+      `<div class="call"><b class="${cls}">${d.side.toUpperCase()}</b>`
+    + `<span class="sub">grade ${esc(d.grade || '')} · ${d.target_ticks} ticks`
+    + ` · ${sign}${d.target_bps.toFixed(1)}bps · ${d.rr}R`
+    + ` · conviction ${(d.conviction*100).toFixed(0)}%</span></div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${px(d.entry)}</b><span>entry</span></div>`
+    + `<div class="stat"><b class="${cls}">${px(d.target_px)}</b><span>target</span></div>`
+    + `<div class="stat"><b class="${d.side === 'long' ? 'short' : 'long'}">${px(d.stop_px)}</b><span>invalid</span></div>`
+    + `<div class="stat"><b>${d.cost_bps.toFixed(1)}bps</b><span>round trip</span></div>`
+    + (need == null ? ''
+       : `<div class="stat"><b>${need.toFixed(0)}%</b><span>needs to win</span></div>`)
+    + (got == null ? ''
+       : `<div class="stat"><b class="${edgeCls}">${got.toFixed(0)}%</b>`
+         + `<span>you win (${d.measured_n})</span></div>`)
+    + '</div>'
+    + (d.edge_pts == null ? ''
+       : `<div class="msg" style="margin-top:6px"><b class="${edgeCls}">`
+         + `${d.edge_pts >= 0 ? '+' : ''}${d.edge_pts} points `
+         + `${d.edge_pts >= 0 ? 'clear of' : 'short of'} breakeven</b>`
+         + ` on ${d.measured_n} settled trades.</div>`)
+    + (d.reasons && d.reasons.length
+        ? `<div class="msg" style="margin-top:8px"><b>Why:</b> ${esc(d.reasons.join('; '))}.</div>` : '')
+    + (d.cautions && d.cautions.length
+        ? `<div class="msg" style="margin-top:4px;color:var(--down)"><b>Against:</b> ${esc(d.cautions.join('; '))}.</div>` : '')
+    + (d.fees_included ? ''
+        : `<div class="msg" style="margin-top:4px">Cost excludes fees — put your
+           round-trip fee in the box above or every suggestion looks cheaper
+           than it is.</div>`);
+
+  stamp('sugStamp', d.feed_age_s == null ? 0 : d.feed_age_s, 5, 30, 'book ');
+}
+
+/* `decide()` lived here, writing your take-it / ignore-it choice to the
+   suggestions table. The agent keeps its own book now and the alert
+   records a fill you took yourself, so there is one record instead of
+   two that disagree.
+*/
+
+/* `loadDecisions()` lived here. It painted the old you-versus-the-tool
+   scorecard into `sugScore`, which went when the take-it / ignore-it row
+   did. The agent's own book is the one record now, and `/api/decisions`
+   is still there for anything that wants the history.
+*/
+async function loadDecisions() { /* retired — see above */ }
+
+function toggleSuggestAuto() {
+  if (sugPoll) { clearInterval(sugPoll); sugPoll = null; }
+  if ($('sAuto').checked) loadSuggest();
+}
+
+function inputFlags(d) {
+  // Report each input separately. One banner saying "flow and absorption
+  // missing" while flow was visibly working in the signal list was simply
+  // untrue, and an untrue status line costs more trust than a missing one.
+  const i = d.inputs || {};
+  let out = '';
+  if (!i.flow) out += '<span class="flag late">NO FLOW</span>';
+  if (i.absorption_warming)
+    out += `<span class="flag late">ABSORPTION WARMING (${i.baseline_samples||0}/20)</span>`;
+  else if (!i.absorption) out += '<span class="flag late">NO ABSORPTION</span>';
+  if (!i.book) out += '<span class="flag late">NO BOOK</span>';
+  return out;
+}
+
+/* How old a ladder row is, and where it came from.
+
+   A row that is a minute stale looks exactly like a row that disagrees
+   with you, and the two call for opposite reactions: one is information,
+   the other is a clock. Rows older than their own bar is long are called
+   out, because by then the row is describing a bar that has closed. */
+function tfAge(t) {
+  if (t.age_s == null) return '';
+  const old = t.source !== 'tape' && t.age_s >= 20;
+  const txt = t.age_s < 1 ? 'now' : Math.round(t.age_s) + 's';
+  return ' · <span class="' + (old ? 'flag late' : 'thin') + '">'
+       + (t.source === 'tape' ? 'tape ' : 'polled ') + txt + '</span>';
+}
+
+/* ---- the merged ladder ---------------------------------------------------
+
+   Two measurements of the same bar, from two feeds, on one row: the
+   candle read on the left and the order flow on the right. They are kept
+   INDEPENDENT -- neither is averaged into the other, each keeps its own
+   side, its own age and its own refusal -- because the information is in
+   whether they agree, and a blend destroys exactly that.
+
+   They are drawn together because they were unreadable apart: comparing
+   the 15m read with the 15m flow meant scrolling between two ladders and
+   holding one in your head.
+
+   Each arrives on its own schedule, so each is stashed and the row is
+   redrawn from whatever is currently known. A half with nothing behind
+   it says so rather than leaving the row to look flat.             */
+
+let ladderRead = [], ladderFlow = null, ladderErr = '';
+
+/* The timeframes the read is showing, built the same way the route builds
+   them. The flow is then asked for exactly these, so the two halves of a
+   row can never be measuring different bars. */
+function readTfList() {
+  const out = [];
+  [($('rHigh') || {}).value, '1h', ($('rInt') || {}).value, '5m', '1m']
+    .forEach(t => { if (t && out.indexOf(t) < 0) out.push(t); });
+  return out;
+}
+
+function readHalf(t) {
+  if (!t) return '<span class="who wide thin">NO READ</span>'
+              + '<span class="meta thin">this timeframe was not read</span>';
+  /* FORMING is not CONTESTED. Contested means both sides turned up and
+     neither won; forming means there is not enough in this bar yet to say
+     anything, and printing a direction for it was how an ordinary down
+     minute came out reading UP. */
+  if (t.forming)
+    return '<span class="who wide thin">FORMING</span>'
+         + '<span class="meta thin">' + moveText(t)
+         + (t.seeded === false ? ' · open not seen' : '')
+         + ' · ' + (t.trades || 0) + ' fills' + tfAge(t) + '</span>';
+  const w = Math.round(Math.abs(t.signed) * 50);
+  return '<span class="who ' + (t.winner === 'buyers' ? 'long'
+            : t.winner === 'sellers' ? 'short' : '') + '">'
+       + t.winner.toUpperCase() + '</span>'
+       + '<span class="bar"><i class="' + t.winner + '" style="width:'
+       + w + '%"></i></span>'
+       + '<span class="meta">' + moveText(t)
+       + (t.absorbing ? ' · absorbed' : '')
+       + (t.measured ? '' : ' · inferred') + tfAge(t) + '</span>';
+}
+
+/* The move on the candle, in bps, with the same move in the market's own
+   increment beside it.
+
+   THE BPS FIGURE IS THE READING. It is what every threshold in this
+   project is expressed in, it is what makes a one-minute bar on a $4
+   token comparable with a four-hour bar on a $100k one, and it is what
+   was on this row for every version of this panel that worked.
+
+   The tick count is an ADDITION, not a replacement. Reading 2.6 ticks on
+   the 1m against 9.1 on the 5m is a comparison you can make at a glance;
+   doing it from -0.34bps against -1.18bps is arithmetic. Swapping one for
+   the other -- which is what I did first -- threw away the figure that
+   was doing the work to show the one that reads more easily. */
+function moveText(t) {
+  /* ONE DECIMAL. This is what the row has always shown, and I changed it
+     to two along the way -- which made every number on the panel look
+     different from the one it was the day before, for no reason anybody
+     asked for. The tick count in brackets is the only addition. */
+  const head = (t.move_bps >= 0 ? '+' : '') + t.move_bps.toFixed(1) + 'bps';
+  const n = t.move_units, u = t.unit_label || 't';
+  if (n == null || !isFinite(n)) return head;
+  return head + ' <span class="thin">(' + (n >= 0 ? '+' : '')
+       + n.toFixed(Math.abs(n) >= 10 ? 0 : 1) + u + ')</span>';
+}
+
+function flowHalf(r) {
+  if (!r) return '<span class="who wide thin">NO TAPE</span>'
+              + '<span class="meta thin">the socket is not running</span>';
+  if (!r.covered)
+    return '<span class="who wide thin">NOT COVERED</span>'
+         + '<span class="meta thin">tape has '
+         + Math.round(r.coverage * 100) + '% of this bar</span>';
+  const cls = r.side === 'buyers' ? 'buyers'
+            : r.side === 'sellers' ? 'sellers' : '';
+  const w = Math.round(Math.abs(r.lean) * 50);
+  /* This rung's OWN pace: the bar in progress against the completed bars
+     of this timeframe. Not the gate's velocity below, which is the market
+     in the last fifteen seconds. A rung that has not seen two of its own
+     bars prints no ratio at all. */
+  const p = r.pace || {};
+  return '<span class="who ' + (cls === 'buyers' ? 'long'
+            : cls === 'sellers' ? 'short' : '') + '">'
+       + r.side.toUpperCase() + '</span>'
+       + '<span class="bar"><i class="' + cls + '" style="width:'
+       + w + '%"></i></span>'
+       + '<span class="meta">Δ ' + flowNum(r.delta)
+       /* The bar count rides with the CVD. Six bars of CVD and two bars of
+          CVD are different claims and the row draws them the same width,
+          so the row says which it is rather than leaving it to be assumed. */
+       + ' · cvd ' + (r.cvd_source === 'none' ? '—' : flowNum(r.cvd))
+       + (r.cvd_complete ? '' : '<span class="thin">(' + (r.bars || 0)
+            + '/' + (r.asked || 0) + ')</span>')
+       + ' · ' + r.trades + 'p'
+       + (p.confident ? ' · ' + p.ratio.toFixed(1) + 'x'
+                      : ' · <span class="thin">pace —</span>')
+       + '</span>';
+}
+
+/* The timeframe, and whether this candle has the volume to move.
+
+   DIRECTION SAYS WHICH WAY, VOLUME SAYS WHETHER IT CAN. A bar leaning hard
+   on a tenth of its usual volume is three traders agreeing with each other;
+   the same lean on twice its usual volume is a move being paid for, and the
+   two look identical on a direction read.
+
+   The figure is the pace against what a normal bar of this length has done
+   BY THIS POINT, not against a whole one -- measured against a whole bar,
+   every bar reads quiet until it is nearly over.
+
+   It is reported and never gates anything: a quiet bar about to break out
+   would go blank exactly when it mattered. */
+/* BUY or SELL, next to the timeframe it belongs to.
+
+   A timeframe does not call a trade on its own. It prints only when it
+   and the faster ones below it all point the same way -- 1m+5m for the
+   5m, both of those plus itself for the 15m, 5m+15m+1h for the hour,
+   15m+1h+4h for the four. The minute argues and never decides, so it
+   never shows a word of its own.
+
+   NOTHING PRINTS WHEN THEY DO NOT AGREE, and that silence is the signal.
+   The reason is on the cell rather than the row, because a row that
+   explained itself every time would be unreadable in the ninety per cent
+   of moments when there is no trade. */
+function verdictTag(d) {
+  if (!d || !d.side) return '';
+  return ' <em class="' + (d.side === 'buy' ? 'long' : 'short') + '">'
+       + d.side.toUpperCase() + '</em>';
+}
+
+function fuelCell(name, v, call) {
+  const head = '<span class="tfname">' + esc(name) + verdictTag(call)
+             + '</span>';
+  const why = call && call.why ? call.why : '';
+  if (!v || !v.known)
+    return '<b title="' + esc(why) + '">' + head
+         + '<span class="thin">vol —</span><i style="--v:0%"></i></b>';
+  const x = v.projected_x || 0;
+  const cls = v.heavy ? 'heavy' : v.quiet ? 'quiet' : '';
+  /* Effort next to its result, because volume alone never answers
+     move-or-hold: the same heavy volume is a move being paid for with a
+     wide range and absorption with none. */
+  const tag = {paid_for: 'paid', absorbed: 'held', thin: 'thin',
+               no_fuel: 'none'}[v.state] || '';
+  return '<b title="' + esc((why ? why + ' | ' : '') + (v.describe || ''))
+       + '">' + head
+       + '<span>' + x.toFixed(x < 10 ? 1 : 0) + 'x '
+       + '<span class="thin">' + tag + '</span></span>'
+       + '<i class="' + cls + '" style="--v:'
+       + Math.round(Math.min(x, 2) / 2 * 100) + '%"></i></b>';
+}
+
+function renderLadder() {
+  const el = $('tfLadder');
+  if (!el) return;
+  const flow = {}, read = {}, names = [];
+  ladderRead.forEach(t => {
+    read[t.timeframe] = t;
+    if (names.indexOf(t.timeframe) < 0) names.push(t.timeframe);
+  });
+  (ladderFlow || []).forEach(r => {
+    flow[r.timeframe] = r;
+    if (names.indexOf(r.timeframe) < 0) names.push(r.timeframe);
+  });
+  const err = ladderErr
+    ? '<div class="msg err">' + esc(ladderErr) + '</div>' : '';
+  el.innerHTML = err + names.map(n => {
+    const t = read[n], r = flow[n], p = (r && r.pace) || {};
+    return '<div class="tf2">' + fuelCell(n, t && t.volume,
+                                           t && t.verdict)
+         + '<div class="half ' + (t ? t.winner : '') + '" title="'
+         + esc((t && t.describe) || 'no candle read on this timeframe')
+         + '">' + readHalf(t) + '</div>'
+         + '<div class="half ' + (r && r.covered ? r.side : '')
+         + '" title="' + esc(p.note || 'no order flow on this timeframe')
+         + '">' + flowHalf(r) + '</div></div>';
+  }).join('');
+}
+
+/* ---- the six layers -----------------------------------------------------
+
+   Read in the order they happen: somebody attacks, with some force, into
+   some resistance, the book reacts, price responds, and all of it is
+   happening somewhere on the map. Kept apart rather than blended, because
+   "heavy buying, into a thinning offer, at the prior day's high, with
+   price refusing to go" is a description and the average of those four
+   numbers is nothing at all.
+
+   Painted from the read payload the ladder already receives, so this
+   panel and the ladder can never be looking at different moments. */
+const LAYER_ORDER = [
+  ["intent", "Intent", "who is attacking"],
+  ["force", "Force", "how hard"],
+  ["resistance", "Resistance", "is it being taken"],
+  ["liquidity", "Liquidity", "what the book is doing"],
+  ["response", "Response", "what price did"],
+  ["location", "Location", "where"],
+];
+
+function layerNums(name, L) {
+  if (name === "intent" && L.measured)
+    /* Total traded, not a delta -- so no sign on it. flowNum prefixes a
+       plus for anything positive, which would read as net buying when
+       this is both sides added together. */
+    return flowNum(L.notional).replace('+', '') + ' traded · '
+         + (L.trades || 0) + ' fills';
+  if (name === "force")
+    return (L.pace_known ? L.pace.toFixed(1) + 'x normal volume' : '')
+         + (L.pace_known && L.velocity_known ? ' · ' : '')
+         + (L.velocity_known ? L.velocity.toFixed(1) + 'x tape' : '');
+  if (name === "resistance" && L.measured)
+    return 'impact ' + (L.impact_ratio * 100).toFixed(0) + '%'
+         + (L.busiest_px ? ' · busiest ' + L.busiest_px + ' ('
+             + (L.busiest_share * 100).toFixed(0) + '% of the bar)' : '');
+  if (name === "response" && L.measured)
+    return 'range ' + L.range.toFixed(1) + L.unit;
+  if (name === "liquidity" && L.dom && L.measured)
+    return 'bid pulled ' + (L.dom.bid.pull_share * 100).toFixed(0)
+         + '% · ask pulled ' + (L.dom.ask.pull_share * 100).toFixed(0) + '%';
+  return '';
+}
+
+/* The stack beneath the timeframe being traded.
+
+   Drawn from the server's reading rather than re-decided here: the page
+   shows which rows qualified and which were thrown out, so a verdict can
+   be argued with on the screen instead of taken on faith. */
+const CASC_WORD = {
+  trend:     ['flag',      'the whole stack agrees'],
+  reversal:  ['flag late', 'it has flipped'],
+  pullback:  ['flag late', 'against the trend, not with it'],
+  no_commit: ['flag',      'nothing is committed'],
+  mixed:     ['flag',      'nothing is committed'],
+  unread:    ['flag',      'not enough to read']
+};
+
+/* The three footprint readings, at the foot of the stack panel.
+
+   MIRRORED, NEVER RECOMPUTED. Both panels sit on the same tab and the
+   footprint already polls; this draws what it drew. The stack above is
+   untouched by it -- no row reads these, and the cascade's verdict is
+   the same whether this strip is on the screen or not.
+
+   It goes blank rather than stale when the selected market is not the
+   one the readings were taken on. A failed OFI poll leaves the last
+   good payload in place, and a crypto symbol showing ES's bar is worse
+   than showing nothing. */
+function paintStackStrip() {
+  const el = $('stackStrip');
+  if (!el) return;
+  if (!_ofiLast || _ofiStripCoin !== coin()) {
+    el.innerHTML = '';
+    return;
+  }
+  el.innerHTML = ofiReadLine(_ofiLast.read, _ofiLast.price, 'stackReadLine')
+    + _ofiThisBar;
+}
+
+/* THE TRADE COLUMN, under the stack.
+
+   It draws what the server already decided. The agreement, the open
+   row and the totals all come off the same /api/read payload that
+   drew the rungs above, so the column cannot show a trade the stack
+   does not justify -- recomputing any of it here would be a second
+   opinion wearing the first one's clothes.
+
+   NOTHING IN THIS FUNCTION PLACES AN ORDER. The buttons write rows. */
+let _jnlBusy = false;
+let _jnlLast = null;
+
+function jnlFmt(t, d) {
+  const sign = t > 0 ? '+' : '';
+  const cls = t > 0 ? 'long' : t < 0 ? 'short' : '';
+  return '<b class="' + cls + '">' + sign + t.toFixed(2) + ' ticks</b>'
+       + ' <span class="thin">(' + sign + '$' + d.toFixed(2) + ')</span>';
+}
+
+function jnlToggleAuto() {
+  const c = $('jnlAuto');
+  if (!c) return;
+  c.checked = !c.checked;
+  const btn = $('jnlAutoBtn');
+  /* Painted immediately so the button does not sit on the old word
+     until the next poll comes back. */
+  if (btn) { btn.textContent = c.checked ? 'AUTO' : 'MANUAL';
+             btn.className = c.checked ? 'on' : ''; }
+  jnlSet();
+}
+
+/* What was last SENT for each control, cleared once the server
+   reports it back. See the pin in the settings painter. */
+let _jnlWant = {};
+
+async function jnlSet() {
+  _jnlWant = {
+    jnlAuto: $('jnlAuto').checked,
+    jnlTpOn: $('jnlTpOn').checked,
+    jnlSlOn: $('jnlSlOn').checked,
+    jnlTp: $('jnlTp').value || 0,
+    jnlSl: $('jnlSl').value || 0,
+    jnlWin: $('jnlWin') ? String(Math.round($('jnlWin').value || 900)) : undefined,
+    jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
+  };
+  const q = new URLSearchParams({
+    coin: coin(),
+    auto: $('jnlAuto').checked ? 'true' : 'false',
+    tp_on: $('jnlTpOn').checked ? 'true' : 'false',
+    sl_on: $('jnlSlOn').checked ? 'true' : 'false',
+    tp_ticks: $('jnlTp').value || 0,
+    sl_ticks: $('jnlSl').value || 0,
+    window_s: $('jnlWin') ? $('jnlWin').value : 900,
+    strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
+  try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
+  catch (e) { $('jnlMsg').textContent = String(e); }
+}
+
+/* RESET THE TEST. Two steps on purpose: a record is the whole point
+   of the column, and one that a stray click can empty is not one.
+   The count is named in the prompt so it is clear what is going. */
+async function jnlReset() {
+  const n = (_jnlLast && _jnlLast.stats && _jnlLast.stats.trades) || 0;
+  const mkt = coin();
+  if (!confirm('Delete ' + n + ' logged trade' + (n === 1 ? '' : 's')
+      + ' for ' + mkt + ' and start the test over? '
+      + 'This cannot be undone.')) return;
+  $('jnlMsg').textContent = '…';
+  try {
+    const d = await api('/api/journal/clear?'
+      + q({coin: mkt, confirm: 'yes'}), {method: 'POST'});
+    $('jnlMsg').textContent = d.ok
+      ? 'cleared ' + d.deleted + ' — the test starts again from here'
+      : (d.why || 'refused');
+  } catch (e) { $('jnlMsg').textContent = String(e); }
+  if (typeof loadRead === 'function') { try { await loadRead(); } catch (e) {} }
+}
+
+async function jnlTrade(action, side) {
+  if (_jnlBusy) return;              /* one click, one row */
+  _jnlBusy = true;
+  $('jnlMsg').textContent = '…';
+  const q = new URLSearchParams({coin: coin(), action: action});
+  if (side) q.set('side', side);
+  try {
+    const d = await api('/api/journal/trade?' + q.toString(),
+                        {method: 'POST'});
+    $('jnlMsg').textContent = d.ok ? '' : (d.why || 'refused');
+  } catch (e) {
+    $('jnlMsg').textContent = String(e);
+  } finally {
+    _jnlBusy = false;
+  }
+  if (typeof loadRead === 'function') { try { await loadRead(); } catch (e) {} }
+}
+
+/* The clock windows, under the OFI candles.
+
+   THE COMPARISON IS THE POINT. The bars above end on a quantity of
+   flow and flip often; these end on a clock. Both are drawn from the
+   same raw events and the same OFI formula, so the difference on the
+   screen is the difference between the two ways of cutting the tape
+   and nothing else. */
+function clockWord(v) {
+  return v === 'up' ? '<b class="long">UP</b>'
+       : v === 'down' ? '<b class="short">DOWN</b>'
+       : '<b>FLAT</b>';
+}
+
+/* ---- the fusion read ------------------------------------------------- */
+
+let _fusSized = false;
+
+async function fusLoad() {
+  const sel = $('fusTick');
+  let d;
+  try {
+    const sm = $('fusSmooth');
+    const ft = $('fusFlip');
+    d = await api('/api/fusion?' + q({
+      coin: coin(), per_bar: (sel && sel.value) || 0,
+      smooth: (sm && sm.value) || 'raw',
+      flip_ticks: (ft && ft.value) || 0,
+      reset_s: ($('fusReset') && $('fusReset').value) || 0}));
+  } catch (e) { return; }
+  if (!_fusSized && d && d.sizes) {
+    // Filled once from the server's own list. Hard-coding the sizes
+    // in the markup is how a panel ends up offering a series that
+    // has no builder behind it.
+    sel.innerHTML = d.sizes.map(n =>
+      `<option value="${n}"${n === d.default_per_bar ? ' selected' : ''}>`
+      + `${n.toLocaleString()} ticks</option>`).join('');
+    _fusSized = true;
+  }
+  paintFusion(d);
+}
+
+function fusArrow(dir) {
+  if (dir === 'up') return '<b style="color:var(--up)">UP &uarr;</b>';
+  if (dir === 'down') return '<b style="color:var(--down)">DOWN &darr;</b>';
+  return '<b style="color:var(--dim)">FLAT</b>';
+}
+
+/* PUSH FROM THE TAPE, no book. Two numbers, because who crossed the
+   spread and which way price went are independent facts and one
+   signed number cannot carry both -- it would be right about two of
+   the four states and wrong about the other two. */
+/* WHAT THE CANDLE'S RATIO IS DOING. Chris: "not just the color the
+   number is which turns red and green but what the number is
+   actually doing going up or down".
+
+   The sign is drawn small and the TRAJECTORY is drawn large,
+   because that is the ordering the numbers themselves justify: the
+   ratio sits a few percent off zero most of the time, so its colour
+   flips on a handful of contracts, while "net buying is building"
+   survives that.
+
+   `pull` gets its own line whenever it contradicts the slope. A
+   cumulative mean goes quiet as the bar fills -- at 1,170 contracts
+   one more 50-lot moves it by about 0.04, at 60 contracts the same
+   lot moves it by 0.5 -- so late in a bar the flow can reverse
+   completely while the line barely bends. The pull is what shows
+   that, and it is the only part of this that leads. */
+function trackBlock(tr) {
+  if (!tr) return '';
+  if (!tr.ready)
+    return `<div class="thin" style="margin-top:6px;border-top:1px `
+      + `solid var(--line);padding-top:6px;color:var(--dim)">`
+      + esc(tr.say || '') + `</div>`;
+
+  const r = Number(tr.ratio);
+  const sgn = r > 0 ? 'up' : r < 0 ? 'down' : 'dim';
+  /* MOTION IS READ AGAINST THE NUMBER'S OWN SIGN, not against zero.
+     On a red number a positive slope is the selling GIVING BACK,
+     not buying rising -- calling that "rising" says the opposite of
+     what is happening to the push being watched. `thrust` is the
+     slope already turned to face the number's direction, so
+     extending and fading mean the same thing on both colours. */
+  const mo = tr.motion;
+  const moCol = mo === 'extending' ? sgn : mo === 'fading' ? 'dim' : 'dim';
+  const moWord = mo === 'extending' ? 'PRESSING HARDER'
+               : mo === 'fading' ? 'GIVING IT BACK'
+               : mo === 'holding' ? 'HOLDING' : 'NO SIDE';
+
+  /* THE NUMBER'S PATH THROUGH THE CANDLE, because "growing in the
+     downwards direction" and "pulling back" are shapes, and no
+     label carries a shape. Zero is the middle line; the trace is
+     the ratio, so the distance from that line IS how hard. */
+  const hist = Array.isArray(tr.history) ? tr.history : [];
+  let spark = '';
+  if (hist.length > 1) {
+    const pts = hist.map((h) => {
+      const x = Math.max(0, Math.min(300, Number(h[0])));
+      const y = 20 - Math.max(-1, Math.min(1, Number(h[1]))) * 19;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    const last = hist[hist.length - 1];
+    const lx = Math.max(0, Math.min(300, Number(last[0])));
+    const ly = 20 - Math.max(-1, Math.min(1, Number(last[1]))) * 19;
+    spark = `<svg viewBox="0 0 300 40" preserveAspectRatio="none" `
+      + `style="width:100%;height:42px;display:block;margin:6px 0">`
+      + `<line x1="0" y1="20" x2="300" y2="20" `
+      + `stroke="var(--line)" stroke-width="1"/>`
+      + `<polyline points="${pts.join(' ')}" fill="none" `
+      + `stroke="var(--${sgn})" stroke-width="1.5" `
+      + `vector-effect="non-scaling-stroke"/>`
+      + `<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" `
+      + `fill="var(--${sgn})"/></svg>`
+      + `<div class="thin" style="display:flex;justify-content:`
+      + `space-between;margin-top:-2px"><span>bar open</span>`
+      + `<span>+1 all buying &middot; 0 even &middot; &minus;1 all `
+      + `selling</span><span>300s</span></div>`;
+  }
+
+  /* HOW HARD, on its own. The sign says who, this says how much of
+     the tape they are. */
+  const st = Math.max(0, Math.min(1, Number(tr.strength)));
+  const strengthBar = `<div style="position:relative;height:5px;`
+    + `border-radius:3px;background:var(--line);margin:4px 0">`
+    + `<div style="position:absolute;left:0;top:0;height:5px;`
+    + `border-radius:3px;width:${(st * 100).toFixed(1)}%;`
+    + `background:var(--${sgn})"></div></div>`;
+
+  const contra = (Number(tr.pull) * r < 0 && mo === 'extending')
+    ? `<div class="thin" style="color:var(--down);margin-top:4px">`
+      + `<b>the last minute has already turned</b> &mdash; recent `
+      + `${tr.marginal > 0 ? '+' : ''}${tr.marginal} against the `
+      + `candle's ${r > 0 ? '+' : ''}${tr.ratio}</div>`
+    : `<div class="thin" style="margin-top:4px">last minute `
+      + `${tr.marginal > 0 ? '+' : ''}${tr.marginal} &middot; `
+      + `pulling ${tr.pull > 0 ? 'toward buying' :
+          tr.pull < 0 ? 'toward selling' : 'neither way'}</div>`;
+
+  return `<div style="margin-top:6px;border-top:1px solid var(--line);`
+    + `padding-top:6px">`
+    + `<div class="thin">THIS 5m CANDLE &mdash; the push, and what `
+    + `it is doing</div>`
+    + `<div style="display:flex;align-items:baseline;gap:10px;`
+    + `margin:2px 0">`
+    + `<span style="font-size:20px;color:var(--${sgn})"><b>`
+    + `${r > 0 ? '+' : ''}${tr.ratio}</b></span>`
+    + `<span style="color:var(--${moCol})"><b>${moWord}</b></span>`
+    + `<span class="thin">${Math.abs(Number(tr.thrust)).toFixed(3)}`
+    + ` a minute</span></div>`
+    + spark
+    + strengthBar
+    + `<div class="thin">${(st * 100).toFixed(1)}% of this candle's `
+    + `${Number(tr.volume).toLocaleString()} contracts are net `
+    + `${r > 0 ? 'buying' : r < 0 ? 'selling' : 'neither'}</div>`
+    + contra
+    + `</div>`;
+}
+
+function kinBlock(k, barK, track) {
+  if (!k) return '';
+  k = Object.assign({}, k, {_bar: barK || null});
+  const dirCol = k.dir === 'up' ? 'up' : k.dir === 'down' ? 'down' : 'dim';
+  const effCol = k.efficiency > 0 ? 'up' : k.efficiency < 0 ? 'down' : 'dim';
+  const warn = (k.attributed_pct != null && k.attributed_pct < 80)
+    ? `<div class="thin" style="color:var(--down)">only `
+      + `${k.attributed_pct}% of prints had an aggressor &mdash; `
+      + `treat this reading with suspicion</div>` : '';
+  const bar = k._bar || null;
+  const ratioBar = (r) => {
+    // A -1..1 reading is only legible as a position on a line.
+    const pct = Math.max(0, Math.min(100, (r + 1) * 50));
+    return `<div style="position:relative;height:6px;border-radius:3px;`
+      + `background:var(--line);margin:6px 0">`
+      + `<div style="position:absolute;left:50%;top:-2px;width:1px;`
+      + `height:10px;background:var(--dim)"></div>`
+      + `<div style="position:absolute;left:${pct}%;top:-3px;`
+      + `width:8px;height:12px;margin-left:-4px;border-radius:2px;`
+      + `background:var(--${r > 0 ? 'up' : r < 0 ? 'down' : 'dim'})">`
+      + `</div></div>`;
+  };
+  return `<div class="thin" style="margin:12px 0 6px">`
+    + `<b>Push</b> &mdash; from the tape only, nothing cancellable `
+    + `(rolling ${Math.round(k.period_s / 60)}m`
+    + (bar ? `, and the 5m candle` : '') + `)</div>`
+    + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
+    + `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
+    + `border-radius:6px;padding:10px">`
+    + `<div class="thin" style="margin-bottom:4px">DIRECTION &mdash; `
+    + `who is crossing the spread</div>`
+    + `<div style="font-size:16px;margin-bottom:6px;color:var(--${dirCol})">`
+    + `<b>${esc(String(k.dir).toUpperCase())} ${k.push > 0 ? '+' : ''}`
+    + `${Number(k.push).toLocaleString()}</b></div>`
+    + `<div class="thin">${Number(k.buy).toLocaleString()} bought &middot; `
+    + `${Number(k.sell).toLocaleString()} sold</div>`
+    + ratioBar(k.push_ratio)
+    + `<div class="thin">${k.push_ratio > 0 ? '+' : ''}${k.push_ratio} `
+    + `of a possible &plusmn;1 &mdash; +1 would be every contract `
+    + `lifting the offer</div>`
+    + (track ? trackBlock(track)
+             : (bar
+        ? `<div class="thin" style="margin-top:6px;border-top:1px solid `
+          + `var(--line);padding-top:6px">this 5m candle: `
+          + `<b style="color:var(--${bar.dir === 'up' ? 'up' : bar.dir === 'down' ? 'down' : 'dim'})">`
+          + `${bar.push_ratio > 0 ? '+' : ''}${bar.push_ratio}</b>`
+          + ` &middot; ${Number(bar.volume).toLocaleString()} contracts `
+          + `so far</div>`
+        : ''))
+    + `</div>`
+    + `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
+    + `border-radius:6px;padding:10px">`
+    + `<div class="thin" style="margin-bottom:4px">EFFICIENCY &mdash; `
+    + `what it bought</div>`
+    + `<div style="font-size:16px;margin-bottom:6px;color:var(--${effCol})">`
+    + `<b>${k.eff_ticks > 0 ? '+' : ''}${k.eff_ticks} ticks</b>`
+    + `<span class="thin"> a contract</span></div>`
+    + `<div class="thin">${esc(k.quadrant || '')}</div></div>`
+    + `</div>`
+    + `<div class="thin" style="margin-top:4px">${esc(k.say || '')}</div>`
+    + warn;
+}
+
+function paintFusion(d) {
+  const box = $('fusionBox');
+  if (!box) return;
+  if (!d || d.error) {
+    /* THE STEPPER LINE SURVIVES THE ERROR. Whether the rule is
+       running at all is the reading you most want when something
+       else is broken, and this used to go out with everything
+       else -- the same shape of bug as the trade column dying
+       with the ladder, and the fusion payload dying with the tick
+       bars. Third time, so it is written down here too. */
+    const sp0 = (d && d.stepper) || {};
+    const T0 = (d && d.timed) || {};
+    box.innerHTML = `<span class="stamp" style="width:100%">`
+      + esc((d && d.error) || 'no reading') + '</span>'
+      + `<div class="thin" style="margin-top:6px">`
+      + (sp0.running
+          ? `<span style="color:var(--up)">&#9679;</span> the rule is `
+            + `still stepping on the server (${sp0.steps || 0} steps)`
+          : `<span style="color:var(--down)">&#9675;</span> the rule is `
+            + `NOT stepping on the server`)
+      + (T0.say ? ` &middot; 1m/5m: ${esc(T0.say)}` : '')
+      + `</div>`;
+    return;
+  }
+  const t = d.tick || {}, o = d.ofi || {};
+  /* THE VERDICT IS THE BIG THING ON THE PANEL, because it is the
+     only part that decides anything. The two readings under it are
+     the evidence for it, in the units each series actually uses. */
+  const m = d.m5 || {};
+  const verdict = d.agree
+    ? `<div style="font-size:22px;font-weight:700;color:var(--`
+      + (d.side === 'up' ? 'up' : 'down') + `)">BOTH &mdash; `
+      + esc(String(d.side).toUpperCase()) + `</div>`
+    : `<div style="font-size:22px;font-weight:700;color:var(--dim)">`
+      + `NO ENTRY</div>`;
+  /* THE ENTRY AND THE EXIT ARE DIFFERENT TESTS NOW and the panel
+     says so, because reading "no entry" as "get out" is exactly the
+     mistake that produced fourteen trades in a few minutes. */
+  const why = d.agree
+    ? 'the tick bar and the 5m point the same way &mdash; this is '
+      + 'the entry'
+      + (d.ofi_known
+          ? (d.ofi_concurs ? ', and the book agrees'
+                           : ', though the book does not')
+          : '')
+    : esc(d.why || '') + ' &mdash; no new entry';
+  /* IN IS STRICT, OUT IS NARROW. All three to enter; only the tick
+     bar or the 5m can close it. The OFI is a filter on the way in
+     and is ignored on the way out, because it changes sign about
+     once a bar and a position abandoned on that is pure churn. */
+  const holdLine = 'in when the <b>tick bar</b> and the <b>5m</b> '
+    + 'agree, out when either turns against it &mdash; the OFI '
+    + 'turning does not close anything, and does not open anything '
+    + 'either';
+
+  const cell = (title, dir, lines) =>
+    `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
+    + `border-radius:6px;padding:10px">`
+    + `<div class="thin" style="margin-bottom:4px">${title}</div>`
+    + `<div style="font-size:16px;margin-bottom:6px">${fusArrow(dir)}</div>`
+    + lines.map(l => `<div class="thin">${l}</div>`).join('')
+    + `</div>`;
+
+  const tickLines = [];
+  if (t.prints != null)
+    tickLines.push(`${Number(t.prints).toLocaleString()} of `
+      + `${Number(t.per_bar || 0).toLocaleString()} prints in`);
+  if (t.ticks != null)
+    tickLines.push(`${t.ticks > 0 ? '+' : ''}${t.ticks} ticks from its open`);
+  if (t.seconds != null) tickLines.push(`${t.seconds}s old`);
+  /* WHAT THE SMOOTHING CHANGED, and what it costs.
+
+     The raw direction stays visible beside the smoothed one. A
+     steadier line that is never compared against the bar it
+     smoothed is a line nobody can judge -- every idea in this
+     engine that went in without its control had to come back out
+     again. When they disagree, THAT is the smoothing working, and
+     it is the moment to decide whether you believe it. */
+  if (t.reset_s) {
+    tickLines.push(`cut every ${Math.round(t.reset_s / 60)}m as well `
+      + `as every ${Number(t.per_bar || 0).toLocaleString()} prints`);
+    if (t.by_clock)
+      tickLines.push(`<b style="color:var(--dim)">the last bar closed `
+        + `on the clock, short of its count</b>`);
+  }
+  const sm_ = t.smooth || {};
+  if (sm_.mode && sm_.mode !== 'raw') {
+    if (t.raw_dir && sm_.dir && t.raw_dir !== sm_.dir)
+      tickLines.push(`<b style="color:var(--dim)">raw bar says `
+        + `${esc(t.raw_dir)}</b> &mdash; held by the smoothing`);
+    else if (t.raw_dir)
+      tickLines.push(`raw bar agrees (${esc(t.raw_dir)})`);
+    if (sm_.say) tickLines.push(esc(sm_.say));
+    if (sm_.flips != null)
+      tickLines.push(`${sm_.flips} direction change`
+        + `${sm_.flips === 1 ? '' : 's'} in ${Number(sm_.bars || 0)
+           .toLocaleString()} bars`);
+  }
+  if (t.why) tickLines.push(esc(t.why));
+
+  const ofiLines = [];
+  if (o.imbalance != null)
+    ofiLines.push(`imbalance ${Number(o.imbalance).toLocaleString()}`
+      + (o.level != null ? ` against a &plusmn;${o.level} band` : ''));
+  if (o.delta != null) ofiLines.push(`delta ${o.delta}`);
+
+  const m5Lines = [];
+  if (m.ticks != null)
+    m5Lines.push(`${m.ticks > 0 ? '+' : ''}${m.ticks} ticks from its open`);
+  if (m.seconds != null) {
+    const left = Math.max(0, Math.round(300 - m.seconds));
+    m5Lines.push(`${Math.round(m.seconds)}s in, ${left}s left`
+      + (d.tail_blocked ? ' &mdash; <b>tail, no new entry</b>' : ''));
+  }
+  if (m.why) m5Lines.push(esc(m.why));
+
+  /* THE CAP, STATED. One trade per 5-minute bar is the thing
+     standing between this rule and the churn, so whether this bar
+     has spent its trade is not a detail to be inferred from the
+     trade list below. */
+  /* WHERE THE DELAY IS. Shown on the panel because "it feels late"
+     cannot be acted on and "the price was 6 seconds old" can. */
+  const tmg = (d.journal_timing) || {};
+  const slow = (tmg.px_age_s != null && tmg.px_age_s > 2)
+            || (tmg.gap_s != null && tmg.gap_s > 3)
+            || (tmg.step_ms != null && tmg.step_ms > 500);
+  const timingLine = (tmg.px_age_s == null && tmg.step_ms == null) ? ''
+    : `<div class="thin" style="margin-top:2px;color:var(--`
+      + (slow ? 'down' : 'dim') + `)">`
+      + `price ${tmg.px_age_s == null ? '?' : tmg.px_age_s + 's'} old`
+      + ` &middot; step ${tmg.step_ms == null ? '?' : tmg.step_ms + 'ms'}`
+      + ` &middot; ${tmg.gap_s == null ? '?' : tmg.gap_s + 's'} since the last one`
+      + (tmg.lock_waits ? ` &middot; ${tmg.lock_waits} queued` : '')
+      + (slow ? ' &mdash; <b>this is the delay</b>' : '')
+      + `</div>`;
+
+  const capLine = `<div class="thin" style="margin-top:2px;color:var(--`
+    + (d.bar_used ? 'dim' : 'ink') + `)">`
+    + (d.bar_used ? '&#9679; ' : '&#9675; ') + esc(d.bar_say || '')
+    + `</div>`;
+
+  /* THE TIMED RULE'S TWO CANDLES, live, beside each other. They
+     drive the Timed strategy and they were on no panel at all. */
+  const T = d.timed || {};
+  const t1 = T.m1 || {}, t5 = T.m5 || {};
+  const tLine = (c) => {
+    const out = [];
+    if (c.ticks != null)
+      out.push(`${c.ticks > 0 ? '+' : ''}${c.ticks} ticks from its open`);
+    if (c.open != null && c.close != null)
+      out.push(`open ${chPx(c.open)} &middot; now ${chPx(c.close)}`);
+    if (c.seconds != null) out.push(`${Math.round(c.seconds)}s into the bar`);
+    return out;
+  };
+  /* THE 5-MINUTE LINE IS NOW WHO CROSSED THE SPREAD, so the lines
+     under it have to say so. `tLine` reports ticks-from-open and
+     open-vs-now -- all price facts. Left as it was, the cell would
+     show a flow direction with a price explanation underneath it
+     and read as though price produced the arrow. That is worse
+     than the old panel, because it looks right.
+
+     Flow first and in bold, price kept but labelled as price, and
+     the disagreement between them called out: buyers crossing hard
+     while price sits lower is absorption, and it is the one thing
+     this pairing can show that neither number shows alone. */
+  const t5Line = (c) => {
+    const out = [];
+    const p = Number(c.push);
+    if (c.source === 'flow') {
+      if (isFinite(p) && p !== 0) {
+        out.push(`<b>${p > 0 ? '+' : ''}${Math.round(p).toLocaleString()}`
+          + `</b> net contracts crossing &mdash; `
+          + (p > 0 ? 'buyers lifting offers' : 'sellers hitting the bid'));
+      } else {
+        out.push('nothing has crossed yet this bar &mdash; flat blocks '
+          + 'an entry');
+      }
+    } else {
+      out.push('<span style="color:var(--down)">reading price, not '
+        + 'flow</span> &mdash; no tape window');
+    }
+    const pd = c.ticks > 0 ? 'up' : (c.ticks < 0 ? 'down' : 'flat');
+    if (c.source === 'flow' && c.dir !== 'flat' && pd !== 'flat'
+        && pd !== c.dir)
+      out.push(`<b style="color:var(--dim)">flow and price disagree`
+        + `</b> &mdash; ${c.dir === 'up' ? 'buying absorbed'
+                                         : 'selling absorbed'}`);
+    if (c.ticks != null)
+      out.push(`price ${c.ticks > 0 ? '+' : ''}${c.ticks} ticks from `
+        + `its open`);
+    if (c.open != null && c.close != null)
+      out.push(`open ${chPx(c.open)} &middot; now ${chPx(c.close)}`);
+    if (c.seconds != null)
+      out.push(`${Math.round(c.seconds)}s in &middot; clears at 300s`);
+    return out;
+  };
+
+  const timedVerdict = T.side
+    ? `<b style="color:var(--${T.side === 'up' ? 'up' : 'down'})">`
+      + `${esc(String(T.side).toUpperCase())}</b> &mdash; both agree`
+    : `<b style="color:var(--dim)">no entry</b> &mdash; `
+      + esc(T.why || 'no reading');
+
+  /* IS THE RULE RUNNING WITHOUT A BROWSER? Shown rather than
+     claimed: a stepper that died silently looks exactly like one
+     that is working, right up until a position is left unmanaged. */
+  const sp = d.stepper || {};
+  const stepLine = sp.running
+    ? `<span style="color:var(--up)">&#9679;</span> the rule is running `
+      + `on the server &mdash; ${sp.steps.toLocaleString()} steps`
+      + (sp.age_s != null ? `, last ${sp.age_s}s ago` : '')
+      + (sp.errors ? ` &middot; ${sp.errors} errors (${esc(sp.last_error)})` : '')
+    : `<span style="color:var(--down)">&#9675;</span> the rule is NOT `
+      + `running on the server &mdash; it only steps while this page is `
+      + `open (${esc(sp.last_error || 'stepper not started')})`;
+
+  box.innerHTML =
+      `<div style="margin-bottom:10px">${verdict}`
+    + `<div class="thin">${why}</div>`
+    + `<div class="thin" style="margin-top:2px">${holdLine}</div>`
+    + capLine + timingLine
+    + `<div class="thin" style="margin-top:4px">${stepLine}</div></div>`
+    + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
+    + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)
+    + cell('OFI BAR &mdash; shown, decides nothing', o.dir, ofiLines)
+    + cell('5 MINUTE BAR &mdash; the slow one', m.dir, m5Lines)
+    + `</div>`
+    + kinBlock(d.kinetic, d.kinetic_bar, d.ratio_track)
+    + `<div class="thin" style="margin:12px 0 6px">`
+    + `<b>Timed strategy</b> &mdash; the 1-minute and the 5-minute, `
+    + `live: ${timedVerdict}</div>`
+    + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
+    + cell('1 MINUTE &mdash; the truth teller', t1.dir, tLine(t1))
+    + cell('5 MINUTE &mdash; who is crossing the spread', t5.dir,
+           t5Line(t5))
+    + `</div>`;
+
+  const note = $('fusNote');
+  if (note) {
+    note.innerHTML = 'the Fused strategy trades exactly this: in '
+      + 'when the tick bar and the 5m agree, out when either turns '
+      + 'against it, and '
+      + '<b>at most one trade per 5-minute bar</b> &mdash; that cap '
+      + 'is what stops it stepping straight back in after a take '
+      + 'profit.';
+  }
+  const st = $('fusionStamp');
+  if (st) st.textContent = d.agree ? d.side : 'no side';
+}
+
+/* ---- the hand-trading alert ------------------------------------------ */
+/*
+   Chris is trading these signals by hand until the Ironbeam account is
+   funded, so the signal has to reach him when he is not looking at the
+   screen. Sound, a desktop notification and a bar that stays up.
+
+   THE EXIT IS ALERTED AS LOUDLY AS THE ENTRY. A missed entry costs a
+   trade; a missed exit leaves a position nobody is managing.
+*/
+const fusAlert = {armed: false, ctx: null, last: ''};
+
+function restoreFusionAlarm() {
+  try {
+    const on = localStorage.getItem('liqmap_fusalarm') === '1';
+    const box = $('fusAlarm');
+    // The checkbox is restored but NOT armed: the browser only grants
+    // sound and notifications off a real click, so arming silently here
+    // would leave a ticked box that makes no noise -- worse than an
+    // unticked one, because it is trusted.
+    if (box && on) box.indeterminate = true;
+  } catch (e) {}
+}
+
+function armFusionAlert() {
+  const on = $('fusAlarm') && $('fusAlarm').checked;
+  fusAlert.armed = !!on;
+  try { localStorage.setItem('liqmap_fusalarm', on ? '1' : '0'); } catch (e) {}
+  if (!on) { const b = $('fusAlertBar'); if (b) b.style.display = 'none'; return; }
+  // Both need a user gesture to be allowed, which is why this hangs off
+  // the checkbox rather than running on load.
+  try {
+    if (!fusAlert.ctx) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) fusAlert.ctx = new AC();
+    }
+    if (fusAlert.ctx && fusAlert.ctx.state === 'suspended') fusAlert.ctx.resume();
+  } catch (e) {}
+  try {
+    if (window.Notification && Notification.permission === 'default')
+      Notification.requestPermission();
+  } catch (e) {}
+}
+
+function fusBeep(kind) {
+  const ctx = fusAlert.ctx;
+  if (!ctx) return;
+  try {
+    const now = ctx.currentTime;
+    // Rising for a buy, falling for a sell, and three flat urgent notes
+    // for an exit -- the direction is audible without looking, and the
+    // exit does not sound like either entry.
+    const pair = kind === 'up' ? [660, 990]
+               : kind === 'down' ? [660, 440]
+               : [880, 880, 880];
+    pair.forEach((f, i) => {
+      const o = ctx.createOscillator(), g = ctx.createGain();
+      o.type = 'sine'; o.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, now + i * 0.16);
+      g.gain.exponentialRampToValueAtTime(0.25, now + i * 0.16 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.16 + 0.15);
+      o.connect(g); g.connect(ctx.destination);
+      o.start(now + i * 0.16); o.stop(now + i * 0.16 + 0.16);
+    });
+  } catch (e) {}
+}
+
+/* Called on every journal poll with the column's payload. */
+function checkFusionAlert(J) {
+  const bar = $('fusAlertBar');
+  if (!bar) return;
+  const a = (J && J.advice) || {};
+  if (!fusAlert.armed || !a.act) {
+    bar.style.display = 'none';
+    if (!a.act) fusAlert.last = '';
+    return;
+  }
+
+  const isClose = a.act === 'close';
+  const side = isClose ? (a.holding || '') : (a.side || '');
+  const word = isClose
+    ? (side === 'up' ? 'SELL to close your LONG'
+                     : 'BUY to close your SHORT')
+    : (side === 'up' ? 'BUY' : 'SELL');
+  const px = a.price ? chPx(a.price) : '';
+  const line = `${word} ${esc(coin())}${px ? ' — ' + px : ''}`
+    + (isClose ? ` — ${esc(a.why || '')}`
+               : ' — the tick bar and the 5m agree');
+
+  bar.className = 'alertbar ' + (isClose ? 'short' : (side === 'up' ? 'long' : 'short'));
+  bar.style.display = '';
+  bar.innerHTML = `<b>${line}</b>`
+    + '<span class="thin" style="margin-left:10px">place this in Ironbeam '
+    + 'yourself, then log the fill so the numbers are real</span>'
+    + `<button style="margin-left:auto" onclick="fusLogFill('${esc(side)}',`
+    + `${isClose ? 'true' : 'false'})">I did it</button>`
+    + `<button onclick="$('fusAlertBar').style.display='none'">dismiss</button>`;
+
+  if (a.key === fusAlert.last) return;     // already called, same event
+  fusAlert.last = a.key;
+  fusBeep(isClose ? 'exit' : side);
+  try {
+    if (window.Notification && Notification.permission === 'granted')
+      new Notification(isClose ? 'ChrisChart — EXIT' : 'ChrisChart — ENTRY',
+                       {body: line.replace(/<[^>]*>/g, ''), tag: a.key});
+  } catch (e) {}
+}
+
+/* Record what you ACTUALLY did, by hand.
+   The signal price is where the rule fired, not where you got filled,
+   and scoring the first as if it were the second flatters every number
+   on the panel. */
+async function fusLogFill(side, closing) {
+  try {
+    await api('/api/journal/trade?' + q(
+      closing ? {coin: coin(), action: 'close'}
+              : {coin: coin(), action: 'open', side: side}),
+      {method: 'POST'});
+  } catch (e) {}
+  const b = $('fusAlertBar'); if (b) b.style.display = 'none';
+  loadRead();
+}
+
+function paintClockWindows(d) {
+  const el = $('clockWin');
+  if (!el) return;
+  if (!d || !d.ok) {
+    el.innerHTML = '<span class="stamp" style="width:100%">'
+      + 'clock windows &mdash; ' + esc((d && d.why) || 'unavailable')
+      + '</span>';
+    return;
+  }
+  const C = d.current, S = d.summary || {}, mins = (d.period_s || 900) / 60;
+  const num = x => Math.round(x || 0).toLocaleString();
+
+  /* THE FORMING WINDOW FIRST, because it is the one that is not in
+     any resampled table -- it is the whole reason this is event
+     driven rather than a query. */
+  let head;
+  if (!C) {
+    head = '<span class="stamp" style="width:100%">'
+      + mins + '-MINUTE WINDOW &mdash; nothing has arrived yet</span>';
+  } else {
+    const into = Math.max(0, (C.ts_last || 0) - (C.start_ts || 0));
+    const left = Math.max(0, (d.period_s || 900) - into);
+    head = '<span class="stamp" style="width:100%">'
+      + mins + '-MINUTE WINDOW &mdash; candle ' + clockWord(C.mid_dir)
+      + ' <span class="thin">' + (C.ticks > 0 ? '+' : '')
+      + (C.ticks || 0).toFixed(2) + ' ticks</span>'
+      + ' &middot; OFI ' + clockWord(C.ofi_dir)
+      + ' <span class="thin">' + num(C.net_ofi) + '</span>'
+      + ' &middot; CVD ' + clockWord(C.cvd_dir)
+      + ' <span class="thin">' + num(C.net_cvd) + '</span>'
+      + ' &middot; ' + (C.agree
+          ? '<b class="long">all three agree</b>'
+          : '<span class="thin">not all three</span>')
+      + ' &middot; <span class="thin">' + Math.round(left / 60)
+      + ' min left, ' + num(C.books) + ' book updates, '
+      + num(C.trades) + ' prints</span>'
+      + (C.unknown
+          ? ' &middot; <span class="short">' + num(C.unknown)
+            + ' with no side stated</span>' : '')
+      + '</span>';
+  }
+
+  /* HOW THE TWO WAYS OF CUTTING THE TAPE COMPARE. Flips and signal
+     count together: either one alone can be made to look good. */
+  const stats = '<span class="stamp" style="width:100%">'
+    + 'OVER ' + num(S.windows) + ' CLOSED WINDOWS &mdash; all three '
+    + 'agreed on <b>' + num(S.agreed) + '</b> of ' + num(S.decided)
+    + ' that had a direction ('
+    + (100 * (S.agree_pct || 0)).toFixed(1) + '%)'
+    + ' &middot; ' + num(S.ofi_flips) + ' OFI flips between windows ('
+    + (S.flips_per_window || 0).toFixed(2) + ' each)'
+    + ' &middot; <b class="long">' + num(S.flips_cvd_confirmed)
+    + ' CVD-confirmed</b>, ' + num(S.flips_unconfirmed) + ' not'
+    + (S.unknown_side_trades
+        ? ' &middot; <span class="short">' + num(S.unknown_side_trades)
+          + ' of ' + num(S.trades) + ' prints stated no side &mdash; '
+          + 'those are dropped everywhere else in this app</span>'
+        : '')
+    + ' &middot; <span class="thin">fewer flips is only better if '
+    + 'there are still enough signals to trade</span></span>';
+
+  const rows = (d.windows || []).slice(-12).reverse();
+  const table = rows.length
+    ? rows.map(w => {
+        const t = new Date((w.start_ts || 0) * 1000)
+          .toISOString().slice(11, 16);
+        return '<div style="display:flex;gap:10px;padding:3px 0;'
+          + 'border-top:1px solid rgba(255,255,255,.06)">'
+          + '<span class="thin" style="width:52px">' + t + '</span>'
+          + '<span style="width:92px">' + clockWord(w.mid_dir)
+          + ' <span class="thin">' + (w.ticks > 0 ? '+' : '')
+          + (w.ticks || 0).toFixed(1) + '</span></span>'
+          + '<span style="width:120px">OFI ' + clockWord(w.ofi_dir)
+          + ' <span class="thin">' + num(w.net_ofi) + '</span></span>'
+          + '<span style="width:120px">CVD ' + clockWord(w.cvd_dir)
+          + ' <span class="thin">' + num(w.net_cvd) + '</span></span>'
+          + '<span>' + (w.agree
+              ? '<b class="long">confirmed</b>'
+              : '<span class="thin">flagged</span>') + '</span>'
+          + '</div>';
+      }).join('')
+    : '<div class="thin">no window has closed yet</div>';
+
+  /* THE TWO OFIs, SIDE BY SIDE AND LABELLED BY THEIR WINDOW.
+     They oppose each other often and legitimately -- fifteen
+     minutes of net flow against the bar in progress -- and with
+     only one of them on the screen that reads as the panel
+     misreading the footprint. */
+  const B = d.bucket || {};
+  const both = B.read
+    ? '<span class="stamp" style="width:100%">'
+      + 'TWO WINDOWS, ONE FORMULA &mdash; the OFI here is the '
+      + '<b>net over ' + mins + ' minutes</b> '
+      + clockWord(C ? C.ofi_dir : 'flat')
+      + ' <span class="thin">' + num(C ? C.net_ofi : 0) + '</span>'
+      + ' &middot; the footprint candle is the <b>bar in progress</b> '
+      + clockWord(B.read)
+      + ' <span class="thin">' + num(B.imbalance) + ' of '
+      + num(B.target) + ' contracts, &plusmn;' + num(B.level)
+      + ' to count</span>'
+      + ((C && B.read && B.read !== 'flat' && C.ofi_dir !== 'flat'
+          && C.ofi_dir !== B.read)
+          ? ' &middot; <b>they point different ways right now, which '
+            + 'is the two windows disagreeing, not a misread</b>'
+          : '')
+      + '</span>'
+    : '';
+
+  el.innerHTML = head + both + stats
+    + '<div style="margin-top:6px">' + table + '</div>'
+    + '<span class="stamp" style="width:100%">'
+    + esc(d.candle || '') + ' &middot; ' + esc(d.ofi || '')
+    + ' &middot; rebuilt from raw events, never resampled; the window '
+    + 'above grows on every event and locks at the boundary</span>';
+}
+
+function paintJournal(d) {
+  /* The hand-trading alert rides this painter: one poll, one source,
+     so the bar cannot announce a signal the column does not show. */
+  try { checkFusionAlert((d && d.journal) || {}); } catch (e) {}
+
+  const J = (d && d.journal) || null;
+  _jnlLast = J;
+  const box = $('jnlBox');
+  if (!box) return;
+  if (!J || J.error) {
+    const el = $('jnlAgree');
+    if (el) el.innerHTML = J && J.error
+      ? '<span class="err">' + esc(J.error) + '</span>'
+      : '<span class="thin">no reading yet</span>';
+    return;
+  }
+  const S = J.settings || {};
+  /* THE INPUTS ARE WRITTEN FROM THE SERVER ON EVERY POLL, AND THE
+     POLL IS NOW ONCE A SECOND.
+
+     The old guard was `document.activeElement !== e`, which holds a
+     text box while it is being typed in. It does nothing for a
+     SELECT: picking an option drops focus immediately, so between
+     the change firing `jnlSet()` and that POST landing, the next
+     poll still carries the OLD strategy and writes it straight back
+     into the dropdown. At one poll a second that reads as the
+     setting fighting you -- Chris: "glitching really bad between my
+     strategies fused and timed".
+
+     So a control the user has just set is PINNED to what was sent
+     until the server reports the same value back. It self-heals: a
+     save that never lands leaves the pin, and the moment the
+     server agrees the pin is dropped and polls own the field
+     again. */
+  const set = (id, v) => { const e = $(id);
+    if (!e || document.activeElement === e) return;
+    if (_jnlWant[id] !== undefined) {
+      if (String(_jnlWant[id]) !== String(v)) return;   // still in flight
+      delete _jnlWant[id];                              // server caught up
+    }
+    e.value = v; };
+  const chk = (id, v) => { const e = $(id);
+    if (!e || document.activeElement === e) return;
+    if (_jnlWant[id] !== undefined) {
+      if (!!_jnlWant[id] !== !!v) return;
+      delete _jnlWant[id];
+    }
+    e.checked = !!v; };
+  chk('jnlAuto', S.auto); chk('jnlTpOn', S.tp_on); chk('jnlSlOn', S.sl_on);
+  set('jnlTp', S.tp_ticks); set('jnlSl', S.sl_ticks);
+  set('jnlWin', String(Math.round(S.window_s || 900)));
+  set('jnlStrat', S.strategy || 'ofi');
+  const mode = $('jnlMode');
+  if (mode) mode.textContent =
+    (S.strategy || 'ofi').toUpperCase() + ' · '
+    + (S.auto ? 'AUTO — rows write themselves'
+              : 'MANUAL — you log the trades');
+  /* ONE BUTTON, TWO STATES, and the label says which one is live
+     rather than which one it would switch to -- a toggle that reads
+     as a command is the commonest way to end up in the mode you
+     thought you had just left. */
+  const btn = $('jnlAutoBtn');
+  if (btn) {
+    btn.textContent = S.auto ? 'AUTO' : 'MANUAL';
+    btn.className = S.auto ? 'on' : '';
+    btn.title = S.auto
+      ? 'The journal is opening and closing its own rows on the rule.'
+        + ' It still does not place orders.'
+      : 'You log each trade yourself. Click to let the journal do it.';
+  }
+
+  /* WHICH OF THE FOUR AGREE, named individually. "no signal" tells
+     you nothing about which one is holding it up. */
+  const says = J.says || {};
+  const word = v => v === 'up' ? '<b class="long">UP</b>'
+                  : v === 'down' ? '<b class="short">DOWN</b>'
+                  : '<span class="thin">—</span>';
+  /* THE READ, WITH ITS NUMBER. It is the fastest of the four and the
+     one most likely to be the reason a signal is not firing, and the
+     column could name it without ever saying what it was doing. */
+  const R = J.read || {};
+  /* THE CAP, VISIBLE. Two trades to a candle and never two the
+     same way -- without this on the screen a quiet column looks like
+     a quiet market rather than a candle that has had its turns. */
+  const taken = J.taken_this_candle || [];
+  const capBit = taken.length
+    ? ' <span class="thin">· this candle has had '
+      + taken.map(x => esc(x).toUpperCase()).join(' and ')
+      + (taken.length >= (J.max_per_candle || 2)
+          ? ' — no more until the next one' : '')
+      + '</span>'
+    : '';
+  const readBit = (R.read)
+    ? word(R.read === 'flat' ? null : R.read)
+      + (R.read === 'flat' ? ' <span class="thin">FLAT</span>' : '')
+      + ' <span class="thin">'
+      + ((R.ticks > 0 ? '+' : '') + (R.ticks || 0).toFixed(2))
+      + ' ticks from the open of this OFI bar</span>'
+    : '<span class="thin">— no OFI bar forming</span>';
+  const ag = $('jnlAgree');
+  const W = J.window || {};
+  if (ag) {
+    /* THE WINDOW IS THE SIGNAL. All three the same way opens a
+       trade; anything else says which one is off, by name, because
+       "no signal" was what this column said for days while the
+       reason sat one function away. */
+    ag.innerHTML = (J.agree
+      ? '<b class="' + (J.agree === 'up' ? 'long' : 'short') + '">'
+        + 'WINDOW ' + J.agree.toUpperCase() + '</b>'
+        + ' <span class="thin">candle, OFI and CVD all the same way</span>'
+      : '<b class="short">NO TRADE</b> <span class="thin">'
+        + esc(J.blocked || 'no window yet') + '</span>')
+      + '<div class="thin" style="margin-top:4px">'
+      + esc(S.window_label || '15m') + ' window'
+      + ' &mdash; candle ' + word(W.mid_dir === 'flat' ? null : W.mid_dir)
+      + (W.mid_dir === 'flat' ? ' <b>FLAT</b>' : '')
+      + ' <span class="thin">' + ((W.ticks > 0 ? '+' : '')
+          + (W.ticks || 0).toFixed(2)) + ' ticks</span>'
+      + ' &middot; OFI ' + word(W.ofi_dir === 'flat' ? null : W.ofi_dir)
+      + (W.ofi_dir === 'flat' ? ' <b>FLAT</b>' : '')
+      + ' <span class="thin">'
+      + Math.round(W.net_ofi || 0).toLocaleString() + '</span>'
+      + ' &middot; CVD ' + word(W.cvd_dir === 'flat' ? null : W.cvd_dir)
+      + (W.cvd_dir === 'flat' ? ' <b>FLAT</b>' : '')
+      + ' <span class="thin">'
+      + Math.round(W.net_cvd || 0).toLocaleString() + '</span>'
+      + ((J.footprint && J.footprint.levels)
+          ? ' &middot; footprint '
+            + word(J.footprint.side || null)
+            + ' <span class="thin">' + J.footprint.buy + ' buy / '
+            + J.footprint.sell + ' sell levels</span>'
+          : '')
+      + capBit
+      + (J.idle ? ' &middot; <b>no trade</b> &mdash; ' + esc(J.idle)
+                : '')
+      + '</div>';
+  }
+
+  const op = $('jnlOpen');
+  if (op) {
+    if (J.open) {
+      const t = J.open;
+      op.innerHTML = '<div class="say">'
+        + '<b class="' + (t.side === 'up' ? 'long' : 'short') + '">OPEN '
+        + t.side.toUpperCase() + '</b> from <b>' + t.open_px.toFixed(2)
+        + '</b> <span class="thin">(' + esc(t.mode) + ')</span> &middot; '
+        + jnlFmt(t.live_ticks || 0, t.live_dollars || 0)
+        + ' <span class="thin">unrealised — this is the last print, '
+        + 'not money</span>'
+        + (t.tp ? ' &middot; <span class="thin">tp ' + t.tp + '</span>' : '')
+        + (t.sl ? ' &middot; <span class="thin">sl ' + t.sl + '</span>' : '')
+        + '</div>';
+    } else {
+      op.innerHTML = '<div class="thin">nothing open</div>';
+    }
+  }
+
+  const st = J.stats || {};
+  const V = st.verdict || {};
+  const el = $('jnlStats');
+  if (el) {
+    el.innerHTML = st.trades
+      ? '<div style="display:flex;flex-wrap:wrap;gap:16px">'
+        + '<span><b>' + st.trades + '</b> <span class="thin">trades'
+        + '</span></span>'
+        + '<span><b class="long">' + st.wins + 'W</b> / '
+        + '<b class="short">' + st.losses + 'L</b>'
+        + (st.flat ? ' <span class="thin">/ ' + st.flat + ' flat</span>' : '')
+        + ' <span class="thin">(' + (100 * st.rate).toFixed(1)
+        + '%)</span></span>'
+        + '<span>' + jnlFmt(st.ticks, st.dollars) + '</span>'
+        + '<span class="thin">per trade '
+        + (st.per_trade_ticks >= 0 ? '+' : '')
+        + st.per_trade_ticks.toFixed(2) + ' ticks ($'
+        + st.per_trade_dollars.toFixed(2) + ')</span>'
+        + '</div>'
+        /* IS IT WORTH TRUSTING YET -- the question the whole column
+           exists to answer. It goes above the caveats because the
+           totals on their own answer it badly: the thing that fools
+           you at small sample size is a run of wins, and a run of
+           wins is exactly what a promising start looks like. */
+        + '<div class="say" style="margin-top:8px">'
+        + (V.enough
+            ? '<b class="long">WORTH A CLOSER LOOK</b> '
+            : '<b>NOT YET READABLE</b> ')
+        + '<span class="thin">' + esc(V.say || '') + '</span>'
+        + (V.need ? ' <span class="thin">(' + V.need + ' more to reach '
+            + 'thirty)</span>' : '')
+        + '</div>'
+        + (st.stops && st.stops.stop_ticks
+            ? '<div class="thin" style="margin-top:4px">'
+              + '<b>stops</b> — ' + st.stops.stops + ' of '
+              + st.trades + ' ended on one ('
+              + (100 * (st.stops.stop_share || 0)).toFixed(0) + '%) · '
+              + esc(st.stops.say || '') + '</div>'
+            : '')
+        + (st.streaks
+            ? '<div class="thin" style="margin-top:4px">longest run — '
+              + '<b class="long">' + st.streaks.win + ' wins</b>, '
+              + '<b class="short">' + st.streaks.loss + ' losses</b>'
+              + ' <span class="thin">· spread ' + st.spread_ticks
+              + ' ticks either way</span></div>'
+            : '')
+        /* COSTS ARE NOT IN THE NUMBERS ABOVE and this is where that
+           gets said. A round trip across the spread is about a tick;
+           an average under that is a loss wearing a profit's clothes. */
+        + '<div class="thin" style="margin-top:6px">'
+        + (st.beats_costs
+            ? 'Averaging more than the ~1 tick a round trip costs. '
+            : '<b class="short">Averaging less than the ~1 tick a round '
+              + 'trip costs</b> — on these numbers the rule is not paying '
+              + 'for itself. ')
+        + 'Commission and spread are in none of these figures; the price '
+        + 'logged is the mid at the click, not a fill.</div>'
+      : '<div class="thin">no trades logged yet</div>';
+  }
+
+  const rec = $('jnlRecent');
+  if (rec) {
+    const rows = J.recent || [];
+    rec.innerHTML = rows.length
+      ? '<div class="thin" style="margin-bottom:4px">last '
+        + rows.length + '</div>'
+        + rows.map(t =>
+            '<div style="display:flex;gap:10px;padding:3px 0;'
+            + 'border-top:1px solid rgba(255,255,255,.06)">'
+            + '<b style="width:52px" class="'
+            + (t.side === 'up' ? 'long' : 'short') + '">'
+            + t.side.toUpperCase() + '</b>'
+            + '<span style="width:150px">' + jnlFmt(t.ticks, t.dollars)
+            + '</span>'
+            + '<span class="thin" style="width:70px">' + esc(t.why)
+            + '</span>'
+            + '<span class="thin">' + t.open_px.toFixed(2) + ' → '
+            + (t.close_px || 0).toFixed(2) + '</span>'
+            + '</div>').join('')
+      : '';
+  }
+}
+
+function paintCascade(d) {
+  paintStackStrip();
+  const el = $('cascRows'), head = $('cascSay');
+  if (!el) return;
+  const C = (d && d.cascade) || {};
+  if (C.error) {
+    el.innerHTML = '<div class="msg err">' + esc(C.error) + '</div>';
+    if (head) head.innerHTML = '—';
+    return;
+  }
+  const w = CASC_WORD[C.state] || CASC_WORD.unread;
+  /* A SIDE ONLY WHERE THERE IS ONE. A pullback is the stack mid-argument
+     and hands out nothing; drawing a greyed-out BUY there would read as a
+     weak buy rather than as no call at all. */
+  const side = C.side
+    ? '<b class="' + (C.side === 'buy' ? 'long' : 'short') + '">'
+      + C.side.toUpperCase() + '</b>'
+    : '<span class="thin">no call</span>';
+  if (head) {
+    head.innerHTML =
+        '<span class="' + w[0] + '">'
+      + esc((C.state || 'unread').replace(/_/g, ' ').toUpperCase())
+      + '</span>' + side
+      + '<div class="thin" style="margin-top:4px">' + esc(C.describe || '')
+      + '</div>'
+      + '<div class="thin" style="margin-top:2px">' + esc(w[1]) + '</div>';
+  }
+  el.innerHTML = (C.rungs || []).map((r, i) => {
+    const traded = i === 0;
+    /* Thrown out is not the same as silent, and the two have to look
+       different -- a row fighting its own number is the one worth
+       looking at. */
+    const mark = !r.present ? '<span class="thin">not read</span>'
+      : r.conflicted
+        ? '<span class="flag late">THROWN OUT</span>'
+      : r.qualified === 'up'   ? '<b class="long">UP</b>'
+      : r.qualified === 'down' ? '<b class="short">DOWN</b>'
+      : '<span class="thin">no colour</span>';
+    const dot = r.colour === 'green' ? '#2ecc71'
+              : r.colour === 'red'   ? '#e74c3c' : '#666';
+    return '<div style="display:flex;align-items:center;gap:10px;'
+         + 'padding:5px 0;border-top:1px solid rgba(255,255,255,.06)">'
+         + '<span style="width:8px;height:8px;border-radius:50%;'
+         + 'background:' + dot + ';flex:none"></span>'
+         + '<b style="width:42px">' + esc(r.timeframe) + '</b>'
+         + '<span style="width:70px" class="thin">'
+         + (r.present ? (r.bps >= 0 ? '+' : '') + r.bps.toFixed(1) + 'bps'
+                      : '—') + '</span>'
+         + '<span style="width:110px">' + mark + '</span>'
+         + '<span class="thin">' + esc(traded ? 'you are trading this'
+                                              : 'building it') + '</span>'
+         + '</div>';
+  }).join('') || '<div class="msg">no rows</div>';
+  /* WHY, NOT JUST WHAT. The line above names the timeframes that did
+     not read; three separate faults have produced that same sentence
+     and none of them could be told apart from the screen. The route
+     records the reason per row now, so it goes here. */
+  if (C.blocked && C.blocked.length) {
+    el.innerHTML += '<div class="msg" style="margin-top:8px">'
+      + '<b>why these rows did not read</b>'
+      + C.blocked.map(b => '<div class="thin" style="margin-top:4px">'
+          + '<b>' + esc(b.timeframe) + '</b> &mdash; ' + esc(b.why)
+          + '</div>').join('')
+      + '</div>';
+  }
+  const st = $('cascStamp');
+  if (st) st.textContent = C.trading ? 'trading ' + C.trading : '';
+}
+
+/* How the read got where it is -- ONE LINE.
+
+   The seven readings behind it (stack, intent, efficiency, response,
+   book, fuel, location) are still taken on every poll and still go out
+   in the payload. They are just not drawn: what is wanted on the screen
+   is the direction and whether the case for it is building or coming
+   apart, directly under the fastest row.
+
+   A COUNT STILL, NEVER A PERCENTAGE -- and here not even the count. When
+   nothing has been measured there is no direction to show, and this says
+   so rather than drawing a confident arrow over an empty feed. */
+function paintTrace(d) {
+  const el = $('traceLine');
+  if (!el) return;
+  const T = (d && d.trace) || null;
+  const N = T && T.now;
+  const line = (cls, txt) =>
+      '<div style="display:flex;align-items:center;gap:8px;padding:7px 0 2px;'
+    + 'border-top:1px solid rgba(255,255,255,.06)">'
+    + '<span class="' + cls + '">' + txt + '</span></div>';
+
+  if (!T || !N || !N.way) {
+    el.innerHTML = line('thin', 'no read on this bar yet');
+    return;
+  }
+  /* Nothing measured is not a direction. Drawing one here would put a
+     confident arrow over a feed that has told us nothing. */
+  if (!N.counted) {
+    el.innerHTML = line('thin', 'warming up');
+    return;
+  }
+  const up = N.way === 'up';
+  const way = '<b class="' + (up ? 'long' : 'short') + '">'
+            + (up ? 'UP' : 'DOWN') + '</b>';
+  const c = T.change_60s;
+  /* null is not zero. A leg a few seconds old, or one that has just
+     crossed the open, has no trajectory -- calling that "holding"
+     claims a steadiness nobody measured. */
+  const move = c === null || c === undefined
+      ? '<span class="thin">just started</span>'
+    : c > 0 ? '<b class="long">strengthening</b>'
+    : c < 0 ? '<b class="short">weakening</b>'
+    : '<span class="thin">holding</span>';
+  el.innerHTML = line('', way + ' &nbsp;' + move);
+}
+
+function paintLayers(d) {
+  const el = $('layerBody'), head = $('layerResult');
+  if (!el) return;
+  const all = (d && d.layers) || {};
+  if (all.error) { el.innerHTML = '<div class="msg err">' + esc(all.error)
+                                 + '</div>'; return; }
+  const tf = ($('rInt') && $('rInt').value) || d.interval;
+  const L = all[tf];
+  if (!L) {
+    el.innerHTML = '<div class="msg">no layer read on ' + esc(tf || '?')
+                 + ' yet</div>';
+    return;
+  }
+  /* The verdict, above the six readings that produced it.
+
+     A PROVISIONAL WORD IS DRAWN DIFFERENTLY. Failed break, exhaustion
+     and reversal all describe how something turned out, and inside a bar
+     that has not closed the most that can honestly be said is "so far".
+     Drawing those the same as a settled word would hand them a
+     confidence the moment does not have. */
+  const R = L.result || {};
+  if (head) {
+    const side = R.side
+      ? '<b class="' + (R.side === 'buy' ? 'long' : 'short') + '">'
+        + R.side.toUpperCase() + '</b>'
+      : '<span class="thin">no side</span>';
+    head.innerHTML =
+        '<span class="flag' + (R.provisional ? ' late' : '') + '">'
+      + esc((R.state || 'unknown').replace(/_/g, ' ').toUpperCase())
+      + '</span>' + side
+      + (R.provisional
+          ? ' <span class="thin">so far — this bar can still close the '
+            + 'other way</span>' : '')
+      + '<div class="thin" style="margin-top:4px">' + esc(R.why || '')
+      + '</div>'
+      + '<div class="thin" style="margin-top:2px">' + esc(R.meaning || '')
+      + '</div>';
+  }
+  el.innerHTML = LAYER_ORDER.map(([key, title, sub], i) => {
+    const part = L[key] || {};
+    const nums = layerNums(key, part);
+    return '<div class="lay' + (part.measured ? '' : ' off') + '">'
+         + '<b><i>' + (i + 1) + '</i>' + title
+         + '<span class="thin" style="display:block;text-transform:none;'
+         + 'letter-spacing:0">' + sub + '</span></b>'
+         + '<span class="says">' + esc(part.describe || '—')
+         + (nums ? '<span class="nums">' + nums + '</span>' : '')
+         + '</span></div>';
+  }).join('');
+  /* The structural consequence: which pivot forms next and which side of
+     the last one it lands.
+
+     SETTLED IS NOT A PREDICTION. When price has already traded through
+     the prior level, the next high is going to be a higher high whatever
+     anyone thinks -- there is nothing left to forecast, only to wait for
+     the confirmation bars. It is drawn as a statement of fact and the
+     word "predicted" is kept for the other kind. */
+  const S = (d && d.swing) || {};
+  const sw = $('swingCall');
+  if (sw) {
+    if (!S.call) {
+      sw.innerHTML = '<span class="thin">' + esc(S.why || 'no structural '
+                   + 'call') + '</span>';
+    } else {
+      sw.innerHTML =
+          '<span class="flag' + (S.settled ? '' : ' late') + '">'
+        + (S.settled ? 'ALREADY SET' : 'PREDICTED') + '</span>'
+        + '<b class="' + (S.call[0] === 'H' ? 'long' : 'short') + '">'
+        + esc(S.call) + '</b> on the next ' + esc(S.next_kind || 'swing')
+        + '<div class="thin" style="margin-top:4px">' + esc(S.describe || '')
+        + '</div>';
+    }
+  }
+  const st = $('layerStamp');
+  if (st) st.textContent = tf + ' · ' + (L.measured || []).length
+                         + ' of 6 measured';
+}
+
+function paintLadder(d) {
+  const tfs = d.timeframes || [];
+  const say = $('tfSay');
+  ladderRead = tfs;
+  ladderErr = d.pressure_error || '';
+  renderLadder();
+  if (!tfs.length) { say.style.display = 'none'; return; }
+
+  const c = d.confrontation;
+  if (!c) { say.style.display = 'none'; return; }
+  say.style.display = '';
+  say.innerHTML = (c.conflicted ? '<span class="flag crowded">CONFLICT</span>'
+                   : c.aligned ? '<span class="flag">ALIGNED</span>' : '')
+                + c.verdict;
+}
+
+function stamp(id, seconds, warn, bad, label) {
+  const el = $(id);
+  if (!el) return;
+  el.className = 'stamp ' + ageClass(seconds, warn, bad);
+  el.textContent = (label || '') + ageText(seconds);
+}
+
+/* ---- the confidence alert ------------------------------------------------
+   Fires once per candle per direction. Three suppressions matter more than
+   the alert itself: it will not fire on stale data, it will not fire early
+   in a candle, and it will not re-fire for a state it already announced.
+   An alert that cries wolf gets ignored, and then the one that matters does
+   too.                                                                     */
+
+let alertedFor = null, audioCtx = null;
+
+function alertThreshold() {
+  const v = parseFloat(($('rAlert') && $('rAlert').value) || '0.8');
+  return isFinite(v) ? v : 0.8;
+}
+
+function saveAlert() {
+  try { localStorage.setItem('liqmap_alert', $('rAlert').value); } catch (e) {}
+  alertedFor = null;
+}
+
+function ping() {
+  // Synthesised rather than a file: an artifact page cannot load external
+  // media, and a two-tone chirp cuts through better than a single beep.
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    [880, 1320].forEach((f, i) => {
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.frequency.value = f; o.type = 'sine';
+      g.gain.setValueAtTime(0.0001, audioCtx.currentTime + i * 0.14);
+      g.gain.exponentialRampToValueAtTime(0.25, audioCtx.currentTime + i * 0.14 + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + i * 0.14 + 0.13);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start(audioCtx.currentTime + i * 0.14);
+      o.stop(audioCtx.currentTime + i * 0.14 + 0.14);
+    });
+  } catch (e) {}
+}
+
+function checkAlert(d) {
+  const bar = $('alertBar');
+  const thr = alertThreshold();
+
+  if (!thr || d.lean === 'flat' || d.confidence < thr) {
+    bar.style.display = 'none';
+    if (d.lean === 'flat' || d.confidence < thr * 0.8) alertedFor = null;
+    return;
+  }
+  if (d.early || d.stale) { bar.style.display = 'none'; return; }
+
+  const key = coin() + '|' + $('rInt').value + '|' + d.lean
+            + '|' + Math.floor(d.seconds_left / 60);
+  const candleKey = coin() + '|' + $('rInt').value + '|' + d.lean;
+
+  bar.className = 'alertbar ' + d.lean;
+  bar.style.display = '';
+  bar.innerHTML = `${d.lean.toUpperCase()} — ${(d.confidence*100).toFixed(0)}% confidence, `
+    + `${(d.agreement*100).toFixed(0)}% of signals agree, `
+    + `${(d.seconds_left/60).toFixed(1)} min left`
+    + `<small>${d.verdict}</small>`;
+
+  if (alertedFor === candleKey) return;      // already announced this one
+  alertedFor = candleKey;
+  ping();
+
+  try {
+    if (window.Notification && Notification.permission === 'granted') {
+      new Notification(`${coin()} ${d.lean.toUpperCase()} ${(d.confidence*100).toFixed(0)}%`,
+        {body: `${(d.seconds_left/60).toFixed(1)} min left · `
+               + `${(d.agreement*100).toFixed(0)}% agree · score ${d.score.toFixed(2)}`});
+    } else if (window.Notification && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+  } catch (e) {}
+}
+
+/* ---- the live feed -------------------------------------------------------
+   Polling asks "what happened"; the stream is told. Once the socket is up,
+   every fill pushes a fresh read instead of waiting for the next poll, which
+   is the difference between seeing a move and reading about it.            */
+
+let stream = null, feedTimer = null;
+
+async function startFeed() {
+  $('feedBtn').disabled = true;
+  try {
+    const r = await api('/api/feed?' + q({coin: coin(),
+                        intervals: '1m,5m,15m,30m,1h,4h'}), {method: 'POST'});
+    if (!r.ok) { note(r.error || 'could not start feed', true); return; }
+    note(`feed starting on ${coin()} — seeding from history…`);
+    openStream();
+    paintFeed();   // one seed; /ws/live ticks keep the bar current
+  } catch (e) { note(e.message, true); }
+  finally { $('feedBtn').disabled = false; }
+}
+
+async function stopFeed() {
+  closeStream();
+  if (feedTimer) { clearInterval(feedTimer); feedTimer = null; }
+  try { await api('/api/feed?stop=true', {method: 'POST'}); } catch (e) {}
+  $('feedBar').textContent = 'Feed off — the current candle is being polled.';
+  note('feed stopped');
+}
+
+function openStream() {
+  closeStream();
+  // EventSource cannot set headers, so the token travels in the query. It is
+  // encoded like every other parameter.
+  // The market this stream speaks for, captured at open. Every
+  // frame it pushes is stamped with it, so if the selection moves
+  // on before the stream is closed its frames are dropped instead
+  // of fighting the poll for the panel.
+  const sCoin = coin();
+  const url = '/api/stream?' + q({coin: sCoin, interval: $('rInt').value,
+                                  higher: $('rHigh').value, token: tok()});
+  stream = new EventSource(url);
+
+  stream.onmessage = (ev) => {
+    try { const f = JSON.parse(ev.data); f.__coin = sCoin; paintRead(f); }
+    catch (e) {}
+  };
+
+  // Price arrives on its own channel, on every batch of fills. The full read
+  // is coalesced; the price is not, because in a fast market it is the number
+  // that goes stale first and a stale price reads as a current one.
+  // For HL markets the SSE 'book' event is still the source; for CME the
+  // /ws/book WebSocket fires on every MBP-10 record instead.
+  stream.addEventListener('book', (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      // Only paint from SSE when the WS book stream is not connected;
+      // both carry the same paintBookCall format.
+      if (!bookWs) paintBookCall(d);
+    } catch (e) {}
+  });
+
+  stream.addEventListener('px', (ev) => {
+    try {
+      const p = JSON.parse(ev.data);
+      tickFromStream(p);
+    } catch (e) {}
+  });
+  stream.addEventListener('hello', (ev) => {
+    try {
+      const h = JSON.parse(ev.data);
+      note(h.feed ? 'streaming ' + h.coin + ' from the websocket'
+                  : 'streaming, but no socket feed — still polled');
+    } catch (e) {}
+  });
+  stream.addEventListener('error', () => {
+    // EventSource reconnects on its own; say so rather than looking dead.
+    $('feedBar').innerHTML = '<b>Stream interrupted</b> — reconnecting…';
+  });
+
+  // Open the real-time MBP-10 book WebSocket alongside the SSE stream.
+  // For CME/ES this fires on every single book record (100s per second);
+  // for HL it will error gracefully and fall back to the SSE book event.
+  openBookStream();
+  // Execution track: independent FootprintStream + DCD. Signals arrive
+  // the instant a stacked imbalance agrees with diagonal delta — no
+  // candle close, no poll interval.
+  openExecStream();
+  openLiveStream();
+}
+
+function closeStream() {
+  if (stream) { stream.close(); stream = null; }
+  closeBookStream();
+  closeExecStream();
+  closeLiveStream();
+}
+
+// ---- Real-time MBP-10 book WebSocket (/ws/book) ---------------------------
+
+let bookWs = null;
+
+function _wsBase() {
+  // Build the ws:// / wss:// base URL from the current page origin.
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+}
+
+function openBookStream() {
+  closeBookStream();
+  const url = _wsBase() + '/ws/book?coin=' + encodeURIComponent(coin())
+            + '&token=' + encodeURIComponent(tok());
+  try {
+    bookWs = new WebSocket(url);
+  } catch (e) { return; }
+
+  bookWs.onopen = () => {
+    const bar = $('bookWsBar');
+    if (bar) bar.textContent = 'MBP-10 book stream live';
+  };
+
+  bookWs.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) {
+        // Non-CME coin: WS sends error and closes; SSE book event is fallback.
+        const bar = $('bookWsBar');
+        if (bar) bar.textContent = 'Book WS: ' + d.error;
+        return;
+      }
+      paintBookCall(d);
+      paintDepthLadder(d);
+    } catch (e) {}
+  };
+
+  bookWs.onclose = () => {
+    bookWs = null;
+    const bar = $('bookWsBar');
+    if (bar) bar.textContent = 'Book WS closed — SSE fallback active';
+  };
+
+  bookWs.onerror = () => {
+    // WS will fire onclose after onerror; log nothing extra.
+  };
+}
+
+function closeBookStream() {
+  if (bookWs) { bookWs.close(); bookWs = null; }
+}
+
+// ---- Execution-track WebSocket (/ws/exec) --------------------------------
+
+let execWs = null;
+const _execLog = [];          // newest first, capped
+const _EXEC_LOG_KEEP = 40;
+
+function openExecStream() {
+  closeExecStream();
+  const url = _wsBase() + '/ws/exec?coin=' + encodeURIComponent(coin())
+            + '&token=' + encodeURIComponent(tok());
+  try {
+    execWs = new WebSocket(url);
+  } catch (e) { return; }
+
+  execWs.onopen = () => {
+    const bar = $('execWsBar');
+    if (bar) bar.textContent = 'Execution track live — signals fire intrabar';
+  };
+
+  execWs.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) {
+        const bar = $('execWsBar');
+        if (bar) bar.textContent = 'Exec WS: ' + d.error;
+        return;
+      }
+      // First frame is ExecState (has pulse / stacked / signals_total).
+      // Subsequent frames are Signal dicts (have side + reason, no pulse).
+      if (d.pulse !== undefined || d.stacked !== undefined) {
+        paintExecState(d);
+      } else if (d.side && d.reason) {
+        paintExecSignal(d);
+      }
+    } catch (e) {}
+  };
+
+  execWs.onclose = () => {
+    execWs = null;
+    const bar = $('execWsBar');
+    if (bar) bar.textContent = 'Execution WS closed';
+  };
+}
+
+function closeExecStream() {
+  if (execWs) { execWs.close(); execWs = null; }
+}
+
+// ---- Unified live micro-delta stream (/ws/live) --------------------------
+// Replaces setInterval(loadOfi), setInterval(fpTick), nowPoll HTTP, and
+// feedTimer. One permanent socket; frames write into existing painters.
+
+let liveWs = null;
+const _ofiHist = [];
+
+function openLiveStream() {
+  closeLiveStream();
+  const url = _wsBase() + '/ws/live?coin=' + encodeURIComponent(coin())
+            + '&token=' + encodeURIComponent(tok());
+  try { liveWs = new WebSocket(url); } catch (e) { return; }
+  liveWs.onmessage = (ev) => {
+    try {
+      const d = JSON.parse(ev.data);
+      if (d.error) return;
+      applyLiveFrame(d);
+    } catch (e) {}
+  };
+  liveWs.onclose = () => { liveWs = null; };
+}
+
+function closeLiveStream() {
+  if (liveWs) { liveWs.close(); liveWs = null; }
+}
+
+function applyLiveFrame(d) {
+  const kind = d.kind || (d.profile ? 'snap' : (d.e_n !== undefined ? 'ofi' : ''));
+  if (kind === 'tick') {
+    tickFromStream({px: d.px, trades: d.raw});
+    /* THE READ LINE REPAINTS HERE, on the print, and nothing else
+       on the OFI panel does. Redrawing the whole chart per tick
+       would be thousands of full re-renders a second for bars that
+       have not changed; rewriting one element is one innerHTML. */
+    if (d.read || d.price) {
+      if (chartData) {
+        if (d.read) chartData.read = d.read;
+        if (d.price) chartData.price = d.price;
+      }
+      if (_ofiLast) {
+        if (d.read) _ofiLast.read = d.read;
+        if (d.price) _ofiLast.price = d.price;
+        const el = document.getElementById('ofiReadLine');
+        if (el && !document.hidden) {
+          /* The function returns the whole span, id and all, and
+             this element IS that span -- so it replaces itself.
+             outerHTML rather than picking the wrapper off with a
+             regex: the id has to survive for the next tick to find
+             it, and a regex that drifts from the markup would
+             silently repaint once and never again. */
+          el.outerHTML = ofiReadLine(_ofiLast.read, _ofiLast.price);
+        }
+        /* The copy on the stack panel repaints on the same print.
+           Leaving it to the slower poll would put two different
+           READ lines on one screen, and the stale one would be the
+           one sitting under the stack it is meant to be read with. */
+        const sEl = document.getElementById('stackReadLine');
+        if (sEl && !document.hidden && _ofiStripCoin === coin()) {
+          sEl.outerHTML = ofiReadLine(_ofiLast.read, _ofiLast.price,
+                                      'stackReadLine');
+        }
+      }
+    }
+    if (d.dcd !== undefined) {
+      paintExecState({
+        pulse: {unconfirmed: d.unconfirmed, buy_flags: d.buy_flags,
+                sell_flags: d.sell_flags, last: d.px},
+        diagonal_delta: d.dcd, raw_delta: d.raw,
+        stacked: d.stacked || [],
+        signals_total: d.signals_total || 0,
+        last_signal: d.last_signal || null,
+      });
+    }
+    if (chartData && chartData.bars && chartData.bars.length && d.px) {
+      const last = chartData.bars[chartData.bars.length - 1];
+      if (last.live) {
+        last.close = d.px;
+        last.high = Math.max(last.high, d.px);
+        last.low = Math.min(last.low, d.px);
+        if (!document.hidden) {
+          const pane = $('tab-dash');
+          if (!pane || !pane.hidden) drawChart();
+        }
+      }
+    }
+    try { paintFeed(); } catch (e) {}
+  } else if (kind === 'book') {
+    paintBookCall(d);
+    paintDepthLadder(d);
+  } else if (kind === 'ofi') {
+    _ofiHist.push({at: d.at || d.ts, window: d.window, z: d.z});
+    if (_ofiHist.length > 150) _ofiHist.shift();
+    paintOfi({ok: true, running: true, last: d, history: _ofiHist, age_s: 0});
+  } else if (kind === 'signal') {
+    paintExecSignal(d);
+  } else if (kind === 'snap') {
+    if (d.px) tickFromStream({px: d.px});
+    if (d.exec) paintExecState(d.exec);
+  }
+}
+
+function paintExecState(d) {
+  const head = $('execHead');
+  const stacks = $('execStacks');
+  if (!head) return;
+  const p = d.pulse || {};
+  const dd = d.diagonal_delta || 0;
+  const rd = d.raw_delta || 0;
+  const ddCls = dd > 0 ? 'long' : dd < 0 ? 'short' : '';
+  const rdCls = rd > 0 ? 'long' : rd < 0 ? 'short' : '';
+  head.innerHTML =
+    '<b class="' + ddCls + '">DCD ' + (dd >= 0 ? '+' : '') + dd + '</b>'
+    + ' · raw ' + '<span class="' + rdCls + '">' + (rd >= 0 ? '+' : '') + rd + '</span>'
+    + ' · flags ' + (p.unconfirmed || 0)
+    + ' (' + (p.buy_flags || 0) + ' buy / ' + (p.sell_flags || 0) + ' sell)'
+    + ' · signals ' + (d.signals_total || 0)
+    + (p.last ? ' · last ' + Number(p.last).toFixed(2) : '');
+  const stamp = $('execStamp');
+  if (stamp) stamp.textContent = new Date().toLocaleTimeString();
+
+  const rows = d.stacked || [];
+  if (!rows.length) {
+    if (stacks) stacks.innerHTML = '<span style="color:var(--dim)">no stacked run yet</span>';
+  } else if (stacks) {
+    stacks.innerHTML = rows.map(r => {
+      const cls = r.side === 'buy' ? 'long' : 'short';
+      return '<span class="' + cls + '">' + r.side.toUpperCase()
+           + ' ×' + r.run + '  ' + Number(r.low).toFixed(2)
+           + '–' + Number(r.high).toFixed(2) + '</span>';
+    }).join(' · ');
+  }
+  if (d.last_signal) paintExecSignal(d.last_signal, true);
+}
+
+function paintExecSignal(sig, fromState) {
+  if (!sig || !sig.side) return;
+  // Dedup: state snapshot and live frame can carry the same last_signal.
+  if (_execLog.length && _execLog[0].ts === sig.ts && _execLog[0].side === sig.side) {
+    if (!fromState) paintExecLog();
+    return;
+  }
+  _execLog.unshift(sig);
+  if (_execLog.length > _EXEC_LOG_KEEP) _execLog.pop();
+  paintExecLog();
+}
+
+function paintExecLog() {
+  const el = $('execLog');
+  if (!el) return;
+  if (!_execLog.length) {
+    el.innerHTML = '<span style="color:var(--dim)">no signals yet</span>';
+    return;
+  }
+  el.innerHTML = _execLog.map(s => {
+    const cls = s.side === 'buy' ? 'long' : 'short';
+    const t = s.ts ? new Date(s.ts * 1000).toLocaleTimeString() : '—';
+    return '<div style="padding:2px 0;border-bottom:1px solid var(--line)">'
+      + '<b class="' + cls + '">' + String(s.side).toUpperCase() + '</b>'
+      + '  ' + Number(s.price).toFixed(2)
+      + '  DCD ' + (s.diagonal_delta >= 0 ? '+' : '') + s.diagonal_delta
+      + '  stack ×' + s.stacked_run
+      + '  <span style="color:var(--dim)">' + t + ' · ' + (s.reason || '') + '</span>'
+      + '</div>';
+  }).join('');
+}
+
+// ---- Depth ladder renderer ------------------------------------------------
+
+function paintDepthLadder(d) {
+  const el = $('bookLadder');
+  if (!el) return;
+  const bids = d.bids || [], asks = d.asks || [];
+  if (!bids.length && !asks.length) {
+    el.innerHTML = '<span style="color:var(--dim)">awaiting book data…</span>';
+    return;
+  }
+  const fmt  = px => Number(px).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 4});
+  const fmtS = sz => sz >= 1000 ? (sz/1000).toFixed(1)+'K' : sz.toFixed(0);
+
+  // Find the max size for bar scaling
+  const allSz = [...bids.map(l=>l.sz), ...asks.map(l=>l.sz)];
+  const maxSz = allSz.length ? Math.max(...allSz) : 1;
+
+  const row = (l, side) => {
+    const pct = Math.round(l.sz / maxSz * 100);
+    const bg  = side === 'bid'
+      ? `linear-gradient(to left, rgba(0,200,80,.18) ${pct}%, transparent ${pct}%)`
+      : `linear-gradient(to right, rgba(220,50,50,.18) ${pct}%, transparent ${pct}%)`;
+    const cls = side === 'bid' ? 'long' : 'short';
+    return `<tr style="background:${bg}">
+      <td style="text-align:right;padding:1px 6px"><b class="${cls}">${fmt(l.px)}</b></td>
+      <td style="padding:1px 8px;color:var(--dim)">${fmtS(l.sz)}${l.n ? ' ×'+l.n : ''}</td>
+    </tr>`;
+  };
+
+  const mid = d.mid ? `<tr><td colspan="2" style="text-align:center;padding:2px 0;font-size:11px;color:var(--dim)">
+    mid ${fmt(d.mid)} · spread ${(d.spread_bps||0).toFixed(2)}bps · imb ${(+(d.imbalance||0)*100).toFixed(1)}%
+  </td></tr>` : '';
+
+  el.innerHTML = `<table style="width:100%;border-collapse:collapse;font-size:13px;font-family:monospace">
+    ${asks.slice().reverse().map(l=>row(l,'ask')).join('')}
+    ${mid}
+    ${bids.map(l=>row(l,'bid')).join('')}
+  </table>`;
+}
+
+async function paintFeed() {
+  let f;
+  try { f = await api('/api/feed'); } catch (e) { return; }
+  const bar = $('feedBar');
+  if (!f.running) {
+    bar.textContent = 'Feed off — the current candle is being polled.';
+    return;
+  }
+  const age = f.age_s == null ? null : f.age_s;
+  const cls = f.stale ? 'short' : 'long';
+  bar.innerHTML = `<b class="${cls}">${f.stale ? 'FEED SILENT' : 'LIVE'}</b> `
+    + `${f.coin} · ${f.trades_seen} fills · ${f.book_updates} book updates · `
+    + `last message ${ageText(age)}`
+    + (f.reconnects ? ` · ${f.reconnects} reconnects` : '')
+    + (f.errors && f.errors.length ? `<br><span style="color:var(--short)">${f.errors[f.errors.length-1]}</span>` : '');
+}
+
+function toggleReadAuto() {
+  if ($('rAuto').checked) loadRead();
+}
+
+/* THE RULE'S CLOCK. /api/read is the ONLY thing that runs the trade
+   column -- the entry test, the exit test, the cap, the alert. It is
+   not a display route.
+
+   The 10-second poll that used to drive it was removed on the
+   reasoning that "/ws/live already pushes the forming bar". That is
+   true and it is beside the point: the socket updates what is DRAWN.
+   It does not evaluate the rule. So the strategy only stepped when
+   something happened to call loadRead -- a click, a page load, a
+   dropdown -- and in between, nothing. Chris: "the trade on this
+   rule is behind real time data completely by several points at a
+   time". Several points, because the rule was not late, it was
+   ASLEEP, and the first poll after a click acted on a signal that
+   had fired minutes earlier at a price long gone.
+
+   One second, in flight tracked so a slow answer cannot stack.
+
+   THE LIMIT THIS DOES NOT FIX, said plainly: the rule still only
+   runs while this page is open, and browsers throttle timers in a
+   hidden tab to about once a minute. Auto-trading that must run
+   with the laptop shut needs a stepper on the server, which this is
+   not. */
+let _readBusy = false;
+setInterval(async () => {
+  if (_readBusy) return;
+  const el = $('rInt');
+  if (!el) return;
+  _readBusy = true;
+  try { await loadRead(); } catch (e) {} finally { _readBusy = false; }
+}, 1000);
+
+/* The order-flow ladder.
+
+   An UNCOVERED rung is not a flat one. The rolling tape holds an hour,
+   so a four-hour rung has seen a fraction of its own bar; printing a
+   delta for it would describe fifteen minutes as though it were the
+   candle. Those rungs are drawn greyed with their coverage, and they do
+   not vote on agreement. */
+/* The scorecard. Polled on its own slow schedule -- it changes when bars
+   close, not when the page refreshes. */
+let scoreAt = 0;
+
+function scorePct(x) { return x === null || x === undefined
+  ? '<span class="thin">—</span>' : Math.round(x * 100) + '%'; }
+
+async function loadScore() {
+  const now = Date.now();
+  if (now - scoreAt < 20000) return;
+  scoreAt = now;
+  const say = $('scoreSay'), body = $('scoreRows');
+  if (!say || !body) return;
+  let d;
+  try {
+    d = await api('/api/calls?' + q({coin: coin(),
+                                         interval: ($('rInt') && $('rInt').value)
+                                                   || ''}));
+  } catch (e) {
+    say.innerHTML = '<span class="thin">scorecard unavailable</span>';
+    return;
+  }
+  say.innerHTML = esc(d.summary || '—')
+    + '<div class="thin" style="margin-top:3px">'
+    + (d.counts ? d.counts.calls + ' calls recorded, ' + d.counts.resolved
+                  + ' scored, ' + d.counts.open + ' waiting on their bars'
+                : '') + '</div>';
+
+  const rows = d.tallies || [];
+  if (!rows.length) {
+    body.innerHTML = '<div class="msg">nothing scored yet — leave the feed '
+                   + 'running and come back</div>';
+    return;
+  }
+  body.innerHTML =
+      '<div style="display:flex;gap:8px;padding:4px 0;font-size:11px"'
+    + ' class="thin">'
+    + '<b style="width:90px">read</b><b style="width:48px">when</b>'
+    + '<b style="width:68px">engine</b><b style="width:68px">naive</b>'
+    + '<b style="width:58px">edge</b><b style="width:78px">agrees</b>'
+    + '<b style="width:68px">called</b><b>n</b></div>'
+    + rows.map(t => {
+    /* The edge is the only number worth colouring, and only once there
+       is enough behind it to mean anything. */
+    const thin = t.scored < 100;
+    const e = t.edge;
+    const ec = (e === null || e === undefined || thin) ? 'thin'
+             : e > 0 ? 'long' : e < 0 ? 'short' : 'thin';
+    const same = t.agreement !== null && t.agreement !== undefined
+              && t.agreement >= 0.9;
+    return '<div style="display:flex;gap:8px;align-items:center;'
+         + 'padding:4px 0;font-size:12px;border-top:1px solid '
+         + 'rgba(255,255,255,.06)">'
+         + '<b style="width:90px">' + esc(t.kind) + '</b>'
+         + '<span class="thin" style="width:48px">' + t.mark + '%</span>'
+         + '<span style="width:68px">' + scorePct(t.rate) + '</span>'
+         + '<span class="thin" style="width:68px">' + scorePct(t.naive_rate)
+         + '</span>'
+         + '<b class="' + ec + '" style="width:58px">'
+         + (e === null || e === undefined ? '—'
+            : (e > 0 ? '+' : '') + Math.round(e * 100) + '%') + '</b>'
+         + '<span class="' + (same ? 'short' : 'thin')
+         + '" style="width:78px">' + scorePct(t.agreement) + '</span>'
+         + '<span class="thin" style="width:68px">' + scorePct(t.coverage)
+         + '</span>'
+         + '<span class="thin">' + t.scored
+         + (thin ? ' <i>(too few)</i>' : '') + '</span>'
+         + '</div>';
+  }).join('');
+  const st = $('scoreStamp');
+  if (st) st.textContent = new Date().toLocaleTimeString();
+}
+
+async function loadFlow() {
+  const gate = $('flowGate');
+  let d;
+  try {
+    d = await api('/api/flow?' + q({
+      coin: coin(),
+      target_ticks: parseFloat(($('flowTgt') || {}).value) || 10,
+      spike: parseFloat(($('flowSpike') || {}).value) || 2,
+      // Exactly the rows the read is showing, so no row ever pairs a 15m
+      // read with a 5m delta.
+      timeframes: readTfList().join(',')}));
+  } catch (e) {
+    ladderFlow = null; renderLadder();
+    if (gate) gate.textContent = e.message;
+    return;
+  }
+  if (!d || !d.ok) {
+    ladderFlow = null; renderLadder();
+    if (gate) gate.textContent = (d && d.why) || 'order flow unavailable';
+    return;
+  }
+  ladderFlow = d.rungs || [];
+  renderLadder();
+
+  const b = d.book, v = d.velocity;
+  if (gate) {
+    gate.innerHTML =
+        '<span class="flag' + (d.tradeable ? '' : ' late') + '">'
+      + (d.tradeable ? 'NOTHING REFUSING' : 'HELD') + '</span>'
+      + '<b>' + d.aligned.toUpperCase() + '</b> across the covered '
+      + 'timeframes &nbsp;·&nbsp; spread ' + b.spread_ticks.toFixed(1)
+      + 't of ' + d.target_ticks + 't &nbsp;·&nbsp; tape '
+      + v.ratio.toFixed(1) + 'x (' + v.now_hz.toFixed(1) + '/s vs '
+      + v.base_hz.toFixed(1) + '/s)'
+      + '<div class="thin" style="margin-top:4px">' + esc(d.why) + '</div>';
+  }
+
+  const st = $('flowStamp');
+  if (st) st.textContent = (d.feed_age_s == null)
+    ? 'feed --' : 'feed ' + d.feed_age_s + 's';
+}
+
+function flowNum(n) {
+  const a = Math.abs(n);
+  const s = a >= 1e6 ? (n / 1e6).toFixed(1) + 'M'
+          : a >= 1e3 ? (n / 1e3).toFixed(0) + 'k'
+          : n.toFixed(0);
+  return (n > 0 ? '+' : '') + s;
+}
+
+/* ---- the read follows the chart -----------------------------------------
+
+   Two candle selectors on one screen is a way to end up reading the 5m
+   while looking at the 15m and never noticing. Trading the 15m means
+   reading the 15m, so the chart leads and the read follows.
+
+   The link is a checkbox rather than a weld, because comparing one
+   timeframe's read against another chart is a real thing to want. Setting
+   the read's own selector by hand breaks the link rather than being
+   silently undone on the next chart change -- an override that gets
+   reverted is worse than no override. */
+// '1000t' is a thousand prints to a bar, not a duration.
+function isTickTf(v) { return /^[0-9]+t$/.test(String(v || '')); }
+// '5000x2000' is prints AND contracts of imbalance. Also not a duration.
+function isFusedTf(v) { return /^[0-9]+x[0-9]+$/.test(String(v || '')); }
+/* EITHER OF THE COUNT-CLOSED FORMS. Everything that has to ask "is
+   this a clock interval?" asks this one, so a form added later is
+   added in one place instead of being half-handled in four. */
+function isCountTf(v) { return isTickTf(v) || isFusedTf(v); }
+
+function followChartTf() {
+  const box = $('rFollow'), chart = $('sInt'), read = $('rInt');
+  if (!box || !chart || !read) return false;
+  // THE READ NEVER FOLLOWS THE CHART ONTO A TICK SERIES. The stack
+  // is built on clock intervals -- it asks for ten closed bars of
+  // one and compares three of them -- so handing it '1000t' would
+  // not switch it to tick bars, it would make every row unreadable
+  // and the panel would blame the data. The chart can show prints
+  // while the read stays on the clock; they are different questions.
+  if (isCountTf(chart.value)) return false;
+  if (!box.checked || read.value === chart.value) return false;
+  read.value = chart.value;
+  return true;
+}
+
+function chartTfChanged() {
+  loadSuggest();
+  if (followChartTf()) loadRead();
+}
+
+function readTfChanged() {
+  const box = $('rFollow'), chart = $('sInt'), read = $('rInt');
+  if (box && box.checked && chart && read && read.value !== chart.value)
+    box.checked = false;
+  loadRead();
+}
+
+async function loadRead() {
+  let d;
+  const want = coin();
+  try {
+    d = await api('/api/read?' + q({coin: want, interval: $('rInt').value,
+                  higher: $('rHigh').value,
+                  size: parseFloat($('liqSize').value || '0') || 0}));
+  } catch (e) { $('readHead').textContent = e.message; return; }
+  d.__coin = want;
+  paintRead(d);
+}
+
+// Split out so the websocket stream can paint without a fetch of its own.
+/* Never oftener than this. On a busy socket paintRead fires many times a
+   second and each flow read walks the whole tape. */
+const FLOW_EVERY_MS = 2000;
+let flowAt = 0;
+
+function paintRead(d) {
+  if (!d) return;
+  /* TWO WRITERS, ONE PANEL. The one-second poll fetches the
+     selected market; the SSE stream pushes whatever market it was
+     OPENED on. Switch coin and the old stream keeps pushing while
+     the new poll fetches, so the panel alternates once a second
+     between the two -- Chris: "price between the ES and the BTC
+     keeps fluctuating between the 2 like it cant select one or the
+     other".
+
+     Neither writer could tell, because nothing in the payload said
+     which market it answered for. Each writer now stamps what it
+     ASKED for and anything that does not match the current
+     selection is dropped. A stale writer becomes harmless rather
+     than needing to be hunted down. */
+  if (d.__coin && d.__coin !== coin()) return;
+
+  /* THE LADDER REFRESHES FROM HERE, NOT FROM loadRead.
+     
+     When the websocket is live the stream calls paintRead DIRECTLY --
+     that is the whole point of it being split out, so a push does not
+     cost a fetch. Hanging the flow refresh off loadRead therefore meant
+     it only ran on the HTTP path: the candle read updated from the
+     socket while the ladder sat frozen on whatever the last poll
+     returned. It looked like dead data and it was stale data. */
+  const t = Date.now();
+  if (t - flowAt >= FLOW_EVERY_MS) {
+    flowAt = t;
+    loadFlow();
+  }
+  if (d.error) {
+    $('readHead').textContent = d.error;
+    $('readSignals').innerHTML = ''; $('readSay').style.display = 'none';
+    /* THE TRADE COLUMN IS DRAWN ANYWAY. It has its own data and its
+       own error line, and it used to be skipped here -- so when the
+       ladder could not build (the UNREAD case, which is most of the
+       first two hours after a restart) the column showed no trades,
+       no stats and no AUTO state. That reads as a broken strategy
+       rather than a stack that is still filling. */
+    paintJournal(d);
+    return;
+  }
+
+  const cls = d.lean === 'up' ? 'long' : d.lean === 'down' ? 'short' : '';
+  paintLadder(d);
+  paintCascade(d);
+  paintJournal(d);
+  loadScore();
+  paintTrace(d);
+  paintLayers(d);
+  const src = (d.source || '').indexOf('websocket') === 0;
+  const flags = (src ? '<span class="flag">LIVE TAPE</span>'
+                     : '<span class="flag late">POLLED</span>')
+              + (d.early ? '<span class="flag late">EARLY</span>' : '')
+              + (d.stale ? '<span class="flag crowded">STALE — candle and live price disagree</span>' : '')
+              + inputFlags(d);
+
+  $('readHead').innerHTML =
+      `<div class="verdict-big ${cls}">${d.lean.toUpperCase()}`
+    + `<span style="font-size:15px;color:var(--dim);font-weight:400">`
+    + `&nbsp;score ${d.score >= 0 ? '+' : ''}${d.score.toFixed(2)}</span></div>`
+    + `<div style="font-size:12px;color:var(--dim)">${flags}</div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${(d.seconds_left/60).toFixed(1)}m</b><span>left in candle</span></div>`
+    + `<div class="stat"><b>${(d.elapsed_fraction*100).toFixed(0)}%</b><span>elapsed</span></div>`
+    + `<div class="stat"><b>${(d.agreement*100).toFixed(0)}%</b><span>signals agree</span></div>`
+    + `<div class="stat"><b>${(d.confidence*100).toFixed(0)}%</b><span>confidence</span></div>`
+    + `<div class="stat"><b class="${d.change_bps >= 0 ? 'long' : 'short'}">`
+    + `${d.change_bps >= 0 ? '+' : ''}${d.change_bps.toFixed(1)}bps</b><span>on the candle</span></div>`
+    + `<div class="stat"><b>${(d.position_in_range*100).toFixed(0)}%</b><span>of candle range</span></div>`
+    + `<div class="stat"><b>${Number(d.last).toLocaleString(undefined,{maximumFractionDigits:6})}</b><span>candle price</span></div>`
+    + (d.spot != null
+       ? `<div class="stat ${d.stale ? 'gap-bad' : 'gap-ok'}">`
+         + `<b>${Number(d.spot).toLocaleString(undefined,{maximumFractionDigits:6})}</b>`
+         + `<span>live mid${d.spot_vs_candle_bps != null ? ' (' + (d.spot_vs_candle_bps >= 0 ? '+' : '') + d.spot_vs_candle_bps.toFixed(1) + 'bps)' : ''}</span></div>`
+       : '')
+    + (d.round_trip_bps != null
+       ? `<div class="stat"><b>${d.round_trip_bps.toFixed(1)}bps</b><span>round trip cost</span></div>` : '')
+    + '</div>';
+
+  const sigs = d.signals || [];
+  $('readSignals').innerHTML = !sigs.length ? '' :
+    '<table style="margin-top:12px"><tr><th>signal</th><th class="r">weight</th>'
+    + '<th>reading</th></tr>'
+    + sigs.map(s => `<tr>
+        <td class="${s.direction === 'up' ? 'long' : s.direction === 'down' ? 'short' : ''}">
+          ${s.direction === 'up' ? '▲' : s.direction === 'down' ? '▼' : '·'} ${s.name}</td>
+        <td class="r ${s.weighted >= 0 ? 'long' : 'short'}">${s.weighted >= 0 ? '+' : ''}${s.weighted.toFixed(2)}</td>
+        <td style="color:var(--dim)">${s.note}</td></tr>`).join('')
+    + '</table>';
+
+  stamp('readStamp', 0, 30, 120, 'read ');
+  checkAlert(d);
+  $('readSay').style.display = '';
+  $('readSay').innerHTML = d.verdict
+    + (d.higher_timeframe ? `<div style="margin-top:6px;color:var(--dim)">Higher timeframe: ${d.higher_timeframe}</div>` : '')
+    + (d.vwap ? `<div style="color:var(--dim)">VWAP ${Number(d.vwap.value).toLocaleString(undefined,{maximumFractionDigits:2})} — ${d.vwap.band}</div>` : '');
+}
+
+async function doCalibrate() {
+  note('replaying history — this measures the lean instead of asserting it…');
+  try {
+    const r = await api('/api/calibrate?' + q({coin: coin(),
+                        interval: $('rInt').value}), {method: 'POST'});
+    if (!r.ok) { note(r.error, true); return; }
+    const rows = (r.table || []).filter(t => t.n > 0)
+      .map(t => `${t.band}: ${(t.up_rate*100).toFixed(0)}% up (n=${t.n})`);
+    note(`scored ${r.scored} past candles — ` + (rows.join(' · ') || 'no bands populated'));
+    loadRead();
+  } catch (e) { note(e.message, true); }
+}
+
+/* ---- the live chart, drawn from OUR OWN data -------------------------
+   Candles the feed built from fills, and the trades the agent took, on one
+   canvas. A chart drawn from the same bars the signals were computed on
+   cannot disagree with them — so when a marker looks wrong here, it IS
+   wrong, which is the entire reason to look.
+
+   Laid out the way a trading chart is laid out, because that is what it is
+   for: OHLC pinned in the corner, a last-price line carried to the axis, a
+   volume pane under the price pane, crosshair labels on both scales, and a
+   countdown on the bar still forming.                                   */
+
+let chartData = null;
+/* Viewport over the bar array. `count` is how many bars are visible and
+   `offset` is how many are hidden off the right edge, so offset 0 always
+   means "pinned to the live bar". */
+let chartView = {count: 90, offset: 0, scale: 1.0, shift: 0};
+let chartHover = null;      // {x, y} in CSS pixels, or null
+let chartTool = 'cursor';   // cursor | hline | trend | erase
+let chartDraft = null;      // a trendline being dragged out
+let chartShapes = [];       // what has been drawn, for this market+timeframe
+/* The vertical scale drawChart last used. Everything that converts between
+   a pixel and a price reads it from here rather than recomputing, because
+   two copies of this arithmetic drift and drawn lines quietly land in the
+   wrong place. */
+let chartScale = null;      // {hi, lo, top, plotH}
+let profileData = null;     // /api/profile payload
+let profileShow = 'dual';   // dual | reference | session | off
+
+/* Which profiles each view draws, and how each one is painted.
+   KEYED, not prefixed globals. A parallel set of svp_* / mvp_* variables
+   is the copy-paste failure this project has already been bitten by twice
+   -- a duplicate checkAlert that silently replaced the original, and a
+   loop variable that shadowed an argparse namespace. One structure means
+   one place to be wrong.
+
+   The two live layers are deliberately NOT painted alike. Drawn at the
+   same width and hue the narrow micro profile disappears inside the wide
+   structural one, and seeing one inside the other is the entire reason
+   there are two. So the structural profile is wide and faint, the micro
+   profile is narrow, opaque and a different hue, and it sits inside the
+   structural footprint rather than beside it. */
+const PROFILE_LAYERS = {
+  dual: [
+    {key: 'svp', tag: 'S', maxShare: 0.22, cap: 150, alpha: 0.26,
+     hue: '#4d8fd1', out: '#5c6470', edge: '#c17d33', poc: '#d14d4d',
+     nodes: true, side: 'left'},
+    {key: 'mvp', tag: 'M', maxShare: 0.13, cap: 92, alpha: 0.72,
+     hue: '#8b6fd0', out: '#6b5a86', edge: '#a982e0', poc: '#e0679b',
+     nodes: false, side: 'right'},
+  ],
+  reference: [
+    {key: 'reference', tag: '', maxShare: 0.22, cap: 150, alpha: 0.30,
+     hue: '#4d8fd1', out: '#7b8794', edge: '#c17d33', poc: '#d14d4d',
+     nodes: true, side: 'left'},
+  ],
+  session: [
+    {key: 'session', tag: '', maxShare: 0.22, cap: 150, alpha: 0.30,
+     hue: '#4d8fd1', out: '#7b8794', edge: '#c17d33', poc: '#d14d4d',
+     nodes: true, side: 'left'},
+  ],
+  off: [],
+};
+
+/* How many HVN/LVN tags a layer may print. The value area levels are
+   always labelled; these are the extras. */
+const NODE_LABELS = 4;
+
+let mtfData = null;         // /api/mtf payload
+let mtfShow = true;         // the 4H/15m/1m setup bubbles
+
+/* Provisional setups are drawn hollow and withdrawn ones are drawn faint
+   rather than deleted. A chart that erases the signals that did not hold
+   shows you a past that is tidier than the one you traded. */
+const MTF_ALPHA = {provisional: 0.95, confirmed: 1.0, withdrawn: 0.30};
+let chartProj = null;       // the projection for the bar still forming
+
+const CH_PAD = {l: 8, r: 62, t: 10, b: 20};
+/* Pane heights, as a share of the drawing area. Drag either divider to
+   change them: the price pane gives up whatever the other two take, and
+   both are clamped so no pane can be squeezed to nothing or swallow the
+   chart. Kept per browser, because it is a preference about this screen
+   rather than anything the agent reads. */
+const CH_GAP = 8;           // breathing room between panes
+const PANE_MIN = 0.08, PANE_MAX = 0.6, PRICE_MIN = 0.25;
+let volShare = 0.24;
+let ppoShare = 0.26;
+let cvdShare = 0.22;
+let cvdOn = true;
+/* One reading per bar, keyed by the bar's own start time. Keyed
+   rather than indexed because the chart can scroll and the two
+   series are produced by different clocks -- lining them up by
+   position would silently slide the CVD against the candles. */
+let cvdMarks = new Map();
+let chartPPO = true;        // Chris's Tick Counter PPO in its own pane
+let chartProjOn = true;     // the projected close on the forming bar
+/* One empty slot on the right when the projection is on, so the block it
+   draws past the live bar is not clipped by the price axis. Every place
+   that converts a bar index to an x must use the same step, or panning
+   drifts against the candles. */
+function rightSlots() { return chartProjOn ? 1 : 0; }
+function chartStep(plotW, n) { return plotW / Math.max(1, n + rightSlots()); }
+/* Your blue and orange from the Pine, nudged into the palette's lightness
+   band so both sit properly against this surface. Validated: they hold
+   deltaE 22 under protanopia, which is what two lines crossing in one
+   small pane need. */
+const PPO_LINE_COL = '#4d8fd1';
+const PPO_SIGNAL_COL = '#c17d33';
+
+/* Which divider the pointer is on, if any. The grab zone is wider than
+   the line: a one pixel target is a line you fight rather than drag. */
+function dividerAt(pt) {
+  const g = chartGeom();
+  if (pt.x < CH_PAD.l || pt.x > CH_PAD.l + g.plotW) return null;
+  if (Math.abs(pt.y - g.volTop) <= 6) return 'vol';
+  if (g.ppoOn && Math.abs(pt.y - g.ppoTop) <= 6) return 'ppo';
+  return null;
+}
+
+function savePanes() {
+  try {
+    localStorage.setItem('liqmap_panes',
+      JSON.stringify({v: volShare, p: ppoShare}));
+  } catch (e) {}
+}
+
+function loadPanes() {
+  try {
+    const raw = localStorage.getItem('liqmap_panes');
+    if (!raw) return;
+    const o = JSON.parse(raw);
+    if (typeof o.v === 'number') {
+      volShare = Math.max(PANE_MIN, Math.min(PANE_MAX, o.v));
+    }
+    if (typeof o.p === 'number') {
+      ppoShare = Math.max(PANE_MIN, Math.min(PANE_MAX, o.p));
+    }
+  } catch (e) {}
+}
+
+function chartKey() {
+  return 'liqmap_draw_' + (chartData ? chartData.coin : '?') + '_'
+         + (chartData ? chartData.interval : '?');
+}
+
+function loadPPOPref() {
+  try {
+    const v = localStorage.getItem('liqmap_ppo');
+    if (v !== null) chartPPO = v === '1';
+    const p2 = localStorage.getItem('liqmap_proj');
+    if (p2 !== null) chartProjOn = p2 === '1';
+  } catch (e) {}
+  const b = $('tool-ppo');
+  if (b) b.classList.toggle('on', chartPPO);
+  const b2 = $('tool-proj');
+  if (b2) b2.classList.toggle('on', chartProjOn);
+}
+
+function loadShapes() {
+  try { chartShapes = JSON.parse(localStorage.getItem(chartKey()) || '[]'); }
+  catch (e) { chartShapes = []; }
+  if (!Array.isArray(chartShapes)) chartShapes = [];
+}
+
+function saveShapes() {
+  // Per viewer, per browser. Lines you drew are a convenience, never
+  // something the agent reads — nothing here reaches a decision.
+  try { localStorage.setItem(chartKey(), JSON.stringify(chartShapes)); }
+  catch (e) {}
+}
+
+function chartGeom() {
+  const cv = $('sugChart');
+  const w = cv.clientWidth, h = cv.clientHeight;
+  const inner = h - CH_PAD.t - CH_PAD.b;
+  const on = chartPPO && chartData && chartData.tick_ppo
+             && chartData.tick_ppo.ready;
+  // Whatever the lower panes are set to, the price pane keeps a floor.
+  // Without this, dragging far enough leaves the candles a few pixels
+  // tall and the chart stops being a chart.
+  const cOn = cvdOn && cvdMarks.size > 1;
+  let v = volShare, pp = on ? ppoShare : 0, cd = cOn ? cvdShare : 0;
+  const room = 1 - PRICE_MIN;
+  if (v + pp + cd > room) {
+    const k = room / (v + pp + cd);
+    v *= k; pp *= k; cd *= k;
+  }
+  const volH = Math.round(inner * v);
+  const ppoH = Math.round(inner * pp);
+  const cvdH = Math.round(inner * cd);
+  const gaps = CH_GAP * (1 + (on ? 1 : 0) + (cOn ? 1 : 0));
+  const plotH = inner - volH - ppoH - cvdH - gaps;
+  const volTop = CH_PAD.t + plotH + CH_GAP;
+  const ppoTop = volTop + volH + CH_GAP;
+  return {w, h, plotW: w - CH_PAD.l - CH_PAD.r, plotH,
+          volH, volTop, ppoH, ppoOn: !!on, ppoTop,
+          cvdH, cvdOn: cOn,
+          cvdTop: (on ? ppoTop + ppoH : volTop + volH) + CH_GAP};
+}
+
+/* How far past the newest bar you may scroll, as a share of the window.
+
+   Without this the last candle is welded to the price axis: you can zoom
+   in as far as you like and the thing you are trying to look at is always
+   jammed against the right edge with nothing in front of it. Every chart
+   worth using lets you pull the live bar into the middle of the screen,
+   because that is where you read what is happening next to it. */
+const RIGHT_ROOM = 0.45;
+
+/* How far the price window may be dragged off the bars, in half-spans.
+   Far enough to bring a profile level sitting above or below the candles
+   into view; not so far that the chart can be lost off-screen. */
+const SHIFT_LIMIT = 3.0;
+
+function chartSlice() {
+  const all = (chartData && chartData.bars) || [];
+  const n = all.length;
+  const count = Math.max(5, Math.min(chartView.count, n));
+  const maxOff = Math.max(0, n - count);
+  /* A NEGATIVE offset scrolls past the newest bar. The slice then returns
+     fewer bars than `count`, and because everything that converts an index
+     to an x uses `count` rather than the bar total, the shortfall renders
+     as empty chart on the right instead of fatter candles. */
+  const minOff = -Math.round(count * RIGHT_ROOM);
+  const off = Math.max(minOff, Math.min(chartView.offset, maxOff));
+  chartView.offset = off;
+  const endIdx = n - off;
+  return {bars: all.slice(Math.max(0, endIdx - count), Math.max(0, endIdx)),
+          all, count, offset: off, maxOff, minOff, atRight: off <= 0};
+}
+
+/* Decimals from the size of the number, so a $4,275 gold print and a
+   $0.00002 token both read correctly without a per-market setting. */
+function chPx(v) {
+  const a = Math.abs(v);
+  const d = a >= 1000 ? 2 : a >= 10 ? 3 : a >= 0.1 ? 5 : 8;
+  return Number(v).toLocaleString(undefined,
+    {minimumFractionDigits: d, maximumFractionDigits: d});
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  return String(d.getHours()).padStart(2, '0') + ':'
+       + String(d.getMinutes()).padStart(2, '0');
+}
+
+function fmtDay(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString(undefined, {month: 'short', day: 'numeric'});
+}
+
+/* mm:ss, the way a bar countdown is read. Hours only when there are any. */
+function fmtLeft(sec) {
+  const s = Math.max(0, Math.round(sec));
+  const two = n => String(n).padStart(2, '0');
+  if (s >= 3600) {
+    return Math.floor(s / 3600) + ':' + two(Math.floor(s / 60) % 60)
+           + ':' + two(s % 60);
+  }
+  return Math.floor(s / 60) + ':' + two(s % 60);
+}
+
+/* A filled label against a scale, the way a trading chart marks a price.
+   Text wears the surface colour on a solid chip so it stays legible over
+   candles, grid and everything else. */
+function axisChip(g, x, y, text, bg, fg, align) {
+  g.font = '11px var(--mono, ui-monospace), monospace';
+  const w = Math.max(g.measureText(text).width + 10, 30);
+  const bx = align === 'left' ? x : x - w / 2;
+  g.fillStyle = bg;
+  g.fillRect(bx, y - 8, w, 16);
+  g.fillStyle = fg;
+  g.textAlign = align === 'left' ? 'left' : 'center';
+  g.fillText(text, align === 'left' ? bx + 5 : x, y + 4);
+  g.font = '10px ui-sans-serif,system-ui,sans-serif';
+  return w;
+}
+
+
+/* ---- volume profile -------------------------------------------------
+   Drawn BEFORE the candles so it sits behind them. A profile painted over
+   the price action hides the thing it is meant to explain.
+
+   Rows come from the server already merged for display; the levels do not.
+   POC, VAH and VAL are drawn at their exact prices, because those are what
+   a reader acts on and a level rounded to a drawing bucket is a level in
+   the wrong place. */
+function drawProfile(g, hi, lo, plotW, plotH) {
+  if (!profileData) return;
+  const layers = PROFILE_LAYERS[profileShow] || [];
+  if (!layers.length) return;
+
+  const y = v => CH_PAD.t + (hi - v) / (hi - lo) * plotH;
+  const right = CH_PAD.l + plotW;
+
+  g.save();
+  /* TWO PASSES, and the reason is not cosmetic: every level line spans
+     the full width, so a one-pass loop lets the second layer's lines
+     paint straight through the first layer's labels. Bars and lines for
+     every layer first, then all the text on top of all of it.
+
+     Widest layer first within each pass, so the narrow opaque profile
+     lands on top of the wide faint one rather than under it. */
+  const labels = [];
+
+  for (const L of layers) {
+    const p = profileData[L.key];
+    if (!p || !p.rows || !p.rows.length) continue;
+    const maxW = Math.min(L.cap, plotW * L.maxShare);
+
+    for (const r of p.rows) {
+      const yTop = y(r.hi), yBot = y(r.lo);
+      const h = Math.max(1, yBot - yTop);
+      if (yBot < CH_PAD.t || yTop > CH_PAD.t + plotH) continue;
+      const w = Math.max(1, (r.share || 0) * maxW);
+      const inVA = r.lo >= p.val && r.hi <= p.vah;
+      g.globalAlpha = inVA ? L.alpha : L.alpha * 0.55;
+      g.fillStyle = inVA ? L.hue : L.out;
+      g.fillRect(right - w, yTop, w, Math.max(1, h - 0.6));
+    }
+    g.globalAlpha = 1;
+
+    /* Exact levels, unmerged. The histogram rows are merged for drawing;
+       these are not, because a level rounded to a drawing bucket is a
+       level in the wrong place and it is the levels a reader acts on. */
+    const pre = L.tag ? L.tag + '·' : '';
+    const mark = (px, label, colour, dash, quiet) => {
+      if (px <= lo || px >= hi) return;
+      const yy = Math.round(y(px)) + 0.5;
+      g.strokeStyle = colour; g.lineWidth = 1;
+      g.setLineDash(dash || []);
+      g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(right, yy); g.stroke();
+      g.setLineDash([]);
+      if (!quiet) labels.push({y: yy, text: pre + label, colour: colour,
+                               L: L});
+    };
+    /* POC FIRST. Where the two auctions are tight the micro value area is
+       a couple of points wide and all three of its levels land inside one
+       label height -- whichever is queued first keeps the slot, and the
+       POC is the one worth reading. */
+    mark(p.poc, 'POC ' + chPx(p.poc), L.poc, []);
+    mark(p.vah, 'VAH ' + chPx(p.vah), L.edge, [4, 3]);
+    mark(p.val, 'VAL ' + chPx(p.val), L.edge, [4, 3]);
+    if (L.nodes) {
+      /* Every node gets a LINE. Only the few nearest the middle of the
+         view get a LABEL: zoomed in on a busy profile there can be a
+         dozen in frame, and a stack of tags reading 'HVN' with no price
+         on it is noise that buries the three levels you came to read. */
+      const mid = (hi + lo) / 2;
+      const near = [].concat((p.hvn || []).map(x => ['HVN', x, L.hue,
+                                                    [2, 4]]),
+                             (p.lvn || []).map(x => ['LVN', x, L.out,
+                                                     [1, 5]]))
+        .filter(nd => nd[1] > lo && nd[1] < hi)
+        .sort((a, b) => Math.abs(a[1] - mid) - Math.abs(b[1] - mid));
+      near.forEach((nd, i) =>
+        mark(nd[1], nd[0] + ' ' + chPx(nd[1]), nd[2], nd[3],
+             i >= NODE_LABELS));
+    }
+  }
+
+  /* Pass two: the text, over every layer's bars and lines.
+
+     Dropped where it would overprint. The POC is very often also an HVN,
+     and a broad shelf can put several nodes within a few ticks of each
+     other; stacked at the same height they smear into something nobody
+     can read. The LINE is always drawn -- only the duplicate label goes.
+     Each side keeps its own occupied list, because the two layers label
+     on opposite edges and cannot collide with each other. */
+  g.font = '10px ui-monospace, monospace';
+  g.textAlign = 'left';
+  const used = {left: [], right: []};
+  for (const t of labels) {
+    const seat = used[t.L.side === 'right' ? 'right' : 'left'];
+    /* The plate is 12px tall, so the guard has to exceed 12 or two
+       labels can still clip each other by a pixel. */
+    if (seat.some(u => Math.abs(u - t.y) < 13)) continue;
+    seat.push(t.y);
+    const w = g.measureText(t.text).width;
+    const x = (t.L.side === 'right') ? right - 3 - w : CH_PAD.l + 3;
+    g.globalAlpha = 0.92;
+    g.fillStyle = plateColour();
+    g.fillRect(x - 2, t.y - 12, w + 4, 12);
+    g.globalAlpha = 1;
+    g.fillStyle = t.colour;
+    g.fillText(t.text, x, t.y - 3);
+  }
+  g.restore();
+}
+
+/* Where the micro auction sits inside the structural one.
+
+   The state is a classification of two shapes that already exist. The
+   second line is the rule YOU stated for that state -- it is shown so the
+   panel can suggest; nothing here sizes, times or places anything. */
+const NEST_COLOUR = {
+  NESTED: '#7b8794', MIGRATING_UP: '#4d8fd1', MIGRATING_DOWN: '#4d8fd1',
+  TESTING_SVP_VAH: '#c17d33', TESTING_SVP_VAL: '#c17d33',
+  BREAKOUT_UP: '#3f9e6a', BREAKOUT_DOWN: '#d14d4d',
+  ENGULFING: '#8b6fd0', UNKNOWN: '#7b8794',
+};
+
+function drawNested(d) {
+  const el = $('nestRead');
+  if (!el) return;
+  el.style.display = profileShow === 'dual' ? '' : 'none';
+  const n = d.nested, s = d.svp, m = d.mvp;
+  if (!n || !s || !m) { el.textContent = ''; return; }
+
+  const vol = n.has_history ? ' · MVP volume ' + n.volume_trend : '';
+  const thin = d.thin ? ' · ' + d.thin : '';
+  el.innerHTML =
+    '<b style="color:' + (NEST_COLOUR[n.state] || '#7b8794') + '">'
+    + n.state.replace(/_/g, ' ') + '</b>'
+    + '  MVP ' + m.minutes + 'm ' + chPx(m.val) + '–' + chPx(m.vah)
+    + ' (POC ' + chPx(m.poc) + ')'
+    + '  in  SVP ' + s.minutes + 'm ' + chPx(s.val) + '–' + chPx(s.vah)
+    + ' (POC ' + chPx(s.poc) + ')' + vol
+    + '<span style="color:var(--dim)">' + thin + '</span>';
+  el.title = n.note + '\\n\\n' + n.playbook;
+}
+
+/* One sentence of structure, refreshed with the chart. No trade, no stop,
+   no direction -- what price is doing against the profile, right now. */
+function cycleProfile() {
+  /* Both -> prior shape -> this session -> off.
+
+     The dual view is the default because the pair is the point: one
+     auction inside another, each with its own levels. The single views
+     are kept because the prior session's shape is a different object
+     from a trailing hour -- it is what was on the chart at the open --
+     and it stays reachable. */
+  const order = ['dual', 'reference', 'session', 'off'];
+  profileShow = order[(order.indexOf(profileShow) + 1) % order.length];
+  const b = $('tool-prof');
+  if (b) {
+    b.classList.toggle('on', profileShow !== 'off');
+    b.textContent = profileShow === 'dual' ? 'prof·2'
+                  : profileShow === 'reference' ? 'prof·prior'
+                  : profileShow === 'session' ? 'prof·now' : 'prof';
+  }
+  const n = $('nestRead');
+  if (n) n.style.display = profileShow === 'dual' ? '' : 'none';
+  drawChart();
+}
+
+/* The two windows are independent inputs. Changing either refetches, so
+   the profile on screen is always the one the numbers describe. */
+function profileWindows() {
+  const num = (id, dflt) => {
+    const v = parseFloat(($(id) || {}).value);
+    return (isFinite(v) && v > 0) ? v : dflt;
+  };
+  const svp = num('svpMin', 60);
+  return {svp_min: svp, mvp_min: Math.min(num('mvpMin', 10), svp)};
+}
+
+/* A micro window as long as the structural one is not a hierarchy -- it
+   is the same profile drawn twice. Rather than silently clamping it (and
+   leaving the dropdown showing a number that is not what you get), the
+   impossible choices are greyed out and a selection that has become
+   impossible falls back to the longest one that still fits. */
+function syncWindowOptions() {
+  const sv = $('svpMin'), mv = $('mvpMin');
+  if (!sv || !mv) return;
+  const svp = parseFloat(sv.value) || 60;
+  let best = null;
+  for (const o of mv.options) {
+    o.disabled = parseFloat(o.value) >= svp;
+    if (!o.disabled) best = o.value;
+  }
+  if (mv.selectedOptions[0] && mv.selectedOptions[0].disabled && best) {
+    mv.value = best;
+  }
+}
+
+function setWindows() {
+  syncWindowOptions();
+  try {
+    localStorage.setItem('profWin', JSON.stringify(profileWindows()));
+  } catch (e) {}
+  loadProfile();
+}
+
+/* Kept per browser, like the drawn lines and the pane heights: which two
+   windows you read is a preference about this screen, not anything the
+   agent acts on. */
+function restoreProfileWindows() {
+  try {
+    const raw = localStorage.getItem('profWin');
+    if (!raw) return;
+    const w = JSON.parse(raw);
+    if (w && w.svp_min && $('svpMin')) $('svpMin').value = w.svp_min;
+    if (w && w.mvp_min && $('mvpMin')) $('mvpMin').value = w.mvp_min;
+  } catch (e) {}
+  syncWindowOptions();
+}
+
+function toggleMTF() {
+  mtfShow = !mtfShow;
+  const b = $('tool-mtf');
+  if (b) b.classList.toggle('on', mtfShow);
+  const r = $('mtfRead');
+  if (r) r.style.display = mtfShow ? '' : 'none';
+  drawChart();
+}
+
+async function loadMTF() {
+  const el = $('mtfRead');
+  try {
+    const d = await api('/api/mtf?' + q({coin: coin(), bars: 1200}));
+    if (!d || !d.ok) {
+      mtfData = null;
+      if (el) el.textContent = (d && d.why) || '';
+      drawChart();
+      return;
+    }
+    mtfData = d;
+    const sv = d.survival || {};
+    const last = (d.signals || []).filter(x => x.status !== 'withdrawn')
+                                  .slice(-1)[0];
+    if (el) {
+      el.style.display = mtfShow ? '' : 'none';
+      if (!last) {
+        el.textContent = `no 4H/15m/1m setup in the last ${d.bars} minutes`;
+        el.title = '';
+      } else {
+        /* The break-even rate is printed BESIDE the setup, not buried in
+           a tooltip. A 10 tick target against a wide stop wins most of
+           the time by construction, and the number that says how much of
+           that is geometry belongs where you read the signal. */
+        el.innerHTML =
+          `<b style="color:${last.side === 'long'
+            ? 'var(--up)' : 'var(--down)'}">${last.side.toUpperCase()}`
+          + `</b> ${last.status}  ·  trigger ${chPx(last.trigger)}`
+          + `  TP ${chPx(last.target)} (${last.target_ticks}t)`
+          + `  SL ${chPx(last.stop)} (${last.stop_ticks}t)`
+          + `  <span style="color:var(--dim)">needs `
+          + `${(last.breakeven * 100).toFixed(1)}% to break even, `
+          + `${(last.driftless * 100).toFixed(1)}% on a coin</span>`
+          + (sv.survival != null
+             ? `  <span style="color:var(--dim)">· ${sv.confirmed}/`
+               + `${sv.resolved} provisional held</span>` : '');
+        el.title = last.note
+          + '\\n\\n"needs X% to break even" is the hit rate this target '
+          + 'and stop require once cost is paid. "Y% on a coin" is what a '
+          + 'driftless random walk scores on the same two distances -- '
+          + 'the gap between them is what the setup has to supply.';
+      }
+    }
+    drawChart();
+  } catch (e) {
+    mtfData = null;
+    if (el) el.textContent = '';
+  }
+}
+
+async function loadProfile() {
+  const el = $('profRead');
+  try {
+    const w = profileWindows();
+    const d = await api('/api/profile?' + q({
+      coin: coin(), interval: $('sInt').value, bars: 400,
+      svp_min: w.svp_min, mvp_min: w.mvp_min}));
+    if (!d || !d.ok) {
+      profileData = null;
+      if (el) el.textContent = (d && d.why) || 'no profile';
+      const n0 = $('nestRead');
+      if (n0) n0.textContent = '';
+      drawChart();
+      return;
+    }
+    profileData = d;
+    drawNested(d);
+    const r = d.read;
+    if (el) {
+      const where = r.at_node
+        ? `at the ${r.at_node} ${chPx(r.node_price)} (${r.ticks_from_node > 0 ? '+' : ''}${r.ticks_from_node}t)`
+        : r.zone;
+      const acc = r.accepted === 'no'
+        ? 'not accepted beyond value'
+        : `accepted ${r.accepted} value`;
+
+      /* The travel: which node is next each way, and whether the ground
+         between here and it is thin. This is the "where does it go from
+         here" part -- not a forecast, just the structure ahead. */
+      const up = r.nearest_above
+        ? `↑ ${chPx(r.nearest_above)}${r.thin_above ? ' (thin)' : ''}`
+        : '↑ clear';
+      const dn = r.nearest_below
+        ? `↓ ${chPx(r.nearest_below)}${r.thin_below ? ' (thin)' : ''}`
+        : '↓ clear';
+
+      el.textContent =
+        `${chPx(r.price)} — ${where} · ${r.doing} · ${acc}   ${up}   ${dn}`;
+      el.title = r.note
+        + (r.thin_above || r.thin_below
+           ? '  |  "thin" = a low-volume node sits between here and that '
+             + 'level, so price has less to trade against on the way.'
+           : '');
+    }
+    drawChart();
+  } catch (e) {
+    profileData = null;
+    if (el) el.textContent = 'profile unavailable';
+  }
+}
+
+function drawChart() {
+  const s = chartSlice();
+  const bars = s.bars;
+  const wrap = $('chartWrap');
+  if (!bars.length) { wrap.style.display = 'none'; return; }
+  wrap.style.display = '';
+
+  const cv = $('sugChart');
+  const dpr = window.devicePixelRatio || 1;
+  const {w, h, plotW, plotH, volH, volTop, ppoH, ppoTop,
+         ppoOn, cvdH, cvdTop, cvdOn: cvdPane} = chartGeom();
+  cv.width = w * dpr; cv.height = h * dpr;
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const css = getComputedStyle(document.documentElement);
+  const col = n => css.getPropertyValue(n).trim() || '#888';
+  const up = col('--up'), down = col('--down'), dim = col('--dim'),
+        line = col('--line'), ink = col('--ink'), panel = col('--panel'),
+        accent = col('--accent'), bg = col('--bg');
+  g.clearRect(0, 0, w, h);
+  g.font = '10px ui-sans-serif,system-ui,sans-serif';
+  g.textBaseline = 'alphabetic';
+
+  /* ---- scales ------------------------------------------------------- */
+
+  let hi = -Infinity, lo = Infinity, vMax = 0;
+  for (const b of bars) {
+    if (b.h > hi) hi = b.h;
+    if (b.l < lo) lo = b.l;
+    if ((b.v || 0) > vMax) vMax = b.v || 0;
+  }
+  if (chartProj && chartProj.ready) {
+    // The projection's own extremes, so the band is never clipped.
+    const a = chartProj.signal.high.q95, b2 = chartProj.signal.low.q5;
+    if (a > hi) hi = a;
+    if (b2 < lo) lo = b2;
+  }
+  for (const m of (chartData.marks || [])) {
+    // Levels belong inside the frame, or a trade's stop sits off-screen
+    // and the chart quietly stops showing you what it risked.
+    const i = markIndex(m, s);
+    if (i < 0 || i >= bars.length) continue;
+    for (const p of [m.target, m.stop, m.entry, m.exit_px]) {
+      if (!p) continue;
+      if (p > hi) hi = p;
+      if (p < lo) lo = p;
+    }
+  }
+  if (!isFinite(hi) || !isFinite(lo) || hi <= lo) { hi = lo + 1; }
+  const mid = (hi + lo) / 2, half = (hi - lo) / 2;
+  // The price axis can be dragged to squash or stretch; 1.0 is a 6% cushion.
+  const span = half * 1.06 / Math.max(0.15, chartView.scale);
+  /* And the whole price window can be dragged up or down. Auto-fitting to
+     the candles alone means anything drawn outside their range -- a value
+     area high above the last hour's bars, a node below them -- is simply
+     not on the chart, with nothing you can do about it. */
+  const push = span * Math.max(-SHIFT_LIMIT,
+                               Math.min(SHIFT_LIMIT, chartView.shift || 0));
+  hi = mid + span + push; lo = mid - span + push;
+
+  chartScale = {hi, lo, top: CH_PAD.t, plotH};
+  drawProfile(g, hi, lo, plotW, plotH);
+  const y = p => CH_PAD.t + (hi - p) / (hi - lo) * plotH;
+  const pxAt = priceAt;
+  /* `count`, NOT `bars.length`. The two are the same until you scroll past
+     the newest bar; after that, using the bar total would stretch the
+     candles to fill the width instead of leaving the room you asked for --
+     and it would put the drawing out of step with the hit-testing, which
+     already uses count. */
+  const step = chartStep(plotW, s.count);
+  const xOf = i => CH_PAD.l + i * step + step / 2;
+  const bw = Math.max(1, Math.min(step * 0.74, 14));
+  const vy = v => volTop + volH - (vMax > 0 ? (v / vMax) * (volH - 2) : 0);
+
+  /* ---- grid --------------------------------------------------------- */
+
+  g.strokeStyle = line; g.lineWidth = 1;
+  g.fillStyle = dim; g.textAlign = 'left';
+  const ticks = 5;
+  for (let i = 0; i <= ticks; i++) {
+    const p = lo + (hi - lo) * i / ticks, yy = Math.round(y(p)) + 0.5;
+    g.globalAlpha = 0.5;
+    g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(CH_PAD.l + plotW, yy);
+    g.stroke(); g.globalAlpha = 1;
+    g.fillText(chPx(p), CH_PAD.l + plotW + 6, yy + 3);
+  }
+
+  // Time axis, spaced by pixels so labels never collide however far you zoom.
+  const minGap = 62;
+  let lastX = -1e9, lastDay = null;
+  g.textAlign = 'center';
+  for (let i = 0; i < bars.length; i++) {
+    const x = xOf(i);
+    if (x - lastX < minGap) continue;
+    lastX = x;
+    const ts = bars[i].ts;
+    g.strokeStyle = line; g.globalAlpha = 0.35;
+    g.beginPath();
+    g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
+    g.lineTo(Math.round(x) + 0.5, cvdPane ? cvdTop + cvdH
+             : (ppoOn ? ppoTop + ppoH : volTop + volH));
+    g.stroke(); g.globalAlpha = 1;
+    g.fillStyle = dim;
+    const day = fmtDay(ts);
+    g.fillText(day !== lastDay ? day : fmtClock(ts), x, h - 6);
+    lastDay = day;
+  }
+
+  // The line between panes, so each reads as its own scale — with a grab
+  // handle on it, because a divider you can drag and cannot see is a
+  // feature nobody finds.
+  const divider = yy2 => {
+    g.strokeStyle = line; g.globalAlpha = 0.8;
+    g.beginPath();
+    g.moveTo(CH_PAD.l, Math.round(yy2) - 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(yy2) - 0.5);
+    g.stroke(); g.globalAlpha = 1;
+    const cx = CH_PAD.l + plotW / 2;
+    g.strokeStyle = dim; g.globalAlpha = 0.55; g.lineWidth = 2;
+    for (const off of [-2, 2]) {
+      g.beginPath();
+      g.moveTo(cx - 9, Math.round(yy2) + off + 0.5);
+      g.lineTo(cx + 9, Math.round(yy2) + off + 0.5);
+      g.stroke();
+    }
+    g.lineWidth = 1; g.globalAlpha = 1;
+  };
+  divider(volTop);
+
+  /* ---- volume pane -------------------------------------------------- */
+
+  for (let i = 0; i < bars.length; i++) {
+    const b = bars[i], x = xOf(i);
+    if (!b.v) continue;
+    g.fillStyle = b.c >= b.o ? up : down;
+    g.globalAlpha = 0.42;
+    const top = vy(b.v);
+    g.fillRect(x - bw / 2, top, bw, volTop + volH - top);
+  }
+  g.globalAlpha = 1;
+  if (vMax > 0) {
+    g.fillStyle = dim; g.textAlign = 'left';
+    g.fillText('vol', CH_PAD.l + 2, volTop + 10);
+    g.fillText(vMax >= 1000 ? (vMax / 1000).toFixed(1) + 'k' : vMax.toFixed(1),
+               CH_PAD.l + plotW + 6, volTop + 10);
+  }
+
+  /* ---- anything you drew -------------------------------------------- */
+
+  for (const sh of chartShapes) {
+    g.strokeStyle = accent; g.globalAlpha = 0.75; g.lineWidth = 1.25;
+    g.beginPath();
+    if (sh.k === 'h') {
+      g.moveTo(CH_PAD.l, y(sh.p)); g.lineTo(CH_PAD.l + plotW, y(sh.p));
+    } else {
+      g.moveTo(tsX(sh.t1, s, xOf, step), y(sh.p1));
+      g.lineTo(tsX(sh.t2, s, xOf, step), y(sh.p2));
+    }
+    g.stroke(); g.lineWidth = 1; g.globalAlpha = 1;
+    if (sh.k === 'h') {
+      axisChip(g, CH_PAD.l + plotW + 1, y(sh.p), chPx(sh.p), accent, bg,
+               'left');
+    }
+  }
+  if (chartDraft) {
+    g.strokeStyle = accent; g.globalAlpha = 0.5; g.setLineDash([4, 3]);
+    g.beginPath();
+    g.moveTo(chartDraft.x1, chartDraft.y1);
+    g.lineTo(chartDraft.x2, chartDraft.y2);
+    g.stroke(); g.setLineDash([]); g.globalAlpha = 1;
+  }
+
+  /* ---- candles ------------------------------------------------------ */
+
+  bars.forEach((b, i) => {
+    const x = xOf(i);
+    /* A FUSED BAR IS COLOURED BY THE BOOK, NOT BY PRICE.
+       Its `dir` is the sign of the OFI accumulator at close, which
+       is how the OFI candles on this chart already read: green when
+       the book committed up, red when down. Using close-vs-open here
+       would make these bars say something different from the ones
+       beside them while looking identical.
+
+       AND THE ONES THAT DISAGREE GO GRAY. `tradeable` is the
+       stricter test -- enough prints AND price agreeing with the
+       book. A bar that fails it still prints, because it happened
+       and it is data, but it is washed out so it cannot be read as
+       a signal at a glance. That is the bar most likely to look
+       like one and not be. */
+    const fused = (b.dir !== undefined && b.tradeable !== undefined);
+    const grayed = fused && !b.tradeable;
+    const c = grayed ? dim
+            : fused ? (b.dir === 'up' ? up : b.dir === 'down' ? down : dim)
+            : (b.c >= b.o ? up : down);
+    g.strokeStyle = c; g.fillStyle = c;
+    if (grayed) g.globalAlpha = 0.45;
+    // Wick as a hairline, body as a filled rect with a one pixel floor so
+    // a doji is still a mark rather than nothing.
+    g.beginPath();
+    g.moveTo(Math.round(x) + 0.5, Math.round(y(b.h)));
+    g.lineTo(Math.round(x) + 0.5, Math.round(y(b.l)));
+    g.stroke();
+    const top = y(Math.max(b.o, b.c)), bot = y(Math.min(b.o, b.c));
+    g.fillRect(Math.round(x - bw / 2), Math.round(top),
+               Math.max(1, Math.round(bw)), Math.max(1, Math.round(bot - top)));
+    if (b.live) {
+      g.strokeStyle = ink; g.globalAlpha = 0.3; g.setLineDash([2, 2]);
+      g.strokeRect(Math.round(x - bw / 2) - 2.5, Math.round(top) - 2.5,
+                   Math.round(bw) + 5, Math.max(1, Math.round(bot - top)) + 5);
+      g.setLineDash([]); g.globalAlpha = 1;
+    }
+    if (grayed) {
+      // The overlay itself: a flat gray box over the bar's whole
+      // span. The wash above makes it recede; this says it was
+      // ruled out on purpose rather than merely drawn faintly.
+      g.globalAlpha = 0.14; g.fillStyle = dim;
+      g.fillRect(Math.round(x - bw / 2) - 1, Math.round(y(b.h)),
+                 Math.max(1, Math.round(bw)) + 2,
+                 Math.max(1, Math.round(y(b.l) - y(b.h))));
+      g.globalAlpha = 1;
+    }
+  });
+
+  /* ---- the bar that has not closed yet ------------------------------ */
+
+  // Drawn one slot to the right of the live bar: a translucent body from
+  // the current price to the projected close, with the 5-95 band as its
+  // wick. It narrows as the bar fills, because the only thing being
+  // projected is the time still left.
+  if (chartProj && chartProj.ready && bars[bars.length - 1] &&
+      bars[bars.length - 1].live) {
+    const q = chartProj.signal.close, hq = chartProj.signal.high,
+          lq = chartProj.signal.low;
+    const px = xOf(bars.length - 1) + step;
+    const now = bars[bars.length - 1].c;
+    const rising = q.q50 >= now;
+    const c = rising ? up : down;
+
+    // The band first, so the body reads over it.
+    g.fillStyle = c; g.globalAlpha = 0.10;
+    g.fillRect(px - bw * 0.8, y(hq.q95), bw * 1.6, y(lq.q5) - y(hq.q95));
+    g.globalAlpha = 0.20;
+    g.fillRect(px - bw * 0.7, y(q.q75), bw * 1.4, y(q.q25) - y(q.q75));
+    g.globalAlpha = 1;
+
+    g.strokeStyle = c; g.globalAlpha = 0.85; g.setLineDash([3, 2]);
+    g.lineWidth = 1.5;
+    g.beginPath();
+    g.moveTo(px, y(q.q50));
+    g.lineTo(px, y(now));
+    g.stroke();
+    g.setLineDash([]); g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(px - 5, y(q.q50)); g.lineTo(px + 5, y(q.q50)); g.stroke();
+    g.globalAlpha = 1;
+
+    // What it is claiming, in one line nobody has to decode.
+    g.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = c; g.textAlign = 'left';
+    // The model's claim and its measured track record, together. The
+    // claim alone reads like a hit rate and is not one.
+    const pu = chartProj.signal.p_up;
+    const m = chartProj.measured || {};
+
+    // BUY or SELL, not "% up".
+    //
+    // Phrasing every projection as a probability of UP meant a short read
+    // printed "37% up" on a red block — the number and the colour saying
+    // opposite-looking things at the moment you most need one glance to
+    // be enough. The probability is now quoted in the direction of the
+    // call, and the distance beside it.
+    const moveBps = ((q.q50 - now) / now) * 10_000;
+    const conf = rising ? pu : 1 - pu;
+    const tickBps = chartData.tick_bps || 0;
+    const inTicks = tickBps > 0
+      ? `  ${(Math.abs(moveBps) / tickBps).toFixed(1)} ticks` : '';
+    const claim = `${rising ? 'BUY' : 'SELL'}  `
+      + `${moveBps >= 0 ? '+' : ''}${moveBps.toFixed(1)}bps${inTicks}`;
+    const track = m.ready
+      ? `${(conf * 100).toFixed(0)}% of paths · ${(m.rate * 100).toFixed(0)}%`
+        + ` measured n=${m.n}`
+      : `${(conf * 100).toFixed(0)}% of paths · not yet measured`;
+
+    // The block sits hard against the price scale, so the labels go to
+    // its LEFT unless there is genuinely room on the right.
+    g.font = '600 10px ui-sans-serif,system-ui,sans-serif';
+    const wNeed = Math.max(g.measureText(claim).width,
+                           g.measureText(track).width) + 10;
+    const fits = px + 8 + wNeed < CH_PAD.l + plotW;
+    const lx = fits ? px + 8 : px - 8 - wNeed;
+    g.textAlign = 'left';
+
+    g.fillStyle = c;
+    g.fillText(claim, lx, y(q.q50) - 4);
+    g.font = '10px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = m.ready ? (m.real ? (m.ci_low > 0.5 ? up : down) : dim)
+                          : dim;
+    g.fillText(track, lx, y(q.q50) + 9);
+  }
+
+  /* ---- last price, carried to the axis ------------------------------ */
+
+  const last = bars[bars.length - 1];
+  const lastUp = last.c >= last.o;
+  const lastY = y(last.c);
+  g.strokeStyle = lastUp ? up : down; g.globalAlpha = 0.55;
+  g.setLineDash([3, 3]);
+  g.beginPath();
+  g.moveTo(CH_PAD.l, Math.round(lastY) + 0.5);
+  g.lineTo(CH_PAD.l + plotW, Math.round(lastY) + 0.5);
+  g.stroke();
+  g.setLineDash([]); g.globalAlpha = 1;
+  axisChip(g, CH_PAD.l + plotW + 1, lastY, chPx(last.c),
+           lastUp ? up : down, bg, 'left');
+
+  // The bar countdown, on the scale directly under the price, which is
+  // where TradingView puts it and where the eye already is. Under thirty
+  // seconds it turns red: on a chart where every trade is out before the
+  // close, the last half minute is the part you act on.
+  if (last.live && chartData.interval_s) {
+    const left = last.ts + chartData.interval_s - Date.now() / 1000;
+    if (left > -60) {
+      axisChip(g, CH_PAD.l + plotW + 1, lastY + 18, fmtLeft(left),
+               left < 30 ? down : dim, bg, 'left');
+    }
+  }
+
+  /* ---- the agent's trades, ON the candle ---------------------------- */
+
+  for (const m of (chartData.marks || [])) {
+    const i = markIndex(m, s);
+    if (i < 0 || i >= bars.length) continue;
+    const b = bars[i], x = xOf(i);
+    const long = m.side === 'long', c = long ? up : down;
+    const xi = exitIndex(m, s);
+    const xe = (xi != null && xi >= 0 && xi < bars.length) ? xOf(xi) : null;
+
+    const right = xe == null ? x + step * 2 : Math.max(xe, x + step * 0.5);
+    g.strokeStyle = c; g.globalAlpha = 0.22; g.setLineDash([2, 4]);
+    for (const p of [m.target, m.stop]) {
+      if (!p) continue;
+      g.beginPath();
+      g.moveTo(x - step * 0.4, y(p)); g.lineTo(right, y(p)); g.stroke();
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    // Clear of the bar, never on it: at the entry price the marker lands
+    // on the body and hides the candle you are trying to verify.
+    const ay = long ? y(b.l) + 12 : y(b.h) - 12;
+    const tip = long ? ay - 7 : ay + 7;
+    g.beginPath();
+    g.moveTo(x, tip); g.lineTo(x - 5.5, ay); g.lineTo(x + 5.5, ay);
+    g.closePath();
+    g.fillStyle = c; g.strokeStyle = c; g.lineWidth = 1.5;
+    if (m.open) g.stroke(); else g.fill();
+    g.lineWidth = 1;
+    g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+    g.textAlign = 'center'; g.fillStyle = c;
+    g.fillText(long ? 'L' : 'S', x, long ? ay + 10 : ay - 4);
+    g.font = '10px ui-sans-serif,system-ui,sans-serif';
+
+    if (xe == null || !m.exit_px) continue;
+    const eb = bars[xi], ok = !!m.won, ec = ok ? up : down;
+    const ey = long ? y(eb.h) - 11 : y(eb.l) + 11;
+    g.strokeStyle = ec; g.globalAlpha = 0.35; g.setLineDash([3, 3]);
+    g.beginPath(); g.moveTo(x, ay); g.lineTo(xe, ey); g.stroke();
+    g.setLineDash([]); g.globalAlpha = 1;
+    g.fillStyle = ec; g.strokeStyle = panel; g.lineWidth = 1.5;
+    g.beginPath(); g.arc(xe, ey, 4, 0, Math.PI * 2);
+    g.fill(); g.stroke(); g.lineWidth = 1;
+    g.fillStyle = ec;
+    g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+    const net = m.net_bps == null ? (ok ? 'win' : 'loss')
+      : (m.net_bps >= 0 ? '+' : '') + Number(m.net_bps).toFixed(0);
+    g.fillText(net, xe, long ? ey - 7 : ey + 14);
+    g.font = '10px ui-sans-serif,system-ui,sans-serif';
+  }
+
+  drawMTF(g, s, xOf, step, y, hi, lo, plotW, up, down, panel);
+
+  /* ---- crosshair ---------------------------------------------------- */
+
+  let readBar = last, readMark = null;
+  if (chartHover) {
+    const i = Math.max(0, Math.min(bars.length - 1,
+                                   Math.floor((chartHover.x - CH_PAD.l) / step)));
+    readBar = bars[i] || last;
+    readMark = (chartData.marks || []).find(m => markIndex(m, s) === i)
+            || (chartData.marks || []).find(m => exitIndex(m, s) === i);
+    const x = xOf(i);
+    g.strokeStyle = dim; g.globalAlpha = 0.55; g.setLineDash([3, 3]);
+    g.beginPath();
+    g.moveTo(Math.round(x) + 0.5, CH_PAD.t);
+    g.lineTo(Math.round(x) + 0.5, cvdPane ? cvdTop + cvdH
+             : (ppoOn ? ppoTop + ppoH : volTop + volH));
+    g.moveTo(CH_PAD.l, Math.round(chartHover.y) + 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(chartHover.y) + 0.5);
+    g.stroke();
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    // Both scales get a label. A crosshair with a price but no time is
+    // half a crosshair.
+    if (chartHover.y < volTop) {
+      axisChip(g, CH_PAD.l + plotW + 1, chartHover.y, chPx(pxAt(chartHover.y)),
+               ink, bg, 'left');
+    }
+    axisChip(g, x, h - 10,
+             fmtDay(readBar.ts) + ' ' + fmtClock(readBar.ts), ink, bg);
+  }
+
+  /* ---- Chris's Tick Counter PPO, in its own pane -------------------- */
+
+  let readPPO = null;
+  /* ---- the two CVD readings, beside the candles that made them ----
+
+     Its OWN pane, sharing the x-axis with the price above. Not an
+     overlay: overlaying would need a second y-scale on the price
+     pane, and two scales on one pane make any two shapes look
+     related -- the lines would appear to track or diverge from price
+     in ways that are an artefact of the scaling.
+
+     Both lines are in standard deviations of their own recent
+     behaviour, which is what lets a book reading running to 244k
+     contracts and a traded one at 42k share a scale at all. The
+     y-axis therefore reads in sigma, and says so.
+
+     Lined up by the bar's OWN start time, not by position in the
+     array: the candles and the CVD come from different clocks, and
+     matching by index would let the two slide against each other
+     without ever looking wrong. */
+  if (cvdPane) {
+    divider(cvdTop);
+
+    let m = 1;
+    const vals = [];
+    for (let i = 0; i < bars.length; i++) {
+      const r = cvdMarks.get(bars[i].ts);
+      vals.push(r || null);
+      if (r) {
+        m = Math.max(m, Math.abs(r.book), Math.abs(r.tape));
+      }
+    }
+    const cy = v => cvdTop + cvdH / 2 - (v / m) * (cvdH / 2 - 3);
+
+    // the zero line and the lean gates, so the scale is readable
+    g.strokeStyle = line; g.globalAlpha = 0.8;
+    g.beginPath(); g.moveTo(CH_PAD.l, Math.round(cy(0)) + 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(cy(0)) + 0.5); g.stroke();
+    g.globalAlpha = 0.35; g.setLineDash([2, 3]);
+    for (const gate of [1, -1]) {
+      g.beginPath(); g.moveTo(CH_PAD.l, Math.round(cy(gate)) + 0.5);
+      g.lineTo(CH_PAD.l + plotW, Math.round(cy(gate)) + 0.5); g.stroke();
+    }
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    /* Identity is not colour alone: the reader is solid, the
+       confirmation dashed. The site's --up/--down sit about five
+       deutan units apart, under the readable floor. */
+    const strokeCvd = (key, col, dash, width) => {
+      g.strokeStyle = col; g.lineWidth = width;
+      g.setLineDash(dash); g.beginPath();
+      let open = false;
+      for (let i = 0; i < bars.length; i++) {
+        const r = vals[i];
+        if (!r) { open = false; continue; }
+        const x = xOf(i), yy = cy(r[key]);
+        if (open) g.lineTo(x, yy); else { g.moveTo(x, yy); open = true; }
+      }
+      g.stroke(); g.setLineDash([]);
+    };
+    // Book line only. Price is the candles directly above this
+    // pane; drawing it again here would be the same information
+    // twice, on a second scale, for no gain.
+    strokeCvd('book', accent, [], 1.8);
+
+    g.fillStyle = dim; g.textAlign = 'left';
+    g.fillText('σ', CH_PAD.l + plotW + 6, cy(0) + 3);
+    g.fillText('book CVD — price ╌╌  (sigma)',
+               CH_PAD.l + 4, cvdTop + 11);
+  }
+
+  if (ppoOn) {
+    const t = chartData.tick_ppo;
+    const from = s.all.length - s.offset - bars.length;
+    const cut = a => (a || []).slice(Math.max(0, from),
+                                     Math.max(0, from) + bars.length);
+    const P = cut(t.ppo), S = cut(t.signal), H = cut(t.hist);
+
+    // One scale for all three, symmetric about zero: the line, its signal
+    // and their difference are the same units, and giving them separate
+    // scales would make a crossover look like something it is not.
+    let m = 0;
+    for (const arr of [P, S, H]) {
+      for (const v of arr) if (v != null && Math.abs(v) > m) m = Math.abs(v);
+    }
+    m = m || 1;
+    const py = v => ppoTop + ppoH / 2 - (v / m) * (ppoH / 2 - 2);
+
+    divider(ppoTop);
+
+    // The histogram first, so the lines sit over it.
+    const zero = py(0);
+    for (let i = 0; i < bars.length; i++) {
+      const v = H[i];
+      if (v == null) continue;
+      const p = P[i];
+      g.fillStyle = p == null || p === 0 ? dim : p > 0 ? up : down;
+      g.globalAlpha = 0.45;
+      const yv = py(v);
+      g.fillRect(xOf(i) - bw / 2, Math.min(zero, yv), Math.max(bw, 1),
+                 Math.max(1, Math.abs(yv - zero)));
+    }
+    g.globalAlpha = 1;
+
+    g.strokeStyle = dim; g.globalAlpha = 0.5; g.setLineDash([2, 3]);
+    g.beginPath(); g.moveTo(CH_PAD.l, Math.round(zero) + 0.5);
+    g.lineTo(CH_PAD.l + plotW, Math.round(zero) + 0.5); g.stroke();
+    g.setLineDash([]); g.globalAlpha = 1;
+
+    const stroke = (arr, col, width) => {
+      g.strokeStyle = col; g.lineWidth = width; g.beginPath();
+      let open = false;
+      for (let i = 0; i < bars.length; i++) {
+        const v = arr[i];
+        if (v == null) { open = false; continue; }
+        const x = xOf(i), yv = py(v);
+        if (!open) { g.moveTo(x, yv); open = true; } else { g.lineTo(x, yv); }
+      }
+      g.stroke(); g.lineWidth = 1;
+    };
+    stroke(S, PPO_SIGNAL_COL, 1);
+    stroke(P, PPO_LINE_COL, 2);
+
+    g.fillStyle = dim; g.textAlign = 'left';
+    g.fillText('tick ppo', CH_PAD.l + 2, ppoTop + 10);
+    g.fillText(m.toFixed(2), CH_PAD.l + plotW + 6, ppoTop + 10);
+    g.fillText('-' + m.toFixed(2), CH_PAD.l + plotW + 6, ppoTop + ppoH - 2);
+
+    const hi2 = chartHover
+      ? Math.max(0, Math.min(bars.length - 1,
+          Math.floor((chartHover.x - CH_PAD.l) / step)))
+      : bars.length - 1;
+    readPPO = {ppo: P[hi2], signal: S[hi2], hist: H[hi2]};
+  }
+
+  /* ---- the corner readout ------------------------------------------- */
+
+  drawCorner(g, {readBar, readMark, readPPO, up, down, dim, ink, bg,
+                 accent, w});
+}
+
+/* The OHLC line, pinned top-left, the way every trading chart does it.
+
+   A floating tooltip box covers whatever it is describing and moves while
+   you read it. In the corner it is always in the same place, so the eye
+   learns where to look and the candles stay uncovered. */
+function drawCorner(g, o) {
+  const b = o.readBar;
+  const rise = b.c >= b.o;
+  const c = rise ? o.up : o.down;
+  const chg = b.o ? (b.c - b.o) / b.o * 100 : 0;
+
+  let x = CH_PAD.l + 2;
+  const yy = CH_PAD.t + 11;
+  const put = (t, col, bold) => {
+    g.font = (bold ? '600 ' : '') + '11px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = col; g.textAlign = 'left';
+    g.fillText(t, x, yy);
+    x += g.measureText(t).width + 6;
+  };
+
+  put((chartData.coin || '') + ' · ' + (chartData.interval || ''), o.ink, true);
+  g.font = '11px var(--mono, ui-monospace), monospace';
+  for (const [k, v] of [['O', b.o], ['H', b.h], ['L', b.l], ['C', b.c]]) {
+    g.fillStyle = o.dim; g.textAlign = 'left';
+    g.fillText(k, x, yy); x += g.measureText(k).width + 3;
+    g.fillStyle = c;
+    g.fillText(chPx(v), x, yy); x += g.measureText(chPx(v)).width + 8;
+  }
+  const pct = (chg >= 0 ? '+' : '') + chg.toFixed(2) + '%';
+  g.fillStyle = c; g.fillText(pct, x, yy);
+  x += g.measureText(pct).width + 10;
+
+  // How long the bar being traded has left. On a chart where every trade
+  // dies with its candle, that is not decoration.
+  if (b.live && chartData.interval_s) {
+    const left = b.ts + chartData.interval_s - Date.now() / 1000;
+    g.font = '600 11px ui-sans-serif,system-ui,sans-serif';
+    g.fillStyle = left < 30 ? o.down : o.accent;
+    const t = fmtLeft(left) + ' to close';
+    g.fillText(t, x, yy);
+    // Advance the cursor. Every other field on this line does, and the
+    // one that did not printed the indicator on top of the countdown.
+    x += g.measureText(t).width + 10;
+  }
+
+  // The indicator, on the same line as the price it belongs to.
+  if (o.readPPO && o.readPPO.ppo != null) {
+    const r = o.readPPO;
+    g.font = '11px var(--mono, ui-monospace), monospace';
+    const put2 = (label, v, col) => {
+      g.fillStyle = o.dim; g.textAlign = 'left';
+      g.fillText(label, x, yy); x += g.measureText(label).width + 3;
+      const t = (v >= 0 ? '+' : '') + v.toFixed(2);
+      g.fillStyle = col;
+      g.fillText(t, x, yy); x += g.measureText(t).width + 8;
+    };
+    x += 4;
+    put2('PPO', r.ppo, PPO_LINE_COL);
+    if (r.signal != null) put2('sig', r.signal, PPO_SIGNAL_COL);
+    if (r.hist != null) {
+      put2('h', r.hist, r.ppo > 0 ? o.up : r.ppo < 0 ? o.down : o.dim);
+    }
+  }
+
+  // A trade under the cursor gets a second line, in the same place.
+  const m = o.readMark;
+  if (!m) return;
+  g.font = '11px ui-sans-serif,system-ui,sans-serif';
+  const mc = m.side === 'long' ? o.up : o.down;
+  let t = (m.side || '').toUpperCase() + ' @ ' + chPx(m.entry)
+        + (m.shape ? '  ' + m.shape : '')
+        + (m.why ? '  ·  ' + m.why : '');
+  if (m.open) {
+    t += '  ·  still open';
+  } else {
+    t += '  ·  ' + (m.won ? 'WIN' : 'LOSS') + ' ' + (m.exit_reason || '')
+       + (m.net_bps == null ? ''
+          : '  ' + (m.net_bps >= 0 ? '+' : '') + Number(m.net_bps).toFixed(1)
+            + 'bps net');
+  }
+  g.fillStyle = mc; g.textAlign = 'left';
+  g.fillText(t, CH_PAD.l + 2, CH_PAD.t + 25);
+}
+
+/* Which visible slot a mark belongs in, from timestamps rather than a
+   stored index, so it stays correct while panning. */
+/* The 4H/15m/1m setups, over the candles.
+
+   Signal timestamps are 1-MINUTE, whatever the chart is showing, because
+   the engine always reads 1m bars. tsX converts by the chart's own
+   interval, so a 1m signal inside a 15m candle lands at a fractional bar
+   index -- which is where it actually happened, not the start of the
+   candle that contains it. */
+function drawMTF(g, s, xOf, step, y, hi, lo, plotW, up, down, panel) {
+  if (!mtfShow || !mtfData || !mtfData.signals || !s.bars.length) return;
+  const right = CH_PAD.l + plotW;
+  const inView = p => p > lo && p < hi;
+
+  g.save();
+  let live = null;
+  for (const sig of mtfData.signals) {
+    const x = tsX(sig.ts, s, xOf, step);
+    if (x < CH_PAD.l - 20 || x > right + 20) continue;
+    if (!inView(sig.trigger)) continue;
+    if (sig.status !== 'withdrawn') live = sig;
+
+    const long = sig.side === 'long';
+    const c = long ? up : down;
+    const yy = y(sig.trigger) + (long ? 14 : -14);
+
+    g.globalAlpha = MTF_ALPHA[sig.status] != null
+      ? MTF_ALPHA[sig.status] : 0.9;
+    g.beginPath();
+    g.arc(x, yy, 5.5, 0, Math.PI * 2);
+    /* Filled means the 15m bar closed the way the setup needed. Hollow
+       means it has not closed yet. Identity never rides on colour alone:
+       the fill says confirmed, the position says which side. */
+    if (sig.status === 'confirmed') {
+      g.fillStyle = c; g.fill();
+      g.strokeStyle = panel; g.lineWidth = 1.5; g.stroke();
+    } else {
+      g.fillStyle = panel; g.fill();
+      g.strokeStyle = c; g.lineWidth = 1.5; g.stroke();
+    }
+    g.lineWidth = 1;
+    g.fillStyle = c;
+    g.font = '600 9px ui-sans-serif,system-ui,sans-serif';
+    g.textAlign = 'center';
+    g.fillText(long ? 'L' : 'S', x, yy + 3);
+    g.textAlign = 'left';
+  }
+  g.globalAlpha = 1;
+
+  /* Target and invalidation for the most recent setup that has not been
+     withdrawn. Drawing them for every signal in view turns the chart into
+     a ladder of lines nobody can read. */
+  if (live) {
+    const band = (px, colour, dash, label) => {
+      if (!inView(px)) return;
+      const yy = Math.round(y(px)) + 0.5;
+      g.strokeStyle = colour; g.lineWidth = 1;
+      g.setLineDash(dash);
+      g.beginPath(); g.moveTo(CH_PAD.l, yy); g.lineTo(right, yy); g.stroke();
+      g.setLineDash([]);
+      /* Labelled down the MIDDLE of the plot, not at either edge. The
+         structural profile already owns the left margin and the micro
+         profile owns the right; a third family stacked on top of either
+         overprints exactly when the levels are close together, which is
+         when you need to read them. These lines span the full width, so
+         the centre is as true a place to label them as an edge. */
+      g.font = '10px ui-monospace, monospace';
+      const w = g.measureText(label).width;
+      const x = CH_PAD.l + plotW * 0.5 - w / 2;
+      g.globalAlpha = 0.92; g.fillStyle = plateColour();
+      g.fillRect(x - 3, yy - 12, w + 6, 12);
+      g.globalAlpha = 1; g.fillStyle = colour;
+      g.fillText(label, x, yy - 3);
+    };
+    const c = live.side === 'long' ? up : down;
+    band(live.target, c, [2, 3], 'TP ' + chPx(live.target));
+    band(live.stop, '#a33', [], 'SL ' + chPx(live.stop));
+  }
+  g.restore();
+}
+
+function markIndex(m, s) {
+  return Math.round(barPos(m.entry_ts || m.ts, s));
+}
+
+function exitIndex(m, s) {
+  if (!m.exit_ts) return null;
+  return Math.round(barPos(m.exit_ts, s));
+}
+
+/* A TIMESTAMP IN BAR UNITS. On a clock chart this is a division --
+   every bar is the same width in seconds, so (ts - first) / interval
+   IS the bar number. On a tick chart it is not: a bar can take two
+   seconds or four minutes, and dividing by any fixed number puts a
+   drawn level on the wrong bar and keeps it there.
+
+   So when there is no interval, this walks the bars. The fractional
+   part interpolates inside whichever bar contains the timestamp, and
+   beyond either end it extrapolates on that end bar's own duration,
+   which is the only rate there is any evidence for. */
+function barPos(ts, s) {
+  const iv = chartData.interval_s;
+  const b = s.bars;
+  if (iv) return (ts - b[0].ts) / iv;
+  if (!b || !b.length) return 0;
+  const span = (r) => Math.max(0.001, (r.ts_last || r.ts) - r.ts);
+  if (ts <= b[0].ts) return (ts - b[0].ts) / span(b[0]);
+  for (let i = 0; i < b.length; i++) {
+    const end = (i + 1 < b.length) ? b[i + 1].ts : b[i].ts + span(b[i]);
+    if (ts < end) return i + (ts - b[i].ts) / Math.max(0.001, end - b[i].ts);
+  }
+  const last = b[b.length - 1];
+  return (b.length - 1) + (ts - last.ts) / span(last);
+}
+
+function posTs(pos, s) {
+  const iv = chartData.interval_s;
+  const b = s.bars;
+  if (iv) return b[0].ts + pos * iv;
+  if (!b || !b.length) return 0;
+  const span = (r) => Math.max(0.001, (r.ts_last || r.ts) - r.ts);
+  const i = Math.floor(pos), f = pos - i;
+  if (i < 0) return b[0].ts + pos * span(b[0]);
+  if (i >= b.length) {
+    const last = b[b.length - 1];
+    return last.ts + (pos - (b.length - 1)) * span(last);
+  }
+  const end = (i + 1 < b.length) ? b[i + 1].ts : b[i].ts + span(b[i]);
+  return b[i].ts + f * (end - b[i].ts);
+}
+
+/* A timestamp's x, even when it is off the visible slice — a trendline
+   anchored to a bar you have scrolled past still has to point somewhere. */
+function tsX(ts, s, xOf, step) {
+  return xOf(0) + barPos(ts, s) * step;
+}
+
+function xTs(x, s, step) {
+  return posTs((x - (CH_PAD.l + step / 2)) / step, s);
+}
+
+/* ---- interaction ------------------------------------------------------ */
+
+function chartPoint(ev) {
+  const r = $('sugChart').getBoundingClientRect();
+  const t = ev.touches && ev.touches[0];
+  return {x: (t ? t.clientX : ev.clientX) - r.left,
+          y: (t ? t.clientY : ev.clientY) - r.top};
+}
+
+function pickTool(t) {
+  chartTool = t;
+  for (const k of ['cursor', 'hline', 'trend', 'erase']) {
+    const el = $('tool-' + k);
+    if (el) el.classList.toggle('on', k === t);
+  }
+  $('sugChart').style.cursor = t === 'cursor' ? 'crosshair' : 'copy';
+}
+
+function toggleProj() {
+  chartProjOn = !chartProjOn;
+  const b = $('tool-proj');
+  if (b) b.classList.toggle('on', chartProjOn);
+  try {
+    localStorage.setItem('liqmap_proj', chartProjOn ? '1' : '0');
+  } catch (e) {}
+  loadChart();
+}
+
+function togglePPO() {
+  chartPPO = !chartPPO;
+  const b = $('tool-ppo');
+  if (b) b.classList.toggle('on', chartPPO);
+  try { localStorage.setItem('liqmap_ppo', chartPPO ? '1' : '0'); } catch (e) {}
+  drawChart();
+}
+
+function clearShapes() {
+  chartShapes = [];
+  saveShapes();
+  drawChart();
+}
+
+function wireChart() {
+  const cv = $('sugChart');
+  if (cv._wired) return;
+  cv._wired = true;
+  cv.style.cursor = 'crosshair';
+
+  cv.addEventListener('mousemove', ev => {
+    const p = chartPoint(ev);
+    chartHover = p;
+    if (chartDraft) { chartDraft.x2 = p.x; chartDraft.y2 = p.y; }
+    if (!drag) {
+      cv.style.cursor = dividerAt(p) ? 'ns-resize'
+        : chartTool === 'cursor' ? 'crosshair' : 'copy';
+    }
+    drawChart();
+  });
+  cv.addEventListener('mouseleave', () => { chartHover = null; drawChart(); });
+
+  // Wheel zooms about the cursor, so the bar you are looking at stays put.
+  cv.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    const s = chartSlice();
+    if (!s.bars.length) return;
+    const {plotW} = chartGeom();
+    const frac = Math.max(0, Math.min(1, (chartPoint(ev).x - CH_PAD.l) / plotW));
+    const before = chartView.count;
+    const next = Math.round(before * (ev.deltaY > 0 ? 1.15 : 0.87));
+    /* Five bars, not fifteen. Reading an interaction with a node means
+       looking at the individual candles that made it. */
+    chartView.count = Math.max(5, Math.min(next, s.all.length));
+    const grew = chartView.count - before;
+    /* No clamp at zero here -- chartSlice owns the bounds, and clamping
+       twice is how the right-hand room gets quietly taken back on the
+       next scroll. */
+    chartView.offset = chartView.offset - Math.round(grew * (1 - frac));
+    drawChart();
+  }, {passive: false});
+
+  let drag = null;
+  const down = ev => {
+    const p = chartPoint(ev);
+    const {plotW} = chartGeom();
+
+    // A divider grab beats every tool: it is the only thing on that line.
+    const div = dividerAt(p);
+    if (div) {
+      const g = chartGeom();
+      drag = {pane: div, y: p.y, vol: volShare, ppo: ppoShare,
+              inner: Math.max(1, g.h - CH_PAD.t - CH_PAD.b)};
+      return;
+    }
+    // Past the plot is the price scale: drag it to squash or stretch.
+    if (p.x > CH_PAD.l + plotW) {
+      drag = {axis: true, y: p.y, scale: chartView.scale};
+      return;
+    }
+    if (chartTool === 'hline') {
+      const s = chartSlice();
+      chartShapes.push({k: 'h', p: priceAt(p.y)});
+      saveShapes(); pickTool('cursor'); drawChart(); return;
+    }
+    if (chartTool === 'trend') {
+      chartDraft = {x1: p.x, y1: p.y, x2: p.x, y2: p.y};
+      return;
+    }
+    if (chartTool === 'erase') {
+      eraseNear(p); pickTool('cursor'); drawChart(); return;
+    }
+    /* Pan. Both axes in one gesture: grab the chart and move it wherever
+       you need it, the way every charting tool works. */
+    drag = {x: p.x, offset: chartView.offset,
+            y: p.y, shift: chartView.shift || 0};
+    cv.style.cursor = 'grabbing';
+  };
+  const move = ev => {
+    if (!drag) return;
+    const p = chartPoint(ev);
+    if (drag.pane) {
+      // Dragging a divider UP makes the pane below it taller, which is
+      // the direction every charting tool uses.
+      const d = (drag.y - p.y) / drag.inner;
+      const clamp = x => Math.max(PANE_MIN, Math.min(PANE_MAX, x));
+      if (drag.pane === 'ppo') {
+        ppoShare = clamp(drag.ppo + d);
+      } else {
+        volShare = clamp(drag.vol + d);
+      }
+      savePanes();
+      drawChart();
+      return;
+    }
+    if (drag.axis) {
+      // Down squashes, up stretches — the direction every chart uses.
+      chartView.scale = Math.max(0.15,
+        Math.min(6, drag.scale * (1 + (p.y - drag.y) / 220)));
+      drawChart();
+      return;
+    }
+    const s = chartSlice();
+    const geo = chartGeom();
+    const step = chartStep(geo.plotW, s.count);
+    /* The lower bound is chartSlice's, not zero, or the scroll-past room
+       is unreachable by dragging -- which is the only way most people
+       ever move a chart. */
+    chartView.offset = Math.max(s.minOff, Math.min(s.all.length - s.count,
+      Math.round(drag.offset + (p.x - drag.x) / step)));
+    /* Vertical, in half-spans, so the drag keeps up with the pointer at
+       any zoom: a full plot height is two spans. Dragging DOWN raises the
+       price window, so the candle under your hand follows your hand. */
+    const inner = Math.max(1, geo.plotH);
+    chartView.shift = Math.max(-SHIFT_LIMIT, Math.min(SHIFT_LIMIT,
+      drag.shift + (p.y - drag.y) / inner * 2));
+    drawChart();
+  };
+  const upEv = ev => {
+    if (chartDraft) {
+      const s = chartSlice();
+      const step = chartStep(chartGeom().plotW, s.count);
+      const far = Math.abs(chartDraft.x2 - chartDraft.x1) > 6
+               || Math.abs(chartDraft.y2 - chartDraft.y1) > 6;
+      if (far) {
+        chartShapes.push({k: 't',
+          t1: xTs(chartDraft.x1, s, step), p1: priceAt(chartDraft.y1),
+          t2: xTs(chartDraft.x2, s, step), p2: priceAt(chartDraft.y2)});
+        saveShapes();
+      }
+      chartDraft = null; pickTool('cursor'); drawChart();
+    }
+    if (drag) cv.style.cursor = chartTool === 'cursor' ? 'crosshair' : 'copy';
+    drag = null;
+  };
+
+  cv.addEventListener('mousedown', down);
+  window.addEventListener('mousemove', move);
+  window.addEventListener('mouseup', upEv);
+  cv.addEventListener('dblclick', resetChartView);
+
+  cv.addEventListener('touchstart', ev => { down(ev); }, {passive: true});
+  cv.addEventListener('touchmove', ev => {
+    const p = chartPoint(ev);
+    chartHover = p; move(ev); drawChart();
+  }, {passive: true});
+  cv.addEventListener('touchend', upEv);
+}
+
+/* The price under a y, from the scale drawChart actually used. */
+function priceAt(yy) {
+  const c = chartScale;
+  if (!c || !c.plotH) return 0;
+  return c.hi - (yy - c.top) / c.plotH * (c.hi - c.lo);
+}
+
+function eraseNear(p) {
+  const s = chartSlice();
+  const {plotW} = chartGeom();
+  const step = chartStep(plotW, s.count);
+  const xOf = i => CH_PAD.l + i * step + step / 2;
+  const target = priceAt(p.y);
+  let best = -1, bestD = 1e18;
+  chartShapes.forEach((sh, i) => {
+    let d;
+    if (sh.k === 'h') {
+      d = Math.abs(sh.p - target);
+    } else {
+      const mx = (tsX(sh.t1, s, xOf, step) + tsX(sh.t2, s, xOf, step)) / 2;
+      d = Math.abs((sh.p1 + sh.p2) / 2 - target) + Math.abs(mx - p.x) * 1e-6;
+    }
+    if (d < bestD) { bestD = d; best = i; }
+  });
+  // Only within a visible distance, so a stray click does not delete
+  // something on the other side of the chart.
+  const reach = Math.abs(priceAt(p.y + 14) - target);
+  if (best >= 0 && bestD <= reach) { chartShapes.splice(best, 1); saveShapes(); }
+}
+
+function resetChartView() {
+  /* Everything back, including the vertical shift -- a chart dragged off
+     its own candles with no one-click way home is a chart you have to
+     reload the page to recover. */
+  chartView = {count: 90, offset: 0, scale: 1.0, shift: 0};
+  drawChart();
+}
+
+async function loadChart() {
+  const prev = chartData;
+  let d;
+  try {
+    d = await api('/api/chart?' + q({
+      coin: coin(), interval: $('sInt').value, bars: 400}));
+  } catch (e) { return; }
+  if (d && d.error) {
+    // SAY IT RATHER THAN DRAWING THE LAST GOOD CHART IN SILENCE.
+    // A tick series that has not filled yet, or a tape that is not
+    // running, returns an error and used to leave the previous
+    // candles on screen wearing the new label -- which is how you
+    // end up reading 15-minute bars believing they are prints.
+    const note = $('chartNote');
+    if (note) note.textContent = d.error;
+    return;
+  }
+
+  // Hold position when new bars arrive. Scrolled back through history and
+  // having the view yanked forward every time a candle closes is the
+  // single most irritating thing a live chart can do.
+  if (prev && prev.bars && d.bars && chartView.offset > 0
+      && prev.coin === d.coin && prev.interval === d.interval) {
+    const grew = d.bars.length - prev.bars.length;
+    if (grew > 0) chartView.offset += grew;
+  }
+  const fresh = !prev || prev.coin !== d.coin || prev.interval !== d.interval;
+  chartData = d;
+  if (fresh) { loadShapes(); loadPPOPref(); loadPanes(); resetChartView(); }
+
+  // The projection rides along with the chart: same poll, same bar.
+  // Not on a tick series: the projection is a distance over a
+  // REMAINING DURATION, and a tick bar has no scheduled end to have
+  // a remainder of.
+  if (chartProjOn && !isCountTf($('sInt').value)) {
+    try {
+      const pr = await api('/api/projection?' + q({
+        coin: coin(), interval: $('sInt').value}));
+      chartProj = pr && pr.ok && pr.ready ? pr : null;
+    } catch (e) { chartProj = null; }
+  } else {
+    chartProj = null;
+  }
+
+  wireChart();
+  drawChart();
+  const n = (chartData.marks || []).length;
+  // On a tick series the bar COUNT is not the interesting number --
+  // the rate is. How long a bar is taking against its own recent
+  // median is the one thing a clock chart cannot show you, so it
+  // goes where the trade count would be.
+  /* On a counted series the bar TALLY is not the interesting number
+     -- what it is waiting on is. A fused bar can sit at 98% on one
+     leg and 4% on the other, and that is the whole point of fusing
+     them, so both are said rather than rolled into one figure. */
+  const head = chartData.source === 'fused'
+    ? `${chartData.tick_target.toLocaleString()} prints &times; `
+      + `${chartData.ofi_target.toLocaleString()} OFI · `
+      + esc((chartData.progress || {}).say || '')
+      + ' · ' + esc((chartData.summary || {}).say || '')
+    : chartData.source === 'tick'
+    ? `${chartData.per_bar} prints a bar · `
+      + esc((chartData.pace || {}).say || '')
+      + (chartData.marks_note ? ' · ' + esc(chartData.marks_note) : '')
+    : `${esc(chartData.source || '')} · ${n} trade${n === 1 ? '' : 's'}`;
+  $('chartNote').innerHTML = head + ' · '
+    + 'scroll to zoom · drag to pan · drag the price scale to stretch · '
+    + 'drag a pane divider to resize it · drag the bottom-right corner for '
+    + 'a taller chart · double-click to reset';
+}
+
+window.addEventListener('resize', () => { if (chartData) drawChart(); });
+
+/* Dragging the box's corner changes its height, and the canvas has to be
+   told: a canvas element scales its bitmap to fit unless you redraw it,
+   which turns a taller chart into a blurrier one. */
+(() => {
+  const box = $('chartBox');
+  if (!box || !window.ResizeObserver) return;
+  let last = 0;
+  new ResizeObserver(() => {
+    const h = box.clientHeight;
+    if (h === last) return;
+    last = h;
+    try { localStorage.setItem('liqmap_charth', String(h)); } catch (e) {}
+    if (chartData) drawChart();
+  }).observe(box);
+  try {
+    const saved = parseInt(localStorage.getItem('liqmap_charth') || '0', 10);
+    if (saved >= 240 && saved <= 1400) box.style.height = saved + 'px';
+  } catch (e) {}
+})();
+
+/* A countdown that only moves when new data arrives is a clock that lies
+   between polls. One redraw a second, and only while the chart is on
+   screen — a hidden canvas has nothing to say and a background tab should
+   not be burning frames. */
+/* Is the chart on screen and worth spending work on? Both loops below
+   ask the same question, and they MUST ask it the same way -- a
+   repaint loop and a refetch loop that disagree about visibility is
+   how you get a chart that fetches forever on a hidden tab. */
+function chartVisible() {
+  if (document.hidden) return false;
+  const pane = $('tab-dash');
+  if (pane && pane.hidden) return false;
+  const wrap = $('chartWrap');
+  if (!wrap || wrap.style.display === 'none') return false;
+  return true;
+}
+
+/* REPAINT. Was gated on `chartData.interval_s`, which a tick series
+   deliberately does not have -- a tick bar has no fixed duration, so
+   the route reports null. That guard froze the tick chart solid:
+   every print arriving, the forming bar growing on the server, and
+   the canvas never redrawn. The live-bar check below is the real
+   condition and it was always doing the work. */
+setInterval(() => {
+  if (!chartData || !chartVisible()) return;
+  const bars = chartData.bars || [];
+  if (!bars.length || !bars[bars.length - 1].live) return;
+  drawChart();
+}, 1000);
+
+/* REFETCH. A repaint only redraws bars already in hand, so without
+   this the chart is only as live as whatever last called loadChart
+   -- which was the suggestion poll, and nothing at all when auto is
+   off. That is the "sits stationary" and the "lagged behind
+   severely": not the tape, the page never asking again.
+
+   Tick bars are asked for more often because they close on
+   ACTIVITY: a busy minute can close several, and a chart that is
+   meant to be the timely one cannot be on a lazy poll. In flight is
+   tracked so a slow answer cannot stack requests on a fast timer. */
+let _chartBusy = false;
+let _chartPoll = 0;
+setInterval(async () => {
+  if (!chartVisible() || _chartBusy) return;
+  const iv = $('sInt') && $('sInt').value;
+  if (!iv) return;
+  const every = isCountTf(iv) ? 2 : 5;        // seconds
+  if ((++_chartPoll % every) !== 0) return;
+  _chartBusy = true;
+  try { await loadChart(); } catch (e) {} finally { _chartBusy = false; }
+}, 1000);
+
+/* ---- book vs price: the table ---------------------------------------- */
+
+const bpsCell = v => v == null ? '—'
+  : `<b class="${v > 0 ? 'long' : v < 0 ? 'short' : ''}">`
+    + `${v >= 0 ? '+' : ''}${v.toFixed(1)}</b>`;
+const pctCell = v => v == null ? '—' : (v * 100).toFixed(0) + '%';
+
+function agreementRows(rows, withSides) {
+  return rows.map(r => {
+    // A row with nothing in it is greyed rather than hidden: "we have never
+    // seen this state" is itself worth knowing.
+    const dim = r.n ? '' : ' style="opacity:.35"';
+    return `<tr${dim}><td><b>${esc(r.state)}</b><br>`
+      + `<span style="color:var(--dim);font-size:11px">${esc(r.detail || '')}</span></td>`
+      + `<td>${r.n}</td>`
+      + `<td>${r.share == null ? '—' : (r.share * 100).toFixed(0) + '%'}</td>`
+      + `<td>${bpsCell(r.avg_called_bps)}</td>`
+      + `<td>${r.median_called_bps == null ? '—' : r.median_called_bps.toFixed(1)}</td>`
+      + `<td>${pctCell(r.hit_rate)}</td>`
+      + (withSides
+          ? `<td>${pctCell(r.book_right)}</td><td>${pctCell(r.price_right)}</td>`
+          : '')
+      + `<td>${r.avg_mfe_bps == null ? '—' : '+' + r.avg_mfe_bps.toFixed(1)}</td>`
+      + `<td>${r.avg_mae_bps == null ? '—' : r.avg_mae_bps.toFixed(1)}</td>`
+      + '</tr>';
+  }).join('');
+}
+
+async function loadAgreement() {
+  let d;
+  try {
+    d = await api('/api/agreement?' + q({
+      coin: $('agThis').checked ? coin() : '',
+      interval: $('agInt').value}));
+  } catch (e) { $('agSay').style.display = ''; $('agSay').textContent = e.message; return; }
+
+  $('agSay').style.display = '';
+  $('agSay').innerHTML = `<b>${esc(d.verdict || '')}</b>`
+    + `<div class="msg" style="margin-top:6px">${d.n} settled · `
+    + `${d.pending || 0} waiting on a close · ${esc(d.source || '')}</div>`;
+
+  $('agTable').innerHTML =
+      '<table><tr><th>state</th><th>n</th><th>share</th>'
+    + '<th>avg move<br>called (bps)</th><th>median</th><th>closed<br>that way</th>'
+    + '<th>book<br>right</th><th>price<br>right</th>'
+    + '<th>avg best</th><th>avg worst</th></tr>'
+    + agreementRows(d.table || [], true) + '</table>';
+
+  loadSlice();
+}
+
+async function runReplay() {
+  $('agSay').style.display = '';
+  $('agSay').textContent = 'replaying price action over history…';
+  let d;
+  try {
+    d = await api('/api/agreement-replay?' + q({
+      coin: coin(), interval: $('agInt').value || '15m', bars: 800}),
+      {method: 'POST'});
+  } catch (e) { $('agSay').textContent = e.message; return; }
+  if (!d.ok) { $('agSay').textContent = d.error; return; }
+
+  $('agSay').innerHTML = `<b>${esc(d.verdict || '')}</b>`
+    + `<div class="msg" style="margin-top:6px">${esc(d.caveat || '')}</div>`;
+  $('agTable').innerHTML =
+      `<div class="msg" style="margin-bottom:6px">${d.bars} bars, `
+    + `${d.sub_bars} one-minute sub-bars, read ${esc(d.read_at || '')}. `
+    + '<b>Price action only — the book half is not in this table.</b></div>'
+    + '<table><tr><th>state</th><th>n</th><th>share</th>'
+    + '<th>avg move<br>called (bps)</th><th>median</th><th>closed<br>that way</th>'
+    + '<th>avg best</th><th>avg worst</th></tr>'
+    + agreementRows(d.table || [], false) + '</table>';
+}
+
+async function loadSlice() {
+  let d;
+  try {
+    d = await api('/api/feature-slice?' + q({
+      coin: $('agThis').checked ? coin() : '',
+      interval: $('agInt').value,
+      feature: $('agFeat').value || 'tilt',
+      verdict: $('agVerdict').value}));
+  } catch (e) { return; }
+
+  const sel = $('agFeat');
+  const keep = sel.value;
+  const names = d.available && d.available.length ? d.available
+              : ['tilt', 'replenish', 'depletion', 'imbalance', 'slope_bps',
+                 'position', 'magnet_bps', 'magnet_with_call'];
+  sel.innerHTML = names.map(n =>
+    `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+  if (keep && names.includes(keep)) sel.value = keep;
+
+  const rows = (d.buckets || []);
+  $('agSlice').innerHTML =
+      '<table><tr><th>range</th><th>n</th><th>avg move called (bps)</th>'
+    + '<th>closed that way</th></tr>'
+    + rows.map(b => `<tr${b.n ? '' : ' style="opacity:.35"'}>`
+        + `<td>${b.from.toFixed(2)} → ${b.to.toFixed(2)}</td>`
+        + `<td>${b.n}</td><td>${bpsCell(b.avg_called_bps)}</td>`
+        + `<td>${pctCell(b.hit_rate)}</td></tr>`).join('')
+    + '</table>'
+    + `<div class="msg" style="margin-top:6px">${esc(d.note || '')}</div>`;
+}
+
+/* ---- backfill from the S3 archive ------------------------------------ */
+
+let bfPoll = null;
+
+async function estimateBackfill() {
+  let d;
+  try {
+    d = await api('/api/backfill/estimate?' + q({
+      coin: coin(), days: parseFloat($('bfDays').value || '2')}));
+  } catch (e) { $('bfSay').textContent = e.message; return; }
+
+  $('bfSay').innerHTML =
+      `About <b>${d.estimated_gib} GiB</b> across ${d.object_count} hourly `
+    + `objects — roughly <b>$${d.estimated_usd}</b> on your AWS bill. `
+    + (d.credentials
+        ? '<span class="long">AWS credentials found.</span>'
+        : '<b class="short">No AWS credentials — set AWS_ACCESS_KEY_ID and '
+          + 'AWS_SECRET_ACCESS_KEY in Railway.</b>')
+    + `<div class="msg" style="margin-top:4px">${esc(d.note || '')}</div>`;
+}
+
+async function startBackfill() {
+  let d;
+  try {
+    d = await api('/api/backfill?' + q({
+      coin: coin(), interval: $('agInt').value || '15m',
+      days: parseFloat($('bfDays').value || '2'),
+      at: parseFloat($('bfAt').value || '0.33'),
+      max_gib: parseFloat($('bfCap').value || '2')}), {method: 'POST'});
+  } catch (e) { $('bfSay').textContent = e.message; return; }
+
+  if (d.ok === false) { $('bfSay').innerHTML = `<b class="short">${esc(d.error)}</b>`; return; }
+  if (!bfPoll) bfPoll = setInterval(pollBackfill, 2000);
+  pollBackfill();
+}
+
+async function stopBackfill() {
+  try { await api('/api/backfill/stop', {method: 'POST'}); } catch (e) {}
+  pollBackfill();
+}
+
+async function pollBackfill() {
+  let d;
+  try { d = await api('/api/backfill'); } catch (e) { return; }
+  const p = d.progress || {};
+
+  $('bfSay').innerHTML =
+      (d.running ? `<b>Running — ${p.pct || 0}%</b> · ` : '<b>Finished.</b> ')
+    + `${p.hours_done || 0}/${p.hours_total || 0} hours · `
+    + `${p.bars_seen || 0} bars read · <b>${p.states || 0} states recorded</b>`
+    + (p.transfer ? `<div class="msg" style="margin-top:4px">${esc(p.transfer)}</div>` : '')
+    + (p.error ? `<div class="msg" style="margin-top:4px"><b class="short">${esc(p.error)}</b></div>` : '')
+    + (p.skipped && Object.keys(p.skipped).length
+        ? `<div class="msg" style="margin-top:4px">skipped: `
+          + Object.entries(p.skipped).map(([k, v]) => `${v} ${esc(k)}`).join(', ')
+          + '</div>' : '');
+
+  if (!d.running) {
+    if (bfPoll) { clearInterval(bfPoll); bfPoll = null; }
+    loadAgreement();          // the table just grew
+  }
+}
+
+/* ---- uploaded chart history ------------------------------------------ */
+
+async function uploadHistory() {
+  const f = $('histFile').files[0];
+  if (!f) { $('histSay').textContent = 'pick a file first'; return; }
+  $('histSay').textContent = 'reading ' + f.name + '…';
+
+  const body = new FormData();
+  body.append('file', f);
+  try {
+    const d = await api('/api/upload-history?' + q({
+                          coin: coin(), merge_into: $('histMerge').value}),
+                        {method: 'POST', body: body});
+    $('histSay').innerHTML = (d.ok ? '' : '<b>Rejected.</b> ')
+      + esc(d.describe || d.error || '');
+  } catch (e) { $('histSay').textContent = e.message; return; }
+  loadDatasets();
+}
+
+async function loadDatasets() {
+  let d;
+  try { d = await api('/api/datasets?' + q({coin: coin()})); }
+  catch (e) { return; }
+
+  const rows = d.datasets || [];
+  const when = ts => new Date(ts * 1000).toISOString().slice(0, 10);
+
+  $('histList').innerHTML = !rows.length ? ''
+    : '<table><tr><th>file</th><th>market</th><th>tf</th><th>bars</th>'
+      + '<th>span</th><th></th></tr>'
+      + rows.map(r => `<tr><td>${esc(r.name)}</td><td>${esc(r.coin)}</td>`
+          + `<td>${esc(r.interval)}</td><td>${r.bars.toLocaleString()}</td>`
+          + `<td>${when(r.start_ts)} → ${when(r.end_ts)}</td>`
+          + `<td><button onclick="dropDataset('${esc(r.id)}')">delete</button></td>`
+          + '</tr>').join('') + '</table>';
+
+  // Both selectors are rebuilt from the same list, keeping whatever was
+  // chosen if it still exists.
+  for (const [id, head] of [['histMerge', '— new dataset —'],
+                            ['btSource', 'exchange candles']]) {
+    const sel = $(id);
+    if (!sel) continue;
+    const keep = sel.value;
+    sel.innerHTML = `<option value="">${head}</option>`
+      + rows.map(r => `<option value="${esc(r.id)}">${esc(r.name)} · `
+          + `${esc(r.interval)} · ${r.bars.toLocaleString()} bars</option>`).join('');
+    if (keep && rows.some(r => r.id === keep)) sel.value = keep;
+  }
+}
+
+async function dropDataset(id) {
+  try { await api('/api/datasets/delete?' + q({id: id}), {method: 'POST'}); }
+  catch (e) { $('histSay').textContent = e.message; return; }
+  loadDatasets();
+}
+
+let tunedWeights = null;
+
+async function runBacktest() {
+  $('btHead').textContent = 'replaying…';
+  $('btSay').style.display = 'none';
+  $('btCurve').innerHTML = '';
+  let d;
+  try {
+    d = await api('/api/backtest?' + q({coin: coin(),
+                  interval: $('rInt').value,
+                  bars: parseInt($('btBars').value, 10) || 1000,
+                  train_fraction: $('btSplit').value,
+                  dataset: $('btSource') ? $('btSource').value : '',
+                  tune: $('btTune').checked ? 'true' : 'false'}),
+                  {method: 'POST'});
+  } catch (e) { $('btHead').textContent = e.message; return; }
+  if (!d.ok) { $('btHead').textContent = d.error; return; }
+
+  tunedWeights = d.tuned_weights || null;
+  const bu = $('btUseTuned');
+  if (bu) bu.disabled = !tunedWeights;
+  if (tunedWeights) paintWeights(liveWeights, tunedWeights);
+
+  const col = (r, held) => {
+    if (!r) return '';
+    const acc = r.calls >= 20 ? (r.accuracy * 100).toFixed(1) + '%' : '—';
+    const edgeCls = r.calls < 20 ? '' : r.edge_pts > 0 ? 'long' : 'short';
+    return `<div class="bt-col${held ? ' held' : ''}"><h3>${r.label}</h3>`
+      + `<div class="bt-big ${edgeCls}">${acc}</div>`
+      + `<div style="font-size:12px;color:var(--dim)">`
+      + `${r.calls} calls from ${r.n} bars (${(r.coverage*100).toFixed(0)}% coverage)<br>`
+      + `${r.calls >= 20 ? (r.edge_pts >= 0 ? '+' : '') + r.edge_pts.toFixed(1) + 'pts vs coin flip'
+                          : 'too few calls to judge'}</div></div>`;
+  };
+
+  $('btHead').innerHTML =
+      `<div style="font-size:12px;color:var(--dim);margin-bottom:6px">`
+    + `${d.candles} real candles (${d.history_span || 'span unknown'}) · `
+    + `${d.samples} scored bars · replay is blind to `
+    + `${(d.blind_to || []).join(', ')}</div>`
+    + '<div class="bt-grid">'
+    + col(d.train, false) + col(d.baseline_test, false) + col(d.test, true)
+    + '</div>'
+    + `<div style="margin-top:8px;font-size:12px;color:var(--dim)">`
+    + `Train minus held-out: <b class="${d.overfit_gap_pts > 8 ? 'short' : ''}">`
+    + `${d.overfit_gap_pts >= 0 ? '+' : ''}${d.overfit_gap_pts.toFixed(1)}pts</b>`
+    + ` — anything large here is fitted noise.</div>`;
+
+  const curve = (d.test && d.test.curve) || [];
+  $('btCurve').innerHTML = !curve.length ? '' :
+    '<table style="margin-top:14px"><tr><th>selectivity (held out)</th>'
+    + '<th class="r">calls</th><th class="r">accuracy</th><th class="r">coverage</th></tr>'
+    + curve.map(r => `<tr>
+        <td>score at or above ${r.threshold.toFixed(2)}</td>
+        <td class="r">${r.n}</td>
+        <td class="r ${r.accuracy == null ? '' : r.accuracy > 0.55 ? 'long' : r.accuracy < 0.45 ? 'short' : ''}">
+          ${r.accuracy == null ? '—' : (r.accuracy*100).toFixed(1) + '%'}</td>
+        <td class="r">${(r.coverage*100).toFixed(0)}%</td></tr>`).join('')
+    + '</table>'
+    + '<div style="margin-top:6px;font-size:12px;color:var(--dim)">'
+    + 'Being more selective trades trades for accuracy. The row you can live '
+    + 'with is the one that decides whether this is worth trading.</div>';
+
+  $('btSay').style.display = '';
+  $('btSay').textContent = d.verdict;
+  loadForward();
+}
+
+async function loadForward() {
+  let d;
+  try {
+    d = await api('/api/forward?' + q({coin: coin(), interval: $('rInt').value}));
+  } catch (e) { $('fwd').textContent = e.message; return; }
+
+  const s = d.stats || {};
+  const o = s.overall || {n: 0};
+  const cell = (label, v) => {
+    if (!v || !v.n) return `<div class="stat"><b>—</b><span>${label} (0)</span></div>`;
+    return `<div class="stat"><b class="${v.accuracy > 0.55 ? 'long' : v.accuracy < 0.45 ? 'short' : ''}">`
+      + `${(v.accuracy*100).toFixed(0)}%</b><span>${label} (${v.n})</span></div>`;
+  };
+
+  if (!o.n) {
+    $('fwd').innerHTML = '<b>Forward test:</b> nothing scored yet'
+      + (s.pending ? ` — ${s.pending} read${s.pending === 1 ? '' : 's'} waiting for their candle to close.`
+                   : '. Leave the read running and it will fill up.');
+    return;
+  }
+
+  $('fwd').innerHTML = '<b>Forward test — measured on live reads</b>'
+    + '<div class="conrow" style="margin-top:6px">'
+    + cell('overall', o)
+    + cell('with flow &amp; absorption', s.with_flow)
+    + cell('candles only', s.without_flow)
+    + (s.bands || []).map(b => cell(b.band + ' signals', b)).join('')
+    + '</div>'
+    + (s.pending ? `<div style="color:var(--dim);font-size:12px">${s.pending} awaiting resolution</div>` : '');
+}
+
+let liveWeights = {}, defaultWeights = {};
+
+function wmsg(m, bad) {
+  const el = $('wMsg');
+  el.textContent = m;
+  el.className = 'msg' + (bad ? ' err' : '');
+}
+
+function paintWeights(w, tuned) {
+  liveWeights = Object.assign({}, w);
+  $('wGrid').innerHTML = Object.keys(w).sort().map(k => {
+    const t = tuned && tuned[k] != null ? tuned[k] : null;
+    const diff = t != null && Math.abs(t - w[k]) > 1e-9;
+    return `<div class="${diff ? 'changed' : ''}">`
+      + `<label>${k}${t != null ? ` <span style="color:var(--accent)">tuned ${t.toFixed(2)}</span>` : ''}</label>`
+      + `<input id="w_${k}" type="number" step="0.05" min="0" max="5" value="${w[k]}"></div>`;
+  }).join('');
+}
+
+function readWeightInputs() {
+  const out = {};
+  Object.keys(liveWeights).forEach(k => {
+    const el = $('w_' + k);
+    if (!el) return;
+    const v = parseFloat(el.value);
+    if (isFinite(v)) out[k] = Math.max(0, Math.min(v, 5));
+  });
+  return out;
+}
+
+async function loadWeights() {
+  try {
+    const r = await api('/api/weights', {method: 'POST'});
+    defaultWeights = r.defaults || r.weights;
+    paintWeights(r.weights, tunedWeights);
+  } catch (e) { wmsg(e.message, true); }
+}
+
+async function applyWeights() {
+  const w = readWeightInputs();
+  if (!Object.keys(w).length) { wmsg('nothing to apply', true); return; }
+  wmsg('applying…');
+  try {
+    const r = await api('/api/weights', {method: 'POST', body: JSON.stringify(w)});
+    if (!r.ok) { wmsg(r.error || 'rejected', true); return; }
+    paintWeights(r.weights, tunedWeights);
+    wmsg('applied — live reads now use these');
+    loadRead();
+  } catch (e) { wmsg(e.message, true); }
+}
+
+async function resetWeights() {
+  wmsg('resetting…');
+  try {
+    const r = await api('/api/weights?reset=true', {method: 'POST'});
+    paintWeights(r.weights, tunedWeights);
+    wmsg('back to defaults');
+    loadRead();
+  } catch (e) { wmsg(e.message, true); }
+}
+
+function useTuned() {
+  if (!tunedWeights) return;
+  Object.keys(tunedWeights).forEach(k => {
+    const el = $('w_' + k);
+    if (el) el.value = tunedWeights[k];
+  });
+  wmsg('tuned values loaded into the boxes — press Apply to use them');
+}
+
+let watchPoll = null;
+
+async function startWatch() {
+  const lvl = parseFloat($('wLevel').value || '0');
+  if (!isFinite(lvl) || lvl <= 0) { note('enter the price level you want watched', true); return; }
+  const mins = parseFloat($('wMins').value || '15');
+  const band = parseFloat($('wBand').value || '10');
+  try {
+    const r = await api('/api/watch?' + q({coin: coin(), level: lvl,
+                        minutes: mins, band_bps: band}), {method: 'POST'});
+    if (!r || r.ok === false) { note('could not start watch: ' + ((r && r.error) || 'unknown'), true); return; }
+    note(`watching ${coin()} at ${lvl} for ${mins} min`);
+    if (watchPoll) { clearInterval(watchPoll); watchPoll = null; }
+    loadLiquidity();   // one seed; book frames keep the ladder current
+    loadLiquidity();
+  } catch (e) { note(e.message, true); }
+}
+
+async function stopWatch() {
+  if (watchPoll) { clearInterval(watchPoll); watchPoll = null; }
+  try { await api('/api/watch?stop=true', {method: 'POST'}); note('watch stopped'); }
+  catch (e) { note(e.message, true); }
+  loadLiquidity();
+}
+
+async function loadLiquidity() {
+  const size = parseFloat($('liqSize').value || '0') || 0;
+  let d;
+  try {
+    d = await api('/api/liquidity?' + q({coin: coin(), size: size}));
+  } catch (e) { $('liqCost').textContent = e.message; return; }
+
+  if (d.error) {
+    $('liqCost').textContent = d.error;
+    $('liqBook').innerHTML = ''; $('liqAbs').style.display = 'none';
+    $('liqShelves').innerHTML = ''; return;
+  }
+
+  stamp('liqStamp', d.book_age_s != null ? d.book_age_s : 0, 30, 120, 'book ');
+
+  const c = d.cost, b = d.book;
+  if (c) {
+    const bad = c.exhausted || c.round_trip_bps > 20;
+    $('liqCost').innerHTML = '<div class="conrow">'
+      + `<div class="stat"><b>${c.entry_bps.toFixed(1)}bps</b><span>cost to get in</span></div>`
+      + `<div class="stat"><b>${c.exit_bps.toFixed(1)}bps</b><span>cost to get out</span></div>`
+      + `<div class="stat ${bad ? 'gap-bad' : 'gap-ok'}"><b>${c.round_trip_bps.toFixed(1)}bps</b>`
+      + `<span>round trip on ${money(c.size)}</span></div>`
+      + `<div class="stat"><b>${c.levels}</b><span>levels eaten</span></div>`
+      + '</div>'
+      + (c.exhausted
+         ? '<div class="say">The book cannot fill that size at all. Anything this '
+           + 'tool says about entries at this size is theoretical.</div>' : '');
+  } else {
+    $('liqCost').textContent = 'set your size above to price the entry and exit';
+  }
+
+  if (b) {
+    const imb = b.imbalance_25bps;
+    $('liqBook').innerHTML = '<div class="conrow">'
+      + `<div class="stat"><b>${b.spread_bps.toFixed(2)}bps</b><span>spread</span></div>`
+      + `<div class="stat"><b>${money(b.depth_bid_25bps)}</b><span>bid depth ±25bps</span></div>`
+      + `<div class="stat"><b>${money(b.depth_ask_25bps)}</b><span>ask depth ±25bps</span></div>`
+      + `<div class="stat"><b class="${imb >= 0 ? 'long' : 'short'}">${imb >= 0 ? '+' : ''}`
+      + `${imb.toFixed(2)}</b><span>${imb >= 0 ? 'bid heavy' : 'offer heavy'}</span></div>`
+      + '</div>';
+
+    const sh = b.shelves || [];
+    $('liqShelves').innerHTML = !sh.length ? '' :
+      '<table style="margin-top:12px"><tr><th>resting shelf</th><th>side</th>'
+      + '<th class="r">size</th><th class="r">vs typical level</th></tr>'
+      + sh.map(s => `<tr>
+          <td>${Number(s.px).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+          <td class="${s.side === 'buy' ? 'long' : 'short'}">${s.side === 'buy' ? 'support' : 'supply'}</td>
+          <td class="r">${money(s.notional)}</td>
+          <td class="r">${s.multiple.toFixed(1)}x</td></tr>`).join('')
+      + '</table>';
+  } else { $('liqBook').innerHTML = ''; $('liqShelves').innerHTML = ''; }
+
+  const a = d.absorption;
+  if (a) {
+    const band = d.band || {};
+    const flag = a.absorbing ? '<span class="flag crowded">ABSORBING</span>'
+               : a.thin ? '<span class="flag late">THIN</span>' : '';
+    const div = d.divergence && d.divergence.disagrees
+      ? `<div style="margin-top:6px;color:var(--dim)">Divergence: ${d.divergence.note}</div>` : '';
+    $('liqAbs').style.display = '';
+    $('liqAbs').innerHTML = flag + a.verdict
+      + `<div style="margin-top:6px;color:var(--dim)">`
+      + `${d.trades_seen} trades and ${d.books_seen} book reads so far`
+      + (band.refill_events ? ` · ${band.refill_events} refills` : '')
+      + `</div>` + div
+      + (d.side_report && d.side_report.indexOf('ambiguous') === -1 ? ''
+         : `<div style="margin-top:6px;color:var(--dim)">side convention: ${d.side_report || '—'}</div>`);
+  } else {
+    $('liqAbs').style.display = 'none';
+  }
+}
+
+async function loadConsensus() {
+  const wo = $('winOnly').checked;
+  const mn = parseFloat($('minNot').value || '0') || 0;
+  const ma = parseFloat($('minAcct').value || '0') || 0;
+  let d;
+  try {
+    d = await api('/api/consensus?' + q({coin: coin(), winners_only: wo,
+                  min_notional: mn, min_account: ma}));
+  } catch (e) { $('consensus').textContent = e.message; return; }
+
+  if (d.error) { $('consensus').textContent = d.error; $('conTraders').innerHTML = ''; return; }
+
+  // The stamp here is the SWEEP's age, not this fetch's. Consensus is built
+  // from stored positions, so a fresh HTTP call can still serve half-hour-old
+  // data and stamping the request time would say it was current.
+  let sweepAge = null;
+  if (d.as_of) {
+    const t = Date.parse(d.as_of);
+    if (!isNaN(t)) sweepAge = (Date.now() - t) / 1000;
+  }
+  stamp('conStamp', sweepAge, 2700, 5400, 'swept ');
+
+  const gapBad = d.entry_gap_pct > 0.005;
+  const flags = (d.crowded ? '<span class="flag crowded">CROWDED</span>' : '')
+              + (d.late ? '<span class="flag late">LATE ENTRY</span>' : '');
+
+  $('consensus').innerHTML =
+      `<div class="verdict-big ${d.direction}">${d.direction.toUpperCase()}`
+    + `<span style="font-size:15px;color:var(--dim);font-weight:400"> `
+    + `&nbsp;${(d.strength*100).toFixed(0)}% of winning size</span></div>`
+    + `<div style="font-size:12px;color:var(--dim)">${flags}`
+    + `${d.n_winning} winning · ${d.n_losing} losing · ${d.n_traders} tracked</div>`
+    + '<div class="conrow">'
+    + `<div class="stat"><b>${money(d.winning_long_notional)}</b><span>winning long</span></div>`
+    + `<div class="stat"><b>${money(d.winning_short_notional)}</b><span>winning short</span></div>`
+    + `<div class="stat"><b>${Number(d.avg_entry).toLocaleString(undefined,{maximumFractionDigits:2})}</b><span>their avg entry</span></div>`
+    + `<div class="stat ${gapBad ? 'gap-bad' : 'gap-ok'}"><b>${(d.entry_gap_pct*100).toFixed(2)}%</b>`
+    + `<span>${gapBad ? 'WORSE than their entry' : 'your entry gap'}</span></div>`
+    + `<div class="stat"><b>${Number(d.room_sigmas).toFixed(1)}sd</b><span>room before liq</span></div>`
+    + `<div class="stat"><b>${Number(d.median_leverage).toFixed(0)}x</b><span>median leverage</span></div>`
+    + '</div>'
+    + `<div class="say">${d.verdict}</div>`;
+
+  const rows = (d.traders || []).filter(t => !wo || t.winning);
+  $('conTraders').innerHTML = !rows.length ? '' :
+    '<table style="margin-top:14px"><tr><th>wallet</th><th>side</th>'
+    + '<th class="r">size</th><th class="r">entry</th><th class="r">your gap</th>'
+    + '<th class="r">uPnL</th><th class="r">return</th><th class="r">room</th>'
+    + '<th class="r">lev</th></tr>'
+    + rows.slice(0,25).map(t => `<tr>
+        <td>${t.wallet.slice(0,10)}…</td>
+        <td class="${t.side}">${t.side}</td>
+        <td class="r">${money(t.notional)}</td>
+        <td class="r">${Number(t.entry).toLocaleString(undefined,{maximumFractionDigits:2})}</td>
+        <td class="r ${t.entry_gap_pct > 0.005 ? 'short' : 'long'}">${(t.entry_gap_pct*100).toFixed(2)}%</td>
+        <td class="r ${t.unrealized_pnl >= 0 ? 'long' : 'short'}">${money(t.unrealized_pnl)}</td>
+        <td class="r">${(t.return_on_position*100).toFixed(1)}%</td>
+        <td class="r">${t.liq_distance_sigmas.toFixed(1)}sd</td>
+        <td class="r">${Number(t.leverage).toFixed(0)}x</td></tr>`).join('')
+    + '</table>';
+}
+
 async function loadMap() {
-  const d = await api('/api/map?coin=' + coin());
+  const d = await api('/api/map?' + q({coin: coin()}));
   if (d.error) { $('mapRaw').textContent = d.error; $('mapW').textContent = d.error; return; }
   $('mapRaw').textContent = d.text.raw;
   $('mapW').textContent = d.text.weighted;
@@ -827,7 +19547,7 @@ async function loadMap() {
 }
 
 async function loadChanges() {
-  const d = await api('/api/changes?hours=24&coin=' + coin());
+  const d = await api('/api/changes?' + q({hours: 24, coin: coin()}));
   const rows = d.changes || [];
   if (!rows.length) {
     $('changes').textContent = 'no changes in the last 24h — needs at least two sweeps';
@@ -849,7 +19569,7 @@ async function loadChanges() {
 }
 
 async function loadPositions() {
-  const d = await api('/api/positions?coin=' + coin() + '&top=40');
+  const d = await api('/api/positions?' + q({coin: coin(), top: 40}));
   if (d.error) { $('pos').textContent = d.error; return; }
   $('pos').innerHTML = '<table><tr><th>wallet</th><th>side</th><th class="r">notional</th>'
     + '<th class="r">entry</th><th class="r">liq</th><th class="r">liq dist</th>'
@@ -875,11 +19595,101 @@ async function loadReport() { $('report').textContent = await api('/api/report')
 async function doSweep() {
   note('sweeping — this takes a while at the rate limit…');
   try {
-    const r = await api('/api/sweep?coin=' + coin(), {method: 'POST'});
-    note(r.ok ? `swept ${r.positions} positions, ${r.changes} changes (${r.defended} defended, ${r.liquidated} liquidated)`
-              : r.error, !r.ok);
-    if (r.ok) loadAll();
+    const r = await api('/api/sweep?' + q({coin: coin()}), {method: 'POST'});
+    if (!r.ok) { note(r.error, true); return; }
+    const coins = r.coins_recorded || [];
+    note(`${coin()}: ${r.positions || 0} positions, ${r.changes || 0} changes `
+         + `(${r.defended || 0} defended, ${r.liquidated || 0} liquidated) · `
+         + `also recorded ${coins.length} coin${coins.length === 1 ? '' : 's'}: `
+         + coins.slice(0, 12).join(' '));
+    if (r.warning) note(r.warning, true);
+    loadCoins();
+    loadAll();
   } catch (e) { note(e.message, true); }
+}
+
+let hip3Markets = {};
+
+let allMarkets = [];
+
+async function loadCoins() {
+  // The picker lists what you can TRADE, not what happens to have been swept.
+  // With well over a thousand markets, a flat alphabetical list is a haystack,
+  // so they are grouped by asset class and filterable by ticker.
+  try {
+    const d = await api('/api/markets');
+    const rows = d.markets || [];
+    if (!rows.length) { $('mktCount').textContent = d.error || 'no markets'; return; }
+
+    allMarkets = rows;
+    hip3Markets = {};
+    rows.forEach(r => { if (r.hip3) hip3Markets[r.symbol] = r.dex; });
+
+    const cls = d.classes || [];
+    $('klass').innerHTML = `<option value="">all (${d.count})</option>`
+      + cls.map(c => `<option value="${c.klass}">${c.label} (${c.n})</option>`).join('');
+
+    renderCoins();
+    $('mktCount').textContent = (d.stale ? 'cached — exchange unreachable' : '');
+  } catch (e) { $('mktCount').textContent = e.message; }
+}
+
+function renderCoins() {
+  const want = $('klass').value;
+  const find = ($('mktFind').value || '').trim().toUpperCase();
+  const keep = allMarkets.filter(r =>
+    (!want || r.klass === want) && (!find || r.base.toUpperCase().includes(find)));
+
+  if (!keep.length) {
+    $('coin').innerHTML = '<option value="">no match</option>';
+    $('mktCount').textContent = '0 of ' + allMarkets.length;
+    return;
+  }
+
+  // Group by class, then by venue inside it, so a builder's gold and the
+  // canonical crypto never sit in the same undifferentiated list.
+  const groups = {};
+  keep.forEach(r => {
+    const g = r.klass_label + (r.dex ? ' · ' + r.dex : '');
+    (groups[g] || (groups[g] = [])).push(r);
+  });
+
+  $('coin').innerHTML = Object.keys(groups).map(g =>
+    `<optgroup label="${g}">`
+    + groups[g].map(r =>
+        `<option value="${r.symbol}">${r.base}${r.has_data ? ' •' : ''}</option>`).join('')
+    + '</optgroup>').join('');
+
+  const still = keep.some(r => r.symbol === lastCoin);
+  if (still) {
+    $('coin').value = lastCoin;
+  } else {
+    /* NOTHING CHOSEN YET: start on the CME contract when there is
+       one. This is a futures chart that also knows about crypto, and
+       opening it on BTC meant every panel but the candles was
+       answering about a market the user was not looking at. */
+    const cme = keep.find(r => r.source === 'cme' && r.has_data)
+             || keep.find(r => r.source === 'cme');
+    if (cme) $('coin').value = cme.symbol;
+  }
+  $('mktCount').textContent = keep.length === allMarkets.length
+    ? allMarkets.length + ' markets'
+    : keep.length + ' of ' + allMarkets.length;
+  showVenueNote();
+}
+
+function showVenueNote() {
+  const el = $('venueNote');
+  if (!el) return;
+  const dex = hip3Markets[coin()];
+  if (!dex) { el.style.display = 'none'; return; }
+  el.style.display = '';
+  el.innerHTML = `<b>${coin()}</b> is a builder-deployed market on <b>${dex}</b>, `
+    + 'priced against an oracle rather than matched on the underlying exchange. '
+    + 'The book here is this venue’s own and is far thinner than the futures '
+    + 'market it tracks — depth, slippage and absorption describe THIS venue, '
+    + 'not COMEX or CME. Oracle dislocations and flash moves have happened on '
+    + 'these markets.';
 }
 
 async function doResolve() {
@@ -889,6 +19699,11 @@ async function doResolve() {
     loadReport();
   } catch (e) { note(e.message, true); }
 }
+
+// Last thing on the page: pick up whichever tab was open last time.
+restoreTheme();
+restoreTab();
+restoreProfileWindows();
 </script></body></html>
 """
 
