@@ -6845,6 +6845,22 @@ def create_app() -> FastAPI:
         px = float(getattr(tape, "last_px", 0.0) or 0.0)
         return round(px, 4) if px > 0 else 0.0
 
+    def _quote_now(rt_) -> tuple:
+        """(bid, ask, last, age_s) from the tape's own book.
+
+        THE TOUCH WAS ALREADY BEING DECODED AND THEN IGNORED. The
+        book is built for the OFI on every MBP-10 record; the fill
+        price read `last_px` instead, so every fill and every stop
+        was priced off whichever side happened to print last.
+        """
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        bk = getattr(tape, "book", None) if tape else None
+        bid = float(getattr(bk, "best_bid", 0.0) or 0.0) if bk else 0.0
+        ask = float(getattr(bk, "best_ask", 0.0) or 0.0) if bk else 0.0
+        last = float(getattr(tape, "last_px", 0.0) or 0.0)
+        return bid, ask, last, _px_age(rt_)
+
     def _px_age(rt_) -> float | None:
         """How old the fill price is, in seconds.
 
@@ -6866,6 +6882,7 @@ def create_app() -> FastAPI:
     MIN_AGREE = 3
 
     from .journal import signal as jn_signal
+    from . import quote as jn_quote
 
     def _windows_for(rt_, period_s: float):
         """The state machine for one period, or None."""
@@ -7374,14 +7391,26 @@ def create_app() -> FastAPI:
                 t.side, (fus.get("m1") or {}).get("dir") or "")
             if rev:
                 disagreed = why_rev
-        act, arg = jn.decide(t, s, px, side, taken,
+        # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
+        # only leave into the bid and a short can only leave into
+        # the ask, so that is the only price a stop or a target can
+        # honestly read. Marking either against the last print lets
+        # whichever side happened to trade decide the outcome.
+        _bid, _ask, _last, _age = _quote_now(rt_)
+        mark_px, mark_src = px, "last"
+        if t is not None and t.open:
+            mark_px, mark_src = jn_quote.mark_px(
+                t.side, _bid, _ask, _last or px, _age)
+            if mark_px <= 0:
+                mark_px, mark_src = px, "last: no price"
+        act, arg = jn.decide(t, s, mark_px, side, taken,
                              (win.get("mid_dir") or ""),
                              window_rule=True,
                              disagreed=disagreed,
                              max_per_bar=cap)
         idle_why = arg if act == "" else ""
         if act == "close":
-            closed = j.close_trade(coin_, px, why=arg)
+            closed = j.close_trade(coin_, mark_px, why=arg)
             t = None
             taken = j.sides_in_bar(coin_, bar_ts, strat)
             # THE CAP HAS TO BE PASSED HERE TOO. It was not, so
@@ -7392,14 +7421,23 @@ def create_app() -> FastAPI:
             # "immediately jumps in for another trade" shape
             # surviving in the one place the cap was not threaded
             # through.
-            act, arg = jn.decide(None, s, px, side, taken,
+            act, arg = jn.decide(None, s, px, side, taken,  # noqa: E501
                                  (win.get("mid_dir") or ""),
                                  window_rule=True,
                                  max_per_bar=cap)
             idle_why = arg if act == "" else ""
         if act == "open":
+            # CROSSING COSTS THE SPREAD. A long pays the ask, a
+            # short receives the bid. Opening at the last print
+            # recorded every round trip as if entry were free, which
+            # is about a tick a trade on ES -- larger than any edge
+            # measured on this tape so far.
+            open_px, open_src = jn_quote.fill_px(
+                arg, "open", _bid, _ask, _last or px, _age)
+            if open_px <= 0:
+                open_px, open_src = px, "last: no price"
             t = j.open_trade(
-                coin_, arg, px, mode="auto", bar_ts=bar_ts,
+                coin_, arg, open_px, mode="auto", bar_ts=bar_ts,
                 strategy=strat,
                 tp=(s.tp_ticks if s.tp_on else 0.0),
                 sl=(s.sl_ticks if s.sl_on else 0.0))
@@ -7409,6 +7447,13 @@ def create_app() -> FastAPI:
         return {
             "settings": s.to_dict(),
             "agree": side, "says": says, "price": px,
+            # WHAT A FILL WOULD ACTUALLY COST, beside the last
+            # print, so a disagreement between them is visible
+            # rather than inferred from a surprising loss.
+            "quote": jn_quote.read(
+                (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
+                (getattr(rt_, "ofi", None)), _last or px, _age),
+            "mark": {"px": mark_px, "src": mark_src},
             # HOW MANY, and WHICH ONE IS AGAINST IT. Three of four
             # fires even with the fourth pointing the other way, so
             # "it agreed" is not enough to tell a clean signal from a
