@@ -69,6 +69,8 @@ MARGINAL_S = 60.0       # the trailing window the leading read uses
 SLOPE_S = 120.0         # how far back the fitted slope looks
 MIN_VOL = 100.0         # contracts before any reading is offered
 MIN_SAMPLES = 5         # a line through fewer points is not a trend
+HIST_EVERY_S = 2.5      # one history point per this many seconds
+MAX_HIST = 130          # 300s / 2.5s, plus slack
 # Ratio points a minute. The ratio spans -1..+1, so 0.05/min is a
 # twentieth of the full scale in sixty seconds: a real move, not a
 # flicker. PROVISIONAL -- set from measured tape, not from here.
@@ -87,6 +89,7 @@ class RatioTrack:
                  "_buy", "_sell",
                  "_mq", "_mbuy", "_msell",
                  "_sq", "_n", "_st", "_sr", "_stt", "_str",
+                 "_hist", "_hist_at", "_bar_t0",
                  "_last_ts", "bars")
 
     def __init__(self, period_s: float = PERIOD_S,
@@ -114,6 +117,14 @@ class RatioTrack:
         self._sq: deque = deque()
         self._n = 0
         self._st = self._sr = self._stt = self._str = 0.0
+        # THE NUMBER'S PATH THROUGH THIS CANDLE. Chris does not want
+        # a verdict word, he wants the number tracked: whether it is
+        # growing in its own direction or pulling back toward zero is
+        # something you read off the shape, and no three-bucket label
+        # carries it.
+        self._hist: deque = deque(maxlen=MAX_HIST)
+        self._hist_at = 0.0
+        self._bar_t0 = 0.0
         self._last_ts = 0.0
         self.bars = 0
 
@@ -148,6 +159,9 @@ class RatioTrack:
             self._sq.clear()
             self._n = 0
             self._st = self._sr = self._stt = self._str = 0.0
+            self._hist.clear()
+            self._hist_at = 0.0
+            self._bar_t0 = float(bar) * self.period_s
             self.bars += 1
 
         self._last_ts = t
@@ -172,7 +186,13 @@ class RatioTrack:
             # the marginal reports a side on no data.
             self._mbuy = self._msell = 0.0
 
+        if not self._bar_t0:
+            self._bar_t0 = float(bar) * self.period_s
         self._push_sample(t)
+        if t - self._hist_at >= HIST_EVERY_S:
+            self._hist_at = t
+            self._hist.append((round(t - self._bar_t0, 1),
+                               round(self.ratio, 4)))
 
     def _push_sample(self, t: float) -> None:
         r = self.ratio
@@ -253,20 +273,57 @@ class RatioTrack:
         return ((n * self._str - self._st * self._sr) / denom) * 60.0
 
     @property
-    def trend(self) -> str:
-        """rising / falling / steady, with a deadband.
+    def strength(self) -> float:
+        """HOW HARD, regardless of which way. |ratio|, 0 to 1."""
+        return abs(self.ratio)
 
-        Without the deadband this alternates all bar and is the OFI
-        sign problem wearing a new number.
+    @property
+    def thrust(self) -> float:
+        """Rate the number is moving IN ITS OWN DIRECTION.
+
+        THE WHOLE CORRECTION IS HERE. A signed slope conflates two
+        different facts. On a red (negative) number a POSITIVE slope
+        does not mean buying is rising -- it means the selling is
+        giving back, the number travelling toward zero. Calling that
+        "rising" tells you the opposite of what is happening to the
+        push you are watching.
+
+        So the slope is taken against the number's own sign:
+
+            positive -> the push is EXTENDING, further from zero,
+                        the side in control is pressing harder
+            negative -> the push is FADING, pulling back toward
+                        even, whoever is winning is giving it up
+
+        Same meaning in both directions, which is what makes it
+        readable without first checking the colour.
+        """
+        r = self.ratio
+        if r > 0:
+            return self.slope_per_min
+        if r < 0:
+            return -self.slope_per_min
+        return 0.0
+
+    @property
+    def motion(self) -> str:
+        """extending / fading / holding, against the number's sign.
+
+        Not a replacement for the number -- the number and its path
+        are the reading. This is a label for the shape so the panel
+        can colour it, and the deadband keeps it from alternating
+        every poll the way a zero-threshold OFI sign did.
         """
         if not self.ready:
             return "unknown"
-        s = self.slope_per_min
-        if s > self.deadband:
-            return "rising"
-        if s < -self.deadband:
-            return "falling"
-        return "steady"
+        if self.strength < 0.01:
+            return "no side"
+        t = self.thrust
+        if t > self.deadband:
+            return "extending"
+        if t < -self.deadband:
+            return "fading"
+        return "holding"
 
     @property
     def damping(self) -> float:
@@ -286,16 +343,26 @@ class RatioTrack:
         if not self.ready:
             need = max(0.0, self.min_vol - self.volume)
             return (f"{int(self.volume):,} contracts in this candle -- "
-                    f"{int(need):,} more before the trend means anything")
-        t = self.trend
-        s = self.slope_per_min
-        word = {"rising": "net buying is building",
-                "falling": "net selling is building",
-                "steady": "the balance is holding"}[t]
-        out = f"{word} ({s:+.3f} a minute)"
+                    f"{int(need):,} more before the push can be read")
+        r = self.ratio
+        side = "buying" if r > 0 else "selling"
+        m = self.motion
+        if m == "no side":
+            return "dead even -- neither side has the push"
+        if m == "holding":
+            return f"{side} holding at {r:+.4f}, not pressing further"
+        word = "pressing harder" if m == "extending" else "giving it back"
+        out = (f"{side} {word} -- {r:+.4f} and moving "
+               f"{abs(self.thrust):.3f} a minute "
+               f"{'away from' if m == 'extending' else 'back toward'} even")
         p = self.pull
-        if t != "steady" and p * s < 0:
-            out += " -- but the last minute is pulling the other way"
+        # The marginal disagreeing with the body of the bar is the
+        # earliest thing here, so it is said out loud rather than
+        # left for the shape to imply.
+        if m == "extending" and p * r < 0:
+            out += " -- though the last minute has already turned"
+        elif m == "fading" and p * r > 0:
+            out += " -- though the last minute is pressing again"
         return out
 
     def to_dict(self) -> dict:
@@ -304,7 +371,12 @@ class RatioTrack:
             "marginal": round(self.marginal, 4),
             "pull": round(self.pull, 4),
             "slope_per_min": round(self.slope_per_min, 4),
-            "trend": self.trend,
+            "strength": round(self.strength, 4),
+            "thrust": round(self.thrust, 4),
+            "motion": self.motion,
+            # The number's path through this candle, so it can be
+            # drawn rather than summarised.
+            "history": list(self._hist),
             "ready": self.ready,
             "volume": round(self.volume, 1),
             "damping": round(self.damping, 6),

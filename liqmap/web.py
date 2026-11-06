@@ -15113,48 +15113,85 @@ function trackBlock(tr) {
       + `solid var(--line);padding-top:6px;color:var(--dim)">`
       + esc(tr.say || '') + `</div>`;
 
-  const col = tr.trend === 'rising' ? 'up'
-            : tr.trend === 'falling' ? 'down' : 'dim';
-  const arrow = tr.trend === 'rising' ? '&#9650;'
-              : tr.trend === 'falling' ? '&#9660;' : '&#9644;';
-  const rCol = tr.ratio > 0 ? 'up' : tr.ratio < 0 ? 'down' : 'dim';
+  const r = Number(tr.ratio);
+  const sgn = r > 0 ? 'up' : r < 0 ? 'down' : 'dim';
+  /* MOTION IS READ AGAINST THE NUMBER'S OWN SIGN, not against zero.
+     On a red number a positive slope is the selling GIVING BACK,
+     not buying rising -- calling that "rising" says the opposite of
+     what is happening to the push being watched. `thrust` is the
+     slope already turned to face the number's direction, so
+     extending and fading mean the same thing on both colours. */
+  const mo = tr.motion;
+  const moCol = mo === 'extending' ? sgn : mo === 'fading' ? 'dim' : 'dim';
+  const moWord = mo === 'extending' ? 'PRESSING HARDER'
+               : mo === 'fading' ? 'GIVING IT BACK'
+               : mo === 'holding' ? 'HOLDING' : 'NO SIDE';
 
-  /* The slope against its own deadband, so "steady" is visibly a
-     threshold being not-met rather than a reading of zero. */
-  const db = Number(tr.deadband) || 0.05;
-  const mag = Math.max(0, Math.min(100,
-    (Math.abs(Number(tr.slope_per_min)) / (db * 3)) * 100));
-  const bar = `<div style="position:relative;height:5px;`
-    + `border-radius:3px;background:var(--line);margin:6px 0">`
+  /* THE NUMBER'S PATH THROUGH THE CANDLE, because "growing in the
+     downwards direction" and "pulling back" are shapes, and no
+     label carries a shape. Zero is the middle line; the trace is
+     the ratio, so the distance from that line IS how hard. */
+  const hist = Array.isArray(tr.history) ? tr.history : [];
+  let spark = '';
+  if (hist.length > 1) {
+    const pts = hist.map((h) => {
+      const x = Math.max(0, Math.min(300, Number(h[0])));
+      const y = 20 - Math.max(-1, Math.min(1, Number(h[1]))) * 19;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    const last = hist[hist.length - 1];
+    const lx = Math.max(0, Math.min(300, Number(last[0])));
+    const ly = 20 - Math.max(-1, Math.min(1, Number(last[1]))) * 19;
+    spark = `<svg viewBox="0 0 300 40" preserveAspectRatio="none" `
+      + `style="width:100%;height:42px;display:block;margin:6px 0">`
+      + `<line x1="0" y1="20" x2="300" y2="20" `
+      + `stroke="var(--line)" stroke-width="1"/>`
+      + `<polyline points="${pts.join(' ')}" fill="none" `
+      + `stroke="var(--${sgn})" stroke-width="1.5" `
+      + `vector-effect="non-scaling-stroke"/>`
+      + `<circle cx="${lx.toFixed(1)}" cy="${ly.toFixed(1)}" r="2.5" `
+      + `fill="var(--${sgn})"/></svg>`
+      + `<div class="thin" style="display:flex;justify-content:`
+      + `space-between;margin-top:-2px"><span>bar open</span>`
+      + `<span>+1 all buying &middot; 0 even &middot; &minus;1 all `
+      + `selling</span><span>300s</span></div>`;
+  }
+
+  /* HOW HARD, on its own. The sign says who, this says how much of
+     the tape they are. */
+  const st = Math.max(0, Math.min(1, Number(tr.strength)));
+  const strengthBar = `<div style="position:relative;height:5px;`
+    + `border-radius:3px;background:var(--line);margin:4px 0">`
     + `<div style="position:absolute;left:0;top:0;height:5px;`
-    + `border-radius:3px;width:${mag}%;background:var(--${col})">`
-    + `</div><div style="position:absolute;left:33.3%;top:-2px;`
-    + `width:1px;height:9px;background:var(--dim)"></div></div>`;
+    + `border-radius:3px;width:${(st * 100).toFixed(1)}%;`
+    + `background:var(--${sgn})"></div></div>`;
 
-  const contra = (tr.trend !== 'steady'
-                  && Number(tr.pull) * Number(tr.slope_per_min) < 0)
+  const contra = (Number(tr.pull) * r < 0 && mo === 'extending')
     ? `<div class="thin" style="color:var(--down);margin-top:4px">`
-      + `<b>the last minute is pulling the other way</b> &mdash; `
-      + `recent flow ${tr.marginal > 0 ? '+' : ''}${tr.marginal} `
-      + `against the candle's ${tr.ratio > 0 ? '+' : ''}${tr.ratio}`
-      + `</div>`
-    : `<div class="thin" style="margin-top:4px">recent minute `
-      + `${tr.marginal > 0 ? '+' : ''}${tr.marginal} &middot; pulling `
-      + `${tr.pull > 0 ? 'up' : tr.pull < 0 ? 'down' : 'neither way'}`
-      + `</div>`;
+      + `<b>the last minute has already turned</b> &mdash; recent `
+      + `${tr.marginal > 0 ? '+' : ''}${tr.marginal} against the `
+      + `candle's ${r > 0 ? '+' : ''}${tr.ratio}</div>`
+    : `<div class="thin" style="margin-top:4px">last minute `
+      + `${tr.marginal > 0 ? '+' : ''}${tr.marginal} &middot; `
+      + `pulling ${tr.pull > 0 ? 'toward buying' :
+          tr.pull < 0 ? 'toward selling' : 'neither way'}</div>`;
 
   return `<div style="margin-top:6px;border-top:1px solid var(--line);`
     + `padding-top:6px">`
-    + `<div class="thin">THIS 5m CANDLE &mdash; what the number is doing`
-    + `</div>`
-    + `<div style="font-size:16px;margin:2px 0;color:var(--${col})">`
-    + `${arrow} <b>${esc(tr.trend.toUpperCase())}</b>`
-    + `<span class="thin"> ${tr.slope_per_min > 0 ? '+' : ''}`
-    + `${tr.slope_per_min} a minute</span></div>`
-    + bar
-    + `<div class="thin">now at <b style="color:var(--${rCol})">`
-    + `${tr.ratio > 0 ? '+' : ''}${tr.ratio}</b> on `
-    + `${Number(tr.volume).toLocaleString()} contracts</div>`
+    + `<div class="thin">THIS 5m CANDLE &mdash; the push, and what `
+    + `it is doing</div>`
+    + `<div style="display:flex;align-items:baseline;gap:10px;`
+    + `margin:2px 0">`
+    + `<span style="font-size:20px;color:var(--${sgn})"><b>`
+    + `${r > 0 ? '+' : ''}${tr.ratio}</b></span>`
+    + `<span style="color:var(--${moCol})"><b>${moWord}</b></span>`
+    + `<span class="thin">${Math.abs(Number(tr.thrust)).toFixed(3)}`
+    + ` a minute</span></div>`
+    + spark
+    + strengthBar
+    + `<div class="thin">${(st * 100).toFixed(1)}% of this candle's `
+    + `${Number(tr.volume).toLocaleString()} contracts are net `
+    + `${r > 0 ? 'buying' : r < 0 ? 'selling' : 'neither'}</div>`
     + contra
     + `</div>`;
 }
