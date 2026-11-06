@@ -416,7 +416,9 @@ class TestTheTapeFeedsIt:
         """
         src = (ROOT / "liqmap" / "cme_tape.py").read_text()
         # The guard has since gained the fused bars as a third term.
-        assert "if self.clockwin is not None or self.tickbars" in src
+        # The guard has gained terms twice (fused bars, then the
+        # kinetic reading) and now wraps. Match the stable start.
+        assert "if (self.clockwin is not None or self.tickbars" in src
 
     def test_one_builder_per_offered_size_is_created(self):
         src = (ROOT / "liqmap" / "web.py").read_text()

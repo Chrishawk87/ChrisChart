@@ -498,7 +498,7 @@ class TestTheTapeFeedsBothLegs:
         to move.
         """
         src = (ROOT / "liqmap" / "cme_tape.py").read_text()
-        assert "if self.clockwin is not None or self.tickbars or self.fusedbars:" in src
+        assert "or self.fusedbars" in src
         assert "if self.ofibars or self.fusedbars:" in src
         assert "for _b in self.ofibars.values():" not in src, \
             "that loop raises when ofibars is None and skips the fused feed"

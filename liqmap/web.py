@@ -1113,6 +1113,16 @@ class Runtime:
                 # from a disk row without the book updates that built
                 # it. Restoring one would produce a bar wearing the
                 # right label with a leg that never happened.
+                from .kinetic import Kinetic
+                if svc.tape.kinetic is None:
+                    # BOTH, because they answer different questions
+                    # and the difference is itself worth seeing: the
+                    # aligned one lines up with the 5m candle a rule
+                    # reads, the rolling one never resets.
+                    svc.tape.kinetic = Kinetic(period_s=300.0)
+                if getattr(svc.tape, "kinetic_bar", None) is None:
+                    svc.tape.kinetic_bar = Kinetic(period_s=300.0,
+                                                   aligned=True)
                 from .fusedbar import PAIRS as _FPAIRS, FusedBars
                 svc.tape.fusedbars = {
                     (int(a), int(b)): FusedBars(tick_target=int(a),
@@ -5674,7 +5684,18 @@ def create_app() -> FastAPI:
         # says whether the rule is running at all. That is the
         # reading you most want when something is wrong.
         st_ = getattr(rt_, "journal_stepper", None)
+        _kin = None
+        try:
+            _tp = getattr(getattr(rt_, "ofi", None), "tape", None)
+            _k = getattr(_tp, "kinetic", None) if _tp else None
+            _kin = _k.to_dict() if _k is not None else None
+            _kb = getattr(_tp, "kinetic_bar", None) if _tp else None
+            _kin_bar = _kb.to_dict() if _kb is not None else None
+        except Exception:                               # noqa: BLE001
+            _kin = _kin_bar = None
         extra = {
+            "kinetic": _kin,
+            "kinetic_bar": _kin_bar,
             "timed": _timed_now(rt_),
             "stepper": ({"running": bool(st_ and st_.is_alive()),
                          "steps": getattr(st_, "steps", 0),
@@ -15042,6 +15063,72 @@ function fusArrow(dir) {
   return '<b style="color:var(--dim)">FLAT</b>';
 }
 
+/* PUSH FROM THE TAPE, no book. Two numbers, because who crossed the
+   spread and which way price went are independent facts and one
+   signed number cannot carry both -- it would be right about two of
+   the four states and wrong about the other two. */
+function kinBlock(k, barK) {
+  if (!k) return '';
+  k = Object.assign({}, k, {_bar: barK || null});
+  const dirCol = k.dir === 'up' ? 'up' : k.dir === 'down' ? 'down' : 'dim';
+  const effCol = k.efficiency > 0 ? 'up' : k.efficiency < 0 ? 'down' : 'dim';
+  const warn = (k.attributed_pct != null && k.attributed_pct < 80)
+    ? `<div class="thin" style="color:var(--down)">only `
+      + `${k.attributed_pct}% of prints had an aggressor &mdash; `
+      + `treat this reading with suspicion</div>` : '';
+  const bar = k._bar || null;
+  const ratioBar = (r) => {
+    // A -1..1 reading is only legible as a position on a line.
+    const pct = Math.max(0, Math.min(100, (r + 1) * 50));
+    return `<div style="position:relative;height:6px;border-radius:3px;`
+      + `background:var(--line);margin:6px 0">`
+      + `<div style="position:absolute;left:50%;top:-2px;width:1px;`
+      + `height:10px;background:var(--dim)"></div>`
+      + `<div style="position:absolute;left:${pct}%;top:-3px;`
+      + `width:8px;height:12px;margin-left:-4px;border-radius:2px;`
+      + `background:var(--${r > 0 ? 'up' : r < 0 ? 'down' : 'dim'})">`
+      + `</div></div>`;
+  };
+  return `<div class="thin" style="margin:12px 0 6px">`
+    + `<b>Push</b> &mdash; from the tape only, nothing cancellable `
+    + `(rolling ${Math.round(k.period_s / 60)}m`
+    + (bar ? `, and the 5m candle` : '') + `)</div>`
+    + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
+    + `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
+    + `border-radius:6px;padding:10px">`
+    + `<div class="thin" style="margin-bottom:4px">DIRECTION &mdash; `
+    + `who is crossing the spread</div>`
+    + `<div style="font-size:16px;margin-bottom:6px;color:var(--${dirCol})">`
+    + `<b>${esc(String(k.dir).toUpperCase())} ${k.push > 0 ? '+' : ''}`
+    + `${Number(k.push).toLocaleString()}</b></div>`
+    + `<div class="thin">${Number(k.buy).toLocaleString()} bought &middot; `
+    + `${Number(k.sell).toLocaleString()} sold</div>`
+    + ratioBar(k.push_ratio)
+    + `<div class="thin">${k.push_ratio > 0 ? '+' : ''}${k.push_ratio} `
+    + `of a possible &plusmn;1 &mdash; +1 would be every contract `
+    + `lifting the offer</div>`
+    + (bar
+        ? `<div class="thin" style="margin-top:6px;border-top:1px solid `
+          + `var(--line);padding-top:6px">this 5m candle: `
+          + `<b style="color:var(--${bar.dir === 'up' ? 'up' : bar.dir === 'down' ? 'down' : 'dim'})">`
+          + `${bar.push_ratio > 0 ? '+' : ''}${bar.push_ratio}</b>`
+          + ` &middot; ${Number(bar.volume).toLocaleString()} contracts `
+          + `so far</div>`
+        : '')
+    + `</div>`
+    + `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
+    + `border-radius:6px;padding:10px">`
+    + `<div class="thin" style="margin-bottom:4px">EFFICIENCY &mdash; `
+    + `what it bought</div>`
+    + `<div style="font-size:16px;margin-bottom:6px;color:var(--${effCol})">`
+    + `<b>${k.eff_ticks > 0 ? '+' : ''}${k.eff_ticks} ticks</b>`
+    + `<span class="thin"> a contract</span></div>`
+    + `<div class="thin">${esc(k.quadrant || '')}</div></div>`
+    + `</div>`
+    + `<div class="thin" style="margin-top:4px">${esc(k.say || '')}</div>`
+    + warn;
+}
+
 function paintFusion(d) {
   const box = $('fusionBox');
   if (!box) return;
@@ -15198,6 +15285,7 @@ function paintFusion(d) {
     + cell('OFI BAR &mdash; shown, decides nothing', o.dir, ofiLines)
     + cell('5 MINUTE BAR &mdash; the slow one', m.dir, m5Lines)
     + `</div>`
+    + kinBlock(d.kinetic, d.kinetic_bar)
     + `<div class="thin" style="margin:12px 0 6px">`
     + `<b>Timed strategy</b> &mdash; the 1-minute and the 5-minute, `
     + `live: ${timedVerdict}</div>`

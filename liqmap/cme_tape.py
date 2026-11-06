@@ -190,6 +190,15 @@ class Tape:
     # decode each of those, in the order trade-then-book that the
     # OFI bars use and for the same reason.
     fusedbars: dict | None = None
+    # PUSH FROM THE TAPE ALONE, no book. Rolling 5-minute signed
+    # aggressive volume, and how many points each contract of it
+    # bought. Fed from the RAW record so that an unattributed print
+    # still moves the price reference the next signed one is
+    # measured against.
+    kinetic: object = None
+    # The same reading cut to the 5-minute candle instead of rolling,
+    # so it lines up with the bar a rule is reading.
+    kinetic_bar: object = None
     # WHICH SIDE IS WINNING, continuously, independent of the bars.
     # One instance, not one per target: the five builders are five
     # slicings of one tape, and the flow underneath them is one thing.
@@ -458,7 +467,9 @@ class Tape:
         # asked for them counted, not dropped, so this reads the
         # record itself: a tape full of unknown-side prints must not
         # be able to look like a balanced one.
-        if self.clockwin is not None or self.tickbars or self.fusedbars:
+        if (self.clockwin is not None or self.tickbars
+                or self.fusedbars or self.kinetic is not None
+                or self.kinetic_bar is not None):
             try:
                 if dbn._action(rec) in (dbn.ACTION_TRADE,
                                         dbn.ACTION_FILL):
@@ -487,6 +498,10 @@ class Tape:
                     # bar that had not started when it happened.
                     for _fb in (self.fusedbars or {}).values():
                         _fb.on_trade(_ts, _rpx, _rsz, _sd)
+                    if self.kinetic is not None:
+                        self.kinetic.on_trade(_ts, _rpx, _rsz, _sd)
+                    if self.kinetic_bar is not None:
+                        self.kinetic_bar.on_trade(_ts, _rpx, _rsz, _sd)
             except Exception:                           # noqa: BLE001
                 pass            # a measurement must not stop the tape
         t = dbn.trade_from(rec)
