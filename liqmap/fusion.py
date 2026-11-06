@@ -258,7 +258,26 @@ def state(tick: dict | None, ofi: dict | None,
     tick = tick or {}
     ofi = ofi or {}
     t_dir = str(tick.get("dir") or "")
-    o_dir = str(ofi.get("read") or "")
+    # THE OFI BAR'S DIRECTION IS WHERE PRICE SITS AGAINST ITS OWN
+    # OPEN -- the candle's body, which is what the chart draws.
+    #
+    # It was `read`, the sign of the imbalance accumulator against
+    # the call level. That is the candle's COLOUR, and the colour
+    # and the body are genuinely different facts about one bar:
+    # the imbalance says which way the book leaned, the body says
+    # where price actually went while the bar was open. This module
+    # has always said they disagree often, and the panel was showing
+    # one while the chart drew the other.
+    #
+    # Chris: "the OFI bar in my fusion area does not match what my
+    # ofi chart actual direction forget about the color where it
+    # actually opened at is the real story".
+    #
+    # The colour stays in the payload under its own name, because a
+    # body and a colour that disagree is absorption and it is worth
+    # seeing -- it is just not the direction any more.
+    o_dir = str(ofi.get("price_dir") or "")
+    o_colour = str(ofi.get("read") or "")
     m_dir, m_why = m5_direction(m5)
     # The fast pair on its own, kept separately from the verdict so
     # the panel can show WHICH of the two tests is failing: the pair
@@ -299,6 +318,14 @@ def state(tick: dict | None, ofi: dict | None,
         },
         "ofi": {
             "dir": o_dir,
+            # The colour, beside the body it disagrees with. Named
+            # so neither can be mistaken for the other again.
+            "colour_dir": o_colour,
+            "agrees_with_colour": bool(o_dir and o_colour
+                                       and o_dir == o_colour),
+            "open_px": ofi.get("open_px"),
+            "last_px": ofi.get("last_px"),
+            "ticks": ofi.get("ticks"),
             "imbalance": ofi.get("imbalance"),
             "level": ofi.get("level"),
             "delta": ofi.get("delta"),
