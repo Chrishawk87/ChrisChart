@@ -6947,7 +6947,24 @@ def create_app() -> FastAPI:
         """
         from . import timed as _tm
 
-        return _tm.state(_candle_now(rt_, "1m"), _candle_now(rt_, "5m"))
+        # The 5-minute leg is WHO IS CROSSING THE SPREAD, cleared at
+        # each boundary -- `kinetic_bar` is already that window,
+        # already fed from this tape, so nothing is recomputed here.
+        # Reading it anywhere else would be a second implementation
+        # of one number.
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        kb = getattr(tape, "kinetic_bar", None) if tape else None
+        d5 = ""
+        push = None
+        if kb is not None:
+            d5 = getattr(kb, "direction", "") or ""
+            push = getattr(kb, "push", None)
+
+        m5 = _candle_now(rt_, "5m") or {}
+        if push is not None:
+            m5 = dict(m5, push=round(float(push), 2))
+        return _tm.state(_candle_now(rt_, "1m"), m5, m5_dir=d5)
 
     def _fusion_now(rt_, per_bar: int = 0) -> dict:
         """The two series side by side, and whether they agree.

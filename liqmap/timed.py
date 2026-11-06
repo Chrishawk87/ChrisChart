@@ -134,15 +134,46 @@ def reversed_against(side: str, m1_dir: str) -> tuple[bool, str]:
     return False, ""
 
 
-def state(m1: dict | None, m5: dict | None) -> dict:
+def state(m1: dict | None, m5: dict | None,
+          m5_dir: str = "") -> dict:
     """Everything the rule and the panel need, from one place.
 
     Built from the candles themselves rather than from a direction
     computed elsewhere: two readings of "which way is this candle
     pointing" is two things to keep correct, and the first time they
     differ the screen and the rule are describing different markets.
+
+    `m5_dir` OVERRIDES THE 5-MINUTE LEG. Chris:
+
+        "all i want is for the direction who is crossing the spread
+        to recompute every 5 minutes thats all"
+
+    Close-against-open says which way price ENDED UP. It does not
+    say who is crossing the spread to put it there, and four
+    different ways of reading it all lost on 109 hours of tape while
+    taking the same 1,194 trades -- the leg was not selecting
+    anything. The aggressor direction is a different fact about the
+    same tape: signed volume that actually crossed, cleared at each
+    5-minute boundary.
+
+    It arrives as an argument rather than being computed here
+    because the window that produces it is fed print by print off
+    the tape and cannot be rebuilt from a candle dict. The 1-minute
+    leg and the reversal exit are untouched; both still read price,
+    which is what keeps "crosses its open" and "turned" the same
+    event on the leg that uses them.
+
+    An empty or unknown override falls back to the candle, so a
+    missing tape degrades to the old reading instead of flat-lining
+    the rule -- and `m5["source"]` says which one was used, so the
+    panel can never imply a reading the rule did not take.
     """
-    d1, d5 = direction(m1), direction(m5)
+    src = "price"
+    if m5_dir in ("up", "down", "flat"):
+        d5, src = m5_dir, "flow"
+    else:
+        d5 = direction(m5)
+    d1 = direction(m1)
     side, why = entry_side(d1, d5)
     m1 = m1 or {}
     m5 = m5 or {}
@@ -151,7 +182,11 @@ def state(m1: dict | None, m5: dict | None) -> dict:
                "ticks": m1.get("ticks"), "seconds": m1.get("seconds")},
         "m5": {"dir": d5, "open": m5.get("open"), "close": m5.get("close"),
                "ticks": m5.get("ticks"), "seconds": m5.get("seconds"),
-               "start_ts": m5.get("start_ts")},
+               "start_ts": m5.get("start_ts"),
+               # Which measure produced `dir`, and the signed
+               # contracts behind it when that measure is the flow.
+               # A direction with no magnitude cannot be audited.
+               "source": src, "push": m5.get("push")},
         "side": side,
         "agree": bool(side),
         "why": why,
