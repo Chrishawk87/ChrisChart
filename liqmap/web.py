@@ -1123,6 +1123,9 @@ class Runtime:
                 if getattr(svc.tape, "kinetic_bar", None) is None:
                     svc.tape.kinetic_bar = Kinetic(period_s=300.0,
                                                    aligned=True)
+                if getattr(svc.tape, "ratio_track", None) is None:
+                    from .ratiotrack import RatioTrack as _RT
+                    svc.tape.ratio_track = _RT(period_s=300.0)
                 from .fusedbar import PAIRS as _FPAIRS, FusedBars
                 svc.tape.fusedbars = {
                     (int(a), int(b)): FusedBars(tick_target=int(a),
@@ -5691,11 +5694,14 @@ def create_app() -> FastAPI:
             _kin = _k.to_dict() if _k is not None else None
             _kb = getattr(_tp, "kinetic_bar", None) if _tp else None
             _kin_bar = _kb.to_dict() if _kb is not None else None
+            _rtk = getattr(_tp, "ratio_track", None) if _tp else None
+            _track = _rtk.to_dict() if _rtk is not None else None
         except Exception:                               # noqa: BLE001
-            _kin = _kin_bar = None
+            _kin = _kin_bar = _track = None
         extra = {
             "kinetic": _kin,
             "kinetic_bar": _kin_bar,
+            "ratio_track": _track,
             "timed": _timed_now(rt_),
             "stepper": ({"running": bool(st_ and st_.is_alive()),
                          "steps": getattr(st_, "steps", 0),
@@ -15084,7 +15090,76 @@ function fusArrow(dir) {
    spread and which way price went are independent facts and one
    signed number cannot carry both -- it would be right about two of
    the four states and wrong about the other two. */
-function kinBlock(k, barK) {
+/* WHAT THE CANDLE'S RATIO IS DOING. Chris: "not just the color the
+   number is which turns red and green but what the number is
+   actually doing going up or down".
+
+   The sign is drawn small and the TRAJECTORY is drawn large,
+   because that is the ordering the numbers themselves justify: the
+   ratio sits a few percent off zero most of the time, so its colour
+   flips on a handful of contracts, while "net buying is building"
+   survives that.
+
+   `pull` gets its own line whenever it contradicts the slope. A
+   cumulative mean goes quiet as the bar fills -- at 1,170 contracts
+   one more 50-lot moves it by about 0.04, at 60 contracts the same
+   lot moves it by 0.5 -- so late in a bar the flow can reverse
+   completely while the line barely bends. The pull is what shows
+   that, and it is the only part of this that leads. */
+function trackBlock(tr) {
+  if (!tr) return '';
+  if (!tr.ready)
+    return `<div class="thin" style="margin-top:6px;border-top:1px `
+      + `solid var(--line);padding-top:6px;color:var(--dim)">`
+      + esc(tr.say || '') + `</div>`;
+
+  const col = tr.trend === 'rising' ? 'up'
+            : tr.trend === 'falling' ? 'down' : 'dim';
+  const arrow = tr.trend === 'rising' ? '&#9650;'
+              : tr.trend === 'falling' ? '&#9660;' : '&#9644;';
+  const rCol = tr.ratio > 0 ? 'up' : tr.ratio < 0 ? 'down' : 'dim';
+
+  /* The slope against its own deadband, so "steady" is visibly a
+     threshold being not-met rather than a reading of zero. */
+  const db = Number(tr.deadband) || 0.05;
+  const mag = Math.max(0, Math.min(100,
+    (Math.abs(Number(tr.slope_per_min)) / (db * 3)) * 100));
+  const bar = `<div style="position:relative;height:5px;`
+    + `border-radius:3px;background:var(--line);margin:6px 0">`
+    + `<div style="position:absolute;left:0;top:0;height:5px;`
+    + `border-radius:3px;width:${mag}%;background:var(--${col})">`
+    + `</div><div style="position:absolute;left:33.3%;top:-2px;`
+    + `width:1px;height:9px;background:var(--dim)"></div></div>`;
+
+  const contra = (tr.trend !== 'steady'
+                  && Number(tr.pull) * Number(tr.slope_per_min) < 0)
+    ? `<div class="thin" style="color:var(--down);margin-top:4px">`
+      + `<b>the last minute is pulling the other way</b> &mdash; `
+      + `recent flow ${tr.marginal > 0 ? '+' : ''}${tr.marginal} `
+      + `against the candle's ${tr.ratio > 0 ? '+' : ''}${tr.ratio}`
+      + `</div>`
+    : `<div class="thin" style="margin-top:4px">recent minute `
+      + `${tr.marginal > 0 ? '+' : ''}${tr.marginal} &middot; pulling `
+      + `${tr.pull > 0 ? 'up' : tr.pull < 0 ? 'down' : 'neither way'}`
+      + `</div>`;
+
+  return `<div style="margin-top:6px;border-top:1px solid var(--line);`
+    + `padding-top:6px">`
+    + `<div class="thin">THIS 5m CANDLE &mdash; what the number is doing`
+    + `</div>`
+    + `<div style="font-size:16px;margin:2px 0;color:var(--${col})">`
+    + `${arrow} <b>${esc(tr.trend.toUpperCase())}</b>`
+    + `<span class="thin"> ${tr.slope_per_min > 0 ? '+' : ''}`
+    + `${tr.slope_per_min} a minute</span></div>`
+    + bar
+    + `<div class="thin">now at <b style="color:var(--${rCol})">`
+    + `${tr.ratio > 0 ? '+' : ''}${tr.ratio}</b> on `
+    + `${Number(tr.volume).toLocaleString()} contracts</div>`
+    + contra
+    + `</div>`;
+}
+
+function kinBlock(k, barK, track) {
   if (!k) return '';
   k = Object.assign({}, k, {_bar: barK || null});
   const dirCol = k.dir === 'up' ? 'up' : k.dir === 'down' ? 'down' : 'dim';
@@ -15124,14 +15199,15 @@ function kinBlock(k, barK) {
     + `<div class="thin">${k.push_ratio > 0 ? '+' : ''}${k.push_ratio} `
     + `of a possible &plusmn;1 &mdash; +1 would be every contract `
     + `lifting the offer</div>`
-    + (bar
+    + (track ? trackBlock(track)
+             : (bar
         ? `<div class="thin" style="margin-top:6px;border-top:1px solid `
           + `var(--line);padding-top:6px">this 5m candle: `
           + `<b style="color:var(--${bar.dir === 'up' ? 'up' : bar.dir === 'down' ? 'down' : 'dim'})">`
           + `${bar.push_ratio > 0 ? '+' : ''}${bar.push_ratio}</b>`
           + ` &middot; ${Number(bar.volume).toLocaleString()} contracts `
           + `so far</div>`
-        : '')
+        : ''))
     + `</div>`
     + `<div style="flex:1;min-width:220px;border:1px solid var(--line);`
     + `border-radius:6px;padding:10px">`
@@ -15272,6 +15348,49 @@ function paintFusion(d) {
     if (c.seconds != null) out.push(`${Math.round(c.seconds)}s into the bar`);
     return out;
   };
+  /* THE 5-MINUTE LINE IS NOW WHO CROSSED THE SPREAD, so the lines
+     under it have to say so. `tLine` reports ticks-from-open and
+     open-vs-now -- all price facts. Left as it was, the cell would
+     show a flow direction with a price explanation underneath it
+     and read as though price produced the arrow. That is worse
+     than the old panel, because it looks right.
+
+     Flow first and in bold, price kept but labelled as price, and
+     the disagreement between them called out: buyers crossing hard
+     while price sits lower is absorption, and it is the one thing
+     this pairing can show that neither number shows alone. */
+  const t5Line = (c) => {
+    const out = [];
+    const p = Number(c.push);
+    if (c.source === 'flow') {
+      if (isFinite(p) && p !== 0) {
+        out.push(`<b>${p > 0 ? '+' : ''}${Math.round(p).toLocaleString()}`
+          + `</b> net contracts crossing &mdash; `
+          + (p > 0 ? 'buyers lifting offers' : 'sellers hitting the bid'));
+      } else {
+        out.push('nothing has crossed yet this bar &mdash; flat blocks '
+          + 'an entry');
+      }
+    } else {
+      out.push('<span style="color:var(--down)">reading price, not '
+        + 'flow</span> &mdash; no tape window');
+    }
+    const pd = c.ticks > 0 ? 'up' : (c.ticks < 0 ? 'down' : 'flat');
+    if (c.source === 'flow' && c.dir !== 'flat' && pd !== 'flat'
+        && pd !== c.dir)
+      out.push(`<b style="color:var(--dim)">flow and price disagree`
+        + `</b> &mdash; ${c.dir === 'up' ? 'buying absorbed'
+                                         : 'selling absorbed'}`);
+    if (c.ticks != null)
+      out.push(`price ${c.ticks > 0 ? '+' : ''}${c.ticks} ticks from `
+        + `its open`);
+    if (c.open != null && c.close != null)
+      out.push(`open ${chPx(c.open)} &middot; now ${chPx(c.close)}`);
+    if (c.seconds != null)
+      out.push(`${Math.round(c.seconds)}s in &middot; clears at 300s`);
+    return out;
+  };
+
   const timedVerdict = T.side
     ? `<b style="color:var(--${T.side === 'up' ? 'up' : 'down'})">`
       + `${esc(String(T.side).toUpperCase())}</b> &mdash; both agree`
@@ -15302,13 +15421,14 @@ function paintFusion(d) {
     + cell('OFI BAR &mdash; shown, decides nothing', o.dir, ofiLines)
     + cell('5 MINUTE BAR &mdash; the slow one', m.dir, m5Lines)
     + `</div>`
-    + kinBlock(d.kinetic, d.kinetic_bar)
+    + kinBlock(d.kinetic, d.kinetic_bar, d.ratio_track)
     + `<div class="thin" style="margin:12px 0 6px">`
     + `<b>Timed strategy</b> &mdash; the 1-minute and the 5-minute, `
     + `live: ${timedVerdict}</div>`
     + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
     + cell('1 MINUTE &mdash; the truth teller', t1.dir, tLine(t1))
-    + cell('5 MINUTE &mdash; the direction', t5.dir, tLine(t5))
+    + cell('5 MINUTE &mdash; who is crossing the spread', t5.dir,
+           t5Line(t5))
     + `</div>`;
 
   const note = $('fusNote');

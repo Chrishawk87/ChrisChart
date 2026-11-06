@@ -199,6 +199,13 @@ class Tape:
     # The same reading cut to the 5-minute candle instead of rolling,
     # so it lines up with the bar a rule is reading.
     kinetic_bar: object = None
+    # WHAT THAT CANDLE'S RATIO IS DOING, not what sign it has. The
+    # ratio sits near zero most of the time, so its colour is a coin
+    # flip while its trajectory is a real statement. Separate from
+    # `kinetic_bar` because it carries a rolling marginal window that
+    # deliberately does NOT clear at the boundary -- the thing that
+    # makes it lead the cumulative number rather than trail it.
+    ratio_track: object = None
     # WHICH SIDE IS WINNING, continuously, independent of the bars.
     # One instance, not one per target: the five builders are five
     # slicings of one tape, and the flow underneath them is one thing.
@@ -502,6 +509,8 @@ class Tape:
                         self.kinetic.on_trade(_ts, _rpx, _rsz, _sd)
                     if self.kinetic_bar is not None:
                         self.kinetic_bar.on_trade(_ts, _rpx, _rsz, _sd)
+                    if self.ratio_track is not None:
+                        self.ratio_track.on_trade(_ts, _rsz, _sd)
             except Exception:                           # noqa: BLE001
                 pass            # a measurement must not stop the tape
         t = dbn.trade_from(rec)
