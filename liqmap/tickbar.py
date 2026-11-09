@@ -122,6 +122,32 @@ class TickBar:
     unknown: int = 0
     unknown_size: float = 0.0
     closed: bool = False
+    # THE PATH, NOT THE ENDPOINTS. Price movement between
+    # consecutive prints INSIDE this bar, split by which way it
+    # went. Close-against-open uses two prints out of thousands and
+    # answers "where did it finish"; this uses every one of them and
+    # answers "which way did the trading actually go".
+    #
+    # In price units, not ticks, so the same builder works on an
+    # instrument with a different tick size.
+    #
+    # THESE DO NOT DECIDE THE DIRECTION, and the reason is worth
+    # keeping: the deltas telescope. Every one is p_i - p_(i-1), so
+    # up_move - down_move collapses to close - open EXACTLY. A
+    # direction taken from the magnitudes is close-against-open
+    # wearing a longer formula, and it was built that way first.
+    # They stay because the SPLIT is real information the body
+    # cannot show -- four points up and four back reads flat on the
+    # body and 4.00/4.00 here.
+    up_move: float = 0.0
+    down_move: float = 0.0
+    # THE VOTES, AND THESE DO DECIDE. One print, one vote, whatever
+    # size it moved. Nothing telescopes, so this is free to disagree
+    # with the body and routinely does: twelve prints grinding up a
+    # tick each against two prints dropping seven ticks each is UP
+    # by the tape and DOWN by the close.
+    up_prints: int = 0
+    down_prints: int = 0
     # Closed because a time boundary arrived, not because the count
     # was reached. Such a bar is SHORT -- possibly a single print in
     # a quiet minute -- and a direction read off three prints is not
@@ -139,8 +165,64 @@ class TickBar:
         return self.buy_size - self.sell_size
 
     @property
+    def path_dir(self) -> str:
+        """THE TRUE DIRECTION: which way the prints actually went.
+
+        Chris: "all the tick bar does is read the information that
+        created the tick bar and that information only to determine
+        the true direction".
+
+        WHY NOT CLOSE AGAINST OPEN. Forcing the tick bar to reset on
+        the 5-minute mark made its open the SAME PRICE as the
+        5-minute candle's open -- at 5,000 prints the count is
+        almost never reached inside five minutes, so the two bars
+        start together every period. Both legs of the fusion rule
+        were then measuring from one open and could only agree.
+        Measured: identical opens in every period of a twelve-minute
+        run.
+
+        This uses no open at all. A bar that climbed four points and
+        gave back four is flat here and reads as a full reversal to
+        close-against-open; a bar that ground up on many small
+        up-ticks against a few larger down-ticks is up here even if
+        it happens to finish a tick below where it started.
+
+        Equal is flat, and flat is not a side. A bar with one print
+        has no path and is flat -- which is also what gives "flat at
+        the reset" for free.
+        """
+        if self.up_prints > self.down_prints:
+            return "up"
+        if self.down_prints > self.up_prints:
+            return "down"
+        return "flat"
+
+    @property
+    def path_net(self) -> int:
+        """Up prints minus down prints. The margin of the vote."""
+        return self.up_prints - self.down_prints
+
+    @property
+    def path_share(self) -> float:
+        """How one-sided the path was, 0 to 1.
+
+        A bar that only ever ticked up reads 1.0. A bar that went up
+        and down in equal measure reads 0.0 however far it travelled,
+        which is the distinction close-against-open cannot draw.
+        """
+        tot = self.up_prints + self.down_prints
+        if tot <= 0:
+            return 0.0
+        return abs(self.path_net) / tot
+
+    @property
     def direction(self) -> str:
-        """Close against open. Equal is flat, and flat is not a side."""
+        """Close against open. THE BODY, for drawing the candle.
+
+        Kept because it is what a candle IS, and shown beside
+        `path_dir` so the two can be compared. It is no longer what
+        the fusion rule reads.
+        """
         if self.close > self.open:
             return "up"
         if self.close < self.open:
@@ -192,6 +274,12 @@ class TickBar:
             "unknown_size": round(self.unknown_size, 2),
             "closed": bool(self.closed),
             "by_clock": bool(self.by_clock),
+            "path_dir": self.path_dir,
+            "up_prints": int(self.up_prints),
+            "down_prints": int(self.down_prints),
+            "up_move": round(self.up_move, 6),
+            "down_move": round(self.down_move, 6),
+            "path_share": round(self.path_share, 4),
             # The chart painter already knows what `live` means and
             # draws that bar differently. Spelling the same state two
             # ways is not redundancy here -- `closed` is this
@@ -297,6 +385,7 @@ class TickBars:
             cut = b
             b = self._cur = None
 
+        fresh = b is None
         if b is None:
             b = self._cur = TickBar(start_ts=t, open=p, high=p,
                                     low=p, close=p, ts_last=t)
@@ -304,6 +393,33 @@ class TickBars:
             b.high = p
         if p < b.low:
             b.low = p
+        # THE PATH ACCUMULATES BEFORE `close` MOVES, because
+        # `b.close` is still the PREVIOUS print's price at this
+        # point. Assigning first would compare the print to itself
+        # and every bar would read flat.
+        #
+        # `fresh` is the bar's first print: there is no previous
+        # print INSIDE this bar, and reaching back to the last print
+        # of the bar before would be reading information that did
+        # not create this bar.
+        #
+        # It is REDUNDANT TODAY and kept deliberately. A new bar is
+        # constructed with `close` seeded from this same print, so
+        # `d` would be zero and no vote would be cast anyway --
+        # removing the guard changes nothing, and a mutation proving
+        # that survived the suite. It stays because it states the
+        # rule, and because the day the constructor stops seeding
+        # `close` it becomes load-bearing silently.
+        if not fresh:
+            d = p - b.close
+            if d > 0:
+                b.up_move += d
+                b.up_prints += 1
+            elif d < 0:
+                b.down_move -= d
+                b.down_prints += 1
+            # A print at the same price moved nothing and votes on
+            # nothing. It is not a tie, it is an abstention.
         b.close = p
         b.ts_last = t
         b.volume += sz

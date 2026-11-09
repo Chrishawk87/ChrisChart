@@ -311,6 +311,14 @@ def state(tick: dict | None, ofi: dict | None,
             # route and died one function later, reading exactly
             # like a mode that does nothing.
             "raw_dir": tick.get("raw_dir") or t_dir,
+            # The body, and the vote behind the direction. This dict
+            # is a reshape: a field not named here is silently
+            # dropped, which is how the smoothing once reached the
+            # route and died one function later.
+            "body_dir": tick.get("body_dir") or "",
+            "up_prints": tick.get("up_prints") or 0,
+            "down_prints": tick.get("down_prints") or 0,
+            "path_share": tick.get("path_share") or 0.0,
             "smooth": tick.get("smooth") or {},
             "reset_s": tick.get("reset_s") or 0.0,
             "by_clock": bool(tick.get("by_clock")),

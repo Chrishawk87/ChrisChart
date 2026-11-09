@@ -7009,7 +7009,27 @@ def create_app() -> FastAPI:
                     "by_clock": bool(getattr(bld, "last_by_clock", False)),
                     "clock_cuts": getattr(bld, "_clock_cuts", 0),
                     "why": "between bars -- the last print closed one"}
-        raw_dir = cur.direction
+        # THE DIRECTION IS THE PATH, NOT THE BODY.
+        #
+        # Forcing the reset onto the 5-minute mark made the tick
+        # bar's open the SAME PRICE as the 5-minute candle's open --
+        # at 5,000 prints the count is almost never reached inside
+        # five minutes, so both bars start together every period.
+        # Measured: identical opens in every period of a twelve
+        # minute run. Both legs of the rule were reading one open
+        # and could only agree with each other.
+        #
+        # Chris: "i dont care what the open of the 5 minute
+        # timeframe does all the tick bar does is read the
+        # information that created the tick bar and that information
+        # only to determine the true direction".
+        #
+        # So every print votes: how many moved price up against how
+        # many moved it down. No open enters it, and it is free to
+        # disagree with the body -- a grind up against two sharp
+        # drops is up by the tape and down by the close.
+        raw_dir = cur.path_dir
+        body_dir = cur.direction
         return {"per_bar": bld.per_bar,
                 "reset_s": getattr(bld, "period_s", 0.0),
                 # Short because the clock cut it, not because the
@@ -7025,6 +7045,14 @@ def create_app() -> FastAPI:
                 # way to find out whether it helped.
                 "dir": (sm.get("dir") or raw_dir) if sm else raw_dir,
                 "raw_dir": raw_dir,
+                # The candle's body, beside the path that overrules
+                # it. When they differ the bar finished one way and
+                # traded the other, which is the reading the body
+                # alone cannot give.
+                "body_dir": body_dir,
+                "up_prints": cur.up_prints,
+                "down_prints": cur.down_prints,
+                "path_share": round(cur.path_share, 3),
                 "smooth": sm,
                 "prints": cur.trades, "open": cur.open,
                 "close": cur.close, "seconds": round(cur.seconds, 1),
@@ -15537,8 +15565,26 @@ function paintFusion(d) {
   if (t.prints != null)
     tickLines.push(`${Number(t.prints).toLocaleString()} of `
       + `${Number(t.per_bar || 0).toLocaleString()} prints in`);
+  /* THE VOTE IS THE DIRECTION; the body sits under it.
+
+     The arrow above is now how many prints moved price up against
+     how many moved it down -- no open involved, because forcing
+     the 5-minute reset had made the tick bar's open the same price
+     as the 5-minute candle's, so the two legs could only agree.
+
+     When the body disagrees, the bar finished one way and traded
+     the other. That is worth seeing and it is not an error. */
+  if (t.up_prints != null && (t.up_prints || t.down_prints))
+    tickLines.push(`<b>${Number(t.up_prints).toLocaleString()} prints up `
+      + `&middot; ${Number(t.down_prints).toLocaleString()} down</b>`
+      + (t.path_share != null
+         ? ` (${Math.round(t.path_share * 100)}% one-sided)` : ''));
+  if (t.body_dir && t.raw_dir && t.body_dir !== t.raw_dir)
+    tickLines.push(`<b style="color:var(--dim)">the candle closed `
+      + `${esc(t.body_dir)}</b> &mdash; it traded the other way`);
   if (t.ticks != null)
-    tickLines.push(`${t.ticks > 0 ? '+' : ''}${t.ticks} ticks from its open`);
+    tickLines.push(`body ${t.ticks > 0 ? '+' : ''}${t.ticks} ticks `
+      + `from its open`);
   if (t.seconds != null) tickLines.push(`${t.seconds}s old`);
   /* WHAT THE SMOOTHING CHANGED, and what it costs.
 
