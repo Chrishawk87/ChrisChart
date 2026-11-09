@@ -74,7 +74,11 @@ from dataclasses import dataclass, field
 # under a few hundred is noise at the chart scale, and anything over a
 # few thousand stops being faster than the clock bars it is meant to
 # beat. The Fibonacci-ish middle is the conventional futures set.
-PER_BAR_CHOICES: tuple[int, ...] = (233, 500, 1000, 2000, 5000, 10000)
+# THE SIZES CHRIS NAMED: "250tick, 500tick, 1000, 2000, 4000, 5000,
+# or even 10,000". 233 was a Fibonacci habit from retail charting
+# software and he does not use it; 4000 was missing.
+PER_BAR_CHOICES: tuple[int, ...] = (250, 500, 1000, 2000, 4000,
+                                    5000, 10000)
 DEFAULT_PER_BAR = 1000
 
 # The series the fusion rule reads unless told otherwise. Chris named

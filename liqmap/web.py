@@ -3267,6 +3267,32 @@ def _flow_snapshot(tape, interval: str) -> dict:
 # app
 # --------------------------------------------------------------------------
 
+# THE FUSION TICK BAR IS CUT AT EVERY TRUE 5-MINUTE MARK, and
+# this is not a preference. Chris: "force reset it once every
+# true 5 minutes for example (7:00AM to 7:05AM resets the 7:05am
+# to 7:10am Resets) ... regardless to if it finished the count or
+# not the reset happens anyway".
+#
+# TRUE means the wall clock, not five minutes from whenever the
+# last bar happened to start. Unix time divides evenly into
+# 300-second buckets from an epoch on a minute boundary, so
+# `int(ts // 300)` lands on :00, :05, :10 of the hour in every
+# zone whose offset is a multiple of five minutes -- which is all
+# of them. Verified against New York across a 7:00-7:10 window.
+#
+# The consequence, stated because it is the point rather than a
+# side effect: a bar can close having seen three prints, and a
+# fresh bar's open IS its close, so the direction at a reset is
+# FLAT until price moves off that open. Chris: "if no true
+# direction at the reset its flat".
+FUSION_RESET_S = 300.0
+# Defined at MODULE level, not inside create_app. A default
+# argument is evaluated when the `def` runs, so a constant set
+# further down the same scope is unbound at that moment -- the
+# identical mistake `MAX_PER_BAR` made in `journal.decide`,
+# which is why that one is a sentinel instead.
+
+
 def create_app() -> FastAPI:
     rt = runtime()
 
@@ -5672,7 +5698,7 @@ def create_app() -> FastAPI:
     @app.get("/api/fusion", dependencies=[Depends(require_token)])
     def api_fusion(coin: str = "ES", per_bar: int = 0,
                    smooth: str = "raw", flip_ticks: float = 0.0,
-                   ema_n: int = 0, reset_s: float = 0.0
+                   ema_n: int = 0, reset_s: float = FUSION_RESET_S
                    ) -> dict[str, Any]:
         """The tick bar and the OFI bar, read separately, compared.
 
@@ -5693,7 +5719,7 @@ def create_app() -> FastAPI:
             return {"error": "the service is still starting"}
         st = _fusion_now(rt_, int(per_bar or 0), smooth,
                          float(flip_ticks or 0.0), int(ema_n or 0),
-                         float(reset_s or 0.0))
+                         float(reset_s or FUSION_RESET_S))
         # THE TIMED READINGS AND THE STEPPER DO NOT DEPEND ON THE
         # TICK BARS, so they are built before the early return
         # rather than going out with it. This route had the same
@@ -6899,6 +6925,7 @@ def create_app() -> FastAPI:
     from .journal import signal as jn_signal
     from . import quote as jn_quote
 
+
     def _windows_for(rt_, period_s: float):
         """The state machine for one period, or None."""
         svc = getattr(rt_, "ofi", None)
@@ -7073,7 +7100,7 @@ def create_app() -> FastAPI:
 
     def _fusion_now(rt_, per_bar: int = 0, smooth: str = "raw",
                     flip_ticks: float = 0.0, ema_n: int = 0,
-                    reset_s: float = 0.0) -> dict:
+                    reset_s: float = FUSION_RESET_S) -> dict:
         """The two series side by side, and whether they agree.
 
         THE SAME READINGS THE PANEL DRAWS AND THE RULE TRADES. One
@@ -9849,10 +9876,11 @@ DASHBOARD = """<!doctype html>
           <option>1m</option><option>5m</option><option selected>15m</option>
           <option>30m</option><option>1h</option></optgroup>
           <optgroup label="by prints (ES tape only)">
-          <option value="233t">233 ticks</option>
+          <option value="250t">250 ticks</option>
           <option value="500t">500 ticks</option>
           <option value="1000t">1,000 ticks</option>
           <option value="2000t">2,000 ticks</option>
+          <option value="4000t">4,000 ticks</option>
           <option value="5000t">5,000 ticks</option>
           <option value="10000t">10,000 ticks</option></optgroup>
           <optgroup label="fused: prints AND imbalance (ES only)">
@@ -10265,8 +10293,7 @@ and a direction off three prints is not the measurement a
 five-thousand-print bar gives. The panel says when the last bar was
 cut short.">reset <select id="fusReset" onchange="fusLoad()"
             style="margin:0 4px">
-            <option value="0" selected>none (native)</option>
-            <option value="300">every 5m</option>
+            <option value="300" selected>every 5m (true clock)</option>
             <option value="900">every 15m</option>
           </select></label>
         <label title="Ticks of give-back before THRESHOLD turns.
@@ -15544,6 +15571,29 @@ function paintFusion(d) {
   if (t.why) tickLines.push(esc(t.why));
 
   const ofiLines = [];
+  /* THE BODY IS THE DIRECTION, THE COLOUR IS BESIDE IT.
+
+     The arrow above was the sign of the imbalance against the call
+     level -- the candle's COLOUR -- while the chart draws the
+     candle's BODY, close against open. Two different facts about
+     one bar, and the panel showed one while the chart showed the
+     other. It also read FLAT whenever the imbalance sat inside the
+     band, which is most of a quiet bar, on a candle the chart was
+     drawing with a visible body.
+
+     Both are shown now. When they disagree the book leaned one way
+     and price went the other, which is absorption and worth
+     seeing -- it is simply not the direction. */
+  if (o.ticks != null && o.open_px != null)
+    ofiLines.push(`<b>${o.ticks > 0 ? '+' : ''}${o.ticks} ticks from `
+      + `its open</b> (${chPx(o.open_px)}`
+      + (o.last_px != null ? ` &rarr; ${chPx(o.last_px)}` : '') + `)`);
+  if (o.colour_dir)
+    ofiLines.push(o.agrees_with_colour
+      ? `colour agrees (${esc(o.colour_dir)})`
+      : `<b style="color:var(--dim)">colour says `
+        + `${esc(o.colour_dir)}</b> &mdash; the book leaned the `
+        + `other way`);
   if (o.imbalance != null)
     ofiLines.push(`imbalance ${Number(o.imbalance).toLocaleString()}`
       + (o.level != null ? ` against a &plusmn;${o.level} band` : ''));
@@ -15667,7 +15717,8 @@ function paintFusion(d) {
     + `<div class="thin" style="margin-top:4px">${stepLine}</div></div>`
     + `<div style="display:flex;gap:10px;flex-wrap:wrap">`
     + cell('TICK BAR &mdash; prints and price only', t.dir, tickLines)
-    + cell('OFI BAR &mdash; shown, decides nothing', o.dir, ofiLines)
+    + cell('OFI BAR &mdash; close against its open, decides nothing',
+           o.dir, ofiLines)
     + cell('5 MINUTE BAR &mdash; the slow one', m.dir, m5Lines)
     + `</div>`
     + kinBlock(d.kinetic, d.kinetic_bar, d.ratio_track)
