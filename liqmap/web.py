@@ -7100,9 +7100,18 @@ def create_app() -> FastAPI:
             sm = _tick_smoothed(bld, smooth,
                                 flip_ticks or DEFAULT_FLIP_TICKS,
                                 ema_n or DEFAULT_EMA_N, live)
+        # THE TICK SERIES AGAINST THE CLOCK. The forming bar's
+        # projected span against the median of recent closed ones:
+        # under 1 the prints are arriving faster than lately and the
+        # tick chart is running ahead of the time chart, over 1 it is
+        # dragging behind. Shown, not gated -- "fast" is not "up".
+        try:
+            pace = bld.pace()
+        except Exception:
+            pace = {}
         if cur is None:
             return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
-                    "smooth": sm,
+                    "smooth": sm, "pace": pace,
                     "reset_s": getattr(bld, "period_s", 0.0),
                     "by_clock": bool(getattr(bld, "last_by_clock", False)),
                     "clock_cuts": getattr(bld, "_clock_cuts", 0),
@@ -7154,6 +7163,7 @@ def create_app() -> FastAPI:
                 "down_prints": cur.down_prints,
                 "path_share": round(cur.path_share, 3),
                 "smooth": sm,
+                "pace": pace,
                 "prints": cur.trades, "open": cur.open,
                 "close": cur.close, "seconds": round(cur.seconds, 1),
                 "ticks": round((cur.close - cur.open) / 0.25, 1)
@@ -7639,7 +7649,8 @@ def create_app() -> FastAPI:
                             float(s.window_s or 900.0),
                             fp=fpi.get("side") or "",
                             held_s=_dw.held_s(_now_s),
-                            flips=_dw.flips)
+                            flips=_dw.flips,
+                            pace=_tk.get("pace") or {})
         else:
             fus = (_timed_now(rt_) if strat == "timed"
                    else _fusion_now(rt_))
@@ -15857,6 +15868,31 @@ function paintFusion(d) {
     tickLines.push(`body ${t.ticks > 0 ? '+' : ''}${t.ticks} ticks `
       + `from its open`);
   if (t.seconds != null) tickLines.push(`${t.seconds}s old`);
+  /* THE TICK CHART AGAINST THE CLOCK -- the push and the pull.
+
+     A tick bar closes on a count, so the seconds it takes ARE the
+     tape's speed. This is the forming bar's projected span against
+     the median of recent closed ones: under 1 the prints are
+     arriving faster than lately and this series is running ahead of
+     the time chart, over 1 it is dragging behind it.
+
+     SHOWN, NOT GATED. Fast is not the same as up, and nothing here
+     is allowed to decide a trade -- the entry still reads the vote
+     alone. A blank reading means not enough closed bars to compare
+     against, which is deliberately not drawn as "even". */
+  const pc_ = t.pace || {};
+  if (pc_.push) {
+    const pcColor = pc_.push === 'push' ? 'var(--up)'
+      : (pc_.push === 'fade' ? 'var(--dim)' : 'var(--fg)');
+    tickLines.push(`<b style="color:${pcColor}">tape ${esc(pc_.push)}</b>`
+      + ` &mdash; ${Number(pc_.projected_s || 0).toFixed(0)}s projected `
+      + `vs ${Number(pc_.median_s || 0).toFixed(0)}s median `
+      + `(${Number(pc_.ratio || 0).toFixed(2)}&times;)`);
+  } else if (pc_.bars_measured != null) {
+    tickLines.push(`<span style="color:var(--dim)">pace: `
+      + `${Number(pc_.bars_measured).toLocaleString()} closed bars to `
+      + `compare against &mdash; not enough yet</span>`);
+  }
   /* WHAT THE SMOOTHING CHANGED, and what it costs.
 
      The raw direction stays visible beside the smoothed one. A
@@ -16392,6 +16428,34 @@ function paintStackWin(SW) {
               + 'this, out when it flips</span>')
         : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
+    /* THE PUSH AND THE PULL, UNDER THE DIRECTION IT DOES NOT DECIDE.
+
+       The same tick bar, read for SPEED rather than side: its
+       projected span against the median of recent closed ones.
+       Under 1 the prints are arriving faster than lately and this
+       series is running ahead of the time chart; over 1 it is
+       dragging behind it. That difference is the hybrid reading --
+       one number off one feed, rather than two charts and an eye.
+
+       It decides nothing. The entry above is still the vote alone,
+       and this line is drawn under a label that says so, because
+       every reading on this panel that was not labelled ended up
+       being read as part of the rule. */
+    + ((SW.pace && SW.pace.push)
+        ? '<div class="thin" style="margin-top:4px">tape '
+          + '<b class="' + (SW.pace.push === 'push' ? 'long'
+              : (SW.pace.push === 'fade' ? 'short' : '')) + '">'
+          + esc(SW.pace.push).toUpperCase() + '</b> &mdash; '
+          + Number(SW.pace.projected_s || 0).toFixed(0) + 's projected vs '
+          + Number(SW.pace.median_s || 0).toFixed(0) + 's median ('
+          + Number(SW.pace.ratio || 0).toFixed(2) + '&times;) '
+          + '&mdash; shown, decides nothing</div>'
+        : ((SW.pace && SW.pace.bars_measured != null)
+            ? '<div class="thin" style="margin-top:4px">tape pace: '
+              + Number(SW.pace.bars_measured).toLocaleString()
+              + ' closed bars to compare against &mdash; not enough yet'
+              + '</div>'
+            : ''))
     + '</div>';
 
   const rows = st.rows || {};

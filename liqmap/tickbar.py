@@ -133,6 +133,49 @@ PATH_BAND = 0.02
 VOTE_FRACTION = 0.05
 MIN_VOTES = 25
 
+# THE TICK CHART AGAINST THE CLOCK, WHICH IS THE PUSH AND THE PULL.
+#
+# Chris: "what if we created a hybrid chart a real live continuous
+# time chart paired with a live continuous feed tick chart and traded
+# the difference in the 2 using the tick chart and the time chart as
+# push pull".
+#
+# The difference between those two charts is already a number here.
+# A tick bar closes on a count, so the seconds it takes ARE the
+# tape's speed, and `pace()` compares the forming bar's projected
+# span against the median of recent closed ones. Under 1 the prints
+# are arriving faster than lately -- the tick chart is running ahead
+# of the clock. Over 1 it is dragging behind it.
+#
+# A second chart would draw the same relationship and leave the
+# comparison to the eye. These are the thresholds `_pace_words`
+# already used, lifted out so the words and the one-word reading
+# cannot drift apart, and so nothing downstream invents its own.
+PUSH_RATIO = 0.8        # at or under: the tape is outrunning the clock
+FADE_RATIO = 1.25       # at or over: it is falling behind it
+# Fewer closed bars than this and there is no median worth comparing
+# against. "Running hot" off three samples is confident noise.
+PACE_MIN_BARS = 8
+
+
+def pace_push(ratio: float, measured: int) -> str:
+    """One word for the tick chart against the clock, or "".
+
+    Blank means UNKNOWN, not balanced -- a reader that cannot tell
+    the two apart will treat a cold start as a quiet tape.
+    """
+    try:
+        r = float(ratio or 0.0)
+    except (TypeError, ValueError):
+        return ""
+    if int(measured or 0) < PACE_MIN_BARS or r <= 0:
+        return ""
+    if r <= PUSH_RATIO:
+        return "push"
+    if r >= FADE_RATIO:
+        return "fade"
+    return "even"
+
 
 @dataclass
 class TickBar:
@@ -569,6 +612,10 @@ class TickBars:
             "elapsed_s": round(elapsed, 2),
             "projected_s": round(projected, 2),
             "ratio": round(ratio, 3),
+            # THE TICK CHART AGAINST THE CLOCK, IN ONE WORD.
+            # "push" / "fade" / "even", and "" when there is not
+            # enough history to say. Blank is not "even".
+            "push": pace_push(ratio, len(spans)),
             # Said in words so the panel does not have to decide what
             # the number means, and so the threshold lives in one
             # place rather than in the page and here.
@@ -596,7 +643,7 @@ def _pace_words(med: float, projected: float, ratio: float,
     against, and saying "running hot" off three samples is the kind
     of confident noise that gets traded on.
     """
-    if measured < 8:
+    if measured < PACE_MIN_BARS:
         return (f"only {measured} closed bars to compare against -- "
                 "not enough to call the pace yet")
     if med <= 0 or projected <= 0:
@@ -604,10 +651,10 @@ def _pace_words(med: float, projected: float, ratio: float,
     if ratio <= 0.5:
         return (f"this bar is on pace for {projected:.0f}s against a "
                 f"{med:.0f}s median -- the tape is roughly twice as busy")
-    if ratio <= 0.8:
+    if ratio <= PUSH_RATIO:
         return (f"on pace for {projected:.0f}s against {med:.0f}s -- "
                 "busier than usual")
-    if ratio < 1.25:
+    if ratio < FADE_RATIO:
         return (f"on pace for {projected:.0f}s against {med:.0f}s -- "
                 "normal")
     if ratio < 2.0:

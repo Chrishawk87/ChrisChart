@@ -333,7 +333,8 @@ def exit_reason(side: str, tick: str, bar_ts: float, now_ts: float,
 def state(win: dict | None, tick: str, rungs: dict | None,
           period_s: float, fp: str = "",
           held_s: float | None = None, flips: int = 0,
-          min_hold_s: float = DWELL_S) -> dict:
+          min_hold_s: float = DWELL_S,
+          pace: dict | None = None) -> dict:
     """Everything the rule and the panel need, from one place.
 
     One source, so the screen cannot show an agreement the rule did
@@ -394,6 +395,22 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "asked": False,
             "decides": False,
         },
+        # THE TICK CHART AGAINST THE CLOCK -- the push and the pull.
+        #
+        # Chris: "a real live continuous time chart paired with a
+        # live continuous feed tick chart and traded the difference
+        # in the 2 using the tick chart and the time chart as push
+        # pull". A tick bar closes on a count, so the seconds it
+        # takes ARE the tape's speed: the forming bar's projected
+        # span against the median of recent closed ones is that
+        # difference, already measured.
+        #
+        # SHOWN, NOT USED, and under its own key rather than inside
+        # `tick` -- the tick block is the whole rule, and a field
+        # that decides nothing sitting beside fields that decide
+        # everything is how this engine has twice ended up trading
+        # something nobody meant it to.
+        "pace": {**(pace or {}), "decides": False},
         # SHOWN, NOT USED. Under its own heading so there is no
         # chance of reading any of it as part of the decision.
         "context": {

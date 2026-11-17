@@ -322,6 +322,12 @@ def state(tick: dict | None, ofi: dict | None,
             "down_prints": tick.get("down_prints") or 0,
             "path_share": tick.get("path_share") or 0.0,
             "smooth": tick.get("smooth") or {},
+            # THE PACE TRAVELS WITH THE DIRECTION. This dict is a
+            # reshape -- a field not named here is silently dropped,
+            # which is how the smoothing once reached the route and
+            # died one function later, reading exactly like a mode
+            # that does nothing.
+            "pace": tick.get("pace") or {},
             "reset_s": tick.get("reset_s") or 0.0,
             "by_clock": bool(tick.get("by_clock")),
             "clock_cuts": tick.get("clock_cuts") or 0,
