@@ -339,8 +339,12 @@ class TestTheStackAboveIsUnchanged:
              "present": True, "qualified": "down", "conflicted": False},
             {"timeframe": "1m", "colour": "green", "bps": 4.2,
              "present": True, "qualified": "up", "conflicted": False},
+            # Green on aggression, price down. It used to be thrown
+            # out and read as no direction; it now counts by its
+            # price and carries the absorption beside it.
             {"timeframe": "30s", "colour": "green", "bps": -1.1,
-             "present": True, "qualified": None, "conflicted": True},
+             "present": True, "qualified": "down", "absorbed": True,
+             "conflicted": True},
             {"timeframe": "10s", "colour": "none", "bps": 0.0,
              "present": False, "qualified": None, "conflicted": False},
         ]}}
@@ -360,12 +364,13 @@ class TestTheStackAboveIsUnchanged:
                      "ES", "ES")
         assert "TREND" in got["say"]
         assert "SELL" in got["say"]
-        # Each row still renders its own shape: a qualified down, a
-        # qualified up, one thrown out for fighting its own number, and
-        # one that is not there at all.
+        # Each row still renders its own shape: a down, an up, one
+        # that is down WITH its aggression against it, and one that
+        # is not there at all. The third used to render THROWN OUT
+        # and show no direction at all.
         assert "DOWN" in got["rows"]
         assert "UP" in got["rows"]
-        assert "THROWN OUT" in got["rows"]
+        assert "ABSORBED" in got["rows"]
         assert "not read" in got["rows"]
 
     def test_nothing_in_the_rows_came_from_the_readings(self, page_js):

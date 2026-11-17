@@ -38,40 +38,77 @@ def stack(m15=("red", -2.0), m5=("red", -1.2), m1=("red", -0.8)):
     return {"15m": m15, "5m": m5, "1m": m1}
 
 
-# ------------------------------------------- the colour must match the move
+# -------------------------------------- the row reads price, like the window
 
-def test_a_green_row_with_a_negative_move_is_thrown_out():
-    """THE caveat. Not a weak up-read -- a row contradicting itself, which
-    is what absorption produces: heavy selling into a bid that will not
-    break reads BUYERS on a candle whose price has gone down."""
-    r = cd.Rung(timeframe="1m", colour="green", bps=-0.8, present=True)
-    assert r.qualified is None
-    assert r.conflicted
-    assert "contradicts itself" in r.describe()
+# Chris: "i want the stack timeframes to read like the 5m window does
+# thats true direction". The window's `mid_dir` is close against open
+# with no threshold. These rows now answer that question on their own
+# timeframe, and the colour -- who won on aggression -- is a SECOND
+# measurement that is shown and decides nothing.
 
 
-def test_a_red_row_with_a_positive_move_is_thrown_out_too():
-    r = cd.Rung(timeframe="1m", colour="red", bps=0.8, present=True)
-    assert r.qualified is None and r.conflicted
-
-
-def test_colour_and_move_agreeing_is_what_counts():
+def test_the_direction_is_price_against_this_bars_open():
     assert cd.Rung("1m", "green", 0.8, True).qualified == "up"
     assert cd.Rung("1m", "red", -0.8, True).qualified == "down"
 
 
-def test_a_row_with_no_colour_is_not_conflicted_it_is_silent():
+def test_a_green_row_with_a_negative_move_counts_by_its_price():
+    """IT USED TO BE THROWN OUT. Requiring the colour and the number
+    to agree meant the stack could not answer the question the window
+    answers, and a silent row blocks every entry built on it."""
+    r = cd.Rung(timeframe="1m", colour="green", bps=-0.8, present=True)
+    assert r.qualified == "down"
+    assert r.absorbed, "the disagreement stopped being measured"
+    assert "absorbed" in r.describe()
+
+
+def test_a_red_row_with_a_positive_move_counts_by_its_price_too():
+    r = cd.Rung(timeframe="1m", colour="red", bps=0.8, present=True)
+    assert r.qualified == "up" and r.absorbed
+
+
+def test_a_row_with_no_colour_still_has_a_direction():
+    """A quiet bar that has nonetheless moved is not silent. Saying
+    "no colour" about it hid the number that now counts."""
     r = cd.Rung(timeframe="15m", colour="none", bps=2.0, present=True)
-    assert r.qualified is None
-    assert not r.conflicted
+    assert r.qualified == "up"
+    assert not r.absorbed, "no colour cannot disagree with anything"
+    assert "up" in r.describe()
 
 
 def test_a_zero_move_qualifies_nothing():
-    """Either colour. Price unchanged is not a small move in that colour's
-    favour, it is the row having gone nowhere."""
+    """Either colour. Price unchanged is not a small move in that
+    colour's favour, it is the row having gone nowhere -- and the
+    window treats a flat candle the same way."""
     assert cd.Rung("1m", "green", 0.0, True).qualified is None
     assert cd.Rung("1m", "red", 0.0, True).qualified is None
-    assert cd.Rung("1m", "red", 0.0, True).conflicted
+    assert not cd.Rung("1m", "red", 0.0, True).absorbed, \
+        "flat is not absorbed, it is flat"
+    assert "flat" in cd.Rung("1m", "red", 0.0, True).describe()
+
+
+def test_an_unseeded_row_has_no_direction_at_all():
+    """THE ONE GATE KEPT. Without the bar's open there is no
+    close-against-open to compute, and a number measured from the
+    wrong anchor is wrong rather than merely noisy."""
+    r = cd.Rung("5m", "green", 5.0, True, seeded=False)
+    assert r.qualified is None
+    assert "open was never seen" in r.describe()
+
+
+def test_seeded_defaults_true_so_existing_callers_are_unchanged():
+    assert cd.Rung("5m", "green", 1.0, True).seeded is True
+    c = cd.read("15m", {"15m": ("green", 1.0), "5m": ("green", 1.0),
+                        "1m": ("green", 1.0)})
+    assert all(g.seeded for g in c.rungs)
+
+
+def test_read_accepts_the_seeded_flag_when_given(self=None):
+    c = cd.read("15m", {"15m": ("green", 1.0, False),
+                        "5m": ("green", 1.0, True),
+                        "1m": ("green", 1.0, True)})
+    assert c.rungs[0].seeded is False
+    assert c.rungs[0].qualified is None
 
 
 # ---------------------------------------------------------- the three cases
@@ -122,10 +159,19 @@ def test_the_lower_rows_agreeing_means_nothing_while_the_traded_one_is_silent():
     assert "no colour" in c.why
 
 
-def test_a_traded_row_that_contradicts_itself_also_commits_to_nothing():
-    c = cd.read("15m", stack(("green", -2.0), ("green", 1.2), ("green", 0.8)))
-    assert c.state is cd.State.NO_COMMIT
-    assert "contradicts itself" in c.why
+def test_a_traded_row_whose_colour_fights_its_price_reads_by_price():
+    """IT USED TO COMMIT TO NOTHING. The traded row being green on
+    aggression while price fell made the whole stack unreadable, and
+    an unreadable traded row blocks every entry beneath it.
+
+    It now reads DOWN by its price, which makes the two green rows
+    beneath it a pullback against it -- a reading, where there was
+    none. The absorption is still measured on the row itself."""
+    c = cd.read("15m", stack(("green", -2.0), ("green", 1.2),
+                             ("green", 0.8)))
+    assert c.state is cd.State.PULLBACK
+    assert c.trend == "down" and c.pull == "up"
+    assert c.rungs[0].absorbed, "the disagreement stopped being measured"
 
 
 # ----------------------------------------------------------- the stacks
@@ -302,10 +348,29 @@ def _panel():
     return fn[:fn.index("function paintLayers(d) {")]
 
 
-def test_the_panel_draws_a_thrown_out_row_differently_from_a_silent_one():
+def test_the_panel_draws_the_direction_before_the_absorption():
+    """`conflicted` was checked AHEAD of `qualified` and rendered
+    THROWN OUT. That was right while the colour and the number had
+    to agree for a row to count; they no longer do, so the old order
+    would have printed THROWN OUT on rows that were being traded."""
     fn = _panel()
-    assert "r.conflicted" in fn and "THROWN OUT" in fn
-    assert "no colour" in fn
+    assert "r.qualified === 'up'" in fn
+    assert "ABSORBED" in fn, "the disagreement is no longer shown"
+    # THE CODE, NOT THE PROSE. A first attempt matched the comment
+    # that DESCRIBES the old badge -- the second time in two days I
+    # have written a test that fails against its own documentation.
+    assert "'<span class=\"flag late\">THROWN OUT</span>'" not in fn, \
+        "a counted row is still called thrown out"
+    i_dir = fn.index("r.qualified === 'up'")
+    assert fn.index("r.absorbed") > i_dir, \
+        "absorption is still being read before the direction"
+
+
+def test_the_panel_distinguishes_flat_from_an_unseen_open():
+    """Two different silences. One is the bar having gone nowhere,
+    the other is not knowing where it started."""
+    fn = _panel()
+    assert "flat" in fn and "open not seen" in fn
 
 
 def test_the_panel_shows_no_call_rather_than_a_greyed_out_side():

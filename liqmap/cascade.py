@@ -81,43 +81,106 @@ class Rung:
     colour: str = "none"         # green | red | none
     bps: float = 0.0
     present: bool = False
+    # Was this bar's OPEN actually observed? Without it `bps` is
+    # measured from whatever price happened to arrive first, which
+    # is not a direction at all -- the one gate below that is about
+    # the data rather than about noise.
+    seeded: bool = True
 
     @property
     def qualified(self) -> Way | None:
-        """Up only if green AND positive; down only if red AND negative.
+        """WHERE PRICE IS AGAINST THIS BAR'S OWN OPEN. Nothing else.
 
-        A row whose colour fights its own number is thrown out rather than
-        counted weakly. That disagreement is absorption, and it means the
-        two are measuring different things.
+        Chris: "i want the stack timeframes to read like the 5m
+        window does thats true direction". The window's `mid_dir` is
+        close against open with no threshold -- one tick either way
+        decides it -- and these rows now answer the same question on
+        their own timeframe.
+
+        WHAT WAS DROPPED, AND WHY IT WAS THERE.
+
+            It used to require the COLOUR and the NUMBER to agree:
+            up only if green and bps positive. A row whose colour
+            fought its own number was thrown out and counted as no
+            direction at all. That disagreement is real -- it is
+            absorption, aggression on one side with price going the
+            other -- but it is a SECOND measurement, and gating the
+            direction on it meant the stack could not answer the
+            question the window answers.
+
+            It is still measured and still shown, as `absorbed`. It
+            decides nothing now.
+
+            The flat band, the three-fill minimum and the pressing
+            share went with it: all three are noise gates, and a
+            gate that makes a row silent is a gate that blocks every
+            entry built on that row.
+
+        THE ONE GATE KEPT is `seeded`. Without the bar's open there
+        is no close-against-open to compute, and a number measured
+        from the wrong anchor is wrong rather than merely noisy.
+
+        Zero is flat and flat is not a side, exactly as the window
+        treats it.
         """
-        if not self.present:
+        if not self.present or not self.seeded:
             return None
-        if self.colour == "green" and self.bps > 0:
+        if self.bps > 0:
             return "up"
-        if self.colour == "red" and self.bps < 0:
+        if self.bps < 0:
             return "down"
         return None
 
     @property
+    def absorbed(self) -> bool:
+        """Aggression one way, price the other. SHOWN, NOT USED.
+
+        It no longer blocks the row. Kept because it is the single
+        most informative thing this stack measures -- a 5m that is
+        green on aggression while price bleeds lower is a different
+        market from one that is simply down -- and because a reading
+        that silently stops being collected is how a panel starts
+        lying.
+        """
+        if not self.present or self.colour not in ("green", "red"):
+            return False
+        want = "up" if self.colour == "green" else "down"
+        return self.qualified is not None and self.qualified != want
+
+    @property
     def conflicted(self) -> bool:
-        """It had a colour, and the number went the other way."""
-        return (self.present and self.colour in ("green", "red")
-                and self.qualified is None)
+        """Retained for the panel's THROWN OUT badge, which no longer
+        means thrown out -- it means the two measurements disagree.
+        The row still counts, by its price."""
+        return self.absorbed
 
     def describe(self) -> str:
+        """Lead with the DIRECTION, because that is what now counts.
+
+        This used to return "no colour" and stop, which was right
+        when the colour decided the row. It does not any more: a row
+        with no colour and a clear price move has a direction, and
+        saying "no colour" about it hides the thing being used.
+        """
         if not self.present:
             return f"{self.timeframe}: not read"
-        if self.colour == "none":
-            return f"{self.timeframe}: no colour"
-        if self.conflicted:
-            return (f"{self.timeframe}: {self.colour} but {self.bps:+.1f}bps "
-                    f"-- contradicts itself, thrown out")
-        return f"{self.timeframe}: {self.colour} {self.bps:+.1f}bps"
+        if not self.seeded:
+            return (f"{self.timeframe}: this bar's open was never seen "
+                    f"-- no direction from it")
+        way = self.qualified
+        if way is None:
+            return f"{self.timeframe}: flat, {self.bps:+.1f}bps"
+        if self.absorbed:
+            return (f"{self.timeframe}: {way} {self.bps:+.1f}bps -- "
+                    f"{self.colour} on aggression, absorbed")
+        return f"{self.timeframe}: {way} {self.bps:+.1f}bps"
 
     def to_dict(self) -> dict:
         return {"timeframe": self.timeframe, "colour": self.colour,
                 "bps": round(self.bps, 3), "present": self.present,
-                "qualified": self.qualified, "conflicted": self.conflicted,
+                "seeded": bool(self.seeded),
+                "qualified": self.qualified, "absorbed": self.absorbed,
+                "conflicted": self.conflicted,
                 "describe": self.describe()}
 
 
@@ -179,7 +242,10 @@ def colour_of(winner: str | None, forming: bool = False) -> str:
 def read(trading: str, rows: dict, previous: Way | None = None) -> Cascade:
     """Read the stack beneath `trading`.
 
-    `rows` maps a timeframe to (colour, bps, present). `previous` is the
+    `rows` maps a timeframe to (colour, bps) or (colour, bps, seeded).
+    The third element is optional so existing callers keep working;
+    without it the bar's open is assumed observed, which is what it
+    is for every row that has been measured normally. `previous` is the
     direction the stack was last ALIGNED in -- the only thing that tells a
     turn apart from a trend that has simply been running. Without it a
     flip is reported as a trend, which is true but is not the thing worth
@@ -196,9 +262,11 @@ def read(trading: str, rows: dict, previous: Way | None = None) -> Cascade:
         if got is None:
             out.rungs.append(Rung(timeframe=tf, present=False))
         else:
-            colour, bps = got
+            colour, bps = got[0], got[1]
+            seeded = bool(got[2]) if len(got) > 2 else True
             out.rungs.append(Rung(timeframe=tf, colour=colour,
-                                  bps=float(bps), present=True))
+                                  bps=float(bps), present=True,
+                                  seeded=seeded))
 
     missing = [r.timeframe for r in out.rungs if not r.present]
     if missing:

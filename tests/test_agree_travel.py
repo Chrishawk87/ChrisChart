@@ -669,14 +669,19 @@ def test_cascade_agrees_when_price_and_aggression_point_the_same_way():
     assert at.way_cascade(fr, "15m", 101.0) == "up"
 
 
-def test_cascade_refuses_a_row_whose_colour_fights_its_number():
-    """Price up on the 1m but the aggressors were net sellers. That row
-    is thrown out, so the stack is not aligned -- this is the whole
-    difference between this rule and the loose one."""
+def test_a_row_whose_colour_fights_its_number_counts_by_its_price():
+    """Price up on the 1m but the aggressors were net sellers.
+
+    IT USED TO BE THROWN OUT, and that was "the whole difference
+    between this rule and the loose one". Chris asked for the stack
+    to read like the 5m window -- close against open, no second
+    opinion -- so the row counts by its price and the two rules
+    become the same rule. See the identity test below.
+    """
     fr = _frames({"1m": (100.0, -5.0), "5m": (100.0, 5.0),
                   "15m": (100.0, 5.0)})
     assert at.way_open(fr, "15m", 101.0) == "up"
-    assert at.way_cascade(fr, "15m", 101.0) == ""
+    assert at.way_cascade(fr, "15m", 101.0) == "up"
 
 
 def test_cascade_agrees_down_when_price_falls_on_selling():
@@ -685,10 +690,12 @@ def test_cascade_agrees_down_when_price_falls_on_selling():
     assert at.way_cascade(fr, "15m", 99.0) == "down"
 
 
-def test_cascade_refuses_a_colourless_row():
+def test_a_colourless_row_still_has_a_direction():
+    """A bar with no aggression winner has still moved, and the
+    window would call that a direction."""
     fr = _frames({"1m": (100.0, 0.0), "5m": (100.0, 5.0),
                   "15m": (100.0, 5.0)})
-    assert at.way_cascade(fr, "15m", 101.0) == ""
+    assert at.way_cascade(fr, "15m", 101.0) == "up"
 
 
 def test_cascade_says_nothing_before_a_bar_has_opened():
@@ -701,11 +708,18 @@ def test_the_five_minute_stack_is_shorter_and_comes_from_cascade():
     import liqmap.cascade as c
     assert c.STACKS["5m"] == ("5m", "1m")
     assert c.STACKS["15m"] == ("15m", "5m", "1m")
-    # a 15m row that disagrees cannot affect a 5m stack
+    # A 15m row cannot affect a 5m stack. The disagreement here is
+    # now in the AGGRESSION only -- price is above the open on all
+    # three -- so the 15m stack reads up too. What this test is for
+    # is the stack SELECTION, not the qualification rule.
     fr = _frames({"1m": (100.0, 5.0), "5m": (100.0, 5.0),
                   "15m": (100.0, -5.0)})
     assert at.way_cascade(fr, "5m", 101.0) == "up"
-    assert at.way_cascade(fr, "15m", 101.0) == ""
+    # and a 15m whose PRICE disagrees is excluded from the 5m stack
+    fr2 = _frames({"1m": (100.0, 5.0), "5m": (100.0, 5.0),
+                   "15m": (102.0, 5.0)})     # opened above price
+    assert at.way_cascade(fr2, "5m", 101.0) == "up"
+    assert at.way_cascade(fr2, "15m", 101.0) == ""
 
 
 def test_the_rule_defers_to_cascades_own_aligned_way():
@@ -724,13 +738,26 @@ def test_the_row_view_and_the_agreement_view_use_the_same_qualification():
     fr = _frames({"1m": (100.0, -5.0), "5m": (100.0, 5.0),
                   "15m": (100.0, 5.0)})
     rows = dict(at.rows_cascade(fr, "15m", 101.0))
-    assert rows["1m"] == "", rows      # thrown out, not 'up'
+    # Was '' -- thrown out for disagreeing with its own aggression.
+    # It reads by price now, like every other row.
+    assert rows["1m"] == "up", rows
     assert rows["5m"] == "up" and rows["15m"] == "up"
 
 
-def test_cascade_fires_less_often_than_the_loose_rule(passthrough):
-    """The hypothesis behind running it at all: requiring the aggression
-    to agree with the price should reject most of the churn."""
+def test_cascade_and_open_are_now_the_SAME_RULE(passthrough):
+    """AND THAT IS WORTH SAYING OUT LOUD.
+
+    The hypothesis behind running two rules was that requiring the
+    aggression to agree with the price would reject most of the
+    churn. That agreement check was the ONLY thing separating them:
+    `rows_open` is price against the bar's open, and `Rung.qualified`
+    is now the sign of bps, which is the same comparison.
+
+    Measured on the walk below they produce identical episode
+    counts. This harness is therefore no longer comparing two
+    rules, and a future change that makes them differ again should
+    break this test rather than pass quietly.
+    """
     import random as _r
     rng = _r.Random(5)
     rows = []
@@ -743,7 +770,7 @@ def test_cascade_fires_less_often_than_the_loose_rule(passthrough):
                             traded=["15m"])
     by = {d.rule: len(d.episodes) for d in dets}
     assert by["open"] > 0 and by["cascade"] > 0
-    assert by["cascade"] < by["open"], by
+    assert by["cascade"] == by["open"], by
 
 
 def test_one_pass_drives_every_rule_and_frame(passthrough):
@@ -840,9 +867,13 @@ def test_a_rising_tape_bought_gives_cascade_up_episodes(passthrough):
 
 def test_price_falling_while_buyers_lift_is_not_cascade_agreement(
         passthrough):
-    """The absorption case, and the reason the rule exists: price is
-    going down but the aggressors are buying it, so every row's colour
-    fights its number and nothing qualifies."""
+    """THE ABSORPTION CASE, AND IT NO LONGER BLOCKS ANYTHING.
+
+    Price is going down while the aggressors buy it, so every row's
+    colour fights its number. That used to disqualify every row and
+    was "the reason the rule exists". The stack reads price now, so
+    the rows all read DOWN and the two rules agree -- the absorption
+    is still measured, on `Rung.absorbed`, and decides nothing."""
     rows = []
     px, t = 7800.0, 0.0
     for _ in range(400):
@@ -854,7 +885,12 @@ def test_price_falling_while_buyers_lift_is_not_cascade_agreement(
     by = {d.rule: d.episodes for d in dets}
     assert by["open"], "the loose rule should call this a down run"
     assert all(e.way == "down" for e in by["open"])
-    assert by["cascade"] == [], [e.way for e in by["cascade"]]
+    # WAS `== []`. Every row was disqualified for disagreeing with
+    # its own aggression; they now read DOWN by price, so the
+    # cascade calls the same run the loose rule does.
+    assert by["cascade"], "the stack should read this as down"
+    assert all(e.way == "down" for e in by["cascade"])
+    assert [e.way for e in by["cascade"]] == [e.way for e in by["open"]]
 
 
 def test_cascade_read_owns_the_stack_so_a_stray_row_cannot_widen_it():
@@ -863,7 +899,8 @@ def test_cascade_read_owns_the_stack_so_a_stray_row_cannot_widen_it():
     Worth pinning: it is why the stack cannot drift out of step with the
     site even if this script builds the dict wrongly."""
     import liqmap.cascade as c
+    # The 15m here disagrees on PRICE, which is what now decides.
     rows = {"1m": ("green", 5.0), "5m": ("green", 5.0),
-            "15m": ("red", 5.0)}            # 15m conflicted
+            "15m": ("red", -5.0)}
     assert c.aligned_way(c.read("5m", rows)) == "up"
     assert c.aligned_way(c.read("15m", rows)) is None

@@ -260,7 +260,10 @@ def state(win: dict | None, fp: str, rungs: dict | None,
         rows[name] = {
             "present": bool(row.get("present")),
             "dir": row.get("qualified") or "",
-            "conflicted": bool(row.get("conflicted")),
+            # Shown beside the direction, not instead of it.
+            "absorbed": bool(row.get("absorbed")
+                             or row.get("conflicted")),
+            "seeded": row.get("seeded", True),
             "bps": row.get("bps"),
         }
 

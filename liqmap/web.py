@@ -6591,9 +6591,14 @@ def create_app() -> FastAPI:
                 from . import callbook as _cbk
                 from . import trace as trc
 
+                # `seeded` travels with the row now. The rung reads
+                # price against the bar's OWN open, so the one thing
+                # that can make that number wrong rather than merely
+                # noisy is not having seen the open.
                 rows_ = {r.timeframe: (csc.colour_of(r.winner,
                                                      forming=r.forming),
-                                       r.move_bps)
+                                       r.move_bps,
+                                       bool(getattr(r, "seeded", True)))
                          for r in conf.ordered if r.measured}
                 casc = csc.read(interval, rows_,
                                 previous=rt.last_aligned(coin, interval))
@@ -16179,9 +16184,16 @@ function paintStackWin(SW) {
     const r = rows[name] || {};
     return '<span style="display:inline-block;min-width:118px">'
       + '<span class="thin">' + esc(name || '') + '</span> '
-      + (r.conflicted
-          ? '<span class="flag late">THROWN OUT</span>'
-          : arrow(r.dir))
+      /* THE DIRECTION, THEN THE ABSORPTION BESIDE IT. This showed
+         THROWN OUT instead of the direction, which was right while
+         a row whose colour fought its number counted for nothing.
+         It counts by its price now, so hiding the direction behind
+         that badge would hide the thing gate 2 is deciding on. */
+      + (r.seeded === false
+          ? '<span class="thin">open not seen</span>'
+          : arrow(r.dir)
+            + (r.absorbed
+                ? ' <span class="flag late">ABSORBED</span>' : ''))
       + (r.bps != null
           ? ' <span class="thin">' + (r.bps >= 0 ? '+' : '')
             + Number(r.bps).toFixed(1) + 'bps</span>' : '')
@@ -16514,12 +16526,21 @@ function paintCascade(d) {
     /* Thrown out is not the same as silent, and the two have to look
        different -- a row fighting its own number is the one worth
        looking at. */
+    /* THE DIRECTION FIRST. `conflicted` was checked ahead of it and
+       rendered THROWN OUT -- which was correct while the colour and
+       the number had to agree for a row to count. They no longer do:
+       the row reads price against its own open, like the window, and
+       an aggression/price disagreement is ABSORPTION shown beside
+       the direction rather than instead of it. Leaving the old order
+       would have printed THROWN OUT on rows that were being traded. */
     const mark = !r.present ? '<span class="thin">not read</span>'
-      : r.conflicted
-        ? '<span class="flag late">THROWN OUT</span>'
+      : r.seeded === false
+        ? '<span class="thin">open not seen</span>'
       : r.qualified === 'up'   ? '<b class="long">UP</b>'
+        + (r.absorbed ? ' <span class="flag late">ABSORBED</span>' : '')
       : r.qualified === 'down' ? '<b class="short">DOWN</b>'
-      : '<span class="thin">no colour</span>';
+        + (r.absorbed ? ' <span class="flag late">ABSORBED</span>' : '')
+      : '<span class="thin">flat</span>';
     const dot = r.colour === 'green' ? '#2ecc71'
               : r.colour === 'red'   ? '#e74c3c' : '#666';
     return '<div style="display:flex;align-items:center;gap:10px;'
