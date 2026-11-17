@@ -1228,7 +1228,11 @@ class TestOneTradePerCandle:
         blk = py_func("_journal_step_un")
         assert "j.sides_in_bar(coin_, bar_ts, strat)" in blk
         assert "bar_ts=bar_ts" in blk
-        assert "jn.decide(t, s, px, side, taken," in blk
+        # A STABLE PREFIX. This anchor has broken twice on changes
+        # that did not touch what it checks -- the candle being
+        # threaded through -- most recently when the price argument
+        # became the position's exit mark instead of the last print.
+        assert "jn.decide(t, s," in blk
         assert "window_rule=True" in blk
 
     def test_the_panel_shows_what_the_candle_has_had(self):

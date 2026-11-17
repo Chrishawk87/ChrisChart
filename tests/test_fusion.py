@@ -131,7 +131,8 @@ class TestState:
         this is where that is reconciled -- once.
         """
         st = fu.state({"dir": "up", "per_bar": 5000, "prints": 1200},
-                      {"read": "up", "imbalance": 900, "level": 250},
+                      {"price_dir": "up", "read": "up",
+                       "imbalance": 900, "level": 250},
                       {"dir": "up", "seconds": 200})
         assert st["side"] == "up" and st["agree"] is True
         assert st["tick"]["dir"] == "up"

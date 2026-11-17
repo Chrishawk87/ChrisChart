@@ -901,6 +901,8 @@ STRATEGIES = {
     "footprint": "Footprint -- candle and footprint imbalance agree",
     "fused": "Fused -- the tick bar and the OFI, read separately, agree",
     "timed": "Timed -- the 5m candle, guided in and out by the 1m",
+    "stack": ("Stack + window -- all four of the window agree, then "
+              "the traded row and the one below it"),
 }
 
 
@@ -960,6 +962,28 @@ def window_signal(win: dict, strategy: str = "ofi",
             return side, ""
         return "", (str(fused.get("why") or "")
                     or "the 1m and the 5m do not agree")
+
+    # THE STACK RULE READS THE WINDOW AND THE STACK, IN THAT ORDER.
+    #
+    # Checked here with the fused and timed rules -- before the
+    # window guards below -- not because it ignores the window, but
+    # because it owns its own warmup and its own flat handling and
+    # must not be refused by guards written for a three-leg rule.
+    #
+    # Chris watched all four of candle/OFI/CVD/footprint read DOWN
+    # and no trade follow. Nothing was broken: no strategy here ever
+    # asked for all four. `ofi` wants three, `footprint` wants two,
+    # and the two intrabar rules return before the window is read at
+    # all. A panel showing an agreement that drives nothing reads as
+    # broken whichever way round the fault is.
+    if strategy == "stack":
+        if not fused:
+            return "", "no window or stack reading yet"
+        side = str(fused.get("side") or "")
+        if side in ("up", "down"):
+            return side, ""
+        return "", (str(fused.get("why") or "")
+                    or "the window and the stack do not agree")
 
     if strategy == "fused":
         if not fused:

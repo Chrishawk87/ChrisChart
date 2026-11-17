@@ -165,7 +165,10 @@ class TestTheOneMinuteIsVisible:
     def test_the_panel_draws_both(self):
         blk = js_func("paintFusion")
         assert "1 MINUTE &mdash; the truth teller" in blk
-        assert "5 MINUTE &mdash; the direction" in blk
+        # A stable prefix: the label changed when the 5-minute leg
+        # became who is crossing the spread. What this checks is
+        # that both cells are drawn.
+        assert "5 MINUTE &mdash;" in blk
 
     def test_the_panel_shows_whether_the_rule_is_running(self):
         blk = js_func("paintFusion")

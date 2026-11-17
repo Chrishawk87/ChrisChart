@@ -7450,7 +7450,20 @@ def create_app() -> FastAPI:
         # reads the tick bar and the OFI. They travel through the
         # same argument because `window_signal` dispatches on the
         # strategy, and only one of them is ever computed.
-        fus = (_timed_now(rt_) if strat == "timed" else _fusion_now(rt_))
+        if strat == "stack":
+            # THE WINDOW AND THE STACK, FROM ONE PLACE. The cascade
+            # is already on `out_` -- the veto above reads it -- so
+            # this takes the same rows rather than computing a
+            # second opinion about the same timeframes.
+            from . import stackwin as _sw
+            _rungs = {g.get("timeframe"): g
+                      for g in ((out_.get("cascade") or {}).get("rungs")
+                                or [])}
+            fus = _sw.state(win, fpi.get("side") or "", _rungs,
+                            float(s.window_s or 900.0))
+        else:
+            fus = (_timed_now(rt_) if strat == "timed"
+                   else _fusion_now(rt_))
         side, blocked_why = jn.window_signal(
             win, strat, fpi.get("side") or "", fus)
         says = {"candle": win.get("mid_dir") or None,
@@ -7467,6 +7480,21 @@ def create_app() -> FastAPI:
         elif strat == "timed":
             says = {"1m": (fus.get("m1") or {}).get("dir") or None,
                     "5m": (fus.get("m5") or {}).get("dir") or None}
+        elif strat == "stack":
+            _w = fus.get("window") or {}
+            _st = fus.get("stack") or {}
+            says = {"candle": _w.get("candle") or None,
+                    "OFI": _w.get("ofi") or None,
+                    "CVD": _w.get("cvd") or None,
+                    "footprint": _w.get("footprint") or None,
+                    (_st.get("trading") or "tf"):
+                        ((_st.get("rows") or {})
+                         .get(_st.get("trading") or "") or {}).get("dir")
+                        or None,
+                    (_st.get("below") or "below"):
+                        ((_st.get("rows") or {})
+                         .get(_st.get("below") or "") or {}).get("dir")
+                        or None}
         vetoed = blocked_why
         # The window is the candle the cap counts against.
         bar_ts = float(win.get("start_ts") or 0.0)
@@ -7531,6 +7559,21 @@ def create_app() -> FastAPI:
                 t.side, (fus.get("m1") or {}).get("dir") or "")
             if rev:
                 disagreed = why_rev
+        elif strat == "stack" and t is not None and t.open:
+            # ALL FOUR THE OTHER WAY, not merely losing agreement.
+            # Chris picked this over the tighter exit, and he has
+            # paid for the difference twice: closing the moment
+            # agreement breaks took twelve trades in an afternoon at
+            # two to five ticks each, none of them a decision about
+            # the market. A reading gone quiet is not a reading gone
+            # against you.
+            from . import stackwin as _sw
+            _w = fus.get("window") or {}
+            rev, why_rev = _sw.reversed_window(
+                t.side, _w.get("candle") or "", _w.get("ofi") or "",
+                _w.get("cvd") or "", _w.get("footprint") or "")
+            if rev:
+                disagreed = why_rev
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -7590,6 +7633,13 @@ def create_app() -> FastAPI:
             # WHAT A FILL WOULD ACTUALLY COST, beside the last
             # print, so a disagreement between them is visible
             # rather than inferred from a surprising loss.
+            # THE TWO GATES, for the panel that shows only them.
+            # Carried whole rather than reassembled on the page: a
+            # screen that recomputes a direction is a screen that
+            # eventually disagrees with the rule beside it, which
+            # has happened here with the 5-minute cell and with the
+            # OFI bar already.
+            "stackwin": (fus if strat == "stack" else None),
             "quote": jn_quote.read(
                 (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
                 (getattr(rt_, "ofi", None)), _last or px, _age),
@@ -10215,6 +10265,12 @@ has to be running before the gate stops refusing.">spike
           rows on the rule, with your take profit and stop loss; the
           order at the broker is still yours to place.</div>
         <div id="jnlAgree" class="say" style="margin-bottom:10px">—</div>
+        <!-- THE TWO GATES, ALONE. Chris: "i also want these 2 to be
+             in its own window all alone". It is its own box and it
+             shows nothing else, so the order the rule applies them
+             in is the order they are read on screen. -->
+        <div id="jnlStackWin" style="display:none;margin-bottom:10px">
+        </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;
           align-items:center;margin-bottom:10px">
           <button id="jnlAutoBtn" onclick="jnlToggleAuto()"
@@ -10230,6 +10286,7 @@ has to be running before the gate stops refusing.">spike
               <option value="footprint">Footprint</option>
               <option value="fused">Fused (intrabar)</option>
               <option value="timed">Timed (1m guides the 5m)</option>
+              <option value="stack">Stack + window (all four, then the stack)</option>
             </select></label>
           <label>window
             <select id="jnlWin" onchange="jnlSet()"
@@ -16028,6 +16085,105 @@ function paintClockWindows(d) {
     + 'above grows on every event and locks at the boundary</span>';
 }
 
+/* THE TWO GATES, IN THE ORDER THE RULE APPLIES THEM.
+
+   Chris: "a buy or a sell is based on what the stack says and what
+   the window says but first the window needs to read true before
+   anything else can be done".
+
+   The order is not presentation. When the window has no side the
+   stack is NOT consulted, and this box says so rather than showing
+   a stack verdict the rule never asked for -- a panel that reports
+   both and lets you guess which one decided is how he came to
+   expect a trade from an agreement that drove nothing.
+
+   It renders only for this strategy and hides itself otherwise,
+   because a box that shows stale readings from a rule you are not
+   running is worse than no box. */
+function paintStackWin(SW) {
+  const box = $('jnlStackWin');
+  if (!box) return;
+  if (!SW) { box.style.display = 'none'; return; }
+  box.style.display = '';
+
+  const w = SW.window || {};
+  const st = SW.stack || {};
+  const arrow = (d) => d === 'up'
+    ? '<b class="long">UP</b>'
+    : d === 'down' ? '<b class="short">DOWN</b>'
+    : '<span class="thin">—</span>';
+
+  const leg = (name, d) =>
+    '<span style="display:inline-block;min-width:118px">'
+    + '<span class="thin">' + name + '</span> ' + arrow(d) + '</span>';
+
+  const mins = Math.round((w.period_s || 0) / 60);
+  const gate1 =
+      '<div style="border-left:3px solid var(--'
+    + (w.side ? (w.side === 'up' ? 'up' : 'down') : 'line')
+    + ');padding:6px 0 6px 10px">'
+    + '<div class="thin">GATE 1 &mdash; THE ' + mins + ' MINUTE WINDOW'
+    + '</div>'
+    + '<div style="margin:4px 0">'
+    + leg('candle', w.candle) + leg('OFI', w.ofi)
+    + leg('CVD', w.cvd) + leg('footprint', w.footprint) + '</div>'
+    + (w.side
+        ? '<b class="' + (w.side === 'up' ? 'long' : 'short') + '">'
+          + 'WINDOW ' + w.side.toUpperCase() + '</b>'
+          + ' <span class="thin">all four the same way</span>'
+        : '<b class="short">WINDOW NOT TRUE</b> <span class="thin">'
+          + esc(w.why || '') + '</span>')
+    + '</div>';
+
+  /* Greyed and explicitly NOT ASKED, rather than blank. Blank reads
+     as "no data"; this is "the rule never got here". */
+  const rows = st.rows || {};
+  const row = (name) => {
+    const r = rows[name] || {};
+    return '<span style="display:inline-block;min-width:118px">'
+      + '<span class="thin">' + esc(name || '') + '</span> '
+      + (r.conflicted
+          ? '<span class="flag late">THROWN OUT</span>'
+          : arrow(r.dir))
+      + (r.bps != null
+          ? ' <span class="thin">' + (r.bps >= 0 ? '+' : '')
+            + Number(r.bps).toFixed(1) + 'bps</span>' : '')
+      + '</span>';
+  };
+  const gate2 =
+      '<div style="border-left:3px solid var(--'
+    + (!st.asked ? 'line'
+       : st.side ? (st.side === 'up' ? 'up' : 'down') : 'line')
+    + ');padding:6px 0 6px 10px;margin-top:6px'
+    + (st.asked ? '' : ';opacity:.45') + '">'
+    + '<div class="thin">GATE 2 &mdash; THE STACK ('
+    + esc(st.trading || '') + ' and ' + esc(st.below || '') + ')</div>'
+    + '<div style="margin:4px 0">'
+    + row(st.trading) + row(st.below) + '</div>'
+    + (!st.asked
+        ? '<span class="thin">not asked &mdash; the window has to read '
+          + 'true first</span>'
+        : st.side
+          ? '<b class="' + (st.side === 'up' ? 'long' : 'short') + '">'
+            + 'STACK ' + st.side.toUpperCase() + '</b>'
+          : '<b class="short">STACK DOES NOT SAY</b> '
+            + '<span class="thin">' + esc(st.why || '') + '</span>')
+    + '</div>';
+
+  const verdict = SW.side
+    ? '<b class="' + (SW.side === 'up' ? 'long' : 'short') + '">'
+      + SW.side.toUpperCase() + '</b> <span class="thin">'
+      + esc(SW.say || '') + '</span>'
+    : '<b class="short">NO SIDE</b> <span class="thin">'
+      + esc(SW.why || '') + '</span>';
+
+  box.innerHTML =
+      '<div class="thin" style="margin-bottom:4px"><b>THE WINDOW AND '
+    + 'THE STACK</b> &mdash; the window first, then the stack</div>'
+    + gate1 + gate2
+    + '<div style="margin-top:8px">' + verdict + '</div>';
+}
+
 function paintJournal(d) {
   /* The hand-trading alert rides this painter: one poll, one source,
      so the bar cannot announce a signal the column does not show. */
@@ -16127,6 +16283,8 @@ function paintJournal(d) {
       + ((R.ticks > 0 ? '+' : '') + (R.ticks || 0).toFixed(2))
       + ' ticks from the open of this OFI bar</span>'
     : '<span class="thin">— no OFI bar forming</span>';
+  paintStackWin(J.stackwin);
+
   const ag = $('jnlAgree');
   const W = J.window || {};
   if (ag) {

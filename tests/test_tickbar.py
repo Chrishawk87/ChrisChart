@@ -357,7 +357,7 @@ class TestPace:
 class TestParseInterval:
     def test_a_tick_size_parses(self):
         assert tb.parse_interval("1000t") == 1000
-        assert tb.parse_interval(" 233T ") == 233
+        assert tb.parse_interval(" 250T ") == 250
 
     @pytest.mark.parametrize("bad", ["15m", "1h", "30m", "1d", "", None,
                                      "t", "tt", "1.5t", "-5t", "0t", "m15",
@@ -649,7 +649,7 @@ class TestThePanel:
         src = (ROOT / "liqmap" / "web.py").read_text()
         i = src.index('id="sInt"')
         box = src[i:src.index("</select>", i)]
-        for n in (233, 500, 1000, 2000):
+        for n in (250, 500, 1000, 2000, 4000):
             assert f'value="{n}t"' in box, n
         # and the clock intervals are still there
         for n in ("1m", "5m", "15m"):

@@ -302,8 +302,14 @@ class TestTheRouteWiring:
 
     def test_the_step_picks_the_right_reading(self):
         blk = py_func("_journal_step_un")
-        assert '_timed_now(rt_) if strat == "timed" else _fusion_now(rt_)' \
-            in blk
+        # THE INTENT, NOT THE FORMATTING. This was an exact-string
+        # anchor on a one-line conditional; adding a third strategy
+        # split it across an if/else and broke a test that has no
+        # opinion about either. What it actually checks is that the
+        # step picks a different reading per strategy.
+        assert '_timed_now(rt_)' in blk
+        assert '_fusion_now(rt_)' in blk
+        assert 'strat == "timed"' in blk
 
     def test_the_exit_uses_the_reversal_not_a_disagreement(self):
         blk = py_func("_journal_step_un")
