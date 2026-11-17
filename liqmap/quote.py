@@ -65,11 +65,23 @@ TICK = 0.25
 MAX_SPREAD_TICKS = 10.0
 # A quote older than this is a memory, not an offer.
 MAX_AGE_S = 3.0
+# How far the last PRINT may sit outside the quoted touch before the
+# two are describing different moments.
+#
+# A trade can print through the touch for an instant in a fast move,
+# so this is deliberately loose -- two points on ES. What it catches
+# is the case a timestamp cannot: a book that stopped updating while
+# prints kept arriving, where the clock looks fine and the bid and
+# ask are from a price that has gone. Chris: "sometimes the entry
+# price is far below or above where price is".
+MAX_AWAY_TICKS = 8.0
 
 
 def usable(bid: float, ask: float, age_s: float | None = None,
            max_spread_ticks: float = MAX_SPREAD_TICKS,
-           max_age_s: float = MAX_AGE_S) -> tuple[bool, str]:
+           max_age_s: float = MAX_AGE_S,
+           last: float = 0.0,
+           max_away_ticks: float = MAX_AWAY_TICKS) -> tuple[bool, str]:
     """Is this quote something a fill could be priced from?
 
     Returns (ok, why_not). The reason is never blank on a refusal,
@@ -93,6 +105,17 @@ def usable(bid: float, ask: float, age_s: float | None = None,
         return False, f"{spread:.0f}-tick spread"
     if age_s is not None and age_s > max_age_s:
         return False, f"quote {age_s:.1f}s old"
+    # THE CHECK A TIMESTAMP CANNOT MAKE. If the last print sits far
+    # outside this touch, the book and the tape are describing
+    # different moments and a fill priced off the book lands
+    # nowhere near where trading is happening.
+    if last and last > 0:
+        if last < b - max_away_ticks * TICK:
+            return False, (f"last print {((b - last) / TICK):.0f} ticks "
+                           f"below the bid")
+        if last > a + max_away_ticks * TICK:
+            return False, (f"last print {((last - a) / TICK):.0f} ticks "
+                           f"above the ask")
     return True, ""
 
 
@@ -104,7 +127,7 @@ def fill_px(side: str, action: str, bid: float, ask: float,
     Returns (price, source) where source is "ask", "bid", or
     "last: <reason>" when the quote could not be used.
     """
-    ok, why = usable(bid, ask, age_s)
+    ok, why = usable(bid, ask, age_s, last=float(last or 0.0))
     fallback = (round(float(last or 0.0), 4), f"last: {why or 'no quote'}")
     if not ok:
         return fallback
@@ -155,7 +178,7 @@ def read(book: object, last: float,
     """The quote as a panel can show it, from whatever the tape has."""
     bid = float(getattr(book, "best_bid", 0.0) or 0.0) if book else 0.0
     ask = float(getattr(book, "best_ask", 0.0) or 0.0) if book else 0.0
-    ok, why = usable(bid, ask, age_s)
+    ok, why = usable(bid, ask, age_s, last=float(last or 0.0))
     return {
         "bid": round(bid, 4) if bid else None,
         "ask": round(ask, 4) if ask else None,

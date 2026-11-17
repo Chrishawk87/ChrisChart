@@ -243,6 +243,14 @@ class Tape:
     trades: int = 0
     records: int = 0
     books: int = 0
+    # WHEN THE BOOK WAS LAST REPLACED. It had no timestamp at all,
+    # and the fill priced off it was aged by `last_ts` -- the last
+    # TRADE. Trades and book updates are different record streams:
+    # prints can keep arriving while the depth stalls, and the
+    # staleness check then passes on the trades' freshness while the
+    # bid and ask are old. A fill taken there lands far from where
+    # price actually is, which is exactly what Chris watched.
+    book_ts: float = 0.0
     # Functions registered by SSE streams; called on each new trade so a
     # stream can push a price update without polling. Same pattern as
     # LiveFeed._listeners -- a snapshot copy before iterating makes
@@ -468,6 +476,14 @@ class Tape:
             try:
                 self.book = dbn.book_from(rec, symbol=self.symbol)
                 self.books += 1
+                # From the RECORD, not the wall clock. A feed that
+                # is behind should look behind; stamping it with
+                # `time.time()` would make a late book look current
+                # and defeat the whole check.
+                _bts = float(dbn.seconds(
+                    dbn._get(rec, "ts_event")) or 0.0)
+                if _bts > 0:
+                    self.book_ts = _bts
             except Exception:                           # noqa: BLE001
                 pass
             for _fn in list(self._book_listeners):

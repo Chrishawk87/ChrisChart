@@ -6970,7 +6970,25 @@ def create_app() -> FastAPI:
         bid = float(getattr(bk, "best_bid", 0.0) or 0.0) if bk else 0.0
         ask = float(getattr(bk, "best_ask", 0.0) or 0.0) if bk else 0.0
         last = float(getattr(tape, "last_px", 0.0) or 0.0)
-        return bid, ask, last, _px_age(rt_)
+        # THE BOOK'S OWN AGE, NOT THE TAPE'S.
+        #
+        # This passed `_px_age`, which measures the last TRADE.
+        # Trades and book updates are separate record streams, so
+        # prints can keep arriving while the depth stalls -- and the
+        # staleness check then passed on the trades' freshness while
+        # the bid and ask were old. The fill priced off that lands
+        # far from where price actually is.
+        #
+        # No book timestamp at all means an old tape that never
+        # recorded one: fall back to the trade age rather than
+        # refusing every quote, which would price every fill off
+        # `last` and silently undo the spread fix.
+        bts = float(getattr(tape, "book_ts", 0.0) or 0.0)
+        if bts > 0:
+            age = round(max(0.0, time.time() - bts), 2)
+        else:
+            age = _px_age(rt_)
+        return bid, ask, last, age
 
     def _px_age(rt_) -> float | None:
         """How old the fill price is, in seconds.
@@ -16508,7 +16526,26 @@ function paintJournal(d) {
           : '<b>NONE</b> <span class="thin">'
             + esc((J.footprint && J.footprint.why)
                   || 'no imbalance either way') + '</span>')
-      + capBit
+      /* THE FILL PRICE AND HOW OLD THE BOOK BEHIND IT IS. A fill is
+     priced off the touch now, so a book that has stopped updating
+     is a fill at a price that has gone -- and that failure was
+     silent, because the staleness check was reading the last TRADE
+     rather than the book. */
+  + ((J.quote && (J.quote.bid || J.quote.ask))
+      ? ' &middot; quote ' + chPx(J.quote.bid) + '/' + chPx(J.quote.ask)
+        + ' <span class="thin">' + (J.quote.spread_ticks || 0)
+        + ' tick' + ((J.quote.spread_ticks === 1) ? '' : 's')
+        + (J.quote.age_s != null
+           ? ' &middot; book ' + Number(J.quote.age_s).toFixed(1) + 's old'
+           : '')
+        + (J.quote.usable === false
+           ? ' &mdash; <b style="color:var(--down)">NOT USED: '
+             + esc(J.quote.why || '') + '</b>' : '')
+        + '</span>'
+      : (J.quote && J.quote.why
+          ? ' &middot; <span class="thin">no quote &mdash; '
+            + esc(J.quote.why) + '</span>' : ''))
+  + capBit
       + (J.idle ? ' &middot; <b>no trade</b> &mdash; ' + esc(J.idle)
                 : '')
       + '</div>';
