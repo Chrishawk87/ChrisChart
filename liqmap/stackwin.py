@@ -265,6 +265,9 @@ def state(win: dict | None, fp: str, rungs: dict | None,
                              or row.get("conflicted")),
             "seeded": row.get("seeded", True),
             "bps": row.get("bps"),
+            "open_px": row.get("open_px"),
+            "last_px": row.get("last_px"),
+            "ticks": row.get("ticks"),
         }
 
     return {

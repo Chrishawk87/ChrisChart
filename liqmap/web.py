@@ -7526,8 +7526,46 @@ def create_app() -> FastAPI:
         # reads the tick bar and the OFI. They travel through the
         # same argument because `window_signal` dispatches on the
         # strategy, and only one of them is ever computed.
-        _rungs = {g.get("timeframe"): g
-                  for g in ((out_.get("cascade") or {}).get("rungs") or [])}
+        # THE RULE BUILDS ITS OWN STACK ROWS. It used to read them
+        # off `out_["cascade"]`, and the server-side stepper calls
+        # this with an EMPTY dict -- so with no browser open the
+        # rungs were {}, gate 2 could never pass, and the stack
+        # strategy could not open a trade at all. Measured, not
+        # inferred: `stack_side({}, 300)` returns "the 5m has not
+        # been read yet".
+        #
+        # Even with a browser it was the wrong source. The cascade
+        # on `out_` is built by /api/read, which takes FOUR SECONDS
+        # on an empty database against 1.3ms for /api/fusion, so
+        # every decision was made on roughly four-second-old rows.
+        #
+        # `rows_from_candles` is the same function the panel uses
+        # and reads the same forming candles, so this is one rule
+        # from one source -- it just no longer waits for the slow
+        # route to hand them over. The colour is not available here
+        # and does not need to be: it is the absorption flag and it
+        # decides nothing.
+        from . import cascade as _csc
+        _rungs = {}
+        try:
+            _tf_for = ("5m" if float(s.window_s or 900.0) <= 300.0
+                       else "15m")
+            for _tf, _row in _csc.rows_from_candles(
+                    _tf_for, lambda tf: _candle_now(rt_, tf)).items():
+                _rungs[_tf] = {
+                    "timeframe": _tf, "present": True,
+                    "qualified": ("up" if _row[1] > 0 else
+                                  "down" if _row[1] < 0 else None),
+                    "conflicted": False, "absorbed": False,
+                    "seeded": True, "bps": round(_row[1], 3),
+                    "source": "candle",
+                }
+        except Exception:                               # noqa: BLE001
+            # A stack that cannot be built must not take the step
+            # down -- the journal still has to manage an open
+            # position. An empty dict reads as "not yet", which is
+            # what it is.
+            _rungs = {}
         if strat == "stack":
             # THE WINDOW AND THE STACK, FROM ONE PLACE. The cascade
             # is already on `out_` -- the veto above reads it -- so
@@ -16245,9 +16283,12 @@ function paintStackWin(SW) {
           : arrow(r.dir)
             + (r.absorbed
                 ? ' <span class="flag late">ABSORBED</span>' : ''))
-      + (r.bps != null
-          ? ' <span class="thin">' + (r.bps >= 0 ? '+' : '')
-            + Number(r.bps).toFixed(1) + 'bps</span>' : '')
+      + (r.open_px != null && r.last_px != null
+          ? ' <span class="thin">' + chPx(r.open_px) + ' &rarr; '
+            + chPx(r.last_px) + '</span>'
+          : r.bps != null
+            ? ' <span class="thin">' + (r.bps >= 0 ? '+' : '')
+              + Number(r.bps).toFixed(1) + 'bps</span>' : '')
       + '</span>';
   };
   const gate2 =
@@ -16599,9 +16640,20 @@ function paintCascade(d) {
          + '<span style="width:8px;height:8px;border-radius:50%;'
          + 'background:' + dot + ';flex:none"></span>'
          + '<b style="width:42px">' + esc(r.timeframe) + '</b>'
-         + '<span style="width:70px" class="thin">'
-         + (r.present ? (r.bps >= 0 ? '+' : '') + r.bps.toFixed(1) + 'bps'
-                      : '—') + '</span>'
+         /* THE PRICES, NOT THE BPS. Chris: "the Gate 2 stack is
+            still reading BPS not true price". The direction IS
+            close against open, but nobody can check a bps figure
+            against a broker's chart -- these are the two numbers it
+            was computed from, so the row can be verified by eye. */
+         + '<span style="width:150px" class="thin">'
+         + (!r.present ? '&mdash;'
+            : (r.open_px != null && r.last_px != null)
+              ? chPx(r.open_px) + ' &rarr; ' + chPx(r.last_px)
+                + (r.ticks != null
+                   ? ' <b>' + (r.ticks > 0 ? '+' : '') + r.ticks + '</b>'
+                   : '')
+              : (r.bps >= 0 ? '+' : '') + r.bps.toFixed(1) + 'bps')
+         + '</span>'
          + '<span style="width:110px">' + mark + '</span>'
          /* WHERE THE ROW CAME FROM. A row built from three polled
             bars read identically to one built from the bar in

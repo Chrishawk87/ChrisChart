@@ -390,3 +390,93 @@ class TestTheFootprintNeverDisappears:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+class TestTheRuleDoesNotWaitForTheSlowRoute:
+    """Chris: "the auto trader isnt following the rules we set for
+    it" and "lagging behind real price".
+
+    MEASURED, NOT INFERRED. /api/read takes ~4,200ms on an empty
+    database; /api/fusion takes ~1.3ms. The stack rows were read off
+    `out_["cascade"]`, which /api/read builds -- so every decision
+    was made on roughly four-second-old rows.
+
+    Worse: the server-side stepper calls the journal step with an
+    EMPTY dict. With no browser open the rungs were {}, gate 2 could
+    never pass, and this strategy could not open a trade at all.
+    """
+
+    def test_an_empty_stack_blocks_gate_two_entirely(self):
+        """The bug, pinned. This is what the stepper saw."""
+        assert sw.stack_side({}, 300.0)[0] == ""
+        assert sw.entry_side(D, {}, 300.0)[0] == ""
+
+    def test_the_step_builds_its_own_rows_from_candles(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert "_csc.rows_from_candles(" in blk, \
+            "the rule still waits for the route to hand it rows"
+        assert "_candle_now(rt_, tf)" in blk
+        assert '(out_.get("cascade") or {}).get("rungs")' not in blk, \
+            "it is reading the slow route's cascade again"
+
+    def test_it_picks_the_stack_from_the_window_length(self):
+        """5m window -> the 5m/1m stack; 15m -> 15m/5m."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert 'float(s.window_s or 900.0) <= 300.0' in blk
+
+    def test_a_failure_building_the_stack_does_not_take_the_step_down(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("_csc.rows_from_candles(")
+        blk = src[max(0, i - 1200):i + 900]
+        assert "except Exception" in blk, \
+            "a stack that cannot build would kill the journal step"
+
+
+class TestTheRowsShowRealPrices:
+    """Chris: "the Gate 2 stack is still reading BPS not true
+    price". The direction was already close against open; a bps
+    figure is simply not something anyone can check against a
+    broker's chart."""
+
+    def test_a_rung_carries_both_prices_and_the_ticks(self):
+        from liqmap import cascade as csc
+        rows = csc.rows_from_candles("5m", lambda tf: {
+            "5m": {"open": 7438.00, "close": 7432.75},
+            "1m": {"open": 7434.00, "close": 7432.75}}.get(tf))
+        g = {r.timeframe: r for r in csc.read("5m", rows).rungs}["5m"]
+        d = g.to_dict()
+        assert d["open_px"] == 7438.0 and d["last_px"] == 7432.75
+        assert d["ticks"] == -21.0
+        assert "7438 -> 7432.75" in g.describe()
+
+    def test_the_ticks_match_the_price_difference(self):
+        from liqmap import cascade as csc
+        g = csc.Rung("5m", "none", 0.0, True,
+                     open_px=7438.0, last_px=7432.75)
+        assert g.to_dict()["ticks"] == (7432.75 - 7438.0) / 0.25
+
+    def test_both_panels_show_the_prices(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        assert src.count("chPx(r.open_px)") >= 2, \
+            "one of the two stack panels still shows only bps"
+
+    def test_the_state_carries_them_to_the_gate_two_panel(self):
+        r = {"5m": {"present": True, "qualified": "down",
+                    "open_px": 7438.0, "last_px": 7432.75, "ticks": -21.0},
+             "1m": {"present": True, "qualified": "down",
+                    "open_px": 7434.0, "last_px": 7432.75, "ticks": -5.0}}
+        st = sw.state({}, D, r, 300.0)
+        assert st["stack"]["rows"]["5m"]["open_px"] == 7438.0
+        assert st["stack"]["rows"]["5m"]["ticks"] == -21.0

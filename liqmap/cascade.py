@@ -95,6 +95,13 @@ class Rung:
     source: str = ""            # tape | last closed | polled
     age_s: float | None = None
     bars_used: float = 1.0
+    # THE ACTUAL PRICES. Chris: "the Gate 2 stack is still reading
+    # BPS not true price". The direction IS close against open now,
+    # but a bps number is not something anyone can check against a
+    # broker's chart -- so the row carries the two prices it was
+    # computed from and the panel shows them.
+    open_px: float = 0.0
+    last_px: float = 0.0
 
     @property
     def qualified(self) -> Way | None:
@@ -182,6 +189,9 @@ class Rung:
         if self.absorbed:
             return (f"{self.timeframe}: {way} {self.bps:+.1f}bps -- "
                     f"{self.colour} on aggression, absorbed")
+        if self.open_px and self.last_px:
+            return (f"{self.timeframe}: {way} "
+                    f"{self.open_px:g} -> {self.last_px:g}")
         return f"{self.timeframe}: {way} {self.bps:+.1f}bps"
 
     def to_dict(self) -> dict:
@@ -189,6 +199,10 @@ class Rung:
                 "bps": round(self.bps, 3), "present": self.present,
                 "seeded": bool(self.seeded),
                 "source": self.source, "age_s": self.age_s,
+                "open_px": round(self.open_px, 4) or None,
+                "last_px": round(self.last_px, 4) or None,
+                "ticks": (round((self.last_px - self.open_px) / 0.25, 1)
+                          if self.open_px and self.last_px else None),
                 "bars_used": round(float(self.bars_used or 1.0), 2),
                 "qualified": self.qualified, "absorbed": self.absorbed,
                 "conflicted": self.conflicted,
@@ -301,7 +315,8 @@ def rows_from_candles(trading: str, candle_of, aggression: dict | None = None,
             # after a restart. Either way it is ONE REAL BAR, and
             # the row says which so a stale source stays visible.
             {"source": str(c.get("source") or "candle"),
-             "age_s": c.get("seconds"), "bars_used": 1.0},
+             "age_s": c.get("seconds"), "bars_used": 1.0,
+             "open_px": o, "last_px": cl},
         )
     return out
 
@@ -340,7 +355,9 @@ def read(trading: str, rows: dict, previous: Way | None = None) -> Cascade:
                 present=True, seeded=seeded,
                 source=str(meta.get("source") or ""),
                 age_s=meta.get("age_s"),
-                bars_used=float(meta.get("bars_used") or 1.0)))
+                bars_used=float(meta.get("bars_used") or 1.0),
+                open_px=float(meta.get("open_px") or 0.0),
+                last_px=float(meta.get("last_px") or 0.0)))
 
     missing = [r.timeframe for r in out.rungs if not r.present]
     if missing:
