@@ -226,7 +226,11 @@ class TestNoTradeOutlivesItsFiveMinuteBar:
                / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step_un(")
         blk = src[i:i + 30000]
-        assert "_swb.bar_of(time.time(), FUSION_RESET_S)" in blk
+        # TRADE_BAR_S, not FUSION_RESET_S. The two were one
+        # constant doing two jobs -- the tick series' reset and the
+        # trade time stop -- and making the series continuous would
+        # have silently switched the time stop off with it.
+        assert "_swb.bar_of(time.time(), TRADE_BAR_S)" in blk
         assert "bar_ts=bar_ts" in blk
 
 
@@ -700,3 +704,45 @@ class TestTheDwellReachesTheRuleAndThePanel:
         blk = src[i:i + 6000]
         assert "HOLDING " in blk, "a waiting entry looks like no signal"
         assert "f.ready === false" in blk
+
+
+class TestTheTwoFiveMinutesAreSeparate:
+    """`FUSION_RESET_S` cut the tick series AND set the period of
+    the trade time stop. Making the series continuous would have
+    silently switched off "no trade will ever last past a 5 minute
+    timeframe" -- a safety rule disappearing as a side effect of a
+    display change."""
+
+    def test_the_tick_series_is_continuous(self):
+        import liqmap.web as web
+        assert web.FUSION_RESET_S == 0.0
+
+    def test_the_time_stop_is_still_five_minutes(self):
+        import liqmap.web as web
+        assert web.TRADE_BAR_S == 300.0
+
+    def test_they_are_different_constants(self):
+        import liqmap.web as web
+        assert web.FUSION_RESET_S != web.TRADE_BAR_S
+
+    def test_the_time_stop_still_fires(self):
+        """The behaviour, not the constant. A trade opened in one
+        5-minute bar must not survive into the next."""
+        import datetime as dt
+        tz = dt.timezone(dt.timedelta(hours=-5))
+        at = lambda h, m: dt.datetime(2026, 11, 17, h, m,
+                                      tzinfo=tz).timestamp()
+        import liqmap.web as web
+        assert sw.expired(at(7, 1), at(7, 5), web.TRADE_BAR_S)[0] is True
+        assert sw.expired(at(7, 1), at(7, 4), web.TRADE_BAR_S)[0] is False
+
+    def test_gate_one_reads_the_continuous_bar(self):
+        """The same series the 5000t chart draws, so what he watches
+        and what trades are one bar."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert '_tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)' in blk
+        assert "FUSION_RESET_S = 0.0" in src

@@ -3267,25 +3267,35 @@ def _flow_snapshot(tape, interval: str) -> dict:
 # app
 # --------------------------------------------------------------------------
 
-# THE FUSION TICK BAR IS CUT AT EVERY TRUE 5-MINUTE MARK, and
-# this is not a preference. Chris: "force reset it once every
-# true 5 minutes for example (7:00AM to 7:05AM resets the 7:05am
-# to 7:10am Resets) ... regardless to if it finished the count or
-# not the reset happens anyway".
+# TWO DIFFERENT FIVE MINUTES, AND THEY WERE ONE CONSTANT.
 #
-# TRUE means the wall clock, not five minutes from whenever the
-# last bar happened to start. Unix time divides evenly into
-# 300-second buckets from an epoch on a minute boundary, so
-# `int(ts // 300)` lands on :00, :05, :10 of the hour in every
-# zone whose offset is a multiple of five minutes -- which is all
-# of them. Verified against New York across a 7:00-7:10 window.
+# `FUSION_RESET_S` cut the tick series at every 5-minute mark AND
+# set the period of the trade time stop. They are not the same
+# thing, and leaving them joined meant changing the bar would have
+# silently switched off "no trade will ever last past a 5 minute
+# timeframe" -- a safety rule disappearing as a side effect of a
+# display change.
+
+# THE TICK SERIES THE RULE READS. Zero means continuous: the bar
+# closes on its count of prints and nothing else.
 #
-# The consequence, stated because it is the point rather than a
-# side effect: a bar can close having seen three prints, and a
-# fresh bar's open IS its close, so the direction at a reset is
-# FLAT until price moves off that open. Chris: "if no true
-# direction at the reset its flat".
-FUSION_RESET_S = 300.0
+# It was cut at every true 5-minute mark, which Chris asked for so
+# it would line up with the candle. The cost showed up later: the
+# chart's 5000t bar is continuous, so after every boundary the
+# rule's bar restarted from nothing while the chart's was mid-move
+# with thousands of prints behind it. "its like the actual tick
+# chart would have already made the move before the tick bar even
+# registers the move". It was not a timing fault -- they were two
+# different bars.
+#
+# Continuous also costs the post-boundary blackout the vote
+# minimum would otherwise impose twelve times an hour; on a
+# continuous bar that happens once, at startup.
+FUSION_RESET_S = 0.0
+
+# NO TRADE OUTLIVES THIS, whatever the bar is doing. Separate from
+# the series above on purpose -- see the note.
+TRADE_BAR_S = 300.0
 # Defined at MODULE level, not inside create_app. A default
 # argument is evaluated when the `def` runs, so a constant set
 # further down the same scope is unbound at that moment -- the
@@ -7133,6 +7143,8 @@ def create_app() -> FastAPI:
                 # way to find out whether it helped.
                 "dir": (sm.get("dir") or raw_dir) if sm else raw_dir,
                 "raw_dir": raw_dir,
+                "votes": cur.votes,
+                "votes_needed": cur.votes_needed,
                 # The candle's body, beside the path that overrules
                 # it. When they differ the bar finished one way and
                 # traded the other, which is the reading the body
@@ -7685,7 +7697,7 @@ def create_app() -> FastAPI:
             # auto trader can trade as many times as need as long as
             # the directional signal confirms direction".
             from . import stackwin as _swb
-            bar_ts = _swb.bar_of(time.time(), FUSION_RESET_S)
+            bar_ts = _swb.bar_of(time.time(), TRADE_BAR_S)
         if strat in ("fused", "timed"):
             # ONE TRADE PER 5-MINUTE CANDLE, for both rules, counted
             # against that candle rather than the 15-minute window.
@@ -7763,7 +7775,7 @@ def create_app() -> FastAPI:
             disagreed = _sw.exit_reason(
                 t.side, (_tk_x.get("dir") or ""),
                 float(getattr(t, "bar_ts", 0.0) or 0.0),
-                time.time(), FUSION_RESET_S) or disagreed
+                time.time(), TRADE_BAR_S) or disagreed
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -10568,7 +10580,8 @@ and a direction off three prints is not the measurement a
 five-thousand-print bar gives. The panel says when the last bar was
 cut short.">reset <select id="fusReset" onchange="fusLoad()"
             style="margin:0 4px">
-            <option value="300" selected>every 5m (true clock)</option>
+            <option value="0" selected>none &mdash; continuous</option>
+            <option value="300">every 5m (true clock)</option>
             <option value="900">every 15m</option>
           </select></label>
         <label title="Ticks of give-back before THRESHOLD turns.
@@ -15826,6 +15839,17 @@ function paintFusion(d) {
       + `&middot; ${Number(t.down_prints).toLocaleString()} down</b>`
       + (t.path_share != null
          ? ` (${Math.round(t.path_share * 100)}% one-sided)` : ''));
+  /* WHY A BAR CAN BE SILENT. The first print of a bar makes the
+     share 1.000 -- one vote to nothing -- so without a floor a
+     fresh bar claims a direction and then changes it on the next
+     few prints, twelve times an hour. Showing the count means a
+     bar that is still counting reads as counting rather than as a
+     market with nothing in it. */
+  if (t.votes_needed && t.votes < t.votes_needed)
+    tickLines.push(`<b style="color:var(--dim)">counting &mdash; `
+      + `${Number(t.votes).toLocaleString()} of `
+      + `${Number(t.votes_needed).toLocaleString()} votes</b> before it `
+      + `can call a direction`);
   if (t.body_dir && t.raw_dir && t.body_dir !== t.raw_dir)
     tickLines.push(`<b style="color:var(--dim)">the candle closed `
       + `${esc(t.body_dir)}</b> &mdash; it traded the other way`);

@@ -316,6 +316,8 @@ def state(tick: dict | None, ofi: dict | None,
             # dropped, which is how the smoothing once reached the
             # route and died one function later.
             "body_dir": tick.get("body_dir") or "",
+            "votes": tick.get("votes") or 0,
+            "votes_needed": tick.get("votes_needed") or 0,
             "up_prints": tick.get("up_prints") or 0,
             "down_prints": tick.get("down_prints") or 0,
             "path_share": tick.get("path_share") or 0.0,

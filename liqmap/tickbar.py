@@ -95,6 +95,43 @@ MAX_PER_BAR = 50_000
 # session -- enough to draw the chart and to measure a pace median
 # against, and small enough to hold several builders at once.
 KEEP = 1_500
+# HOW ONE-SIDED THE VOTE HAS TO BE BEFORE THE BAR CLAIMS A SIDE.
+#
+# Without it the direction is a bare majority of prints, and a bar
+# sitting near parity -- 2,501 up against 2,499 down -- flips on
+# every single print. That is the OFI's failure repeated with a new
+# number: its sign changed 3.17 times a bar against a zero deadband
+# and once a bar at +/-500.
+#
+# It also gives hysteresis for free. At 2% the vote must be 100
+# prints one way on a 5,000-print bar to claim a side, so turning
+# that side over needs a 200-print swing -- twice what it took to
+# establish. A direction is therefore harder to lose than it was to
+# gain, which is the property that stops flapping.
+#
+# PROVISIONAL. It is a starting point, not a measured one, and it
+# is the first number to move if the bar still turns too often.
+PATH_BAND = 0.02
+# AND A MINIMUM NUMBER OF VOTES, because a percentage is no
+# protection when the counts are single digits.
+#
+# The first print of a bar makes the share 1.000 -- one vote to
+# nothing -- so a fresh bar claims a direction immediately and then
+# changes it on the next few prints. The bar is cut at every true
+# 5-minute mark, so that happens twelve times an hour, and the
+# entry dwell never survives it: the hold counter restarts every
+# time the direction turns. Chris: "the 10's hold is not holding".
+#
+# THIS IS THE THIRD TIME THIS CLASS OF BUG HAS APPEARED HERE. The
+# pressure reading has MIN_TRADES for it, the ratio tracker has
+# min_vol. A ratio is only a reading once there is something to
+# take a ratio of.
+#
+# Scaled to the bar, with a floor: 5% of a 5,000-print bar is 250
+# votes, about fifteen seconds of a busy tape. A 250-print bar
+# needs the floor instead, or it would never say anything.
+VOTE_FRACTION = 0.05
+MIN_VOTES = 25
 
 
 @dataclass
@@ -148,6 +185,10 @@ class TickBar:
     # by the tape and DOWN by the close.
     up_prints: int = 0
     down_prints: int = 0
+    # The size this bar was built for, so the minimum vote count can
+    # scale with it rather than being one number for a 250-print bar
+    # and a 10,000-print one.
+    per_bar: int = 0
     # Closed because a time boundary arrived, not because the count
     # was reached. Such a bar is SHORT -- possibly a single print in
     # a quiet minute -- and a direction read off three prints is not
@@ -165,32 +206,42 @@ class TickBar:
         return self.buy_size - self.sell_size
 
     @property
+    def votes(self) -> int:
+        """Prints that moved price, either way."""
+        return self.up_prints + self.down_prints
+
+    @property
+    def votes_needed(self) -> int:
+        """Before this bar is entitled to claim a direction."""
+        return max(MIN_VOTES, int((self.per_bar or 0) * VOTE_FRACTION))
+
+    @property
     def path_dir(self) -> str:
         """THE TRUE DIRECTION: which way the prints actually went.
 
-        Chris: "all the tick bar does is read the information that
-        created the tick bar and that information only to determine
-        the true direction".
+        One print, one vote, whatever size it moved -- and the vote
+        has to be one-sided by `PATH_BAND` before the bar claims a
+        side at all.
+
+        WHY THE BAND IS NOT OPTIONAL. A bare majority flips on a
+        single print whenever the counts are near parity, and near
+        parity is where a bar spends much of its life. Chris: "this
+        is having a bunch of flipping issues". The OFI had exactly
+        this and for exactly this reason.
 
         WHY NOT CLOSE AGAINST OPEN. Forcing the tick bar to reset on
         the 5-minute mark made its open the SAME PRICE as the
-        5-minute candle's open -- at 5,000 prints the count is
-        almost never reached inside five minutes, so the two bars
-        start together every period. Both legs of the fusion rule
-        were then measuring from one open and could only agree.
-        Measured: identical opens in every period of a twelve-minute
-        run.
+        5-minute candle's open, so both legs of the rule measured
+        from one open and could only agree.
 
-        This uses no open at all. A bar that climbed four points and
-        gave back four is flat here and reads as a full reversal to
-        close-against-open; a bar that ground up on many small
-        up-ticks against a few larger down-ticks is up here even if
-        it happens to finish a tick below where it started.
-
-        Equal is flat, and flat is not a side. A bar with one print
-        has no path and is flat -- which is also what gives "flat at
-        the reset" for free.
+        Equal, or inside the band, is FLAT -- and flat is not a
+        side. A bar with one print has no path and is flat, which
+        is also what gives "flat at the reset" for free.
         """
+        if self.votes < self.votes_needed:
+            return "flat"
+        if self.path_share < PATH_BAND:
+            return "flat"
         if self.up_prints > self.down_prints:
             return "up"
         if self.down_prints > self.up_prints:
@@ -275,6 +326,7 @@ class TickBar:
             "closed": bool(self.closed),
             "by_clock": bool(self.by_clock),
             "path_dir": self.path_dir,
+            "votes": self.votes, "votes_needed": self.votes_needed,
             "up_prints": int(self.up_prints),
             "down_prints": int(self.down_prints),
             "up_move": round(self.up_move, 6),
@@ -388,7 +440,8 @@ class TickBars:
         fresh = b is None
         if b is None:
             b = self._cur = TickBar(start_ts=t, open=p, high=p,
-                                    low=p, close=p, ts_last=t)
+                                    low=p, close=p, ts_last=t,
+                                    per_bar=self.per_bar)
         if p > b.high:
             b.high = p
         if p < b.low:
