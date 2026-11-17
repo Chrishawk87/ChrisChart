@@ -203,55 +203,82 @@ class Dwell:
                 "flips": self.flips}
 
 
-def entry_side(tick: str, rungs: dict | None = None,
-               period_s: float = 0.0, held_s: float | None = None,
+def hold_dir(now: str, prev: str = "") -> str:
+    """The direction to REPORT: this one, or the last real one.
+
+    Chris: "the gate 1 should never say flat at all as long as there
+    is a 5000t candle it should show the trading direction of that
+    candle", and "one always show what the real 15 minute is doing
+    and the other always what the tick chart is doing".
+
+    FLAT WAS NEVER AN ANSWER, IT WAS AN ABSENCE, and both gates were
+    reporting it as though it were a reading. A candle whose close
+    sits exactly on its open has not turned neutral -- it is one
+    tick from wherever it just was, and the direction it had a
+    moment ago is still the best answer to "which way is this
+    going". Reporting flat there made the panel claim no direction
+    while the chart plainly showed one, and an entry needing two
+    gates to agree can never fire if either keeps blanking.
+
+    So a side, once seen, is HELD until the other side replaces it.
+    Nothing is invented: "" in and "" remembered is still "", which
+    is the honest state before the first print of the session.
+
+    This is not a smoother and it is not a threshold. It fills the
+    gap at an exact tie and does nothing else -- a real flip passes
+    through it untouched, which is what keeps the exit honest.
+    """
+    if now in SIDES:
+        return now
+    return prev if prev in SIDES else ""
+
+
+def entry_side(tick: str, candle: str = "",
+               held_s: float | None = None,
                min_hold_s: float = DWELL_S) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    THE TICK BAR IS THE WHOLE RULE, and since it decides everything
-    it has to prove a flip meant something before acting on it.
-    Chris: "a flip has to hold for 10 seconds before a trade is
-    taken ... flips that lead to nothing".
+    TWO DIRECTIONS IN, ONE SIDE OUT. Both are already resolved by
+    the caller -- the tick candle's own direction and the traded
+    timeframe candle's -- so this function cannot disagree with the
+    panel about what either of them said. It used to take `rungs`
+    and dig the candle out itself, which meant the screen and the
+    rule each did their own extraction and could differ.
 
-    `held_s` is how long the tick bar has pointed this way, from
+    BOTH MUST POINT THE SAME WAY. Chris: "one always show what the
+    real 15 minute is doing and the other always what the tick chart
+    is doing when they agree thats the direction we take".
+
+    A FLIP STILL HAS TO HOLD. Chris: "a flip has to hold for 10
+    seconds before a trade is taken ... flips that lead to nothing".
+    `held_s` is how long the tick candle has pointed this way, from
     `Dwell`. None means the caller is not tracking it and the check
     is skipped -- a caller that cannot measure the dwell must not be
     silently blocked from ever trading.
 
-    THE TRADED TIMEFRAME'S CANDLE IS A GATE AGAIN. Chris: "the tick
-    bar should be a continuous direction tracking with the timeframe
-    candle tracing at the same time thats how im going to be making
-    trades". Both must point the same way before anything opens.
-
-    `rungs` and `period_s` ARE NOW READ. They were taken and ignored
-    while the tick bar was the whole rule; this docstring said so,
-    and the line above is the only reason that changed.
-
     THE ORDER OF THE CHECKS IS THE ORDER OF THE REASONS, and it is
-    chosen rather than incidental. Everything about the tick bar is
-    settled first -- has it a direction, has it held -- and the
-    candle is asked last. A rule that reports whichever test failed
-    first is a DIFFERENT rule when the order changes: it fires on
-    the same trades and explains them differently, and every wrong
+    chosen rather than incidental. The tick candle is settled first
+    -- has it a direction, has it held -- and the timeframe candle
+    is asked last. A rule that reports whichever test failed first
+    is a DIFFERENT rule when the order changes: it fires on the same
+    trades and explains them differently, and every wrong
     explanation in this engine has cost a day.
 
     EXITS DO NOT CONSULT THE CANDLE. `holds` is untouched: a trade
-    still ends on the tick bar flipping, or on the caller's time
+    still ends on the tick candle flipping, or on the caller's time
     stop. A candle that turns mid-trade is the pullback being traded
     into, and closing on it would be a second rule nobody asked for.
     """
     if tick not in SIDES:
-        return "", "the tick bar has no direction"
+        return "", "the tick candle has no direction yet"
     if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
-        return "", (f"the tick bar turned {tick} {held_s:.0f}s ago -- "
-                    f"it has to hold {min_hold_s:.0f}s")
-    tf = traded_tf(period_s) or "candle"
-    c_side, c_why = stack_side(rungs or {}, period_s)
-    if not c_side:
-        return "", (c_why or f"the {tf} candle has no direction")
-    if c_side != tick:
-        return "", (f"the tick bar is {tick} but the {tf} candle is "
-                    f"{c_side}")
+        return "", (f"the tick candle turned {tick} {held_s:.0f}s ago "
+                    f"-- it has to hold {min_hold_s:.0f}s")
+    if candle not in SIDES:
+        return "", "the timeframe candle has no direction yet"
+    if candle != tick:
+        return "", (f"the tick candle is {tick} but the timeframe "
+                    f"candle is {candle}")
     return tick, ""
 
 
@@ -359,26 +386,49 @@ def state(win: dict | None, tick: str, rungs: dict | None,
           held_s: float | None = None, flips: int = 0,
           min_hold_s: float = DWELL_S,
           pace: dict | None = None,
-          roll: dict | None = None) -> dict:
+          roll: dict | None = None,
+          prev: dict | None = None) -> dict:
     """Everything the rule and the panel need, from one place.
 
     One source, so the screen cannot show an agreement the rule did
     not see. Every panel in this engine that computed its own copy
     of a direction ended up telling a different story from the rule
     beside it -- the 5-minute cell and the OFI bar both did.
+
+    `tick` IS THE 5,000-TICK CANDLE'S OWN DIRECTION, close against
+    open, exactly as the chart colours it. Chris: "as long as there
+    is a 5000t candle it should show the trading direction of that
+    candle".
+
+    `prev` IS THE MEMORY AND THIS FUNCTION STAYS PURE. It is the
+    `held` block from the previous call, and the one returned by
+    this call is what the caller stores. Both gates hold their last
+    real direction through an exact tie, and holding it means
+    remembering it -- but a module that kept that memory inside
+    itself would hand two callers one history, which is how the
+    screen and the rule end up disagreeing. The caller owns the
+    memory; the rule owns the policy.
     """
     win = win or {}
-    candle = str(win.get("mid_dir") or "")
+    w_candle = str(win.get("mid_dir") or "")
     ofi = str(win.get("ofi_dir") or "")
     cvd = str(win.get("cvd_dir") or "")
-    tick = str(tick or "")
+    tick_raw = str(tick or "")
     fp = str(fp or "")
     tf = traded_tf(period_s)
     below = BELOW_OF.get(tf, "")
 
-    w_side, w_why = window_side(candle, ofi, cvd, fp)
-    s_side, s_why = stack_side(rungs or {}, period_s)
-    side, why = entry_side(tick, rungs or {}, period_s,
+    w_side, w_why = window_side(w_candle, ofi, cvd, fp)
+    s_raw, s_why = stack_side(rungs or {}, period_s)
+
+    # NEITHER GATE REPORTS FLAT ONCE IT HAS HAD A DIRECTION. The
+    # raw readings are kept beside the held ones so the moment a
+    # gate is being carried is visible rather than silent.
+    prev = prev or {}
+    tick = hold_dir(tick_raw, str(prev.get("tick") or ""))
+    s_side = hold_dir(s_raw, str(prev.get("candle") or ""))
+
+    side, why = entry_side(tick, s_side,
                            held_s=held_s, min_hold_s=min_hold_s)
 
     rows = {}
@@ -403,6 +453,13 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "side": tick,
             "true": tick in SIDES,
             "why": "" if tick in SIDES else "no direction yet",
+            # WHAT THE 5,000-TICK CANDLE SAID THIS INSTANT, beside
+            # the direction being reported. They differ only while
+            # the candle sits exactly on its open, and showing both
+            # is what keeps the hold from being invisible.
+            "raw": tick_raw,
+            "held_through_flat": bool(tick in SIDES
+                                      and tick_raw not in SIDES),
             # How long it has pointed this way, and what it has to
             # reach. Shown so a blocked entry reads as waiting
             # rather than as nothing happening.
@@ -422,6 +479,11 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "trading": tf, "below": below,
             "rows": rows,
             "side": s_side, "why": s_why,
+            # As above: what the timeframe candle said this instant,
+            # against what is being reported for it.
+            "raw": s_raw,
+            "held_through_flat": bool(s_side in SIDES
+                                      and s_raw not in SIDES),
             # ASKED AND DECIDING. The traded timeframe's candle is a
             # gate on ENTRY -- both it and the tick bar have to point
             # the same way. The row below it is still read and still
@@ -456,12 +518,17 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         # chance of reading any of it as part of the decision.
         "context": {
             "period_s": float(period_s or 0.0),
-            "candle": candle, "ofi": ofi, "cvd": cvd, "footprint": fp,
+            "candle": w_candle, "ofi": ofi, "cvd": cvd,
+            "footprint": fp,
             "side": w_side, "why": w_why,
             "decides": False,
         },
+        # THE MEMORY THE CALLER STORES AND HANDS BACK AS `prev`.
+        # Returned rather than kept, so one module cannot serve two
+        # callers one history.
+        "held": {"tick": tick, "candle": s_side},
         "side": side,
         "why": why,
-        "say": ((f"the tick bar and the {tf} candle are both {side}")
+        "say": ((f"the tick candle and the {tf} candle are both {side}")
                 if side else why),
     }

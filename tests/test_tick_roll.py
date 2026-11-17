@@ -1,38 +1,40 @@
-"""A direction that slides instead of stepping.
+"""The rolling vote: a direction that slides instead of stepping.
 
-Chris: "the tick bar should be a continuous direction tracking with
-the timeframe candle tracing at the same time thats how im going to
-be making trades".
+SHOWN, NOT USED. Read this first.
 
-WHAT THE BAR'S VOTE COULD NOT DO.
+    This was built to BE gate 1 and it is not. Chris, on that
+    version: "the gate 1 should never say flat at all as long as
+    there is a 5000t candle it should show the trading direction of
+    that candle". A vote behind a margin band and a minimum count
+    produces FLAT, which is what he was watching the panel report
+    while the chart drew a plain green candle.
+
+    Gate 1 is now the candle's own direction, close against open --
+    `test_never_flat.py` holds it to that. This window stays
+    because it is a real measurement and a reading that silently
+    stops being collected is how a screen starts lying, and because
+    when it disagrees with the body that is worth seeing. It decides
+    nothing, and a test at the bottom of this file holds it to that.
+
+WHAT IT MEASURES, AND WHY A BAR COULD NOT.
 
     A tick bar's vote is thrown away when the bar closes. The next
-    bar starts at nought and is FLAT until it has earned
+    bar starts at nought and is silent until it has earned
     `votes_needed` again -- roughly fifteen seconds of a busy tape
-    at 5,000 prints. So the direction blinked out and restarted
-    every 5,000 prints, and the ten-second dwell restarted with it:
-    a flip arriving shortly before a close was forgotten shortly
-    after, and the hold could not elapse across a boundary however
-    steady the tape was.
+    at 5,000 prints. So the vote blinked out and restarted every
+    5,000 prints.
 
-    That gap was never a reading. It was the bar's bookkeeping
-    showing through, read by a rule as "no direction".
-
-    THIS IS THE SAME CLASS OF BUG AS THE CLOCK CUT. Gate 1 used to
+    THIS IS THE SAME CLASS OF BUG AS THE CLOCK CUT. Gate 1 once
     read the clock-cut series while the chart drew the continuous
-    one, so after every 5-minute mark the gate restarted from zero
-    while the chart was mid-move. That was fixed by pointing the
-    gate at the continuous SERIES. This fixes the restart that was
-    left -- the one inside the series, at every count close.
+    one, so after every 5-minute mark it restarted from zero while
+    the chart was mid-move. That was fixed by pointing it at the
+    continuous SERIES. This fixes the restart left inside the
+    series, at every count close -- and it is still worth fixing
+    for a reading that is drawn rather than traded.
 
-WHAT IT KEEPS. Both guards, unchanged: the `PATH_BAND` margin and
-the `votes_needed` floor. They are what stopped the flipping and a
-new reading that quietly dropped them would bring all of it back.
-
-WHAT IT COSTS, SAID PLAINLY. The window is warm ONCE, at a cold
-start, instead of being cold for the first stretch of every bar. It
-is not "never flat": a window whose prints nearly all landed at one
-price is a dead tape, and it still says flat, which is correct.
+WHAT IT KEEPS. Both guards: the `PATH_BAND` margin and the
+`votes_needed` floor. They belong on a vote. What was wrong was
+putting a vote where a candle's direction was asked for.
 """
 
 from __future__ import annotations
@@ -278,30 +280,40 @@ class TestItReachesTheRule:
         assert '"roll": roll' in main, \
             "the forming bar's reading is returned without the window"
 
-    def test_gate_one_reads_the_window_not_the_bar(self):
-        """THE WIRING IS THE CHANGE. A correct rolling direction that
-        the rule never reads is the smoothing bug again -- it got to
-        the route and died one function later."""
+    def test_gate_one_does_NOT_read_the_window(self):
+        """IT WAS WIRED TO GATE 1 AND HAD TO COME BACK OUT. Pinned
+        in the negative, because the obvious "improvement" is to
+        put it back."""
         i = WEB.index("def _journal_step_un(")
         blk = WEB[i:i + 30000]
-        assert '_rd = (_tk.get("roll") or {}).get("dir")' in blk
-        assert "_dw.on_tick(_rd," in blk, \
-            "the dwell is still fed the bar's own vote"
-        assert "_sw.state(win, _rd," in blk, \
-            "gate 1 is still fed the bar's own vote"
-        # AND THE COUNT BEHIND IT REACHES THE PANEL. Passing {} here
-        # left the panel unable to tell a cold start from a flat
-        # market -- the exact confusion this change removes -- and
-        # a state-level test of `roll` could not see it, because
-        # `state` was still perfectly capable of carrying a window
-        # nobody handed it.
+        assert '_bd = _tk.get("body_dir")' in blk, \
+            "gate 1 is not reading the candle's own direction"
+        assert '(_tk.get("roll") or {}).get("dir")' not in blk, \
+            "the vote is gating entries again"
+
+    def test_the_window_decides_nothing(self):
+        from liqmap import stackwin as sw
+        up = sw.state({}, "down", {"5m": {"present": True,
+                                          "qualified": "down"}},
+                      300.0, held_s=99.0,
+                      roll={"dir": "up", "window": 5000})
+        assert up["side"] == "down", "the vote overruled the candle"
+
+    def test_the_counts_still_reach_the_panel(self):
+        """It is drawn, so it has to arrive. Passing {} here left
+        the panel with nothing to draw, and a state-level test of
+        `roll` could not see it -- `state` is perfectly capable of
+        carrying a window nobody handed it."""
+        i = WEB.index("def _journal_step_un(")
+        blk = WEB[i:i + 30000]
         assert 'roll=_tk.get("roll")' in blk, \
             "the window's counts never reach the panel"
 
-    def test_the_panel_can_show_a_cold_start_as_warming(self):
-        assert "warming up" in WEB
-        assert "not every bar" in WEB, \
-            "nothing says the warmup happens once"
+    def test_the_panel_draws_it_beside_the_direction(self):
+        """And says so when it disagrees, which is the only reason
+        to keep drawing it."""
+        assert "the vote says " in WEB
+        assert "shown only" in WEB
 
     def test_the_state_carries_the_window_behind_the_side(self):
         from liqmap import stackwin as sw

@@ -7660,26 +7660,43 @@ def create_app() -> FastAPI:
                 except Exception:                       # noqa: BLE001
                     pass
             _now_s = time.time()
-            # GATE 1 READS THE ROLLING WINDOW, NOT THE BAR'S VOTE.
+            # GATE 1 IS THE 5,000-TICK CANDLE'S OWN DIRECTION --
+            # close against open, exactly what the chart colours.
             #
-            # The bar's vote is thrown away at every close and spends
-            # the first ~250 votes of the next bar flat, so the
-            # direction blinked out roughly every 5,000 prints and
-            # the dwell restarted with it -- the hold could not
-            # elapse across a close however steady the tape was.
+            # Chris: "the gate 1 should never say flat at all as
+            # long as there is a 5000t candle it should show the
+            # trading direction of that candle".
             #
-            # The rolling window never restarts, so the dwell it
-            # feeds measures a real turn rather than a bar boundary.
-            # The bar's own vote stays in the payload beside it.
-            _rd = (_tk.get("roll") or {}).get("dir") or ""
-            _dw.on_tick(_rd, _now_s)
-            fus = _sw.state(win, _rd, _rungs,
+            # It read a VOTE before this: how many prints moved
+            # price up against how many moved it down, behind a
+            # margin band and a minimum count. Both of those produce
+            # FLAT, and flat is what he was watching the panel
+            # report while the chart in front of him showed a plain
+            # green candle. The vote is still computed and still
+            # shown; it is not the direction.
+            #
+            # `_sw.state` holds the last real direction through the
+            # instant a candle sits exactly on its open, so the gate
+            # never blanks while a candle exists. The memory lives
+            # on the runtime and is handed back in, because a module
+            # keeping it would serve the panel and the rule from one
+            # history and they would drift.
+            _prev = getattr(rt_, "_gate_held", None) or {}
+            _bd = _tk.get("body_dir") or ""
+            _dw.on_tick(_sw.hold_dir(_bd, str(_prev.get("tick") or "")),
+                        _now_s)
+            fus = _sw.state(win, _bd, _rungs,
                             float(s.window_s or 900.0),
                             fp=fpi.get("side") or "",
                             held_s=_dw.held_s(_now_s),
                             flips=_dw.flips,
                             pace=_tk.get("pace") or {},
-                            roll=_tk.get("roll") or {})
+                            roll=_tk.get("roll") or {},
+                            prev=_prev)
+            try:
+                rt_._gate_held = fus.get("held") or {}
+            except Exception:                           # noqa: BLE001
+                pass
         else:
             fus = (_timed_now(rt_) if strat == "timed"
                    else _fusion_now(rt_))
@@ -16436,8 +16453,8 @@ function paintStackWin(SW) {
       '<div style="border-left:3px solid var(--'
     + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 1 &mdash; THE TICK BAR, rolling'
-    + '</div>'
+    + '<div class="thin">GATE 1 &mdash; THE 5000T CANDLE '
+    + '(close vs open, as the chart draws it)</div>'
     + '<div style="margin:4px 0">' + leg('direction', f.side) + '</div>'
     /* THE WINDOW BEHIND THE DIRECTION.
 
@@ -16448,20 +16465,31 @@ function paintStackWin(SW) {
        reads as warming up rather than as a market with nothing in
        it, which is the same mistake the per-bar version made twelve
        times an hour. */
+    /* HELD THROUGH THE TIE, AND SAID SO. The candle sits exactly
+       on its open for an instant and has no body to read. The gate
+       keeps its last real direction rather than reporting flat --
+       flat was never a reading, it was an absence, and reporting it
+       made this panel claim no direction while the chart showed a
+       plain green candle. */
+    + (f.held_through_flat
+        ? '<div class="thin">price is exactly on this candle’s open '
+          + '&mdash; holding ' + esc(f.side || '').toUpperCase()
+          + ' until it moves</div>'
+        : '')
+    /* The vote, as information. It used to BE the direction, behind
+       a margin band and a minimum count, and both of those produce
+       flat. It is kept because a reading that silently stops being
+       collected is how a screen starts lying -- and because when it
+       disagrees with the body that is worth seeing. */
     + ((f.roll && f.roll.window)
-        ? '<div class="thin">'
-          + (f.roll.warm === false
-              ? '<b style="color:var(--dim)">warming up &mdash; '
-                + Number(f.roll.votes || 0).toLocaleString() + ' of '
-                + Number(f.roll.votes_needed || 0).toLocaleString()
-                + ' votes</b> (once, at the start &mdash; not every bar)'
-              : 'last ' + Number(f.roll.window).toLocaleString()
-                + ' prints &middot; '
-                + Number(f.roll.up_prints || 0).toLocaleString() + ' up '
-                + '&middot; '
-                + Number(f.roll.down_prints || 0).toLocaleString()
-                + ' down (' + Math.round((f.roll.path_share || 0) * 100)
-                + '% one-sided)')
+        ? '<div class="thin">prints: '
+          + Number(f.roll.up_prints || 0).toLocaleString() + ' up '
+          + '&middot; '
+          + Number(f.roll.down_prints || 0).toLocaleString() + ' down'
+          + (f.roll.dir && f.side && f.roll.dir !== f.side
+              ? ' &mdash; the vote says ' + esc(f.roll.dir).toUpperCase()
+                + ', shown only'
+              : '')
           + '</div>'
         : '')
     /* A HELD DIRECTION AND A FRESH ONE LOOK THE SAME WITHOUT THIS.
@@ -16513,14 +16541,19 @@ function paintStackWin(SW) {
     + '</div>';
 
   const rows = st.rows || {};
-  const row = (name) => {
+  /* `shown` overrides the arrow with the direction the GATE is
+     using. They differ only while price sits exactly on the open,
+     where the row has no body and the gate is holding its last
+     real direction -- and an arrow reading "—" beside a verdict
+     reading AGREES UP is the panel contradicting itself. */
+  const row = (name, shown) => {
     const r = rows[name] || {};
     if (!name) return '';
     return '<span style="display:inline-block;min-width:168px">'
       + '<span class="thin">' + esc(name) + '</span> '
       + (r.seeded === false
           ? '<span class="thin">open not seen</span>'
-          : arrow(r.dir)
+          : arrow(shown || r.dir)
             + (r.absorbed
                 ? ' <span class="flag late">ABSORBED</span>' : ''))
       + (r.open_px != null && r.last_px != null
@@ -16552,9 +16585,15 @@ function paintStackWin(SW) {
       '<div style="margin-top:8px;border-left:3px solid var(--'
     + (g2side ? (g2side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 2 &mdash; THE ' + esc(st.trading || '')
-    .toUpperCase() + ' CANDLE &mdash; it must agree to open</div>'
-    + '<div style="margin:4px 0">' + row(st.trading) + '</div>'
+    + '<div class="thin">GATE 2 &mdash; THE REAL ' + esc(st.trading || '')
+    .toUpperCase() + ' CANDLE (close vs open, live) &mdash; it must '
+    + 'agree to open</div>'
+    + '<div style="margin:4px 0">' + row(st.trading, g2side) + '</div>'
+    + (st.held_through_flat
+        ? '<div class="thin">price is exactly on the '
+          + esc(st.trading || '') + ' open &mdash; holding '
+          + esc(g2side || '').toUpperCase() + ' until it moves</div>'
+        : '')
     + (st.agrees
         ? '<b class="' + (g2side === 'up' ? 'long' : 'short') + '">'
           + 'AGREES &mdash; both ' + esc(g2side).toUpperCase() + '</b>'

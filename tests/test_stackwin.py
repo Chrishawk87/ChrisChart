@@ -110,53 +110,67 @@ class TestBothMustAgreeToOpen:
 
     @pytest.mark.parametrize("d", [U, D])
     def test_agreement_is_an_entry(self, d):
-        assert sw.entry_side(d, rungs(**{"5m": d}), 300.0) == (d, "")
+        assert sw.entry_side(d, d) == (d, "")
 
     def test_no_direction_is_no_entry(self):
-        side, why = sw.entry_side("", rungs(**{"5m": U}), 300.0)
-        assert side == "" and "tick bar has no direction" in why
+        side, why = sw.entry_side("", U)
+        assert side == "" and "tick candle has no direction" in why
 
     @pytest.mark.parametrize("junk", [None, "flat", "UP", 7])
     def test_junk_is_never_a_side(self, junk):
-        assert sw.entry_side(junk, rungs(**{"5m": U}), 300.0)[0] == ""
+        assert sw.entry_side(junk, U)[0] == ""
 
     @pytest.mark.parametrize("tick,candle", [(U, D), (D, U)])
     def test_a_disagreeing_candle_blocks_it(self, tick, candle):
-        side, why = sw.entry_side(tick, rungs(**{"5m": candle}), 300.0)
+        side, why = sw.entry_side(tick, candle)
         assert side == ""
-        assert f"the tick bar is {tick}" in why
-        assert f"the 5m candle is {candle}" in why
+        assert f"the tick candle is {tick}" in why
+        assert f"the timeframe candle is {candle}" in why
 
-    def test_a_flat_candle_blocks_it_too(self):
-        """Flat is not a side, so it is not agreement. A window with
-        nothing in it would otherwise read as the strongest there
-        is -- the rule this module states in its own header."""
-        side, why = sw.entry_side(U, rungs(**{"5m": "flat"}), 300.0)
-        assert side == "" and "the 5m is flat" in why
-
-    def test_an_unread_candle_blocks_it(self):
-        side, why = sw.entry_side(U, rungs(**{"5m": None}), 300.0)
-        assert side == "" and "has not been read" in why
-
-    def test_no_stack_at_all_blocks_it(self):
+    @pytest.mark.parametrize("junk", ["", "flat", None, "UP", 7])
+    def test_no_candle_direction_blocks_it(self, junk):
         """A caller that cannot supply the candle must not trade on
-        the tick bar alone. It used to, because the argument was
+        the tick candle alone. It used to, because the argument was
         accepted and ignored."""
-        assert sw.entry_side(U, {}, 300.0)[0] == ""
-        assert sw.entry_side(U, None, 300.0)[0] == ""
+        side, why = sw.entry_side(U, junk)
+        assert side == ""
+        assert "timeframe candle has no direction" in why
+
+    def test_it_takes_two_directions_not_a_stack(self):
+        """BOTH ARE RESOLVED BY THE CALLER. While this function dug
+        the candle out of `rungs` itself, the panel did its own
+        extraction and the two could differ about what the same row
+        said. One extraction, in `state`, feeding both."""
+        import inspect
+        names = list(inspect.signature(sw.entry_side).parameters)
+        assert names[:2] == ["tick", "candle"]
+        assert "rungs" not in names and "period_s" not in names
+
+
+class TestTheStateResolvesTheCandle:
+    """`state` is where a stack row becomes a direction, so that the
+    screen and the rule cannot extract it differently."""
+
+    def test_it_reads_the_traded_row(self):
+        st = sw.state({}, D, rungs(**{"5m": D, "1m": U}), 300.0)
+        assert st["side"] == "down"
 
     def test_the_row_below_still_gates_nothing(self):
-        """Chris: "paying no attention to the 1 minute at all". The
-        candle coming back is the TRADED row only."""
+        """Chris: "paying no attention to the 1 minute at all"."""
         for below in (U, D, None, "conflict"):
             r = rungs(**{"5m": D, "1m": below})
-            assert sw.entry_side(D, r, 300.0) == ("down", ""), below
+            assert sw.state({}, D, r, 300.0)["side"] == "down", below
 
     def test_fifteen_minutes_gates_on_the_15m(self):
-        assert sw.entry_side(D, rungs(**{"15m": D, "5m": U}),
-                             900.0) == ("down", "")
-        assert sw.entry_side(D, rungs(**{"15m": U, "5m": D}),
-                             900.0)[0] == ""
+        assert sw.state({}, D, rungs(**{"15m": D, "5m": U}),
+                        900.0)["side"] == "down"
+        assert sw.state({}, D, rungs(**{"15m": U, "5m": D}),
+                        900.0)["side"] == ""
+
+    def test_an_unread_candle_blocks_it(self):
+        st = sw.state({}, U, rungs(**{"5m": None}), 300.0)
+        assert st["side"] == ""
+        assert "has not been read" in st["stack"]["why"]
 
     def test_the_state_marks_the_stack_as_deciding(self):
         """THE SCREEN HAS TO SAY WHICH THINGS DECIDE. The panel
@@ -178,7 +192,7 @@ class TestBothMustAgreeToOpen:
         st = sw.state({}, D, r, 300.0)
         assert st["side"] == ""
         assert st["stack"]["agrees"] is False
-        assert "the 5m candle is up" in st["why"]
+        assert "the timeframe candle is up" in st["why"]
 
     def test_the_stack_is_still_reported(self):
         r = rungs(**{"5m": U, "1m": D})
@@ -188,7 +202,7 @@ class TestBothMustAgreeToOpen:
 
     def test_the_verdict_names_both(self):
         st = sw.state({}, U, rungs(**{"5m": U}), 300.0)
-        assert "tick bar" in st["say"] and "5m candle" in st["say"]
+        assert "tick candle" in st["say"] and "5m candle" in st["say"]
 
     def test_the_footprint_reads_exactly_as_it_did(self):
         """Chris: "we will not change the way the footprint reads on
@@ -319,7 +333,7 @@ class TestTheEdges:
     @pytest.mark.parametrize("bad", [None, 0, "", "x"])
     def test_junk_never_produces_a_side(self, bad):
         assert sw.traded_tf(bad) in ("", "5m", "15m")
-        assert sw.entry_side(bad, {}, 300.0)[0] == ""
+        assert sw.entry_side(bad, U)[0] == ""
 
     def test_no_rungs_at_all_is_a_reason_not_a_crash(self):
         side, why = sw.stack_side({}, 300.0)
@@ -525,9 +539,9 @@ class TestTheRuleDoesNotWaitForTheSlowRoute:
         sufficient alone.
         """
         assert sw.stack_side({}, 300.0)[0] == ""
-        side, why = sw.entry_side(D, {}, 300.0)
-        assert side == "", "an empty stack opened a trade"
-        assert "has not been read" in why
+        st = sw.state({}, D, {}, 300.0)
+        assert st["side"] == "", "an empty stack opened a trade"
+        assert "has not been read" in st["stack"]["why"]
 
     def test_the_step_builds_its_own_rows_from_candles(self):
         import pathlib
@@ -659,25 +673,23 @@ class TestAFlipHasToHoldBeforeItTrades:
         (10.0, True), (37.0, True),
     ])
     def test_it_waits_for_the_full_dwell(self, held, opens):
-        side, why = sw.entry_side(D, rungs(**{"5m": D}), 300.0,
-                                  held_s=held)
+        side, why = sw.entry_side(D, D, held_s=held)
         assert bool(side) is opens
         if not opens:
             assert "has to hold 10s" in why
 
     def test_the_reason_says_how_long_it_has_held(self):
         assert "turned down 4s ago" in sw.entry_side(
-            D, rungs(**{"5m": D}), 300.0, held_s=4.0)[1]
+            D, D, held_s=4.0)[1]
 
     def test_no_tracking_means_no_check(self):
         """A caller that cannot measure the dwell must not be
         silently blocked from ever trading."""
-        assert sw.entry_side(D, rungs(**{"5m": D}), 300.0,
-                             held_s=None) == ("down", "")
+        assert sw.entry_side(D, D, held_s=None) == ("down", "")
 
     def test_a_zero_minimum_disables_it(self):
-        assert sw.entry_side(D, rungs(**{"5m": D}), 300.0,
-                             held_s=0.0, min_hold_s=0.0) == ("down", "")
+        assert sw.entry_side(D, D, held_s=0.0,
+                             min_hold_s=0.0) == ("down", "")
 
     def test_the_exit_is_NOT_delayed(self):
         """The asymmetry is the point: a flip gets you OUT at once
