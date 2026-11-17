@@ -7663,6 +7663,13 @@ def create_app() -> FastAPI:
         # fourteen-trades-in-minutes shape is arithmetically
         # impossible -- the ceiling is twelve an hour.
         cap = 0
+        if strat == "stack":
+            # NO CAP, and the bar is stamped so the time stop below
+            # can tell when a trade has outlived it. Chris: "the
+            # auto trader can trade as many times as need as long as
+            # the directional signal confirms direction".
+            from . import stackwin as _swb
+            bar_ts = _swb.bar_of(time.time(), FUSION_RESET_S)
         if strat in ("fused", "timed"):
             # ONE TRADE PER 5-MINUTE CANDLE, for both rules, counted
             # against that candle rather than the 15-minute window.
@@ -7731,10 +7738,16 @@ def create_app() -> FastAPI:
             # close trades at every 5-minute boundary, where a tick
             # bar between bars has no direction.
             from . import stackwin as _sw
-            _ok, _why_out = _sw.holds(
-                t.side, _rungs, float(s.window_s or 900.0))
-            if not _ok:
-                disagreed = _why_out
+            # THE CLOCK FIRST. "no trade will ever last past a 5
+            # minute timeframe" -- and it is checked ahead of the
+            # direction so the log says the bar ended rather than
+            # blaming a tick bar that is merely between bars at
+            # that same instant. Two different events, two reasons.
+            _tk_x = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
+            disagreed = _sw.exit_reason(
+                t.side, (_tk_x.get("dir") or ""),
+                float(getattr(t, "bar_ts", 0.0) or 0.0),
+                time.time(), FUSION_RESET_S) or disagreed
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -16279,6 +16292,24 @@ function paintClockWindows(d) {
    stops counting is exactly what made the old window look broken.
 
    It renders only for this strategy and hides itself otherwise. */
+/* THE TICK BAR IS THE WHOLE RULE.
+
+   In on its direction, out on its flip, and never past the
+   5-minute bar it opened in. Chris: "the entry and exit strategy
+   to be based on the tick bar in gate one ... no trade will ever
+   last past a 5 minute timeframe".
+
+   Everything else -- the stack, the candle, the OFI, the CVD, the
+   footprint -- is drawn and decides nothing. None of it is deleted,
+   because a reading that silently stops being collected is how a
+   screen starts lying, and he has already watched four readings
+   agree and drive nothing.
+
+   THE TIME STOP IS NOT A DIRECTION READING. The tick bar is cut at
+   the same 5-minute mark, so at that instant it also has no
+   direction -- and an exit that read flat as a reversal would close
+   for an absence. The clock running out and the market turning get
+   different reasons in the log because they are different events. */
 function paintStackWin(SW) {
   const box = $('jnlStackWin');
   if (!box) return;
@@ -16300,11 +16331,13 @@ function paintStackWin(SW) {
       '<div style="border-left:3px solid var(--'
     + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 1 &mdash; THE TICK BAR</div>'
+    + '<div class="thin">THE TICK BAR &mdash; this is the whole rule'
+    + '</div>'
     + '<div style="margin:4px 0">' + leg('direction', f.side) + '</div>'
     + (f.side
         ? '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
           + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
+          + ' <span class="thin">in on this, out when it flips</span>'
         : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
     + '</div>';
@@ -16312,13 +16345,9 @@ function paintStackWin(SW) {
   const rows = st.rows || {};
   const row = (name) => {
     const r = rows[name] || {};
-    return '<span style="display:inline-block;min-width:118px">'
-      + '<span class="thin">' + esc(name || '') + '</span> '
-      /* THE DIRECTION, THEN THE ABSORPTION BESIDE IT. This showed
-         THROWN OUT instead of the direction, which was right while
-         a row whose colour fought its number counted for nothing.
-         It counts by its price now, so hiding the direction behind
-         that badge would hide the thing gate 2 is deciding on. */
+    if (!name) return '';
+    return '<span style="display:inline-block;min-width:168px">'
+      + '<span class="thin">' + esc(name) + '</span> '
       + (r.seeded === false
           ? '<span class="thin">open not seen</span>'
           : arrow(r.dir)
@@ -16326,45 +16355,21 @@ function paintStackWin(SW) {
                 ? ' <span class="flag late">ABSORBED</span>' : ''))
       + (r.open_px != null && r.last_px != null
           ? ' <span class="thin">' + chPx(r.open_px) + ' &rarr; '
-            + chPx(r.last_px) + '</span>'
-          : r.bps != null
-            ? ' <span class="thin">' + (r.bps >= 0 ? '+' : '')
-              + Number(r.bps).toFixed(1) + 'bps</span>' : '')
+            + chPx(r.last_px) + '</span>' : '')
       + '</span>';
   };
-  const gate2 =
-      '<div style="border-left:3px solid var(--'
-    + (!st.asked ? 'line'
-       : st.side ? (st.side === 'up' ? 'up' : 'down') : 'line')
-    + ');padding:6px 0 6px 10px;margin-top:6px'
-    + (st.asked ? '' : ';opacity:.45') + '">'
-    + '<div class="thin">GATE 2 &mdash; THE ' + esc(st.trading || '')
-    + ' &mdash; and only a flip of it closes a trade</div>'
-    + '<div style="margin:4px 0">' + row(st.trading) + '</div>'
-    + (!st.asked
-        ? '<span class="thin">not asked &mdash; the tick bar has to '
-          + 'have a direction first</span>'
-        : st.side
-          ? '<b class="' + (st.side === 'up' ? 'long' : 'short') + '">'
-            + 'STACK ' + st.side.toUpperCase() + '</b>'
-          : '<b class="short">STACK DOES NOT SAY</b> '
-            + '<span class="thin">' + esc(st.why || '') + '</span>')
-    + '</div>';
 
-  const mins = Math.round((cx.period_s || 0) / 60);
+  const mins = Math.round((cx.period_s || 0) / 60) || 5;
   const context =
-      '<div style="margin-top:6px;padding:6px 0 0 13px;opacity:.55;'
+      '<div style="margin-top:8px;padding:6px 0 0 13px;opacity:.55;'
     + 'border-top:1px solid var(--line)">'
-    + '<div class="thin">SHOWN ONLY &mdash; these do not decide '
-    + 'anything (' + mins + 'm window)</div>'
+    + '<div class="thin">SHOWN ONLY &mdash; none of this decides '
+    + 'anything</div>'
     + '<div style="margin-top:4px">'
+    + row(st.trading) + row(st.below) + '</div>'
+    + '<div style="margin-top:2px">'
     + leg('candle', cx.candle) + leg('OFI', cx.ofi) + leg('CVD', cx.cvd)
     + leg('footprint', cx.footprint)
-    /* The faster row. It gated entries until Chris took it out --
-       "paying no attention to the 1 minute at all" -- and it is
-       still drawn, because a reading that silently stops being
-       collected is how a panel starts lying. */
-    + (st.below ? row(st.below) : '')
     + '</div></div>';
 
   const verdict = SW.side
@@ -16375,12 +16380,11 @@ function paintStackWin(SW) {
       + esc(SW.why || '') + '</span>';
 
   box.innerHTML =
-      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
-    + 'AND THE ' + esc((SW.stack || {}).trading || 'STACK')
-    + '</b> &mdash; both to get in. Only a flip of the '
-    + esc((SW.stack || {}).trading || 'traded bar') + ' gets you out.'
-    + '</div>'
-    + gate1 + gate2
+      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR'
+    + '</b> &mdash; in on its direction, out on its flip, and never '
+    + 'past the ' + mins + '-minute bar it opened in. As many trades '
+    + 'as the tape gives.</div>'
+    + gate1
     + '<div style="margin-top:8px">' + verdict + '</div>'
     + context;
 }

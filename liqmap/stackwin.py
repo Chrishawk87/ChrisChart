@@ -138,80 +138,128 @@ def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
     return q, ""
 
 
-def entry_side(tick: str, rungs: dict,
-               period_s: float) -> tuple[str, str]:
+def entry_side(tick: str, rungs: dict | None = None,
+               period_s: float = 0.0) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    THE TICK BAR GATES AND THE STACK CONFIRMS.
+    THE TICK BAR IS THE WHOLE RULE NOW. Chris: "lets do number 2" --
+    enter when the tick bar has a direction, exit when it flips.
 
-    Chris asked for a hybrid of the tick bar and the 5-minute here,
-    replacing the footprint. The 5-minute came out, and the reason
-    is worth keeping: GATE 2 ALREADY CHECKS IT. On a 5-minute
-    window the stack is 5m + 1m, so a 5m in gate 1 has to agree
-    with itself -- free, and the rule takes exactly the same trades
-    as the tick bar alone. Same trade set, one more clause to keep
-    correct.
+    `rungs` and `period_s` are still taken and still ignored. The
+    stack is computed for the panel because a reading that silently
+    stops being collected is how a screen starts lying, and because
+    dropping the arguments would break every caller for no gain. It
+    gates nothing.
 
-    So gate 1 contributes what nothing else in this rule has:
-    PRINTS RATHER THAN TIME. The tick bar closes on a count of
-    trades, so it moves fast when the tape is busy and slowly when
-    it is not, and its direction is one vote per print -- not where
-    price happened to finish. The stack is three readings of the
-    clock. They are measuring genuinely different things, which is
-    the only reason pairing them says anything.
-
-    THE FOOTPRINT IS STILL READ AND STILL SHOWN. It decides nothing
-    now. It stays on the panel for the same reason the candle, OFI
-    and CVD do: a leg that silently stops being collected is how a
-    screen starts lying, and he has already watched four readings
-    agree and drive nothing.
-
-    THE TICK BAR IS ASKED FIRST AND ALONE. When it has no direction
-    the stack is never consulted and the reason does not mention it.
+    WHAT THE TICK BAR IS, SINCE IT NOW DECIDES EVERYTHING: a bar
+    that closes on a count of prints rather than a clock, whose
+    direction is ONE VOTE PER PRINT -- how many prints moved price
+    up against how many moved it down -- not where price happened
+    to finish. It is also cut at every true 5-minute mark, so it
+    carries no direction across a boundary.
     """
     if tick not in SIDES:
         return "", "the tick bar has no direction"
-
-    s_side, s_why = stack_side(rungs, period_s)
-    if not s_side:
-        return "", (f"the tick bar is {tick} but the stack does not "
-                    f"back it: {s_why}")
-    if s_side != tick:
-        return "", (f"the tick bar is {tick} and the "
-                    f"{traded_tf(period_s)} is {s_side} -- they "
-                    f"point apart")
     return tick, ""
 
 
-def holds(side: str, rungs: dict,
-          period_s: float) -> tuple[bool, str]:
+def holds(side: str, tick: str) -> tuple[bool, str]:
     """Does the trade still stand?
 
-    ONLY A FLIP OF THE TRADED TIMEFRAME ENDS IT. Chris: "a
-    disagreement is only when the primary timeframe that im trading
-    on flips".
+    ONLY THE TICK BAR FLIPPING ENDS IT.
 
-    THE TICK BAR IS NOT CONSULTED HERE AT ALL, and that is the
-    point. It gets you in; the traded timeframe keeps you in. It
-    closes on a count of prints, so between bars it has no
-    direction -- and with the 5-minute reset forced onto that
-    series, an exit that read it would fire on the clock at every
-    boundary rather than on the market. That was the live risk in
-    the previous version.
+    FLAT IS NOT A FLIP, and here that matters more than anywhere
+    else it has come up: the tick bar is cut at every true 5-minute
+    mark, so it has no direction for the first prints of every bar.
+    An exit that closed on flat would fire twelve times an hour on
+    the clock rather than on the market.
 
-    FLAT IS NOT A FLIP. A 5-minute candle sitting on its open has
-    gone nowhere; it has not turned. Closing on that would end
-    trades for an absence, which is the churn this rule has been
-    rewritten twice to remove. Only the OPPOSITE side ends it.
+    The five-minute boundary DOES end a trade, but as a time stop
+    applied by the caller -- not as a direction reading. The two are
+    different events and conflating them is what made the earlier
+    version close for an absence.
     """
     if side not in SIDES:
         return True, ""
-    tf = traded_tf(period_s)
-    now, why = stack_side(rungs, period_s)
-    if now == _other(side):
-        return False, (f"the {tf} flipped {now} against your "
+    if tick == _other(side):
+        return False, (f"the tick bar flipped {tick} against your "
                        f"{side} trade")
     return True, ""
+
+
+def bar_of(ts: float, period_s: float = 300.0) -> float:
+    """The TRUE wall-clock bar this instant falls in.
+
+    Unix time divides evenly into 300-second buckets from an epoch
+    on a minute boundary, so this lands on :00, :05, :10 of the hour
+    in every zone whose offset is a multiple of five minutes --
+    which is all of them.
+    """
+    try:
+        t = float(ts or 0.0)
+        p = float(period_s or 300.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if t <= 0 or p <= 0:
+        return 0.0
+    return float(int(t // p) * p)
+
+
+def expired(bar_ts: float, now_ts: float,
+            period_s: float = 300.0) -> tuple[bool, str]:
+    """Has this trade outlived its 5-minute bar?
+
+    Chris: "no trade will ever last past a 5 minute timeframe".
+
+    A TIME STOP, NOT A DIRECTION READING, and the distinction is
+    the whole reason this is a separate function. The tick bar is
+    cut at the same boundary, so at that instant it also has no
+    direction -- and an exit that read flat as a reversal would
+    close for an absence, which is the churn this rule has been
+    rewritten twice to remove. One of these is the clock running
+    out; the other is the market turning. They get different
+    reasons in the log because they are different events.
+
+    A trade with no recorded bar is NOT expired. Zero is "we do not
+    know", and closing every such position at the first boundary
+    would be acting on missing data.
+    """
+    b = bar_of(bar_ts, period_s)
+    n = bar_of(now_ts, period_s)
+    if b <= 0 or n <= 0:
+        return False, ""
+    if n > b:
+        mins = int(period_s // 60) or 5
+        return True, (f"the {mins}-minute bar it was opened in has "
+                      f"ended")
+    return False, ""
+
+
+def exit_reason(side: str, tick: str, bar_ts: float, now_ts: float,
+                period_s: float = 300.0) -> str:
+    """Why this trade should end now, or "" to hold it.
+
+    ONE FUNCTION, IN ORDER, because the order carries meaning. The
+    clock is checked FIRST so a trade that outlived its bar is
+    logged as the bar ending rather than blamed on a tick bar that
+    is merely between bars at that same instant -- the tick series
+    is cut on the same boundary, so both are true and only one is
+    the reason.
+
+    WHY THIS IS NOT A FEW LINES IN THE ROUTE. It was, and a mutation
+    that deleted the time stop's effect broke no test: the route
+    checks lived in a closure reachable only through an HTTP
+    request. That is how the auto gate and the one-per-candle cap
+    were each removed without anything noticing. The policy is here
+    and the route calls it.
+    """
+    if side not in SIDES:
+        return ""
+    gone, why_gone = expired(bar_ts, now_ts, period_s)
+    if gone:
+        return why_gone
+    ok, why = holds(side, tick)
+    return "" if ok else why
 
 
 def state(win: dict | None, tick: str, rungs: dict | None,
@@ -234,7 +282,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
 
     w_side, w_why = window_side(candle, ofi, cvd, fp)
     s_side, s_why = stack_side(rungs or {}, period_s)
-    side, why = entry_side(tick, rungs or {}, period_s)
+    side, why = entry_side(tick)
 
     rows = {}
     for name in (tf, below):
@@ -263,10 +311,9 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "trading": tf, "below": below,
             "rows": rows,
             "side": s_side, "why": s_why,
-            # Never consulted while the tick bar has no direction,
-            # and the panel says that rather than showing a verdict
-            # the rule did not ask for.
-            "asked": tick in SIDES,
+            # SHOWN, NOT USED. The tick bar is the whole rule now.
+            "asked": False,
+            "decides": False,
         },
         # SHOWN, NOT USED. Under its own heading so there is no
         # chance of reading any of it as part of the decision.
@@ -278,6 +325,5 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         },
         "side": side,
         "why": why,
-        "say": (f"the tick bar and the {tf} are both {side}"
-                if side else why),
+        "say": (f"the tick bar is {side}" if side else why),
     }

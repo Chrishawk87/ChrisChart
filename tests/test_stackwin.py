@@ -93,139 +93,158 @@ class TestTheStackIsTheTradedRowAlone:
         assert side == "" and "open was never seen" in why
 
 
-class TestTheTickBarGatesFirstAndAlone:
-    def test_no_tick_direction_never_reaches_the_stack(self):
-        r = rungs(**{"5m": D, "1m": D})
-        side, why = sw.entry_side("", r, 300.0)
-        assert side == ""
-        assert "tick bar has no direction" in why
-        assert "stack" not in why.lower()
+class TestTheTickBarIsTheWholeRule:
+    """Chris chose "the tick bar is the whole rule": enter when it
+    has a direction, exit when it flips, and never hold past the
+    5-minute bar."""
 
-    def test_the_stack_is_marked_not_asked(self):
-        r = rungs(**{"5m": D, "1m": D})
-        st = sw.state({"mid_dir": D, "ofi_dir": D, "cvd_dir": D}, "",
-                      r, 300.0)
-        assert st["stack"]["asked"] is False
-        assert st["tick"]["true"] is False
+    @pytest.mark.parametrize("d", [U, D])
+    def test_a_direction_is_an_entry(self, d):
+        assert sw.entry_side(d) == (d, "")
 
-    def test_a_tick_direction_with_a_silent_stack_says_so(self):
-        # The TRADED row has to be the silent one now. With `5m: D`
-        # this entry succeeds -- the 1m is no longer consulted --
-        # which is the whole change.
-        r = rungs(**{"5m": "flat", "1m": U})
-        side, why = sw.entry_side(D, r, 300.0)
-        assert side == ""
-        assert "the tick bar is down but the stack does not back it" in why
-        assert "the 5m is flat" in why
+    def test_no_direction_is_no_entry(self):
+        side, why = sw.entry_side("")
+        assert side == "" and "tick bar has no direction" in why
 
-    def test_both_true_and_pointing_apart(self):
-        r = rungs(**{"5m": U, "1m": D})
-        side, why = sw.entry_side(D, r, 300.0)
-        assert side == "" and "point apart" in why
+    @pytest.mark.parametrize("junk", [None, "flat", "UP", 7])
+    def test_junk_is_never_a_side(self, junk):
+        assert sw.entry_side(junk)[0] == ""
 
-    def test_both_agreeing_is_the_trade(self):
-        r = rungs(**{"5m": D, "1m": U})     # the 1m is ignored
-        assert sw.entry_side(D, r, 300.0) == ("down", "")
+    def test_the_stack_does_not_gate_it(self):
+        """It is still computed and still drawn. It decides
+        nothing."""
+        for a, b in ((U, U), (D, D), (U, D), (None, None)):
+            r = rungs(**{"5m": a, "1m": b})
+            assert sw.entry_side(D, r, 300.0) == ("down", "")
 
-    def test_it_is_symmetric(self):
-        r = rungs(**{"5m": U, "1m": D})
-        assert sw.entry_side(U, r, 300.0) == ("up", "")
-
-
-class TestTheOtherLegsDecideNothing:
-    def test_all_four_against_it_and_it_still_fires(self):
-        """Candle, OFI, CVD and the FOOTPRINT all the other way.
-        The footprint used to be gate 1; it decides nothing now."""
-        r = rungs(**{"5m": D, "1m": D})
+    def test_the_state_marks_the_stack_as_deciding_nothing(self):
+        r = rungs(**{"5m": U, "1m": U})
         st = sw.state({"mid_dir": U, "ofi_dir": U, "cvd_dir": U}, D,
                       r, 300.0, fp=U)
-        assert st["side"] == "down"
+        assert st["side"] == "down", "something other than the tick gated"
+        assert st["stack"]["decides"] is False
+        assert st["stack"]["asked"] is False
         assert st["context"]["decides"] is False
+
+    def test_the_stack_is_still_reported(self):
+        r = rungs(**{"5m": U, "1m": D})
+        st = sw.state({}, D, r, 300.0)
+        assert st["stack"]["rows"]["5m"]["dir"] == "up"
+        assert st["stack"]["side"] == "up"
+
+    def test_the_footprint_reads_exactly_as_it_did(self):
+        """Chris: "we will not change the way the footprint reads on
+        this strategy"."""
+        st = sw.state({}, D, {}, 300.0, fp=U)
         assert st["context"]["footprint"] == "up"
 
-    def test_they_are_still_reported(self):
-        """Shown, not used. A leg that silently stops counting is
-        what made the old window look broken."""
-        r = rungs(**{"5m": D, "1m": D})
-        cx = sw.state({"mid_dir": U, "ofi_dir": D, "cvd_dir": U}, D,
-                      r, 300.0, fp=D)["context"]
-        assert cx["candle"] == "up" and cx["ofi"] == "down"
-        assert cx["footprint"] == "down"
 
-    def test_the_four_leg_reading_is_kept_for_the_panel(self):
-        assert sw.window_side(D, D, D, D) == ("down", "")
-        side, why = sw.window_side(D, D, U, U)
-        assert side == "" and "two against two" in why
+class TestOnlyTheTickBarFlippingEndsIt:
+    def test_it_holds_while_the_tick_bar_agrees(self):
+        assert sw.holds(D, D) == (True, "")
 
-
-class TestOnlyAFlipOfTheTradedTimeframeEndsIt:
-    """Chris: "a disagreement is only when the primary timeframe
-    that im trading on flips".
-
-    THE TICK BAR IS NOT CONSULTED AT ALL HERE. It gets you in; the
-    traded timeframe keeps you in. It closes on a count of prints,
-    so between bars it has no direction -- and with the 5-minute
-    reset forced onto that series, an exit that read it would fire
-    on the clock at every boundary rather than on the market. That
-    was the live risk in the previous version.
-    """
-
-    def test_it_holds_while_the_traded_row_still_backs_it(self):
-        r = rungs(**{"5m": D, "1m": U})
-        assert sw.holds(D, r, 300.0) == (True, "")
-
-    def test_only_the_opposite_side_ends_it(self):
-        r = rungs(**{"5m": U, "1m": U})
-        ok, why = sw.holds(D, r, 300.0)
+    def test_the_opposite_direction_ends_it(self):
+        ok, why = sw.holds(D, U)
         assert ok is False
-        assert "the 5m flipped up against your down trade" in why
+        assert "the tick bar flipped up against your down trade" in why
 
-    def test_a_FLAT_traded_row_is_not_a_flip(self):
-        """A candle sitting on its open has gone nowhere; it has
-        not turned. Closing on that ends trades for an absence,
-        which is the churn this rule has twice been rewritten to
-        remove."""
-        r = rungs(**{"5m": "flat", "1m": U})
-        assert sw.holds(D, r, 300.0) == (True, "")
-
-    def test_an_unread_traded_row_is_not_a_flip_either(self):
-        r = rungs(**{"5m": None, "1m": U})
-        assert sw.holds(D, r, 300.0)[0] is True
-
-    def test_the_one_minute_cannot_end_it(self):
-        for below in (U, D, None, "conflict"):
-            r = rungs(**{"5m": D, "1m": below})
-            assert sw.holds(D, r, 300.0)[0] is True, below
-
-    def test_the_tick_bar_cannot_end_it(self):
-        """It is not even an argument to `holds` any more. Pinned
-        by signature so it cannot quietly come back."""
-        import inspect
-        params = list(inspect.signature(sw.holds).parameters)
-        assert params == ["side", "rungs", "period_s"], params
-
-    def test_on_a_fifteen_minute_window_the_15m_decides(self):
-        r = rungs(**{"15m": U, "5m": D, "1m": D})
-        ok, why = sw.holds(D, r, 900.0)
-        assert ok is False and "the 15m flipped up" in why
-        assert sw.holds(U, r, 900.0)[0] is True
+    def test_FLAT_IS_NOT_A_FLIP(self):
+        """It matters more here than anywhere else it has come up.
+        The tick bar is cut at every true 5-minute mark, so it has
+        no direction for the first prints of every bar. An exit on
+        flat would fire twelve times an hour on the clock."""
+        assert sw.holds(D, "") == (True, "")
+        assert sw.holds(U, "") == (True, "")
 
     def test_it_is_symmetric(self):
-        r = rungs(**{"5m": D, "1m": U})
-        assert sw.holds(D, r, 300.0)[0] is True
-        assert sw.holds(U, r, 300.0)[0] is False
+        assert sw.holds(U, U)[0] is True
+        assert sw.holds(U, D)[0] is False
 
     def test_no_open_side_is_never_an_exit(self):
-        r = rungs(**{"5m": U, "1m": U})
-        assert sw.holds("", r, 300.0)[0] is True
+        assert sw.holds("", U)[0] is True
 
-    def test_a_trade_survives_what_would_block_a_new_one(self):
-        """ASYMMETRIC ON PURPOSE, and worth stating. A flat 5m
-        blocks an entry -- the tick bar has nothing to agree with --
-        and holds an open position, because flat is not a flip."""
-        r = rungs(**{"5m": "flat", "1m": U})
-        assert sw.entry_side(D, r, 300.0)[0] == ""
-        assert sw.holds(D, r, 300.0)[0] is True
+    def test_the_stack_is_not_an_argument_any_more(self):
+        """Pinned by signature so it cannot quietly come back."""
+        import inspect
+        assert list(inspect.signature(sw.holds).parameters) == \
+            ["side", "tick"]
+
+
+class TestNoTradeOutlivesItsFiveMinuteBar:
+    """Chris: "no trade will ever last past a 5 minute timeframe"."""
+
+    @staticmethod
+    def at(h, m, s=0):
+        import datetime as dt
+        tz = dt.timezone(dt.timedelta(hours=-5))
+        return dt.datetime(2026, 11, 17, h, m, s, tzinfo=tz).timestamp()
+
+    def test_it_survives_inside_its_own_bar(self):
+        assert sw.expired(self.at(7, 1), self.at(7, 4, 59))[0] is False
+
+    def test_the_boundary_ends_it(self):
+        gone, why = sw.expired(self.at(7, 1), self.at(7, 5))
+        assert gone is True and "bar it was opened in has ended" in why
+
+    def test_a_trade_opened_a_second_before_the_boundary_still_ends(self):
+        assert sw.expired(self.at(7, 4, 59), self.at(7, 5))[0] is True
+
+    def test_the_buckets_are_true_wall_clock_marks(self):
+        import datetime as dt
+        tz = dt.timezone(dt.timedelta(hours=-5))
+        for h, m in ((7, 0), (7, 5), (7, 10), (13, 35)):
+            b = sw.bar_of(self.at(h, m, 30))
+            opened = dt.datetime.fromtimestamp(b, tz)
+            assert (opened.minute % 5, opened.second) == (0, 0)
+
+    def test_a_trade_with_no_recorded_bar_is_not_expired(self):
+        """Zero is "we do not know". Closing every such position at
+        the first boundary would be acting on missing data."""
+        assert sw.expired(0.0, self.at(7, 5))[0] is False
+        assert sw.expired(self.at(7, 1), 0.0)[0] is False
+
+    def test_fifteen_minutes_works_too(self):
+        assert sw.expired(self.at(7, 1), self.at(7, 5), 900.0)[0] is False
+        assert sw.expired(self.at(7, 1), self.at(7, 15), 900.0)[0] is True
+
+    def test_the_clock_is_checked_before_the_direction(self):
+        """So the log says the bar ended rather than blaming a tick
+        bar that is merely between bars at that same instant. Held
+        by behaviour now rather than by the order of two lines in a
+        route -- see TestTheExitPolicyIsOneFunction."""
+        import datetime as dt
+        tz = dt.timezone(dt.timedelta(hours=-5))
+        at = lambda h, m: dt.datetime(2026, 11, 17, h, m,
+                                      tzinfo=tz).timestamp()
+        why = sw.exit_reason(D, U, at(7, 1), at(7, 5))
+        assert "bar it was opened in has ended" in why
+        assert "flipped" not in why
+
+    def test_the_route_stamps_the_bar_a_trade_opened_in(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert "_swb.bar_of(time.time(), FUSION_RESET_S)" in blk
+        assert "bar_ts=bar_ts" in blk
+
+
+class TestItStillTakesAsManyTradesAsTheTapeGives:
+    def test_the_cap_does_not_apply_to_this_strategy(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("cap = 0")
+        # To the cap itself, not a fixed window -- the stack branch
+        # now sits between them and pushed it out of a 700-char
+        # slice.
+        blk = src[i:src.index("cap = 1", i) + 10]
+        assert 'strat in ("fused", "timed")' in blk
+        assert 'strat == "stack"' in blk
+        head = blk.split('if strat in ("fused", "timed")')[0]
+        assert "cap = 1" not in head, \
+            "the stack rule was given a one-per-candle cap"
 
 
 class TestTheEdges:
@@ -293,7 +312,7 @@ class TestTheWiring:
         assert 'strat == "stack"' in blk, "the route never builds it"
         assert "_sw.state(" in blk
         assert '"stackwin"' in blk, "it never reaches the payload"
-        assert "_sw.holds(" in blk, "the tight exit is not wired"
+        assert "_sw.exit_reason(" in blk, "the exit is not wired"
         assert "_tick_now(rt_, 0, \"raw\", 0.0, 0, FUSION_RESET_S)" in blk, \
             "gate 1 is not reading the Fusion panel's tick series"
 
@@ -304,8 +323,10 @@ class TestTheWiring:
         i = src.index("function paintStackWin(")
         blk = src[i:i + 6000]
         assert "style.display = 'none'" in blk
-        assert "not asked" in blk, "gate 2 does not say it was skipped"
-        assert "do not decide" in blk, "the shown-only legs are unlabelled"
+        assert "none of this decides" in blk, \
+            "the shown-only block is unlabelled"
+        assert "this is the whole rule" in blk, \
+            "the tick bar is not marked as the rule"
 
     def test_the_dropdown_offers_it(self):
         import pathlib
@@ -314,26 +335,6 @@ class TestTheWiring:
         i = src.index('id="jnlStrat"')
         box = src[i:src.index("</select>", i)]
         assert 'value="stack"' in box
-
-
-class TestItCanTakeMoreThanOneTrade:
-    """Chris: "it takes a trade hits take profit but signal is still
-    holding strong then it takes another trade".
-
-    IT ALREADY COULD -- the one-per-candle cap is set only for the
-    fused and timed rules, and this one was never in that list. The
-    test exists so that adding a third strategy to the cap does not
-    quietly take it away."""
-
-    def test_the_cap_does_not_apply_to_this_strategy(self):
-        import pathlib
-        src = (pathlib.Path(__file__).resolve().parents[1]
-               / "liqmap" / "web.py").read_text()
-        i = src.index("cap = 0")
-        blk = src[i:i + 400]
-        assert 'strat in ("fused", "timed")' in blk
-        assert '"stack"' not in blk.split("cap = 1")[0], \
-            "the stack rule was added to the one-per-candle cap"
 
 
 class TestTheFootprintNeverDisappears:
@@ -435,10 +436,13 @@ class TestTheRuleDoesNotWaitForTheSlowRoute:
     never pass, and this strategy could not open a trade at all.
     """
 
-    def test_an_empty_stack_blocks_gate_two_entirely(self):
-        """The bug, pinned. This is what the stepper saw."""
+    def test_an_empty_stack_no_longer_blocks_anything(self):
+        """THE BUG IS STILL PINNED, one layer down. The stepper saw
+        {} and `stack_side` still reports that honestly -- it is
+        just no longer allowed to stop a trade, because the tick bar
+        is the whole rule now."""
         assert sw.stack_side({}, 300.0)[0] == ""
-        assert sw.entry_side(D, {}, 300.0)[0] == ""
+        assert sw.entry_side(D, {}, 300.0) == ("down", "")
 
     def test_the_step_builds_its_own_rows_from_candles(self):
         import pathlib
@@ -509,3 +513,49 @@ class TestTheRowsShowRealPrices:
         st = sw.state({}, D, r, 300.0)
         assert st["stack"]["rows"]["5m"]["open_px"] == 7438.0
         assert st["stack"]["rows"]["5m"]["ticks"] == -21.0
+
+
+class TestTheExitPolicyIsOneFunction:
+    """A mutation deleting the time stop's effect in the route broke
+    no test, because the checks lived in a closure reachable only
+    through an HTTP request -- the same shape that let the auto gate
+    and the one-per-candle cap each be removed unnoticed."""
+
+    @staticmethod
+    def at(h, m, s=0):
+        import datetime as dt
+        tz = dt.timezone(dt.timedelta(hours=-5))
+        return dt.datetime(2026, 11, 17, h, m, s, tzinfo=tz).timestamp()
+
+    def test_a_healthy_trade_holds(self):
+        assert sw.exit_reason(D, D, self.at(7, 1), self.at(7, 3)) == ""
+
+    def test_a_flipped_tick_bar_ends_it(self):
+        why = sw.exit_reason(D, U, self.at(7, 1), self.at(7, 3))
+        assert "flipped up" in why
+
+    def test_the_bar_ending_ends_it(self):
+        why = sw.exit_reason(D, D, self.at(7, 1), self.at(7, 5))
+        assert "bar it was opened in has ended" in why
+
+    def test_the_clock_wins_when_both_are_true(self):
+        """At the boundary the tick series is cut too, so it has no
+        direction and could also look like a reason. The log must
+        say the bar ended."""
+        why = sw.exit_reason(D, U, self.at(7, 1), self.at(7, 5))
+        assert "bar it was opened in has ended" in why
+        assert "flipped" not in why
+
+    def test_a_flat_tick_bar_inside_the_bar_holds(self):
+        assert sw.exit_reason(D, "", self.at(7, 1), self.at(7, 3)) == ""
+
+    def test_no_open_side_never_exits(self):
+        assert sw.exit_reason("", U, self.at(7, 1), self.at(7, 9)) == ""
+
+    def test_the_route_delegates_to_it(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert "_sw.exit_reason(" in blk, "the policy is inline again"
