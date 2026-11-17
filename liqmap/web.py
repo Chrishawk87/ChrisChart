@@ -7572,8 +7572,14 @@ def create_app() -> FastAPI:
             # this takes the same rows rather than computing a
             # second opinion about the same timeframes.
             from . import stackwin as _sw
-            fus = _sw.state(win, fpi.get("side") or "", _rungs,
-                            float(s.window_s or 900.0))
+            # GATE 1 IS THE TICK BAR. The same series the Fusion
+            # panel's tick column shows -- same size, same forced
+            # 5-minute reset -- so the column he reads and the gate
+            # that fires cannot be two different bars.
+            _tk = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
+            fus = _sw.state(win, (_tk.get("dir") or ""), _rungs,
+                            float(s.window_s or 900.0),
+                            fp=fpi.get("side") or "")
         else:
             fus = (_timed_now(rt_) if strat == "timed"
                    else _fusion_now(rt_))
@@ -7594,12 +7600,8 @@ def create_app() -> FastAPI:
             says = {"1m": (fus.get("m1") or {}).get("dir") or None,
                     "5m": (fus.get("m5") or {}).get("dir") or None}
         elif strat == "stack":
-            _w = fus.get("window") or {}
             _st = fus.get("stack") or {}
-            says = {"candle": _w.get("candle") or None,
-                    "OFI": _w.get("ofi") or None,
-                    "CVD": _w.get("cvd") or None,
-                    "footprint": _w.get("footprint") or None,
+            says = {"tick": (fus.get("tick") or {}).get("side") or None,
                     (_st.get("trading") or "tf"):
                         ((_st.get("rows") or {})
                          .get(_st.get("trading") or "") or {}).get("dir")
@@ -7692,8 +7694,9 @@ def create_app() -> FastAPI:
             # readings break less often than four. If it churns,
             # this is where to look, and the reason string says so.
             from . import stackwin as _sw
+            _tk_x = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
             _ok, _why_out = _sw.holds(
-                t.side, fpi.get("side") or "", _rungs,
+                t.side, (_tk_x.get("dir") or ""), _rungs,
                 float(s.window_s or 900.0))
             if not _ok:
                 disagreed = _why_out
@@ -16223,13 +16226,16 @@ function paintClockWindows(d) {
    It renders only for this strategy and hides itself otherwise,
    because a box that shows stale readings from a rule you are not
    running is worse than no box. */
-/* THE FOOTPRINT GATES, THEN THE STACK. In that order.
+/* THE TICK BAR GATES, THEN THE STACK. In that order.
 
-   Chris: "we are just going to use the stack and the footprint
-   thats all the make entry and exits".
+   The 5-minute came out of the hybrid Chris asked for because
+   GATE 2 ALREADY CHECKS IT -- on a 5m window the stack is 5m + 1m,
+   so a 5m here would have to agree with itself and the rule would
+   take exactly the same trades. Gate 1 contributes what nothing
+   else in this rule does: PRINTS RATHER THAN TIME.
 
-   The order is not presentation. When the footprint shows no
-   imbalance the stack is NOT consulted, and this box says so
+   The order is not presentation. When the tick bar has no
+   direction the stack is NOT consulted, and this box says so
    rather than showing a stack verdict the rule never asked for.
 
    The candle, OFI and CVD are still drawn, under a heading that
@@ -16244,7 +16250,7 @@ function paintStackWin(SW) {
   if (!SW) { box.style.display = 'none'; return; }
   box.style.display = '';
 
-  const f = SW.footprint || {};
+  const f = SW.tick || {};
   const st = SW.stack || {};
   const cx = SW.context || {};
   const arrow = (d) => d === 'up'
@@ -16259,12 +16265,12 @@ function paintStackWin(SW) {
       '<div style="border-left:3px solid var(--'
     + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 1 &mdash; THE FOOTPRINT</div>'
-    + '<div style="margin:4px 0">' + leg('imbalance', f.side) + '</div>'
+    + '<div class="thin">GATE 1 &mdash; THE TICK BAR</div>'
+    + '<div style="margin:4px 0">' + leg('direction', f.side) + '</div>'
     + (f.side
         ? '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
-          + 'FOOTPRINT ' + f.side.toUpperCase() + '</b>'
-        : '<b class="short">NO IMBALANCE</b> <span class="thin">'
+          + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
+        : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
     + '</div>';
 
@@ -16302,8 +16308,8 @@ function paintStackWin(SW) {
     + '<div style="margin:4px 0">'
     + row(st.trading) + row(st.below) + '</div>'
     + (!st.asked
-        ? '<span class="thin">not asked &mdash; the footprint has to '
-          + 'show an imbalance first</span>'
+        ? '<span class="thin">not asked &mdash; the tick bar has to '
+          + 'have a direction first</span>'
         : st.side
           ? '<b class="' + (st.side === 'up' ? 'long' : 'short') + '">'
             + 'STACK ' + st.side.toUpperCase() + '</b>'
@@ -16319,6 +16325,7 @@ function paintStackWin(SW) {
     + 'anything (' + mins + 'm window)</div>'
     + '<div style="margin-top:4px">'
     + leg('candle', cx.candle) + leg('OFI', cx.ofi) + leg('CVD', cx.cvd)
+    + leg('footprint', cx.footprint)
     + '</div></div>';
 
   const verdict = SW.side
@@ -16329,8 +16336,8 @@ function paintStackWin(SW) {
       + esc(SW.why || '') + '</span>';
 
   box.innerHTML =
-      '<div class="thin" style="margin-bottom:4px"><b>THE FOOTPRINT '
-    + 'AND THE STACK</b> &mdash; footprint first, then the stack. '
+      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
+    + 'AND THE STACK</b> &mdash; the tick bar first, then the stack. '
     + 'A trade closes the moment they stop agreeing.</div>'
     + gate1 + gate2
     + '<div style="margin-top:8px">' + verdict + '</div>'

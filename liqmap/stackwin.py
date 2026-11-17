@@ -141,63 +141,67 @@ def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
     return out[tf], ""
 
 
-def entry_side(fp: str, rungs: dict,
+def entry_side(tick: str, rungs: dict,
                period_s: float) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    THE FOOTPRINT GATES AND THE STACK CONFIRMS. Chris: "we are just
-    going to use the stack and the footprint thats all the make
-    entry and exits".
+    THE TICK BAR GATES AND THE STACK CONFIRMS.
 
-    The candle, the OFI and the CVD are still read and still shown,
-    and they decide nothing. They are kept on the panel under their
-    own heading rather than deleted, because a leg that quietly
-    stops counting is the thing that makes a screen lie -- he has
-    already watched four readings agree and drive nothing.
+    Chris asked for a hybrid of the tick bar and the 5-minute here,
+    replacing the footprint. The 5-minute came out, and the reason
+    is worth keeping: GATE 2 ALREADY CHECKS IT. On a 5-minute
+    window the stack is 5m + 1m, so a 5m in gate 1 has to agree
+    with itself -- free, and the rule takes exactly the same trades
+    as the tick bar alone. Same trade set, one more clause to keep
+    correct.
 
-    THE FOOTPRINT IS ASKED FIRST AND ALONE. When it has no
-    imbalance the stack is never consulted and the reason does not
-    mention it.
+    So gate 1 contributes what nothing else in this rule has:
+    PRINTS RATHER THAN TIME. The tick bar closes on a count of
+    trades, so it moves fast when the tape is busy and slowly when
+    it is not, and its direction is one vote per print -- not where
+    price happened to finish. The stack is three readings of the
+    clock. They are measuring genuinely different things, which is
+    the only reason pairing them says anything.
+
+    THE FOOTPRINT IS STILL READ AND STILL SHOWN. It decides nothing
+    now. It stays on the panel for the same reason the candle, OFI
+    and CVD do: a leg that silently stops being collected is how a
+    screen starts lying, and he has already watched four readings
+    agree and drive nothing.
+
+    THE TICK BAR IS ASKED FIRST AND ALONE. When it has no direction
+    the stack is never consulted and the reason does not mention it.
     """
-    if fp not in SIDES:
-        return "", "the footprint shows no imbalance either way"
+    if tick not in SIDES:
+        return "", "the tick bar has no direction"
 
     s_side, s_why = stack_side(rungs, period_s)
     if not s_side:
-        return "", (f"the footprint is {fp} but the stack does not "
+        return "", (f"the tick bar is {tick} but the stack does not "
                     f"back it: {s_why}")
-    if s_side != fp:
-        return "", (f"the footprint is {fp} and the stack is "
+    if s_side != tick:
+        return "", (f"the tick bar is {tick} and the stack is "
                     f"{s_side} -- they point apart")
-    return fp, ""
+    return tick, ""
 
 
-def holds(side: str, fp: str, rungs: dict,
+def holds(side: str, tick: str, rungs: dict,
           period_s: float) -> tuple[bool, str]:
     """Does the signal still back an open trade?
 
-    THE MOMENT THEY DISAGREE, IT IS OVER. Chris: "you are going to
-    auto close trades the minute they disagree because right now its
-    holding the trades for no reason".
+    THE MOMENT THEY DISAGREE, IT IS OVER. Chris: "auto close trades
+    the minute they disagree because right now its holding the
+    trades for no reason".
 
-    THIS IS THE TIGHT EXIT, DELIBERATELY, AND IT HAS A HISTORY. The
-    rule that exited the moment agreement broke closed twelve trades
-    in an afternoon at two to five ticks each, and was replaced
-    twice for it. What is different now is the entry: those exits
-    came from a four-leg window where one leg going quiet for an
-    instant broke agreement constantly. Two readings break less
-    often than four -- but if it churns, the exit is where to look,
-    and the reason string below is what will show it.
-
-    A reading going FLAT ends it too, and that is the part most
-    likely to bite: a footprint between bars has no side, and that
-    is not the same as the market turning. It is counted as a
-    disagreement because he asked for the minute they disagree, not
-    the minute they oppose.
+    A tick bar between bars has no direction, and that is not the
+    market turning -- it counts anyway, because he asked for the
+    minute they disagree, not the minute they oppose. With the
+    5-minute reset forced on the tick series this happens at every
+    boundary, so if exits cluster there, this is why.
     """
     if side not in SIDES:
         return True, ""
-    now, why = entry_side(fp, rungs, period_s)
+    now, why = entry_side(tick, rungs, period_s)
     if now == side:
         return True, ""
     if now:
@@ -206,51 +210,27 @@ def holds(side: str, fp: str, rungs: dict,
     return False, (why or "the signal no longer backs it")
 
 
-def reversed_window(side: str, candle: str, ofi: str, cvd: str,
-                    fp: str) -> tuple[bool, str]:
-    """Has the window turned fully against an open trade?
-
-    ALL FOUR THE OTHER WAY, not merely losing agreement. Chris chose
-    this over the tighter exit for a reason he has paid for twice:
-    exiting the moment agreement breaks closed twelve trades in an
-    afternoon at two to five ticks each, none of which was a
-    decision about the market. A reading that has gone quiet is not
-    a reading that has gone against you.
-    """
-    if side not in SIDES:
-        return False, ""
-    against = _other(side)
-    w, _why = window_side(candle, ofi, cvd, fp)
-    if w == against:
-        return True, (f"the window turned fully {against} against "
-                      f"your {side} trade")
-    return False, ""
-
-
-def state(win: dict | None, fp: str, rungs: dict | None,
-          period_s: float) -> dict:
+def state(win: dict | None, tick: str, rungs: dict | None,
+          period_s: float, fp: str = "") -> dict:
     """Everything the rule and the panel need, from one place.
 
     One source, so the screen cannot show an agreement the rule did
-    not see. Every previous panel in this engine that computed its
-    own copy of a direction ended up telling a different story from
-    the rule beside it.
+    not see. Every panel in this engine that computed its own copy
+    of a direction ended up telling a different story from the rule
+    beside it -- the 5-minute cell and the OFI bar both did.
     """
     win = win or {}
     candle = str(win.get("mid_dir") or "")
     ofi = str(win.get("ofi_dir") or "")
     cvd = str(win.get("cvd_dir") or "")
+    tick = str(tick or "")
     fp = str(fp or "")
     tf = traded_tf(period_s)
     below = BELOW_OF.get(tf, "")
 
-    # The four-leg reading is kept and SHOWN. It decides nothing
-    # now; leaving it out would make the panel quieter and the rule
-    # less checkable, and a leg that silently stops counting is what
-    # makes a screen lie.
     w_side, w_why = window_side(candle, ofi, cvd, fp)
     s_side, s_why = stack_side(rungs or {}, period_s)
-    side, why = entry_side(fp, rungs or {}, period_s)
+    side, why = entry_side(tick, rungs or {}, period_s)
 
     rows = {}
     for name in (tf, below):
@@ -260,7 +240,6 @@ def state(win: dict | None, fp: str, rungs: dict | None,
         rows[name] = {
             "present": bool(row.get("present")),
             "dir": row.get("qualified") or "",
-            # Shown beside the direction, not instead of it.
             "absorbed": bool(row.get("absorbed")
                              or row.get("conflicted")),
             "seeded": row.get("seeded", True),
@@ -271,31 +250,30 @@ def state(win: dict | None, fp: str, rungs: dict | None,
         }
 
     return {
-        "footprint": {
-            "side": fp,
-            "true": fp in SIDES,
-            "why": ("" if fp in SIDES
-                    else "no imbalance either way"),
+        "tick": {
+            "side": tick,
+            "true": tick in SIDES,
+            "why": "" if tick in SIDES else "no direction yet",
         },
         "stack": {
             "trading": tf, "below": below,
             "rows": rows,
             "side": s_side, "why": s_why,
-            # Never consulted while the footprint has no side, and
-            # the panel says that rather than showing a verdict the
-            # rule did not ask for.
-            "asked": fp in SIDES,
+            # Never consulted while the tick bar has no direction,
+            # and the panel says that rather than showing a verdict
+            # the rule did not ask for.
+            "asked": tick in SIDES,
         },
         # SHOWN, NOT USED. Under its own heading so there is no
-        # chance of reading it as part of the decision.
+        # chance of reading any of it as part of the decision.
         "context": {
             "period_s": float(period_s or 0.0),
-            "candle": candle, "ofi": ofi, "cvd": cvd,
+            "candle": candle, "ofi": ofi, "cvd": cvd, "footprint": fp,
             "side": w_side, "why": w_why,
             "decides": False,
         },
         "side": side,
         "why": why,
-        "say": (f"the footprint and the {tf}/{below} stack are both "
+        "say": (f"the tick bar and the {tf}/{below} stack are both "
                 f"{side}" if side else why),
     }

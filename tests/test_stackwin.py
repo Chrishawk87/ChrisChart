@@ -85,12 +85,12 @@ class TestTheStackIsTheTradedRowAndTheOneBelow:
         assert side == "" and "contradicts itself" in why
 
 
-class TestTheFootprintGatesFirstAndAlone:
-    def test_no_imbalance_never_reaches_the_stack(self):
+class TestTheTickBarGatesFirstAndAlone:
+    def test_no_tick_direction_never_reaches_the_stack(self):
         r = rungs(**{"5m": D, "1m": D})
         side, why = sw.entry_side("", r, 300.0)
         assert side == ""
-        assert "footprint shows no imbalance" in why
+        assert "tick bar has no direction" in why
         assert "stack" not in why.lower()
 
     def test_the_stack_is_marked_not_asked(self):
@@ -98,13 +98,13 @@ class TestTheFootprintGatesFirstAndAlone:
         st = sw.state({"mid_dir": D, "ofi_dir": D, "cvd_dir": D}, "",
                       r, 300.0)
         assert st["stack"]["asked"] is False
-        assert st["footprint"]["true"] is False
+        assert st["tick"]["true"] is False
 
-    def test_a_footprint_with_a_silent_stack_says_so(self):
+    def test_a_tick_direction_with_a_silent_stack_says_so(self):
         r = rungs(**{"5m": D, "1m": U})
         side, why = sw.entry_side(D, r, 300.0)
         assert side == ""
-        assert "the footprint is down but the stack does not back it" in why
+        assert "the tick bar is down but the stack does not back it" in why
 
     def test_both_true_and_pointing_apart(self):
         r = rungs(**{"5m": U, "1m": U})
@@ -120,21 +120,25 @@ class TestTheFootprintGatesFirstAndAlone:
         assert sw.entry_side(U, r, 300.0) == ("up", "")
 
 
-class TestTheOtherThreeDecideNothing:
-    def test_all_three_against_it_and_it_still_fires(self):
+class TestTheOtherLegsDecideNothing:
+    def test_all_four_against_it_and_it_still_fires(self):
+        """Candle, OFI, CVD and the FOOTPRINT all the other way.
+        The footprint used to be gate 1; it decides nothing now."""
         r = rungs(**{"5m": D, "1m": D})
         st = sw.state({"mid_dir": U, "ofi_dir": U, "cvd_dir": U}, D,
-                      r, 300.0)
+                      r, 300.0, fp=U)
         assert st["side"] == "down"
         assert st["context"]["decides"] is False
+        assert st["context"]["footprint"] == "up"
 
     def test_they_are_still_reported(self):
         """Shown, not used. A leg that silently stops counting is
         what made the old window look broken."""
         r = rungs(**{"5m": D, "1m": D})
         cx = sw.state({"mid_dir": U, "ofi_dir": D, "cvd_dir": U}, D,
-                      r, 300.0)["context"]
+                      r, 300.0, fp=D)["context"]
         assert cx["candle"] == "up" and cx["ofi"] == "down"
+        assert cx["footprint"] == "down"
 
     def test_the_four_leg_reading_is_kept_for_the_panel(self):
         assert sw.window_side(D, D, D, D) == ("down", "")
@@ -156,20 +160,21 @@ class TestTheExitIsTheMomentTheyDisagree:
         r = rungs(**{"5m": D, "1m": D})
         assert sw.holds(D, D, r, 300.0) == (True, "")
 
-    def test_the_footprint_flipping_ends_it(self):
+    def test_the_tick_bar_flipping_ends_it(self):
         r = rungs(**{"5m": D, "1m": D})
         ok, why = sw.holds(D, U, r, 300.0)
         assert ok is False and why
 
-    def test_the_footprint_going_quiet_ends_it_too(self):
-        """The part most likely to bite: a footprint between bars
-        has no side, and that is not the market turning. It counts
-        anyway -- he asked for the minute they DISAGREE, not the
-        minute they oppose."""
+    def test_the_tick_bar_going_quiet_ends_it_too(self):
+        """The part most likely to bite: a tick bar between bars
+        has no direction, and that is not the market turning. It
+        counts anyway -- he asked for the minute they DISAGREE, not
+        the minute they oppose. With the 5-minute reset forced on
+        the tick series this happens at every boundary."""
         r = rungs(**{"5m": D, "1m": D})
         ok, why = sw.holds(D, "", r, 300.0)
         assert ok is False
-        assert "no imbalance" in why
+        assert "no direction" in why
 
     def test_the_stack_splitting_ends_it(self):
         r = rungs(**{"5m": D, "1m": U})
@@ -180,7 +185,7 @@ class TestTheExitIsTheMomentTheyDisagree:
         r = rungs(**{"5m": U, "1m": U})
         ok, why = sw.holds(D, U, r, 300.0)
         assert ok is False
-        assert "turned up against your down trade" in why
+        assert "point apart" in why or "turned up" in why
 
     def test_it_is_symmetric(self):
         r = rungs(**{"5m": U, "1m": U})
@@ -220,7 +225,7 @@ class TestTheEdges:
     def test_state_survives_empty_everything(self):
         st = sw.state(None, "", None, 300.0)
         assert st["side"] == ""
-        assert st["footprint"]["true"] is False
+        assert st["tick"]["true"] is False
         assert st["stack"]["asked"] is False
 
 
@@ -267,6 +272,8 @@ class TestTheWiring:
         assert "_sw.state(" in blk
         assert '"stackwin"' in blk, "it never reaches the payload"
         assert "_sw.holds(" in blk, "the tight exit is not wired"
+        assert "_tick_now(rt_, 0, \"raw\", 0.0, 0, FUSION_RESET_S)" in blk, \
+            "gate 1 is not reading the Fusion panel's tick series"
 
     def test_the_panel_labels_what_does_not_decide(self):
         import pathlib
