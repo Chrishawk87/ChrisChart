@@ -218,16 +218,40 @@ def entry_side(tick: str, rungs: dict | None = None,
     is skipped -- a caller that cannot measure the dwell must not be
     silently blocked from ever trading.
 
-    `rungs` and `period_s` are still taken and still ignored. The
-    stack is computed for the panel because a reading that silently
-    stops being collected is how a screen starts lying; it gates
-    nothing.
+    THE TRADED TIMEFRAME'S CANDLE IS A GATE AGAIN. Chris: "the tick
+    bar should be a continuous direction tracking with the timeframe
+    candle tracing at the same time thats how im going to be making
+    trades". Both must point the same way before anything opens.
+
+    `rungs` and `period_s` ARE NOW READ. They were taken and ignored
+    while the tick bar was the whole rule; this docstring said so,
+    and the line above is the only reason that changed.
+
+    THE ORDER OF THE CHECKS IS THE ORDER OF THE REASONS, and it is
+    chosen rather than incidental. Everything about the tick bar is
+    settled first -- has it a direction, has it held -- and the
+    candle is asked last. A rule that reports whichever test failed
+    first is a DIFFERENT rule when the order changes: it fires on
+    the same trades and explains them differently, and every wrong
+    explanation in this engine has cost a day.
+
+    EXITS DO NOT CONSULT THE CANDLE. `holds` is untouched: a trade
+    still ends on the tick bar flipping, or on the caller's time
+    stop. A candle that turns mid-trade is the pullback being traded
+    into, and closing on it would be a second rule nobody asked for.
     """
     if tick not in SIDES:
         return "", "the tick bar has no direction"
     if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
         return "", (f"the tick bar turned {tick} {held_s:.0f}s ago -- "
                     f"it has to hold {min_hold_s:.0f}s")
+    tf = traded_tf(period_s) or "candle"
+    c_side, c_why = stack_side(rungs or {}, period_s)
+    if not c_side:
+        return "", (c_why or f"the {tf} candle has no direction")
+    if c_side != tick:
+        return "", (f"the tick bar is {tick} but the {tf} candle is "
+                    f"{c_side}")
     return tick, ""
 
 
@@ -334,7 +358,8 @@ def state(win: dict | None, tick: str, rungs: dict | None,
           period_s: float, fp: str = "",
           held_s: float | None = None, flips: int = 0,
           min_hold_s: float = DWELL_S,
-          pace: dict | None = None) -> dict:
+          pace: dict | None = None,
+          roll: dict | None = None) -> dict:
     """Everything the rule and the panel need, from one place.
 
     One source, so the screen cannot show an agreement the rule did
@@ -353,7 +378,8 @@ def state(win: dict | None, tick: str, rungs: dict | None,
 
     w_side, w_why = window_side(candle, ofi, cvd, fp)
     s_side, s_why = stack_side(rungs or {}, period_s)
-    side, why = entry_side(tick, held_s=held_s, min_hold_s=min_hold_s)
+    side, why = entry_side(tick, rungs or {}, period_s,
+                           held_s=held_s, min_hold_s=min_hold_s)
 
     rows = {}
     for name in (tf, below):
@@ -386,14 +412,29 @@ def state(win: dict | None, tick: str, rungs: dict | None,
                           and (held_s is None or min_hold_s <= 0
                                or held_s >= min_hold_s)),
             "flips": int(flips or 0),
+            # THE WINDOW THE DIRECTION CAME OUT OF. `side` above IS
+            # this window's reading -- the caller passes it in -- and
+            # this is the count behind it, so the panel can show a
+            # cold start as warming up rather than as a flat market.
+            "roll": dict(roll or {}),
         },
         "stack": {
             "trading": tf, "below": below,
             "rows": rows,
             "side": s_side, "why": s_why,
-            # SHOWN, NOT USED. The tick bar is the whole rule now.
-            "asked": False,
-            "decides": False,
+            # ASKED AND DECIDING. The traded timeframe's candle is a
+            # gate on ENTRY -- both it and the tick bar have to point
+            # the same way. The row below it is still read and still
+            # drawn and still gates nothing.
+            #
+            # These two flags are what the panel reads to decide
+            # whether to draw this block as a gate or as a reading,
+            # so they are not decoration: a screen that labelled a
+            # live gate "shown, not used" is the exact failure this
+            # module was written after.
+            "asked": True,
+            "decides": True,
+            "agrees": bool(s_side and tick in SIDES and s_side == tick),
         },
         # THE TICK CHART AGAINST THE CLOCK -- the push and the pull.
         #
@@ -421,5 +462,6 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         },
         "side": side,
         "why": why,
-        "say": (f"the tick bar is {side}" if side else why),
+        "say": ((f"the tick bar and the {tf} candle are both {side}")
+                if side else why),
     }

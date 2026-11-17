@@ -93,44 +93,102 @@ class TestTheStackIsTheTradedRowAlone:
         assert side == "" and "open was never seen" in why
 
 
-class TestTheTickBarIsTheWholeRule:
-    """Chris chose "the tick bar is the whole rule": enter when it
-    has a direction, exit when it flips, and never hold past the
-    5-minute bar."""
+class TestBothMustAgreeToOpen:
+    """Chris: "the tick bar should be a continuous direction tracking
+    with the timeframe candle tracing at the same time thats how im
+    going to be making trades".
+
+    THE CANDLE IS A GATE AGAIN. It was one, he removed it, and he
+    has now put it back -- so these tests are the previous rule's
+    tests rewritten rather than deleted, and the pair below pins the
+    reversal itself so nobody re-derives the old behaviour from the
+    old docstrings.
+
+    EXIT IS UNCHANGED. The tick bar flipping, or the time stop. The
+    candle has no say in closing, which is tested in its own class.
+    """
 
     @pytest.mark.parametrize("d", [U, D])
-    def test_a_direction_is_an_entry(self, d):
-        assert sw.entry_side(d) == (d, "")
+    def test_agreement_is_an_entry(self, d):
+        assert sw.entry_side(d, rungs(**{"5m": d}), 300.0) == (d, "")
 
     def test_no_direction_is_no_entry(self):
-        side, why = sw.entry_side("")
+        side, why = sw.entry_side("", rungs(**{"5m": U}), 300.0)
         assert side == "" and "tick bar has no direction" in why
 
     @pytest.mark.parametrize("junk", [None, "flat", "UP", 7])
     def test_junk_is_never_a_side(self, junk):
-        assert sw.entry_side(junk)[0] == ""
+        assert sw.entry_side(junk, rungs(**{"5m": U}), 300.0)[0] == ""
 
-    def test_the_stack_does_not_gate_it(self):
-        """It is still computed and still drawn. It decides
-        nothing."""
-        for a, b in ((U, U), (D, D), (U, D), (None, None)):
-            r = rungs(**{"5m": a, "1m": b})
-            assert sw.entry_side(D, r, 300.0) == ("down", "")
+    @pytest.mark.parametrize("tick,candle", [(U, D), (D, U)])
+    def test_a_disagreeing_candle_blocks_it(self, tick, candle):
+        side, why = sw.entry_side(tick, rungs(**{"5m": candle}), 300.0)
+        assert side == ""
+        assert f"the tick bar is {tick}" in why
+        assert f"the 5m candle is {candle}" in why
 
-    def test_the_state_marks_the_stack_as_deciding_nothing(self):
+    def test_a_flat_candle_blocks_it_too(self):
+        """Flat is not a side, so it is not agreement. A window with
+        nothing in it would otherwise read as the strongest there
+        is -- the rule this module states in its own header."""
+        side, why = sw.entry_side(U, rungs(**{"5m": "flat"}), 300.0)
+        assert side == "" and "the 5m is flat" in why
+
+    def test_an_unread_candle_blocks_it(self):
+        side, why = sw.entry_side(U, rungs(**{"5m": None}), 300.0)
+        assert side == "" and "has not been read" in why
+
+    def test_no_stack_at_all_blocks_it(self):
+        """A caller that cannot supply the candle must not trade on
+        the tick bar alone. It used to, because the argument was
+        accepted and ignored."""
+        assert sw.entry_side(U, {}, 300.0)[0] == ""
+        assert sw.entry_side(U, None, 300.0)[0] == ""
+
+    def test_the_row_below_still_gates_nothing(self):
+        """Chris: "paying no attention to the 1 minute at all". The
+        candle coming back is the TRADED row only."""
+        for below in (U, D, None, "conflict"):
+            r = rungs(**{"5m": D, "1m": below})
+            assert sw.entry_side(D, r, 300.0) == ("down", ""), below
+
+    def test_fifteen_minutes_gates_on_the_15m(self):
+        assert sw.entry_side(D, rungs(**{"15m": D, "5m": U}),
+                             900.0) == ("down", "")
+        assert sw.entry_side(D, rungs(**{"15m": U, "5m": D}),
+                             900.0)[0] == ""
+
+    def test_the_state_marks_the_stack_as_deciding(self):
+        """THE SCREEN HAS TO SAY WHICH THINGS DECIDE. The panel
+        reads these flags to choose whether to draw the row as a
+        gate or under "shown only", and a live gate drawn as
+        scenery is the exact fault this panel was rebuilt after."""
         r = rungs(**{"5m": U, "1m": U})
-        st = sw.state({"mid_dir": U, "ofi_dir": U, "cvd_dir": U}, D,
+        st = sw.state({"mid_dir": U, "ofi_dir": U, "cvd_dir": U}, U,
                       r, 300.0, fp=U)
-        assert st["side"] == "down", "something other than the tick gated"
-        assert st["stack"]["decides"] is False
-        assert st["stack"]["asked"] is False
+        assert st["side"] == "up"
+        assert st["stack"]["decides"] is True
+        assert st["stack"]["asked"] is True
+        assert st["stack"]["agrees"] is True
+        # The four window legs did NOT come back with it.
         assert st["context"]["decides"] is False
+
+    def test_the_state_blocks_when_they_disagree(self):
+        r = rungs(**{"5m": U, "1m": U})
+        st = sw.state({}, D, r, 300.0)
+        assert st["side"] == ""
+        assert st["stack"]["agrees"] is False
+        assert "the 5m candle is up" in st["why"]
 
     def test_the_stack_is_still_reported(self):
         r = rungs(**{"5m": U, "1m": D})
         st = sw.state({}, D, r, 300.0)
         assert st["stack"]["rows"]["5m"]["dir"] == "up"
         assert st["stack"]["side"] == "up"
+
+    def test_the_verdict_names_both(self):
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0)
+        assert "tick bar" in st["say"] and "5m candle" in st["say"]
 
     def test_the_footprint_reads_exactly_as_it_did(self):
         """Chris: "we will not change the way the footprint reads on
@@ -271,7 +329,10 @@ class TestTheEdges:
         st = sw.state(None, "", None, 300.0)
         assert st["side"] == ""
         assert st["tick"]["true"] is False
-        assert st["stack"]["asked"] is False
+        # The gate is always consulted now, so `asked` is always
+        # true. What an empty stack must still do is BLOCK.
+        assert st["stack"]["asked"] is True
+        assert st["stack"]["agrees"] is False
 
 
 class TestItDoesNotTrade:
@@ -325,12 +386,21 @@ class TestTheWiring:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("function paintStackWin(")
-        blk = src[i:i + 6000]
+        # TO THE END OF THE FUNCTION, not a fixed slice. A byte
+        # count silently stopped covering the shown-only block
+        # the moment gate 2 was added above it, and a label test
+        # that cannot see the label it checks is worse than none.
+        blk = src[i:src.index("function paintJournal(", i)]
         assert "style.display = 'none'" in blk
         assert "none of this decides" in blk, \
             "the shown-only block is unlabelled"
-        assert "this is the whole rule" in blk, \
-            "the tick bar is not marked as the rule"
+        assert "GATE 1" in blk and "GATE 2" in blk, \
+            "the two gates are not marked as gates"
+        # The row that gates is OUT of the shown-only block.
+        tail = blk[blk.index("none of this decides"):]
+        assert "row(st.trading)" not in tail, \
+            "the deciding row is drawn under SHOWN ONLY"
+        assert "row(st.below)" in tail
 
     def test_the_dropdown_offers_it(self):
         import pathlib
@@ -440,13 +510,24 @@ class TestTheRuleDoesNotWaitForTheSlowRoute:
     never pass, and this strategy could not open a trade at all.
     """
 
-    def test_an_empty_stack_no_longer_blocks_anything(self):
-        """THE BUG IS STILL PINNED, one layer down. The stepper saw
-        {} and `stack_side` still reports that honestly -- it is
-        just no longer allowed to stop a trade, because the tick bar
-        is the whole rule now."""
+    def test_an_empty_stack_blocks_again_and_that_is_the_danger(self):
+        """THE ORIGINAL BUG IS LIVE AGAIN BY DESIGN, so the test
+        that found it has to stay pointed at it.
+
+        While the tick bar was the whole rule an empty stack cost
+        nothing. The candle is a gate again, so {} means no trade --
+        exactly the state the server-side stepper was in when it
+        could not open a trade at all with the browser closed.
+
+        What stops it this time is the NEXT test: the step builds
+        its own rows from candles instead of waiting for the route
+        to hand them over. These two belong together and neither is
+        sufficient alone.
+        """
         assert sw.stack_side({}, 300.0)[0] == ""
-        assert sw.entry_side(D, {}, 300.0) == ("down", "")
+        side, why = sw.entry_side(D, {}, 300.0)
+        assert side == "", "an empty stack opened a trade"
+        assert "has not been read" in why
 
     def test_the_step_builds_its_own_rows_from_candles(self):
         import pathlib
@@ -578,21 +659,25 @@ class TestAFlipHasToHoldBeforeItTrades:
         (10.0, True), (37.0, True),
     ])
     def test_it_waits_for_the_full_dwell(self, held, opens):
-        side, why = sw.entry_side(D, held_s=held)
+        side, why = sw.entry_side(D, rungs(**{"5m": D}), 300.0,
+                                  held_s=held)
         assert bool(side) is opens
         if not opens:
             assert "has to hold 10s" in why
 
     def test_the_reason_says_how_long_it_has_held(self):
-        assert "turned down 4s ago" in sw.entry_side(D, held_s=4.0)[1]
+        assert "turned down 4s ago" in sw.entry_side(
+            D, rungs(**{"5m": D}), 300.0, held_s=4.0)[1]
 
     def test_no_tracking_means_no_check(self):
         """A caller that cannot measure the dwell must not be
         silently blocked from ever trading."""
-        assert sw.entry_side(D, held_s=None) == ("down", "")
+        assert sw.entry_side(D, rungs(**{"5m": D}), 300.0,
+                             held_s=None) == ("down", "")
 
     def test_a_zero_minimum_disables_it(self):
-        assert sw.entry_side(D, held_s=0.0, min_hold_s=0.0) == ("down", "")
+        assert sw.entry_side(D, rungs(**{"5m": D}), 300.0,
+                             held_s=0.0, min_hold_s=0.0) == ("down", "")
 
     def test_the_exit_is_NOT_delayed(self):
         """The asymmetry is the point: a flip gets you OUT at once
@@ -673,12 +758,12 @@ class TestTheDwellReachesTheRuleAndThePanel:
         assert st["tick"]["flips"] == 3
 
     def test_a_held_direction_reads_ready(self):
-        st = sw.state({}, D, {}, 300.0, held_s=30.0)
+        st = sw.state({}, D, rungs(**{"5m": D}), 300.0, held_s=30.0)
         assert st["side"] == "down"
         assert st["tick"]["ready"] is True
 
     def test_an_untracked_dwell_is_ready(self):
-        st = sw.state({}, D, {}, 300.0)
+        st = sw.state({}, D, rungs(**{"5m": D}), 300.0)
         assert st["tick"]["ready"] is True
         assert st["side"] == "down"
 

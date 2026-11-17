@@ -7109,9 +7109,24 @@ def create_app() -> FastAPI:
             pace = bld.pace()
         except Exception:
             pace = {}
+        # THE DIRECTION THAT DOES NOT RESTART AT A BAR CLOSE.
+        #
+        # Chris: "the tick bar should be a continuous direction
+        # tracking with the timeframe candle tracing at the same
+        # time thats how im going to be making trades".
+        #
+        # The last N prints, slid forward one print at a time, with
+        # the same two guards the bar uses. It is returned BESIDE
+        # the bar's own vote rather than replacing it, so what the
+        # window changed stays visible -- every reading that went
+        # into this engine without its control had to come back out.
+        try:
+            roll = bld.roll.as_dict()
+        except Exception:
+            roll = {}
         if cur is None:
             return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
-                    "smooth": sm, "pace": pace,
+                    "smooth": sm, "pace": pace, "roll": roll,
                     "reset_s": getattr(bld, "period_s", 0.0),
                     "by_clock": bool(getattr(bld, "last_by_clock", False)),
                     "clock_cuts": getattr(bld, "_clock_cuts", 0),
@@ -7164,6 +7179,7 @@ def create_app() -> FastAPI:
                 "path_share": round(cur.path_share, 3),
                 "smooth": sm,
                 "pace": pace,
+                "roll": roll,
                 "prints": cur.trades, "open": cur.open,
                 "close": cur.close, "seconds": round(cur.seconds, 1),
                 "ticks": round((cur.close - cur.open) / 0.25, 1)
@@ -7644,13 +7660,26 @@ def create_app() -> FastAPI:
                 except Exception:                       # noqa: BLE001
                     pass
             _now_s = time.time()
-            _dw.on_tick(_tk.get("dir") or "", _now_s)
-            fus = _sw.state(win, (_tk.get("dir") or ""), _rungs,
+            # GATE 1 READS THE ROLLING WINDOW, NOT THE BAR'S VOTE.
+            #
+            # The bar's vote is thrown away at every close and spends
+            # the first ~250 votes of the next bar flat, so the
+            # direction blinked out roughly every 5,000 prints and
+            # the dwell restarted with it -- the hold could not
+            # elapse across a close however steady the tape was.
+            #
+            # The rolling window never restarts, so the dwell it
+            # feeds measures a real turn rather than a bar boundary.
+            # The bar's own vote stays in the payload beside it.
+            _rd = (_tk.get("roll") or {}).get("dir") or ""
+            _dw.on_tick(_rd, _now_s)
+            fus = _sw.state(win, _rd, _rungs,
                             float(s.window_s or 900.0),
                             fp=fpi.get("side") or "",
                             held_s=_dw.held_s(_now_s),
                             flips=_dw.flips,
-                            pace=_tk.get("pace") or {})
+                            pace=_tk.get("pace") or {},
+                            roll=_tk.get("roll") or {})
         else:
             fus = (_timed_now(rt_) if strat == "timed"
                    else _fusion_now(rt_))
@@ -16407,9 +16436,34 @@ function paintStackWin(SW) {
       '<div style="border-left:3px solid var(--'
     + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">THE TICK BAR &mdash; this is the whole rule'
+    + '<div class="thin">GATE 1 &mdash; THE TICK BAR, rolling'
     + '</div>'
     + '<div style="margin:4px 0">' + leg('direction', f.side) + '</div>'
+    /* THE WINDOW BEHIND THE DIRECTION.
+
+       It is the last N prints, slid forward one print at a time,
+       and it does NOT restart when a bar closes -- that restart is
+       what blinked the direction out roughly every 5,000 prints and
+       took the dwell with it. Showing the count means a cold start
+       reads as warming up rather than as a market with nothing in
+       it, which is the same mistake the per-bar version made twelve
+       times an hour. */
+    + ((f.roll && f.roll.window)
+        ? '<div class="thin">'
+          + (f.roll.warm === false
+              ? '<b style="color:var(--dim)">warming up &mdash; '
+                + Number(f.roll.votes || 0).toLocaleString() + ' of '
+                + Number(f.roll.votes_needed || 0).toLocaleString()
+                + ' votes</b> (once, at the start &mdash; not every bar)'
+              : 'last ' + Number(f.roll.window).toLocaleString()
+                + ' prints &middot; '
+                + Number(f.roll.up_prints || 0).toLocaleString() + ' up '
+                + '&middot; '
+                + Number(f.roll.down_prints || 0).toLocaleString()
+                + ' down (' + Math.round((f.roll.path_share || 0) * 100)
+                + '% one-sided)')
+          + '</div>'
+        : '')
     /* A HELD DIRECTION AND A FRESH ONE LOOK THE SAME WITHOUT THIS.
        A flip has to stand for its full dwell before it can open a
        trade, so an entry that has not fired yet is WAITING, not
@@ -16476,13 +16530,49 @@ function paintStackWin(SW) {
   };
 
   const mins = Math.round((cx.period_s || 0) / 60) || 5;
+
+  /* GATE 2 -- THE TRADED TIMEFRAME'S CANDLE, WHICH NOW DECIDES.
+
+     Chris: "the tick bar should be a continuous direction tracking
+     with the timeframe candle tracing at the same time thats how im
+     going to be making trades".
+
+     IT IS DRAWN AS A GATE BECAUSE IT IS ONE. This row used to sit
+     inside the SHOWN ONLY block below, and leaving it there would
+     have put a live gate under a heading saying it decides nothing
+     -- a screen that labels the rule wrongly is the fault this
+     whole panel was rebuilt after, and it has happened here twice.
+
+     The timeframe is NAMED on the line rather than implied. Which
+     row gates depends on the window setting, and "the candle"
+     without a name is how you end up gated on a 15m while reading
+     a 5m. */
+  const g2side = st.side || '';
+  const gate2 =
+      '<div style="margin-top:8px;border-left:3px solid var(--'
+    + (g2side ? (g2side === 'up' ? 'up' : 'down') : 'line')
+    + ');padding:6px 0 6px 10px">'
+    + '<div class="thin">GATE 2 &mdash; THE ' + esc(st.trading || '')
+    .toUpperCase() + ' CANDLE &mdash; it must agree to open</div>'
+    + '<div style="margin:4px 0">' + row(st.trading) + '</div>'
+    + (st.agrees
+        ? '<b class="' + (g2side === 'up' ? 'long' : 'short') + '">'
+          + 'AGREES &mdash; both ' + esc(g2side).toUpperCase() + '</b>'
+        : (g2side
+            ? '<b class="short">DISAGREES</b> <span class="thin">the '
+              + esc(st.trading || '') + ' candle is '
+              + esc(g2side).toUpperCase() + '</span>'
+            : '<b class="short">NO DIRECTION</b> <span class="thin">'
+              + esc(st.why || '') + '</span>'))
+    + '</div>';
+
   const context =
       '<div style="margin-top:8px;padding:6px 0 0 13px;opacity:.55;'
     + 'border-top:1px solid var(--line)">'
     + '<div class="thin">SHOWN ONLY &mdash; none of this decides '
     + 'anything</div>'
     + '<div style="margin-top:4px">'
-    + row(st.trading) + row(st.below) + '</div>'
+    + row(st.below) + '</div>'
     + '<div style="margin-top:2px">'
     + leg('candle', cx.candle) + leg('OFI', cx.ofi) + leg('CVD', cx.cvd)
     + leg('footprint', cx.footprint)
@@ -16496,11 +16586,19 @@ function paintStackWin(SW) {
       + esc(SW.why || '') + '</span>';
 
   box.innerHTML =
-      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR'
-    + '</b> &mdash; in on its direction, out on its flip, and never '
-    + 'past the ' + mins + '-minute bar it opened in. As many trades '
-    + 'as the tape gives.</div>'
+      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
+    + '&amp; THE ' + esc(st.trading || '').toUpperCase() + ' CANDLE'
+    /* NO BARE APOSTROPHE IN A SINGLE-QUOTED STRING. Escaping it in
+       the PYTHON source produces a raw ' in the JavaScript, which
+       ends the string and breaks the whole page -- caught by the
+       node parse in test_clockwin, not by anything reading this
+       file as text. */
+    + '</b> &mdash; both must agree to open. Out on the tick '
+    + 'bar&rsquo;s flip alone, and never past the ' + mins
+    + '-minute bar it opened in. As many trades as the tape gives.'
+    + '</div>'
     + gate1
+    + gate2
     + '<div style="margin-top:8px">' + verdict + '</div>'
     + context;
 }

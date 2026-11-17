@@ -158,6 +158,152 @@ FADE_RATIO = 1.25       # at or over: it is falling behind it
 PACE_MIN_BARS = 8
 
 
+class RollingDir:
+    """Direction over the last N prints, recomputed on every print.
+
+    Chris: "the tick bar should be a continuous direction tracking
+    with the timeframe candle tracing at the same time thats how im
+    going to be making trades".
+
+    WHAT THIS REPLACES, AND WHY A BAR COULD NOT DO IT.
+
+        A tick bar's vote is thrown away when the bar closes. The
+        next bar starts at nought votes and is FLAT until it has
+        earned `votes_needed` again -- about fifteen seconds of a
+        busy tape at 5,000 prints -- so the direction blinked out
+        and restarted on every close, and a flip arriving two prints
+        before a close was forgotten two prints later.
+
+        That gap is not a reading. It is the bar's bookkeeping
+        showing through, and it was being read as "no direction" by
+        a rule that then refused to trade.
+
+    THIS WINDOW NEVER RESTARTS. It holds the last N prints, oldest
+    evicted as each new one arrives, so the direction slides instead
+    of stepping and a bar boundary means nothing at all to it. The
+    bars still exist for the chart; they no longer gate the reading.
+
+    THE GUARDS ARE THE SAME TWO, deliberately -- `PATH_BAND` for the
+    margin and `votes_needed` for the count. They are what stopped
+    the flipping, and a new reading that quietly dropped them would
+    bring all of it back. After warmup the count is satisfied by
+    construction, so what it still catches is the honest case: a
+    window whose prints nearly all landed at one price. That is a
+    dead tape, not a direction, and it has to be able to say so.
+
+    AN ABSTENTION TAKES A SLOT. A print at an unchanged price votes
+    on nothing, but it is still one of the last N prints -- dropping
+    it would let a stalled tape keep a direction alive indefinitely
+    on a handful of ancient moving prints.
+
+    Nothing here places, sizes, routes or times an order.
+    """
+
+    __slots__ = ("window", "_q", "_up", "_dn")
+
+    def __init__(self, window: int = STRATEGY_PER_BAR) -> None:
+        self.window = max(1, int(window or STRATEGY_PER_BAR))
+        self._q: deque[int] = deque(maxlen=self.window)
+        self._up = 0
+        self._dn = 0
+
+    def on_print(self, delta: float) -> None:
+        """One print, as the price change it made. 0 is an abstention.
+
+        The eviction is done by hand rather than left to the deque's
+        `maxlen`, because the running counts have to be told what
+        left -- a deque drops the oldest silently and the tallies
+        would drift up forever.
+        """
+        try:
+            d = float(delta or 0.0)
+        except (TypeError, ValueError):
+            return
+        v = 1 if d > 0 else (-1 if d < 0 else 0)
+        if len(self._q) == self.window:
+            old = self._q[0]
+            if old > 0:
+                self._up -= 1
+            elif old < 0:
+                self._dn -= 1
+        self._q.append(v)
+        if v > 0:
+            self._up += 1
+        elif v < 0:
+            self._dn += 1
+
+    @property
+    def prints(self) -> int:
+        """Prints in the window, moving or not."""
+        return len(self._q)
+
+    @property
+    def up_prints(self) -> int:
+        return self._up
+
+    @property
+    def down_prints(self) -> int:
+        return self._dn
+
+    @property
+    def votes(self) -> int:
+        """Prints in the window that moved price, either way."""
+        return self._up + self._dn
+
+    @property
+    def votes_needed(self) -> int:
+        """The same floor a bar of this size would have to clear."""
+        return max(MIN_VOTES, int(self.window * VOTE_FRACTION))
+
+    @property
+    def warm(self) -> bool:
+        """Has it seen enough to be entitled to an opinion?
+
+        False only at a cold start, ONCE -- not once a bar, which is
+        the whole difference. A caller showing "warming up" is
+        describing the first seconds of the session.
+        """
+        return self.votes >= self.votes_needed
+
+    @property
+    def path_net(self) -> int:
+        return self._up - self._dn
+
+    @property
+    def path_share(self) -> float:
+        tot = self._up + self._dn
+        if tot <= 0:
+            return 0.0
+        return abs(self.path_net) / tot
+
+    @property
+    def path_dir(self) -> str:
+        """Which way the last N prints went. "flat" is not a side."""
+        if not self.warm:
+            return "flat"
+        if self.path_share < PATH_BAND:
+            return "flat"
+        if self._up > self._dn:
+            return "up"
+        if self._dn > self._up:
+            return "down"
+        return "flat"
+
+    def as_dict(self) -> dict:
+        return {
+            "window": self.window,
+            "prints": self.prints,
+            "dir": self.path_dir,
+            "votes": self.votes,
+            "votes_needed": self.votes_needed,
+            "warm": self.warm,
+            "up_prints": self.up_prints,
+            "down_prints": self.down_prints,
+            "path_share": round(self.path_share, 3),
+            "path_net": self.path_net,
+        }
+
+
 def pace_push(ratio: float, measured: int) -> str:
     """One word for the tick chart against the clock, or "".
 
@@ -398,7 +544,7 @@ class TickBars:
 
     __slots__ = ("per_bar", "keep", "period_s", "done", "_cur",
                  "_prints", "_unknown", "_bars_built", "_clock_cuts",
-                 "_last_by_clock")
+                 "_last_by_clock", "roll", "_last_px")
 
     def __init__(self, per_bar: int = DEFAULT_PER_BAR,
                  keep: int = KEEP, period_s: float = 0.0) -> None:
@@ -433,6 +579,16 @@ class TickBars:
         # bar -- reaching into a closed one for a flag is how that
         # rule gets eroded one harmless-looking line at a time.
         self._last_by_clock = False
+        # THE DIRECTION THAT DOES NOT RESTART. Fed from the same
+        # prints as the bars, from the print before -- whichever bar
+        # that one landed in. A bar boundary is bookkeeping and this
+        # reading is not allowed to see it.
+        self.roll = RollingDir(self.per_bar)
+        # The previous print's price, kept on the BUILDER rather than
+        # the bar. A bar's own first print has nothing before it
+        # inside that bar; the rolling window does, and it is the
+        # last print of the bar before.
+        self._last_px = 0.0
 
     # -- feeding ---------------------------------------------------------
 
@@ -516,6 +672,15 @@ class TickBars:
                 b.down_prints += 1
             # A print at the same price moved nothing and votes on
             # nothing. It is not a tie, it is an abstention.
+        # THE ROLLING WINDOW IS FED HERE, from the previous print
+        # ACROSS bar boundaries -- `_last_px`, not `b.close`, which
+        # was reseeded a moment ago if this print opened a new bar.
+        # The very first print of all has nothing before it and
+        # casts no vote; it still takes a slot, because a window of
+        # prints that silently skipped some would not be a window of
+        # the last N prints.
+        self.roll.on_print(p - self._last_px if self._last_px > 0 else 0.0)
+        self._last_px = p
         b.close = p
         b.ts_last = t
         b.volume += sz
