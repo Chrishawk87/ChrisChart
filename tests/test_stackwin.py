@@ -559,3 +559,144 @@ class TestTheExitPolicyIsOneFunction:
         i = src.index("def _journal_step_un(")
         blk = src[i:i + 30000]
         assert "_sw.exit_reason(" in blk, "the policy is inline again"
+
+
+class TestAFlipHasToHoldBeforeItTrades:
+    """Chris: "a flip has to hold for 10 seconds before a trade is
+    taken that keeps us from taking wrong direction trades and flips
+    that lead to nothing"."""
+
+    def test_the_default_is_ten_seconds(self):
+        assert sw.DWELL_S == 10.0
+
+    @pytest.mark.parametrize("held,opens", [
+        (0.0, False), (4.0, False), (9.9, False),
+        (10.0, True), (37.0, True),
+    ])
+    def test_it_waits_for_the_full_dwell(self, held, opens):
+        side, why = sw.entry_side(D, held_s=held)
+        assert bool(side) is opens
+        if not opens:
+            assert "has to hold 10s" in why
+
+    def test_the_reason_says_how_long_it_has_held(self):
+        assert "turned down 4s ago" in sw.entry_side(D, held_s=4.0)[1]
+
+    def test_no_tracking_means_no_check(self):
+        """A caller that cannot measure the dwell must not be
+        silently blocked from ever trading."""
+        assert sw.entry_side(D, held_s=None) == ("down", "")
+
+    def test_a_zero_minimum_disables_it(self):
+        assert sw.entry_side(D, held_s=0.0, min_hold_s=0.0) == ("down", "")
+
+    def test_the_exit_is_NOT_delayed(self):
+        """The asymmetry is the point: a flip gets you OUT at once
+        and only lets you back IN once it has proved it meant
+        something. Making the exit wait would hold a losing position
+        for ten seconds to protect against a flip that was right."""
+        import inspect
+        assert "held" not in str(inspect.signature(sw.holds))
+        assert sw.holds(D, U)[0] is False
+
+
+class TestTheDwellTracker:
+    def test_it_times_from_the_turn(self):
+        d = sw.Dwell()
+        d.on_tick("down", 1000.0)
+        assert d.direction == "down"
+        assert d.held_s(1004.0) == 4.0
+
+    def test_the_opposite_direction_restarts_it(self):
+        d = sw.Dwell()
+        d.on_tick("down", 1000.0)
+        d.on_tick("up", 1020.0)
+        assert d.direction == "up"
+        assert d.held_s(1021.0) == 1.0
+        assert d.flips == 1
+
+    def test_FLAT_DOES_NOT_RESET_IT(self):
+        """The tick series is cut at every true 5-minute mark, so it
+        has no direction for the first prints of every bar. Counting
+        that as a turn would restart the clock twelve times an hour
+        and cost ten seconds of every bar for nothing. A gap is not
+        a turn."""
+        d = sw.Dwell()
+        d.on_tick("down", 1000.0)
+        d.on_tick("", 1005.0)
+        d.on_tick("down", 1006.0)
+        assert d.held_s(1010.0) == 10.0, "the gap restarted the clock"
+        assert d.flips == 0
+
+    def test_the_same_direction_repeated_does_not_restart_it(self):
+        d = sw.Dwell()
+        for t in range(1000, 1010):
+            d.on_tick("up", float(t))
+        assert d.held_s(1010.0) == 10.0
+
+    def test_nothing_held_reads_zero(self):
+        d = sw.Dwell()
+        assert d.direction == "" and d.held_s(1000.0) == 0.0
+        d.on_tick("", 1000.0)
+        assert d.held_s(1001.0) == 0.0
+
+    def test_a_clock_going_backwards_is_zero_not_negative(self):
+        d = sw.Dwell()
+        d.on_tick("up", 1000.0)
+        assert d.held_s(990.0) == 0.0
+
+    @pytest.mark.parametrize("junk", [None, "flat", "UP", 7, ""])
+    def test_junk_is_not_a_direction(self, junk):
+        d = sw.Dwell()
+        d.on_tick(junk, 1000.0)
+        assert d.direction == ""
+
+    def test_a_junk_clock_does_not_corrupt_it(self):
+        d = sw.Dwell()
+        d.on_tick("up", 1000.0)
+        d.on_tick("up", None)
+        d.on_tick("up", "x")
+        assert d.held_s(1005.0) == 5.0
+
+
+class TestTheDwellReachesTheRuleAndThePanel:
+    def test_the_state_reports_it(self):
+        st = sw.state({}, D, {}, 300.0, held_s=4.0, flips=3)
+        assert st["side"] == "", "it traded before the dwell was met"
+        assert st["tick"]["held_s"] == 4.0
+        assert st["tick"]["ready"] is False
+        assert st["tick"]["min_hold_s"] == 10.0
+        assert st["tick"]["flips"] == 3
+
+    def test_a_held_direction_reads_ready(self):
+        st = sw.state({}, D, {}, 300.0, held_s=30.0)
+        assert st["side"] == "down"
+        assert st["tick"]["ready"] is True
+
+    def test_an_untracked_dwell_is_ready(self):
+        st = sw.state({}, D, {}, 300.0)
+        assert st["tick"]["ready"] is True
+        assert st["side"] == "down"
+
+    def test_the_route_keeps_ONE_tracker_on_the_runtime(self):
+        """A second instance would let the screen show a dwell the
+        rule never saw -- the fault the 5-minute cell and the OFI
+        bar both had."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert 'getattr(rt_, "_tick_dwell", None)' in blk
+        assert "_dw.on_tick(" in blk
+        assert "held_s=_dw.held_s(" in blk
+        assert blk.count("_sw.Dwell()") == 1, "more than one tracker"
+
+    def test_the_panel_shows_waiting_rather_than_nothing(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("function paintStackWin(")
+        blk = src[i:i + 6000]
+        assert "HOLDING " in blk, "a waiting entry looks like no signal"
+        assert "f.ready === false" in blk

@@ -57,6 +57,17 @@ TRADED_OF = {300.0: "5m", 900.0: "15m"}
 # The four readings the window is built from, in the order a reason
 # names them.
 LEGS = ("candle", "OFI", "CVD", "footprint")
+# How long a tick-bar direction must stand before it can open a
+# trade. Chris: "a flip has to hold for 10 seconds before a trade is
+# taken that keeps us from taking wrong direction trades and flips
+# that lead to nothing".
+#
+# ENTRY ONLY. The exit stays immediate, and the asymmetry is the
+# point: a flip gets you OUT at once and only lets you back IN once
+# it has proved it meant something. Making the exit wait too would
+# hold a losing position for ten seconds to protect against a flip
+# that was right.
+DWELL_S = 10.0
 
 
 def _other(side: str) -> str:
@@ -138,28 +149,85 @@ def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
     return q, ""
 
 
+class Dwell:
+    """How long the tick bar has pointed the way it currently does.
+
+    FLAT DOES NOT RESET IT, and that is deliberate. The tick series
+    is cut at every true 5-minute mark, so it has no direction for
+    the first prints of every bar -- counting that as a change would
+    restart the clock twelve times an hour and cost ten seconds of
+    every bar for nothing. A gap is not a turn. Only the OPPOSITE
+    direction restarts it.
+
+    Monotonic time is not required: the caller passes the same clock
+    it uses everywhere else, and a clock that jumps backwards makes
+    `held_s` zero rather than negative.
+    """
+
+    __slots__ = ("_dir", "_since", "flips")
+
+    def __init__(self) -> None:
+        self._dir = ""
+        self._since = 0.0
+        self.flips = 0
+
+    def on_tick(self, direction: str, now: float) -> None:
+        d = direction if direction in SIDES else ""
+        try:
+            t = float(now or 0.0)
+        except (TypeError, ValueError):
+            return
+        if not d or t <= 0:
+            return              # a gap, not a turn
+        if d != self._dir:
+            if self._dir:
+                self.flips += 1
+            self._dir = d
+            self._since = t
+
+    @property
+    def direction(self) -> str:
+        return self._dir
+
+    def held_s(self, now: float) -> float:
+        try:
+            t = float(now or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if not self._dir or self._since <= 0 or t <= 0:
+            return 0.0
+        return max(0.0, t - self._since)
+
+    def to_dict(self, now: float = 0.0) -> dict:
+        return {"dir": self._dir, "held_s": round(self.held_s(now), 1),
+                "flips": self.flips}
+
+
 def entry_side(tick: str, rungs: dict | None = None,
-               period_s: float = 0.0) -> tuple[str, str]:
+               period_s: float = 0.0, held_s: float | None = None,
+               min_hold_s: float = DWELL_S) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    THE TICK BAR IS THE WHOLE RULE NOW. Chris: "lets do number 2" --
-    enter when the tick bar has a direction, exit when it flips.
+    THE TICK BAR IS THE WHOLE RULE, and since it decides everything
+    it has to prove a flip meant something before acting on it.
+    Chris: "a flip has to hold for 10 seconds before a trade is
+    taken ... flips that lead to nothing".
+
+    `held_s` is how long the tick bar has pointed this way, from
+    `Dwell`. None means the caller is not tracking it and the check
+    is skipped -- a caller that cannot measure the dwell must not be
+    silently blocked from ever trading.
 
     `rungs` and `period_s` are still taken and still ignored. The
     stack is computed for the panel because a reading that silently
-    stops being collected is how a screen starts lying, and because
-    dropping the arguments would break every caller for no gain. It
-    gates nothing.
-
-    WHAT THE TICK BAR IS, SINCE IT NOW DECIDES EVERYTHING: a bar
-    that closes on a count of prints rather than a clock, whose
-    direction is ONE VOTE PER PRINT -- how many prints moved price
-    up against how many moved it down -- not where price happened
-    to finish. It is also cut at every true 5-minute mark, so it
-    carries no direction across a boundary.
+    stops being collected is how a screen starts lying; it gates
+    nothing.
     """
     if tick not in SIDES:
         return "", "the tick bar has no direction"
+    if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
+        return "", (f"the tick bar turned {tick} {held_s:.0f}s ago -- "
+                    f"it has to hold {min_hold_s:.0f}s")
     return tick, ""
 
 
@@ -263,7 +331,9 @@ def exit_reason(side: str, tick: str, bar_ts: float, now_ts: float,
 
 
 def state(win: dict | None, tick: str, rungs: dict | None,
-          period_s: float, fp: str = "") -> dict:
+          period_s: float, fp: str = "",
+          held_s: float | None = None, flips: int = 0,
+          min_hold_s: float = DWELL_S) -> dict:
     """Everything the rule and the panel need, from one place.
 
     One source, so the screen cannot show an agreement the rule did
@@ -282,7 +352,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
 
     w_side, w_why = window_side(candle, ofi, cvd, fp)
     s_side, s_why = stack_side(rungs or {}, period_s)
-    side, why = entry_side(tick)
+    side, why = entry_side(tick, held_s=held_s, min_hold_s=min_hold_s)
 
     rows = {}
     for name in (tf, below):
@@ -306,6 +376,15 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "side": tick,
             "true": tick in SIDES,
             "why": "" if tick in SIDES else "no direction yet",
+            # How long it has pointed this way, and what it has to
+            # reach. Shown so a blocked entry reads as waiting
+            # rather than as nothing happening.
+            "held_s": (round(held_s, 1) if held_s is not None else None),
+            "min_hold_s": float(min_hold_s or 0.0),
+            "ready": bool(tick in SIDES
+                          and (held_s is None or min_hold_s <= 0
+                               or held_s >= min_hold_s)),
+            "flips": int(flips or 0),
         },
         "stack": {
             "trading": tf, "below": below,

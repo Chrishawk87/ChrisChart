@@ -7609,9 +7609,25 @@ def create_app() -> FastAPI:
             # 5-minute reset -- so the column he reads and the gate
             # that fires cannot be two different bars.
             _tk = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
+            # HOW LONG THE TICK BAR HAS POINTED THIS WAY. One
+            # tracker on the runtime, so the stepper and the panel
+            # read the same clock -- a second instance would let
+            # the screen show a dwell the rule never saw, which is
+            # the fault the 5-minute cell and the OFI bar both had.
+            _dw = getattr(rt_, "_tick_dwell", None)
+            if _dw is None:
+                _dw = _sw.Dwell()
+                try:
+                    rt_._tick_dwell = _dw
+                except Exception:                       # noqa: BLE001
+                    pass
+            _now_s = time.time()
+            _dw.on_tick(_tk.get("dir") or "", _now_s)
             fus = _sw.state(win, (_tk.get("dir") or ""), _rungs,
                             float(s.window_s or 900.0),
-                            fp=fpi.get("side") or "")
+                            fp=fpi.get("side") or "",
+                            held_s=_dw.held_s(_now_s),
+                            flips=_dw.flips)
         else:
             fus = (_timed_now(rt_) if strat == "timed"
                    else _fusion_now(rt_))
@@ -16334,10 +16350,22 @@ function paintStackWin(SW) {
     + '<div class="thin">THE TICK BAR &mdash; this is the whole rule'
     + '</div>'
     + '<div style="margin:4px 0">' + leg('direction', f.side) + '</div>'
+    /* A HELD DIRECTION AND A FRESH ONE LOOK THE SAME WITHOUT THIS.
+       A flip has to stand for its full dwell before it can open a
+       trade, so an entry that has not fired yet is WAITING, not
+       absent -- and the two call for very different reactions. */
     + (f.side
-        ? '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
-          + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
-          + ' <span class="thin">in on this, out when it flips</span>'
+        ? (f.ready === false
+            ? '<b class="short">HOLDING ' + f.side.toUpperCase()
+              + ' &mdash; ' + Number(f.held_s || 0).toFixed(0) + 's of '
+              + Number(f.min_hold_s || 0).toFixed(0) + 's</b>'
+              + ' <span class="thin">a flip has to stand before it '
+              + 'can open a trade</span>'
+            : '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
+              + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
+              + ' <span class="thin">held '
+              + Number(f.held_s || 0).toFixed(0) + 's &mdash; in on '
+              + 'this, out when it flips</span>')
         : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
     + '</div>';
