@@ -6591,15 +6591,66 @@ def create_app() -> FastAPI:
                 from . import callbook as _cbk
                 from . import trace as trc
 
-                # `seeded` travels with the row now. The rung reads
-                # price against the bar's OWN open, so the one thing
-                # that can make that number wrong rather than merely
-                # noisy is not having seen the open.
-                rows_ = {r.timeframe: (csc.colour_of(r.winner,
-                                                     forming=r.forming),
-                                       r.move_bps,
-                                       bool(getattr(r, "seeded", True)))
-                         for r in conf.ordered if r.measured}
+                # THE REAL CANDLE, NOT A READING OF IT. Chris: "i
+                # want what a real 5 minute 15 minute and 1 minute
+                # candle is doing not a calculation of it".
+                #
+                # The bps came off the pressure reading, which is a
+                # measurement BUILT from bars rather than the bars
+                # themselves, and three things it does made the row
+                # disagree with the candle on the chart:
+                #
+                #   - a polled row aggregates three bars and takes
+                #     its open from the OLDEST, so a 5m row was
+                #     measured against an open fifteen minutes back
+                #   - it falls back to the LAST CLOSED bar when the
+                #     forming one is not usable
+                #   - it is polled, so it is as old as its last write
+                #
+                # `_candle_now` is the forming time candle exactly
+                # as the chart draws it and as the window reads it.
+                # One source, so the row, the chart and the window
+                # cannot tell three stories.
+                #
+                # The aggression reading is still used -- for the
+                # COLOUR, which is the absorption flag and decides
+                # nothing -- and its provenance still travels so a
+                # stale or aggregated source stays visible.
+                _agg = {r.timeframe: (getattr(r, "winner", None),
+                                      bool(getattr(r, "forming", False)))
+                        for r in conf.ordered if r.measured}
+                def _stack_candle(tf: str) -> dict:
+                    """One real bar for this timeframe, live first.
+
+                    AFTER A RESTART THERE IS NO LIVE BAR. It was in
+                    progress when the process died, and the first
+                    one built mid-period is unseeded by definition.
+                    Chris watched that as fifteen minutes of "the
+                    stack is incomplete" on the 15m, with nothing to
+                    tell it from a market nobody was trading -- so
+                    the stored bar stands in.
+
+                    Still ONE bar either way. The thing that made
+                    the row disagree with the chart was aggregating
+                    three of them, not which store they came from.
+                    """
+                    live = _candle_now(rt, tf)
+                    if live and live.get("open"):
+                        return dict(live, source="candle")
+                    hist = tf_hist.get(tf) or []
+                    if not hist:
+                        return {}
+                    b = hist[-1]
+                    try:
+                        o, cl = float(b.open), float(b.close)
+                    except (TypeError, ValueError, AttributeError):
+                        return {}
+                    if o <= 0 or cl <= 0:
+                        return {}
+                    return {"open": o, "close": cl, "source": "stored",
+                            "seconds": ages.get(tf)}
+
+                rows_ = csc.rows_from_candles(interval, _stack_candle, _agg)
                 casc = csc.read(interval, rows_,
                                 previous=rt.last_aligned(coin, interval))
                 rt.remember_aligned(coin, interval, csc.aligned_way(casc))
@@ -16552,8 +16603,18 @@ function paintCascade(d) {
          + (r.present ? (r.bps >= 0 ? '+' : '') + r.bps.toFixed(1) + 'bps'
                       : '—') + '</span>'
          + '<span style="width:110px">' + mark + '</span>'
+         /* WHERE THE ROW CAME FROM. A row built from three polled
+            bars read identically to one built from the bar in
+            progress, which is most of why the 5m row and the 5m
+            window could disagree without either looking wrong. */
          + '<span class="thin">' + esc(traded ? 'you are trading this'
-                                              : 'building it') + '</span>'
+                                              : 'building it')
+         + (r.source ? ' &middot; ' + esc(r.source) : '')
+         + (r.bars_used > 1 ? ' &middot; <b>' + r.bars_used
+            + ' bars</b>' : '')
+         + (r.age_s != null && r.age_s > 2
+            ? ' &middot; ' + Number(r.age_s).toFixed(0) + 's old' : '')
+         + '</span>'
          + '</div>';
   }).join('') || '<div class="msg">no rows</div>';
   /* WHY, NOT JUST WHAT. The line above names the timeframes that did

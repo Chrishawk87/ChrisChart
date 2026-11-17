@@ -86,6 +86,15 @@ class Rung:
     # is not a direction at all -- the one gate below that is about
     # the data rather than about noise.
     seeded: bool = True
+    # WHERE THIS ROW CAME FROM AND HOW OLD IT IS. The route has
+    # always known -- `srcs` and `ages` are computed beside the
+    # reading -- and the stack panel has never shown it, so a row
+    # built from three polled bars looked identical to one built
+    # from the bar in progress. That is most of why the 5m row and
+    # the 5m window could disagree without either looking wrong.
+    source: str = ""            # tape | last closed | polled
+    age_s: float | None = None
+    bars_used: float = 1.0
 
     @property
     def qualified(self) -> Way | None:
@@ -179,6 +188,8 @@ class Rung:
         return {"timeframe": self.timeframe, "colour": self.colour,
                 "bps": round(self.bps, 3), "present": self.present,
                 "seeded": bool(self.seeded),
+                "source": self.source, "age_s": self.age_s,
+                "bars_used": round(float(self.bars_used or 1.0), 2),
                 "qualified": self.qualified, "absorbed": self.absorbed,
                 "conflicted": self.conflicted,
                 "describe": self.describe()}
@@ -239,10 +250,67 @@ def colour_of(winner: str | None, forming: bool = False) -> str:
     return {"buyers": "green", "sellers": "red"}.get(winner, "none")
 
 
+def rows_from_candles(trading: str, candle_of, aggression: dict | None = None,
+                      ) -> dict:
+    """Stack rows built from the REAL forming candles.
+
+    Chris: "i want what a real 5 minute 15 minute and 1 minute
+    candle is doing not a calculation of it".
+
+    `candle_of(timeframe)` returns that timeframe's forming candle as
+    the chart draws it -- a mapping with `open` and `close` -- or
+    None. `aggression` optionally maps a timeframe to (colour,
+    forming) for the absorption flag, which is shown and decides
+    nothing.
+
+    WHY THIS IS A NAMED FUNCTION AND NOT A FEW LINES IN THE ROUTE.
+    It lived in a route closure, reachable only through an HTTP
+    request, and a test of it had to stand up the whole handler --
+    which is how the auto gate and the one-per-candle cap each got
+    deleted without breaking anything. The policy is here; the route
+    supplies the candles.
+
+    A timeframe with no candle is LEFT OUT rather than given a flat
+    row. Absent and flat call for opposite reactions, and a row that
+    invents a reading is worse than one that admits it has none.
+    """
+    out: dict = {}
+    for tf in STACKS.get(trading, ()):
+        try:
+            c = candle_of(tf)
+        except Exception:                               # noqa: BLE001
+            c = None
+        if not c:
+            continue
+        try:
+            o = float(c.get("open") or 0.0)
+            cl = float(c.get("close") or 0.0)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if o <= 0 or cl <= 0:
+            continue
+        colour, forming = (aggression or {}).get(tf, ("none", False))
+        out[tf] = (
+            colour_of(colour, forming=forming) if colour in
+            ("buyers", "sellers") else (colour if colour in
+                                        ("green", "red") else "none"),
+            (cl - o) / o * 10_000.0,
+            True,
+            # The caller says where it found the candle -- the live
+            # forming one, or the stored bar it falls back to right
+            # after a restart. Either way it is ONE REAL BAR, and
+            # the row says which so a stale source stays visible.
+            {"source": str(c.get("source") or "candle"),
+             "age_s": c.get("seconds"), "bars_used": 1.0},
+        )
+    return out
+
+
 def read(trading: str, rows: dict, previous: Way | None = None) -> Cascade:
     """Read the stack beneath `trading`.
 
-    `rows` maps a timeframe to (colour, bps) or (colour, bps, seeded).
+    `rows` maps a timeframe to (colour, bps), (colour, bps, seeded)
+    or (colour, bps, seeded, meta).
     The third element is optional so existing callers keep working;
     without it the bar's open is assumed observed, which is what it
     is for every row that has been measured normally. `previous` is the
@@ -264,9 +332,15 @@ def read(trading: str, rows: dict, previous: Way | None = None) -> Cascade:
         else:
             colour, bps = got[0], got[1]
             seeded = bool(got[2]) if len(got) > 2 else True
-            out.rungs.append(Rung(timeframe=tf, colour=colour,
-                                  bps=float(bps), present=True,
-                                  seeded=seeded))
+            # Provenance travels as an optional fourth element so
+            # every existing caller keeps working untouched.
+            meta = got[3] if len(got) > 3 else {}
+            out.rungs.append(Rung(
+                timeframe=tf, colour=colour, bps=float(bps),
+                present=True, seeded=seeded,
+                source=str(meta.get("source") or ""),
+                age_s=meta.get("age_s"),
+                bars_used=float(meta.get("bars_used") or 1.0)))
 
     missing = [r.timeframe for r in out.rungs if not r.present]
     if missing:

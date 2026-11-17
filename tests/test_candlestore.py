@@ -477,6 +477,11 @@ class TestThePanelSaysWhyNotJustWhat:
         return {b["timeframe"]: b["why"]
                 for b in (casc.get("blocked") or [])}
 
+    def _rungs(self, client):
+        casc = self._read(client).get("cascade") or {}
+        return {g["timeframe"]: g for g in (casc.get("rungs") or [])
+                if g.get("present")}
+
     def test_a_healthy_stack_blocks_nothing(self, client, monkeypatch):
         from tests.test_cme_panels import _cme
 
@@ -493,10 +498,22 @@ class TestThePanelSaysWhyNotJustWhat:
                 b.current.seeded = False
             for c in b.closed:
                 c.flow_measured = False
+        # THESE ROWS USED TO BE BLOCKED AND NOW READ.
+        #
+        # The direction was the aggression and the price having to
+        # agree, so a bar with no aggressor split had no direction
+        # at all. It is now close against open -- what the chart
+        # draws -- and a bar with prices but no split has a
+        # perfectly good one. The aggression is still missing and
+        # still matters, but only for the absorption flag.
         got = self._blocked(client)
-        assert set(got) >= {"15m", "5m", "1m"}, got
-        assert "unseeded" in got["15m"], got["15m"]
-        assert "no aggressor" in got["15m"], got["15m"]
+        assert got == {}, got
+        rungs = self._rungs(client)
+        assert set(rungs) >= {"15m", "5m", "1m"}, rungs
+        assert any(rungs[t]["qualified"] in ("up", "down")
+                   for t in ("15m", "5m", "1m")), rungs
+        assert all(r["colour"] == "none" for r in rungs.values()), \
+            "a colour appeared from bars with no aggressor"
 
     def test_history_without_flow_says_so(self, client, monkeypatch):
         """The failure mode of a candle store that saved prices and
@@ -509,9 +526,19 @@ class TestThePanelSaysWhyNotJustWhat:
             b.current = None
             for c in b.closed:
                 c.flow_measured = False
+        # NO BAR IN PROGRESS, SO THE STORED ONE STANDS IN -- the
+        # restart case, which is the whole reason the fallback
+        # exists. It has prices and no split, so the row has a
+        # direction and no colour, and the panel says `stored`
+        # rather than going blank the way it used to.
         got = self._blocked(client)
-        assert "no bar in progress" in got["15m"], got["15m"]
-        assert "no aggressor" in got["15m"], got["15m"]
+        assert got == {}, got
+        rungs = self._rungs(client)
+        assert rungs, "the stack went silent with history available"
+        assert all(r["source"] == "stored" for r in rungs.values()), rungs
+        assert all(r["colour"] == "none" for r in rungs.values())
+        assert all(r["bars_used"] == 1.0 for r in rungs.values()), \
+            "it is aggregating bars again"
 
     def test_a_blocked_row_never_goes_unexplained(self, client,
                                                   monkeypatch):
@@ -533,7 +560,11 @@ class TestThePanelSaysWhyNotJustWhat:
         web_src = (Path(__file__).resolve().parent.parent / "liqmap"
                    / "web.py").read_text()
         i = web_src.index("function paintCascade(")
-        blk = web_src[i:i + 4000]
+        # To the END of the function, not a fixed 4,000 characters.
+        # Adding provenance to each row pushed this past the slice
+        # and failed a test that has no opinion about row contents.
+        j = web_src.index("\nfunction ", i + 1)
+        blk = web_src[i:j]
         assert "C.blocked" in blk
         assert "why these rows did not read" in blk
 

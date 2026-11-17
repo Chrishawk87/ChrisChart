@@ -296,17 +296,29 @@ def _route():
     return block[:block.index('out["confrontation"] = {')]
 
 
-def test_the_route_reads_the_rows_already_on_the_ladder():
-    """Not anything recomputed. If the panel built its own numbers it
-    could contradict the row sitting directly above it."""
+def test_the_route_takes_the_direction_from_the_candle_and_the_colour_from_the_ladder():
+    """TWO SOURCES, ON PURPOSE, AND THEY ANSWER DIFFERENT THINGS.
+
+    The DIRECTION is the real forming candle -- Chris: "i want what
+    a real 5 minute 15 minute and 1 minute candle is doing not a
+    calculation of it". The COLOUR is still the ladder's own
+    aggression row, not recomputed, so the absorption flag cannot
+    contradict the row sitting directly above it.
+    """
     block = _route()
-    assert "for r in conf.ordered" in block
-    assert "r.move_bps" in block
-    assert "csc.colour_of(r.winner" in block
+    assert "csc.rows_from_candles(" in block, "the direction is not the candle"
+    assert "_candle_now(rt, tf)" in block
+    assert "for r in conf.ordered" in block, "the colour was recomputed"
+    assert 'getattr(r, "winner", None)' in block
+    # Scoped to the ROW BUILD. `r.move_bps` legitimately survives
+    # elsewhere in this slice -- the `timeframes` payload and a
+    # trace both want the aggregate -- so a blanket "not in" fails
+    # on code it has no opinion about.
+    assert "rows_ = {r.timeframe" not in block, "the aggregate is back"
 
 
-def test_the_route_drops_the_colour_on_a_forming_row():
-    assert "forming=r.forming" in _route()
+def test_the_route_still_drops_the_colour_on_a_forming_row():
+    assert 'getattr(r, "forming", False)' in _route()
 
 
 def test_the_route_leaves_an_unmeasured_row_out_rather_than_calling_it_flat():
@@ -399,3 +411,193 @@ def test_the_dict_carries_every_rung_for_the_panel():
     assert [r["timeframe"] for r in d["rungs"]] == ["15m", "5m", "1m"]
     for k in ("state", "trend", "pull", "depth", "side", "describe"):
         assert k in d
+
+
+# ------------------------------- the row reads the bar, not the window
+
+
+def test_bar_move_bps_is_the_current_bar_not_the_aggregate():
+    """Chris: "the stack 5 minutes is still reading the old data".
+
+    `from_candles` aggregates three bars and sets `open_px` from the
+    FIRST of them. That is right for what it was built for -- "the
+    4-hour is down" means the recent ones, not two minutes into the
+    current candle -- and wrong for a 5m row that has to answer the
+    same question as a 5m window: it measures price against an open
+    fifteen minutes old.
+    """
+    from collections import namedtuple
+    from liqmap.pressure import from_candles
+
+    C = namedtuple("C", "open high low close volume trades ts")
+    bars = [C(100.0, 100.2, 99.0, 99.2, 1000, 50, 0.0),
+            C(99.2, 99.4, 98.5, 98.7, 1000, 50, 300.0),
+            C(98.7, 99.9, 98.6, 99.8, 1000, 50, 600.0)]   # this one is UP
+    r = from_candles("5m", 300.0, bars, lookback=3)
+    assert r.open_px == 100.0, "the window still starts at the oldest bar"
+    assert r.bar_open_px == 98.7, "the current bar's open is not carried"
+    assert r.move_bps < 0, "the three-bar window is down"
+    assert r.bar_move_bps > 0, "the current bar is up"
+
+
+def test_a_single_bar_reading_is_unchanged():
+    """`bar_open_px` must be a no-op wherever one bar is read, or
+    this would quietly move every live row as well."""
+    from collections import namedtuple
+    from liqmap.pressure import from_candles
+
+    C = namedtuple("C", "open high low close volume trades ts")
+    bars = [C(100.0, 101.0, 99.0, 100.5, 1000, 50, 0.0)]
+    r = from_candles("5m", 300.0, bars, lookback=1)
+    assert r.bar_open_px == r.open_px
+    assert r.bar_move_bps == r.move_bps
+
+
+def test_an_unset_bar_open_falls_back_to_the_window_open():
+    """Zero means not supplied. A caller that does not set it has to
+    behave exactly as it did before."""
+    from liqmap.pressure import Pressure
+    p = Pressure(timeframe="5m", interval_s=300.0,
+                 open_px=100.0, last_px=101.0,
+                 high_px=101.0, low_px=99.0,
+                 buy_notional=1.0, sell_notional=1.0, measured=True)
+    assert p.bar_open_px == 0.0
+    assert p.bar_move_bps == p.move_bps
+
+
+# ------------------------------------------- a row says where it came from
+
+
+def test_a_rung_carries_its_source_age_and_span():
+    r = cd.Rung("5m", "green", 1.0, True, source="polled",
+                age_s=47.0, bars_used=3.0)
+    d = r.to_dict()
+    assert d["source"] == "polled" and d["age_s"] == 47.0
+    assert d["bars_used"] == 3.0
+
+
+def test_the_meta_is_optional_so_old_callers_are_unchanged():
+    c = cd.read("15m", {"15m": ("green", 1.0), "5m": ("green", 1.0),
+                        "1m": ("green", 1.0)})
+    assert all(g.source == "" and g.bars_used == 1.0 for g in c.rungs)
+
+
+def test_read_takes_the_meta_when_given():
+    c = cd.read("5m", {"5m": ("green", 1.0, True,
+                              {"source": "polled", "age_s": 12.0,
+                               "bars_used": 3}),
+                       "1m": ("green", 1.0)})
+    assert c.rungs[0].source == "polled"
+    assert c.rungs[0].bars_used == 3.0
+    assert c.rungs[1].source == ""
+
+
+def test_the_panel_shows_the_provenance():
+    fn = _panel()
+    assert "r.source" in fn, "the row does not say where it came from"
+    assert "r.bars_used" in fn, "a three-bar row looks like a one-bar row"
+    assert "r.age_s" in fn
+
+
+# --------------------------------- the stack rows ARE the real candles
+
+
+class TestTheStackReadsTheRealCandle:
+    """Chris: "i want what a real 5 minute 15 minute and 1 minute
+    candle is doing not a calculation of it".
+
+    The bps came off the pressure reading -- a measurement BUILT
+    from bars rather than the bars themselves. Three things it did
+    made the row disagree with the candle on the chart: a polled row
+    aggregates three bars and takes its open from the OLDEST; it
+    falls back to the last CLOSED bar when the forming one is not
+    usable; and it is as old as its last write.
+    """
+
+    @staticmethod
+    def rows(candles: dict, trading: str = "5m", aggression=None):
+        return cd.rows_from_candles(
+            trading, lambda tf: candles.get(tf), aggression)
+
+    def _read(self, candles: dict, trading: str = "5m"):
+        c = cd.read(trading, self.rows(candles, trading))
+        return {g.timeframe: g for g in c.rungs}
+
+    def test_each_row_is_its_candles_close_against_its_open(self):
+        r = self._read({"5m": {"open": 100.0, "close": 100.5},
+                        "1m": {"open": 100.4, "close": 100.1}})
+        assert r["5m"].qualified == "up"
+        assert r["1m"].qualified == "down"
+
+    def test_a_flat_candle_is_flat(self):
+        r = self._read({"5m": {"open": 100.0, "close": 100.0},
+                        "1m": {"open": 100.0, "close": 100.5}})
+        assert r["5m"].qualified is None
+        assert r["1m"].qualified == "up"
+
+    def test_the_row_says_it_came_from_the_candle(self):
+        r = self._read({"5m": {"open": 100.0, "close": 100.5, "seconds": 90},
+                        "1m": {"open": 100.0, "close": 100.5}})
+        assert r["5m"].source == "candle"
+        assert r["5m"].bars_used == 1.0, "it is aggregating again"
+        assert r["5m"].age_s == 90
+
+    def test_a_missing_candle_leaves_the_row_absent(self):
+        """Absent, not invented. A row with no candle has nothing to
+        say and must not say flat -- the two call for opposite
+        reactions."""
+        r = self._read({"5m": {"open": 100.0, "close": 100.5}})
+        assert r["5m"].present is True
+        assert r["1m"].present is False
+
+    def test_a_zero_or_junk_candle_is_left_out(self):
+        for bad in ({"open": 0.0, "close": 100.0},
+                    {"open": 100.0, "close": 0.0},
+                    {"open": "x", "close": 100.0}, {}):
+            assert self.rows({"5m": bad, "1m": {"open": 1.0, "close": 2.0}},
+                             "5m").get("5m") is None
+
+    def test_a_raising_candle_source_does_not_take_the_stack_down(self):
+        def boom(tf):
+            if tf == "5m":
+                raise RuntimeError("feed died")
+            return {"open": 100.0, "close": 100.5}
+        rows = cd.rows_from_candles("5m", boom)
+        assert "5m" not in rows and "1m" in rows
+
+    def test_the_fifteen_minute_stack_reads_its_own_three(self):
+        r = self._read({"15m": {"open": 100.0, "close": 99.0},
+                        "5m": {"open": 99.5, "close": 99.0},
+                        "1m": {"open": 99.1, "close": 99.0}}, trading="15m")
+        assert [r[t].qualified for t in ("15m", "5m", "1m")] \
+            == ["down", "down", "down"]
+
+    def test_it_matches_what_the_window_would_say(self):
+        """THE WHOLE POINT. The window's `mid_dir` is close against
+        open with no threshold; so is this now."""
+        for o, cl, want in ((100.0, 100.25, "up"), (100.0, 99.75, "down"),
+                            (100.0, 100.0, None)):
+            r = self._read({"5m": {"open": o, "close": cl},
+                            "1m": {"open": 100.0, "close": 100.5}})
+            mid = ("up" if cl > o else "down" if cl < o else None)
+            assert r["5m"].qualified == want == mid
+
+    def test_the_aggression_still_rides_along_as_the_colour(self):
+        r = self._read({"5m": {"open": 100.0, "close": 99.0},
+                        "1m": {"open": 100.0, "close": 100.5}})
+        assert r["5m"].qualified == "down"
+        r2 = cd.read("5m", self.rows(
+            {"5m": {"open": 100.0, "close": 99.0},
+             "1m": {"open": 100.0, "close": 100.5}},
+            "5m", {"5m": ("buyers", False)}))
+        row = {g.timeframe: g for g in r2.rungs}["5m"]
+        assert row.colour == "green"
+        assert row.qualified == "down", "the colour decided again"
+        assert row.absorbed, "the absorption stopped being flagged"
+
+    def test_the_route_delegates_rather_than_inlining_it(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        assert "csc.rows_from_candles(" in src
+        assert "_candle_now(rt, tf)" in src

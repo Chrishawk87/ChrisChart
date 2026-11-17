@@ -127,9 +127,28 @@ class Pressure:
     typical_bps: float = 0.0
     typical_notional: float = 0.0
 
-    # Whether this bar's OPEN was actually observed. A bar adopted mid-flight
-    # has an open that is really "the first price we happened to see", and
-    # every bps figure derived from it is measured from the wrong place.
+    # THE OPEN OF THE MOST RECENT BAR IN THE WINDOW, which for a
+    # single-bar reading is the same as `open_px` and for an
+    # aggregated one is NOT.
+    #
+    # `from_candles` aggregates three bars and sets `open_px` from
+    # the FIRST of them, which is right for the thing it was built
+    # for -- "the 4-hour is down" means the recent ones, not two
+    # minutes into the current candle. It is wrong for a 5-minute
+    # row that has to answer the same question as a 5-minute
+    # window: a three-bar 5m measures price against an open fifteen
+    # minutes old, so the row and the window disagree by
+    # construction and no amount of staring at them reconciles it.
+    #
+    # Zero means "not supplied", and every reader falls back to
+    # `open_px`, so a caller that does not set it behaves exactly
+    # as before.
+    bar_open_px: float = 0.0
+
+    # Whether this bar's OPEN was actually observed. A bar adopted
+    # mid-flight has an open that is really "the first price we
+    # happened to see", and every bps figure derived from it is
+    # measured from the wrong place.
     seeded: bool = True
 
     # How many bars of this timeframe this reading spans. A polled slow
@@ -142,9 +161,19 @@ class Pressure:
 
     @property
     def move_bps(self) -> float:
+        """Across the whole window, however many bars that is."""
         if self.open_px <= 0:
             return 0.0
         return (self.last_px - self.open_px) / self.open_px * 10_000.0
+
+    @property
+    def bar_move_bps(self) -> float:
+        """Within the CURRENT bar only. What a window of this length
+        would report, and what the stack row now reads."""
+        o = self.bar_open_px or self.open_px
+        if o <= 0:
+            return 0.0
+        return (self.last_px - o) / o * 10_000.0
 
     @property
     def total_notional(self) -> float:
@@ -524,6 +553,7 @@ def from_live(timeframe: str, interval_s: float, candle, book: Book | None,
     return Pressure(
         timeframe=timeframe, interval_s=interval_s,
         open_px=candle.open, last_px=candle.close,
+        bar_open_px=candle.open,
         high_px=candle.high, low_px=candle.low,
         buy_notional=candle.buy_notional, sell_notional=candle.sell_notional,
         measured=True, trades=candle.trades,
@@ -620,6 +650,7 @@ def from_candles(timeframe: str, interval_s: float, bars: Sequence[Candle],
     return Pressure(
         timeframe=timeframe, interval_s=interval_s,
         open_px=window[0].open, last_px=window[-1].close,
+        bar_open_px=window[-1].open,
         high_px=max(b.high for b in window),
         low_px=min(b.low for b in window),
         buy_notional=buy, sell_notional=sell,
