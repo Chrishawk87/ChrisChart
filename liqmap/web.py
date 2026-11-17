@@ -7203,18 +7203,38 @@ def create_app() -> FastAPI:
         fp = getattr(tape, "footprint", None) if tape else None
         eng = getattr(fp, "_engine", None) if fp else None
         cur = getattr(eng, "current", None) if eng else None
+        # EVERY PATH RETURNS THE SAME SHAPE, INCLUDING `levels`.
+        #
+        # The two early returns omitted it, and the panel's guard
+        # was `J.footprint && J.footprint.levels` -- so a missing
+        # key AND a genuine zero both rendered as nothing at all and
+        # the footprint vanished off the screen. Chris: "is there a
+        # way to keep footprint always visible because it
+        # disappears".
+        #
+        # Three different states were collapsing into one blank: no
+        # bar forming, the imbalance call failing, and a quiet bar
+        # with no imbalanced levels at all. The last is not an
+        # absence -- it is the reading, and it is the commonest one.
+        if fp is None or eng is None:
+            return {"side": "", "buy": 0, "sell": 0, "levels": 0,
+                    "why": "no footprint stream"}
         if cur is None:
-            return {"side": "", "buy": 0, "sell": 0}
+            return {"side": "", "buy": 0, "sell": 0, "levels": 0,
+                    "why": "between footprint bars"}
         try:
             flags = cur.imbalances(fp.cfg)
-        except Exception:                               # noqa: BLE001
-            return {"side": "", "buy": 0, "sell": 0}
+        except Exception as exc:                        # noqa: BLE001
+            return {"side": "", "buy": 0, "sell": 0, "levels": 0,
+                    "why": f"{type(exc).__name__}"}
         buy = sum(1 for f in flags if f.side == "buy")
         sell = sum(1 for f in flags if f.side == "sell")
         return {"side": ("up" if buy > sell
                          else "down" if sell > buy else ""),
                 "buy": buy, "sell": sell,
-                "levels": len(flags)}
+                "levels": len(flags),
+                "why": ("" if flags else
+                        "no imbalanced levels in this bar yet")}
 
     def _window_now(rt_, period_s: float = 900.0) -> dict:
         """The forming 15-minute window, as the panel draws it.
@@ -7450,15 +7470,14 @@ def create_app() -> FastAPI:
         # reads the tick bar and the OFI. They travel through the
         # same argument because `window_signal` dispatches on the
         # strategy, and only one of them is ever computed.
+        _rungs = {g.get("timeframe"): g
+                  for g in ((out_.get("cascade") or {}).get("rungs") or [])}
         if strat == "stack":
             # THE WINDOW AND THE STACK, FROM ONE PLACE. The cascade
             # is already on `out_` -- the veto above reads it -- so
             # this takes the same rows rather than computing a
             # second opinion about the same timeframes.
             from . import stackwin as _sw
-            _rungs = {g.get("timeframe"): g
-                      for g in ((out_.get("cascade") or {}).get("rungs")
-                                or [])}
             fus = _sw.state(win, fpi.get("side") or "", _rungs,
                             float(s.window_s or 900.0))
         else:
@@ -7567,13 +7586,23 @@ def create_app() -> FastAPI:
             # two to five ticks each, none of them a decision about
             # the market. A reading gone quiet is not a reading gone
             # against you.
+            # THE MINUTE THEY DISAGREE. Chris: "you are going to
+            # auto close trades the minute they disagree because
+            # right now its holding the trades for no reason".
+            #
+            # This is the tight exit and it has a history -- it
+            # closed twelve trades in an afternoon at two to five
+            # ticks each and was replaced twice. What is different
+            # is the entry: those came from a four-leg window where
+            # one leg going quiet broke agreement constantly. Two
+            # readings break less often than four. If it churns,
+            # this is where to look, and the reason string says so.
             from . import stackwin as _sw
-            _w = fus.get("window") or {}
-            rev, why_rev = _sw.reversed_window(
-                t.side, _w.get("candle") or "", _w.get("ofi") or "",
-                _w.get("cvd") or "", _w.get("footprint") or "")
-            if rev:
-                disagreed = why_rev
+            _ok, _why_out = _sw.holds(
+                t.side, fpi.get("side") or "", _rungs,
+                float(s.window_s or 900.0))
+            if not _ok:
+                disagreed = _why_out
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -16100,43 +16129,51 @@ function paintClockWindows(d) {
    It renders only for this strategy and hides itself otherwise,
    because a box that shows stale readings from a rule you are not
    running is worse than no box. */
+/* THE FOOTPRINT GATES, THEN THE STACK. In that order.
+
+   Chris: "we are just going to use the stack and the footprint
+   thats all the make entry and exits".
+
+   The order is not presentation. When the footprint shows no
+   imbalance the stack is NOT consulted, and this box says so
+   rather than showing a stack verdict the rule never asked for.
+
+   The candle, OFI and CVD are still drawn, under a heading that
+   says they decide nothing. Deleting them would make the panel
+   quieter and the rule less checkable -- and a leg that silently
+   stops counting is exactly what made the old window look broken.
+
+   It renders only for this strategy and hides itself otherwise. */
 function paintStackWin(SW) {
   const box = $('jnlStackWin');
   if (!box) return;
   if (!SW) { box.style.display = 'none'; return; }
   box.style.display = '';
 
-  const w = SW.window || {};
+  const f = SW.footprint || {};
   const st = SW.stack || {};
+  const cx = SW.context || {};
   const arrow = (d) => d === 'up'
     ? '<b class="long">UP</b>'
     : d === 'down' ? '<b class="short">DOWN</b>'
     : '<span class="thin">—</span>';
-
   const leg = (name, d) =>
     '<span style="display:inline-block;min-width:118px">'
     + '<span class="thin">' + name + '</span> ' + arrow(d) + '</span>';
 
-  const mins = Math.round((w.period_s || 0) / 60);
   const gate1 =
       '<div style="border-left:3px solid var(--'
-    + (w.side ? (w.side === 'up' ? 'up' : 'down') : 'line')
+    + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 1 &mdash; THE ' + mins + ' MINUTE WINDOW'
-    + '</div>'
-    + '<div style="margin:4px 0">'
-    + leg('candle', w.candle) + leg('OFI', w.ofi)
-    + leg('CVD', w.cvd) + leg('footprint', w.footprint) + '</div>'
-    + (w.side
-        ? '<b class="' + (w.side === 'up' ? 'long' : 'short') + '">'
-          + 'WINDOW ' + w.side.toUpperCase() + '</b>'
-          + ' <span class="thin">all four the same way</span>'
-        : '<b class="short">WINDOW NOT TRUE</b> <span class="thin">'
-          + esc(w.why || '') + '</span>')
+    + '<div class="thin">GATE 1 &mdash; THE FOOTPRINT</div>'
+    + '<div style="margin:4px 0">' + leg('imbalance', f.side) + '</div>'
+    + (f.side
+        ? '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
+          + 'FOOTPRINT ' + f.side.toUpperCase() + '</b>'
+        : '<b class="short">NO IMBALANCE</b> <span class="thin">'
+          + esc(f.why || '') + '</span>')
     + '</div>';
 
-  /* Greyed and explicitly NOT ASKED, rather than blank. Blank reads
-     as "no data"; this is "the rule never got here". */
   const rows = st.rows || {};
   const row = (name) => {
     const r = rows[name] || {};
@@ -16161,14 +16198,24 @@ function paintStackWin(SW) {
     + '<div style="margin:4px 0">'
     + row(st.trading) + row(st.below) + '</div>'
     + (!st.asked
-        ? '<span class="thin">not asked &mdash; the window has to read '
-          + 'true first</span>'
+        ? '<span class="thin">not asked &mdash; the footprint has to '
+          + 'show an imbalance first</span>'
         : st.side
           ? '<b class="' + (st.side === 'up' ? 'long' : 'short') + '">'
             + 'STACK ' + st.side.toUpperCase() + '</b>'
           : '<b class="short">STACK DOES NOT SAY</b> '
             + '<span class="thin">' + esc(st.why || '') + '</span>')
     + '</div>';
+
+  const mins = Math.round((cx.period_s || 0) / 60);
+  const context =
+      '<div style="margin-top:6px;padding:6px 0 0 13px;opacity:.55;'
+    + 'border-top:1px solid var(--line)">'
+    + '<div class="thin">SHOWN ONLY &mdash; these do not decide '
+    + 'anything (' + mins + 'm window)</div>'
+    + '<div style="margin-top:4px">'
+    + leg('candle', cx.candle) + leg('OFI', cx.ofi) + leg('CVD', cx.cvd)
+    + '</div></div>';
 
   const verdict = SW.side
     ? '<b class="' + (SW.side === 'up' ? 'long' : 'short') + '">'
@@ -16178,10 +16225,12 @@ function paintStackWin(SW) {
       + esc(SW.why || '') + '</span>';
 
   box.innerHTML =
-      '<div class="thin" style="margin-bottom:4px"><b>THE WINDOW AND '
-    + 'THE STACK</b> &mdash; the window first, then the stack</div>'
+      '<div class="thin" style="margin-bottom:4px"><b>THE FOOTPRINT '
+    + 'AND THE STACK</b> &mdash; footprint first, then the stack. '
+    + 'A trade closes the moment they stop agreeing.</div>'
     + gate1 + gate2
-    + '<div style="margin-top:8px">' + verdict + '</div>';
+    + '<div style="margin-top:8px">' + verdict + '</div>'
+    + context;
 }
 
 function paintJournal(d) {
@@ -16312,12 +16361,19 @@ function paintJournal(d) {
       + (W.cvd_dir === 'flat' ? ' <b>FLAT</b>' : '')
       + ' <span class="thin">'
       + Math.round(W.net_cvd || 0).toLocaleString() + '</span>'
-      + ((J.footprint && J.footprint.levels)
-          ? ' &middot; footprint '
-            + word(J.footprint.side || null)
-            + ' <span class="thin">' + J.footprint.buy + ' buy / '
-            + J.footprint.sell + ' sell levels</span>'
-          : '')
+      /* ALWAYS DRAWN. It used to be hidden whenever `levels` was
+         zero or missing, which is a quiet bar, a bar boundary and a
+         failed call all rendering as nothing -- so the one reading
+         that now decides entries could silently not be there. A
+         reading at zero is a reading. */
+      + ' &middot; footprint '
+      + (J.footprint && J.footprint.side
+          ? word(J.footprint.side)
+            + ' <span class="thin">' + (J.footprint.buy || 0)
+            + ' buy / ' + (J.footprint.sell || 0) + ' sell levels</span>'
+          : '<b>NONE</b> <span class="thin">'
+            + esc((J.footprint && J.footprint.why)
+                  || 'no imbalance either way') + '</span>')
       + capBit
       + (J.idle ? ' &middot; <b>no trade</b> &mdash; ' + esc(J.idle)
                 : '')

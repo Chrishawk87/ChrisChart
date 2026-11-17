@@ -141,27 +141,69 @@ def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
     return out[tf], ""
 
 
-def entry_side(candle: str, ofi: str, cvd: str, fp: str,
-               rungs: dict, period_s: float) -> tuple[str, str]:
+def entry_side(fp: str, rungs: dict,
+               period_s: float) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    THE WINDOW IS ASKED FIRST AND ALONE. When it has no side the
-    stack is never consulted and the reason never mentions it --
-    "first the window needs to read true before anything else can
-    be done".
+    THE FOOTPRINT GATES AND THE STACK CONFIRMS. Chris: "we are just
+    going to use the stack and the footprint thats all the make
+    entry and exits".
+
+    The candle, the OFI and the CVD are still read and still shown,
+    and they decide nothing. They are kept on the panel under their
+    own heading rather than deleted, because a leg that quietly
+    stops counting is the thing that makes a screen lie -- he has
+    already watched four readings agree and drive nothing.
+
+    THE FOOTPRINT IS ASKED FIRST AND ALONE. When it has no
+    imbalance the stack is never consulted and the reason does not
+    mention it.
     """
-    w_side, w_why = window_side(candle, ofi, cvd, fp)
-    if not w_side:
-        return "", f"the window has no side: {w_why}"
+    if fp not in SIDES:
+        return "", "the footprint shows no imbalance either way"
 
     s_side, s_why = stack_side(rungs, period_s)
     if not s_side:
-        return "", (f"the window is {w_side} but the stack does not "
+        return "", (f"the footprint is {fp} but the stack does not "
                     f"back it: {s_why}")
-    if s_side != w_side:
-        return "", (f"the window is {w_side} and the stack is "
+    if s_side != fp:
+        return "", (f"the footprint is {fp} and the stack is "
                     f"{s_side} -- they point apart")
-    return w_side, ""
+    return fp, ""
+
+
+def holds(side: str, fp: str, rungs: dict,
+          period_s: float) -> tuple[bool, str]:
+    """Does the signal still back an open trade?
+
+    THE MOMENT THEY DISAGREE, IT IS OVER. Chris: "you are going to
+    auto close trades the minute they disagree because right now its
+    holding the trades for no reason".
+
+    THIS IS THE TIGHT EXIT, DELIBERATELY, AND IT HAS A HISTORY. The
+    rule that exited the moment agreement broke closed twelve trades
+    in an afternoon at two to five ticks each, and was replaced
+    twice for it. What is different now is the entry: those exits
+    came from a four-leg window where one leg going quiet for an
+    instant broke agreement constantly. Two readings break less
+    often than four -- but if it churns, the exit is where to look,
+    and the reason string below is what will show it.
+
+    A reading going FLAT ends it too, and that is the part most
+    likely to bite: a footprint between bars has no side, and that
+    is not the same as the market turning. It is counted as a
+    disagreement because he asked for the minute they disagree, not
+    the minute they oppose.
+    """
+    if side not in SIDES:
+        return True, ""
+    now, why = entry_side(fp, rungs, period_s)
+    if now == side:
+        return True, ""
+    if now:
+        return False, (f"the signal turned {now} against your "
+                       f"{side} trade")
+    return False, (why or "the signal no longer backs it")
 
 
 def reversed_window(side: str, candle: str, ofi: str, cvd: str,
@@ -202,9 +244,13 @@ def state(win: dict | None, fp: str, rungs: dict | None,
     tf = traded_tf(period_s)
     below = BELOW_OF.get(tf, "")
 
+    # The four-leg reading is kept and SHOWN. It decides nothing
+    # now; leaving it out would make the panel quieter and the rule
+    # less checkable, and a leg that silently stops counting is what
+    # makes a screen lie.
     w_side, w_why = window_side(candle, ofi, cvd, fp)
     s_side, s_why = stack_side(rungs or {}, period_s)
-    side, why = entry_side(candle, ofi, cvd, fp, rungs or {}, period_s)
+    side, why = entry_side(fp, rungs or {}, period_s)
 
     rows = {}
     for name in (tf, below):
@@ -219,23 +265,31 @@ def state(win: dict | None, fp: str, rungs: dict | None,
         }
 
     return {
-        "window": {
-            "period_s": float(period_s or 0.0),
-            "candle": candle, "ofi": ofi, "cvd": cvd, "footprint": fp,
-            "side": w_side, "why": w_why,
-            "true": bool(w_side),
+        "footprint": {
+            "side": fp,
+            "true": fp in SIDES,
+            "why": ("" if fp in SIDES
+                    else "no imbalance either way"),
         },
         "stack": {
             "trading": tf, "below": below,
             "rows": rows,
             "side": s_side, "why": s_why,
-            # Not consulted at all while the window has no side, and
-            # the panel says so rather than showing a verdict the
-            # rule never asked for.
-            "asked": bool(w_side),
+            # Never consulted while the footprint has no side, and
+            # the panel says that rather than showing a verdict the
+            # rule did not ask for.
+            "asked": fp in SIDES,
+        },
+        # SHOWN, NOT USED. Under its own heading so there is no
+        # chance of reading it as part of the decision.
+        "context": {
+            "period_s": float(period_s or 0.0),
+            "candle": candle, "ofi": ofi, "cvd": cvd,
+            "side": w_side, "why": w_why,
+            "decides": False,
         },
         "side": side,
         "why": why,
-        "say": (f"the window and the {tf}/{below} stack are both {side}"
-                if side else why),
+        "say": (f"the footprint and the {tf}/{below} stack are both "
+                f"{side}" if side else why),
     }
