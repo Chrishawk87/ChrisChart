@@ -3432,6 +3432,20 @@ def create_app() -> FastAPI:
         if _st is not None:
             try:
                 _st.stop()
+                # AND WAIT FOR IT. `stop()` only sets the event; the
+                # thread outlives the app until its next wake. In a
+                # process that builds one app that is invisible, and
+                # in the test suite -- which stands up dozens -- the
+                # steppers accumulate and contend for the
+                # module-level `_step_lock`, which is what made two
+                # candlestore tests fail in a long run and pass on
+                # their own.
+                #
+                # The wait is bounded because a shutdown that can
+                # hang is worse than a thread that lingers, and the
+                # loop wakes on the event rather than the interval,
+                # so this normally returns at once.
+                _st.join(timeout=3.0)
             except Exception:                           # noqa: BLE001
                 pass
 
@@ -7693,11 +7707,14 @@ def create_app() -> FastAPI:
             # one leg going quiet broke agreement constantly. Two
             # readings break less often than four. If it churns,
             # this is where to look, and the reason string says so.
+            # ONLY A FLIP OF THE TRADED TIMEFRAME ENDS IT. The
+            # tick bar is not read here at all -- it gets you in,
+            # the traded timeframe keeps you in. Reading it would
+            # close trades at every 5-minute boundary, where a tick
+            # bar between bars has no direction.
             from . import stackwin as _sw
-            _tk_x = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
             _ok, _why_out = _sw.holds(
-                t.side, (_tk_x.get("dir") or ""), _rungs,
-                float(s.window_s or 900.0))
+                t.side, _rungs, float(s.window_s or 900.0))
             if not _ok:
                 disagreed = _why_out
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
@@ -16303,10 +16320,9 @@ function paintStackWin(SW) {
        : st.side ? (st.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px;margin-top:6px'
     + (st.asked ? '' : ';opacity:.45') + '">'
-    + '<div class="thin">GATE 2 &mdash; THE STACK ('
-    + esc(st.trading || '') + ' and ' + esc(st.below || '') + ')</div>'
-    + '<div style="margin:4px 0">'
-    + row(st.trading) + row(st.below) + '</div>'
+    + '<div class="thin">GATE 2 &mdash; THE ' + esc(st.trading || '')
+    + ' &mdash; and only a flip of it closes a trade</div>'
+    + '<div style="margin:4px 0">' + row(st.trading) + '</div>'
     + (!st.asked
         ? '<span class="thin">not asked &mdash; the tick bar has to '
           + 'have a direction first</span>'
@@ -16326,6 +16342,11 @@ function paintStackWin(SW) {
     + '<div style="margin-top:4px">'
     + leg('candle', cx.candle) + leg('OFI', cx.ofi) + leg('CVD', cx.cvd)
     + leg('footprint', cx.footprint)
+    /* The faster row. It gated entries until Chris took it out --
+       "paying no attention to the 1 minute at all" -- and it is
+       still drawn, because a reading that silently stops being
+       collected is how a panel starts lying. */
+    + (st.below ? row(st.below) : '')
     + '</div></div>';
 
   const verdict = SW.side
@@ -16337,8 +16358,10 @@ function paintStackWin(SW) {
 
   box.innerHTML =
       '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
-    + 'AND THE STACK</b> &mdash; the tick bar first, then the stack. '
-    + 'A trade closes the moment they stop agreeing.</div>'
+    + 'AND THE ' + esc((SW.stack || {}).trading || 'STACK')
+    + '</b> &mdash; both to get in. Only a flip of the '
+    + esc((SW.stack || {}).trading || 'traded bar') + ' gets you out.'
+    + '</div>'
     + gate1 + gate2
     + '<div style="margin-top:8px">' + verdict + '</div>'
     + context;

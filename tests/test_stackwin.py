@@ -47,14 +47,22 @@ def rungs(**kw) -> dict:
     return out
 
 
-class TestTheStackIsTheTradedRowAndTheOneBelow:
-    def test_five_minutes_takes_the_5m_and_the_1m(self):
-        r = rungs(**{"15m": U, "5m": D, "1m": D})
+class TestTheStackIsTheTradedRowAlone:
+    def test_five_minutes_reads_the_5m(self):
+        r = rungs(**{"15m": U, "5m": D, "1m": U})
         assert sw.stack_side(r, 300.0) == ("down", "")
 
-    def test_fifteen_minutes_takes_the_15m_and_the_5m(self):
-        r = rungs(**{"15m": D, "5m": D, "1m": U})
+    def test_fifteen_minutes_reads_the_15m(self):
+        r = rungs(**{"15m": D, "5m": U, "1m": U})
         assert sw.stack_side(r, 900.0) == ("down", "")
+
+    def test_the_row_below_is_ignored_entirely(self):
+        """Chris: "paying no attention to the 1 minute at all". It
+        gated entries until he took it out; it is still read and
+        still drawn and it decides nothing."""
+        for below in (U, D, None, "conflict"):
+            r = rungs(**{"5m": D, "1m": below})
+            assert sw.stack_side(r, 300.0)[0] == "down", below
 
     def test_the_row_above_is_not_consulted(self):
         """On the 5-minute he is trading the 5-minute. A 15-minute
@@ -66,23 +74,23 @@ class TestTheStackIsTheTradedRowAndTheOneBelow:
         r = rungs(**{"15m": D, "5m": D, "1m": U})
         assert sw.stack_side(r, 900.0)[0] == "down"
 
-    def test_the_two_rows_disagreeing_is_no_side(self):
-        r = rungs(**{"5m": D, "1m": U})
+    def test_a_flat_traded_row_is_no_side(self):
+        r = rungs(**{"5m": "flat", "1m": D})
         side, why = sw.stack_side(r, 300.0)
-        assert side == ""
-        assert "5m is down but the 1m is up" in why
+        assert side == "" and "the 5m is flat" in why
 
-    def test_an_unread_row_is_named(self):
-        r = rungs(**{"5m": D, "1m": None})
+    def test_an_unread_traded_row_is_named(self):
+        r = rungs(**{"5m": None, "1m": D})
         side, why = sw.stack_side(r, 300.0)
-        assert side == "" and "1m has not been read" in why
+        assert side == "" and "5m has not been read" in why
 
-    def test_a_row_contradicting_itself_is_thrown_out(self):
-        """The cascade sets `qualified` to None when a row's colour
-        and its own number disagree. That is not a direction."""
-        r = rungs(**{"5m": D, "1m": "conflict"})
+    def test_an_unseeded_traded_row_has_no_direction(self):
+        """Without the bar's open there is no close-against-open."""
+        r = {"5m": {"present": True, "qualified": "down",
+                    "seeded": False}, "1m": {"present": True,
+                                             "qualified": "down"}}
         side, why = sw.stack_side(r, 300.0)
-        assert side == "" and "contradicts itself" in why
+        assert side == "" and "open was never seen" in why
 
 
 class TestTheTickBarGatesFirstAndAlone:
@@ -101,22 +109,26 @@ class TestTheTickBarGatesFirstAndAlone:
         assert st["tick"]["true"] is False
 
     def test_a_tick_direction_with_a_silent_stack_says_so(self):
-        r = rungs(**{"5m": D, "1m": U})
+        # The TRADED row has to be the silent one now. With `5m: D`
+        # this entry succeeds -- the 1m is no longer consulted --
+        # which is the whole change.
+        r = rungs(**{"5m": "flat", "1m": U})
         side, why = sw.entry_side(D, r, 300.0)
         assert side == ""
         assert "the tick bar is down but the stack does not back it" in why
+        assert "the 5m is flat" in why
 
     def test_both_true_and_pointing_apart(self):
-        r = rungs(**{"5m": U, "1m": U})
+        r = rungs(**{"5m": U, "1m": D})
         side, why = sw.entry_side(D, r, 300.0)
         assert side == "" and "point apart" in why
 
     def test_both_agreeing_is_the_trade(self):
-        r = rungs(**{"5m": D, "1m": D})
+        r = rungs(**{"5m": D, "1m": U})     # the 1m is ignored
         assert sw.entry_side(D, r, 300.0) == ("down", "")
 
     def test_it_is_symmetric(self):
-        r = rungs(**{"5m": U, "1m": U})
+        r = rungs(**{"5m": U, "1m": D})
         assert sw.entry_side(U, r, 300.0) == ("up", "")
 
 
@@ -146,64 +158,74 @@ class TestTheOtherLegsDecideNothing:
         assert side == "" and "two against two" in why
 
 
-class TestTheExitIsTheMomentTheyDisagree:
-    """Chris: "auto close trades the minute they disagree because
-    right now its holding the trades for no reason".
+class TestOnlyAFlipOfTheTradedTimeframeEndsIt:
+    """Chris: "a disagreement is only when the primary timeframe
+    that im trading on flips".
 
-    THE TIGHT EXIT, DELIBERATELY, AND IT HAS A HISTORY: it closed
-    twelve trades in an afternoon at two to five ticks each when it
-    ran against a four-leg window, and was replaced twice for it.
-    What is different is the entry -- two readings break agreement
-    less often than four. If it churns, this is where to look."""
+    THE TICK BAR IS NOT CONSULTED AT ALL HERE. It gets you in; the
+    traded timeframe keeps you in. It closes on a count of prints,
+    so between bars it has no direction -- and with the 5-minute
+    reset forced onto that series, an exit that read it would fire
+    on the clock at every boundary rather than on the market. That
+    was the live risk in the previous version.
+    """
 
-    def test_it_holds_while_both_still_back_it(self):
-        r = rungs(**{"5m": D, "1m": D})
-        assert sw.holds(D, D, r, 300.0) == (True, "")
-
-    def test_the_tick_bar_flipping_ends_it(self):
-        r = rungs(**{"5m": D, "1m": D})
-        ok, why = sw.holds(D, U, r, 300.0)
-        assert ok is False and why
-
-    def test_the_tick_bar_going_quiet_ends_it_too(self):
-        """The part most likely to bite: a tick bar between bars
-        has no direction, and that is not the market turning. It
-        counts anyway -- he asked for the minute they DISAGREE, not
-        the minute they oppose. With the 5-minute reset forced on
-        the tick series this happens at every boundary."""
-        r = rungs(**{"5m": D, "1m": D})
-        ok, why = sw.holds(D, "", r, 300.0)
-        assert ok is False
-        assert "no direction" in why
-
-    def test_the_stack_splitting_ends_it(self):
+    def test_it_holds_while_the_traded_row_still_backs_it(self):
         r = rungs(**{"5m": D, "1m": U})
-        ok, why = sw.holds(D, D, r, 300.0)
-        assert ok is False and "1m is up" in why
+        assert sw.holds(D, r, 300.0) == (True, "")
 
-    def test_a_flipped_signal_names_the_new_side(self):
+    def test_only_the_opposite_side_ends_it(self):
         r = rungs(**{"5m": U, "1m": U})
-        ok, why = sw.holds(D, U, r, 300.0)
+        ok, why = sw.holds(D, r, 300.0)
         assert ok is False
-        assert "point apart" in why or "turned up" in why
+        assert "the 5m flipped up against your down trade" in why
+
+    def test_a_FLAT_traded_row_is_not_a_flip(self):
+        """A candle sitting on its open has gone nowhere; it has
+        not turned. Closing on that ends trades for an absence,
+        which is the churn this rule has twice been rewritten to
+        remove."""
+        r = rungs(**{"5m": "flat", "1m": U})
+        assert sw.holds(D, r, 300.0) == (True, "")
+
+    def test_an_unread_traded_row_is_not_a_flip_either(self):
+        r = rungs(**{"5m": None, "1m": U})
+        assert sw.holds(D, r, 300.0)[0] is True
+
+    def test_the_one_minute_cannot_end_it(self):
+        for below in (U, D, None, "conflict"):
+            r = rungs(**{"5m": D, "1m": below})
+            assert sw.holds(D, r, 300.0)[0] is True, below
+
+    def test_the_tick_bar_cannot_end_it(self):
+        """It is not even an argument to `holds` any more. Pinned
+        by signature so it cannot quietly come back."""
+        import inspect
+        params = list(inspect.signature(sw.holds).parameters)
+        assert params == ["side", "rungs", "period_s"], params
+
+    def test_on_a_fifteen_minute_window_the_15m_decides(self):
+        r = rungs(**{"15m": U, "5m": D, "1m": D})
+        ok, why = sw.holds(D, r, 900.0)
+        assert ok is False and "the 15m flipped up" in why
+        assert sw.holds(U, r, 900.0)[0] is True
 
     def test_it_is_symmetric(self):
-        r = rungs(**{"5m": U, "1m": U})
-        assert sw.holds(U, U, r, 300.0)[0] is True
-        assert sw.holds(U, D, r, 300.0)[0] is False
+        r = rungs(**{"5m": D, "1m": U})
+        assert sw.holds(D, r, 300.0)[0] is True
+        assert sw.holds(U, r, 300.0)[0] is False
 
     def test_no_open_side_is_never_an_exit(self):
-        r = rungs(**{"5m": D, "1m": D})
-        assert sw.holds("", D, r, 300.0)[0] is True
+        r = rungs(**{"5m": U, "1m": U})
+        assert sw.holds("", r, 300.0)[0] is True
 
-    def test_the_exit_is_exactly_the_entry_inverted(self):
-        """One rule, read two ways. If these ever diverge, a trade
-        can be held on a signal that would not open it."""
-        r = rungs(**{"5m": D, "1m": D})
-        for fp in (D, U, ""):
-            want, _w = sw.entry_side(fp, r, 300.0)
-            ok, _o = sw.holds(D, fp, r, 300.0)
-            assert ok is (want == D)
+    def test_a_trade_survives_what_would_block_a_new_one(self):
+        """ASYMMETRIC ON PURPOSE, and worth stating. A flat 5m
+        blocks an entry -- the tick bar has nothing to agree with --
+        and holds an open position, because flat is not a flip."""
+        r = rungs(**{"5m": "flat", "1m": U})
+        assert sw.entry_side(D, r, 300.0)[0] == ""
+        assert sw.holds(D, r, 300.0)[0] is True
 
 
 class TestTheEdges:

@@ -109,36 +109,33 @@ def window_side(candle: str, ofi: str, cvd: str,
 
 
 def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
-    """The traded row and the one below it, or why they do not say.
+    """THE TRADED TIMEFRAME, AND NOTHING UNDER IT.
 
-    `rungs` maps timeframe to its reading, as the cascade reports
-    them: `qualified` is the direction a row is entitled to claim,
-    and it is None when the row's colour and its own number
-    contradict each other -- which is not a direction and must not
-    be read as one.
+    Chris: "a new trade is taken only when stack 5m and tick bar
+    agrees paying no attention to the 1 minute at all".
+
+    It was the traded row AND the one below -- 5m with 1m, 15m with
+    5m. The faster row is now ignored entirely for the decision. It
+    is still read and still drawn, because a reading that silently
+    stops being collected is how a panel starts lying, but it gates
+    nothing.
+
+    `qualified` is the direction a row is entitled to claim and it
+    is None when the bar's open was never observed, which is not a
+    direction and must not be read as one.
     """
     tf = traded_tf(period_s)
-    below = BELOW_OF.get(tf, "")
-    if not tf or not below:
+    if not tf:
         return "", f"no stack row for a {period_s:.0f}s window"
-
-    out = {}
-    for name in (tf, below):
-        row = (rungs or {}).get(name) or {}
-        if not row.get("present"):
-            return "", f"the {name} has not been read yet"
-        if row.get("conflicted"):
-            return "", (f"the {name} contradicts itself -- "
-                        f"thrown out")
-        q = row.get("qualified") or ""
-        if q not in SIDES:
-            return "", f"the {name} has no direction"
-        out[name] = q
-
-    if out[tf] != out[below]:
-        return "", (f"the {tf} is {out[tf]} but the {below} is "
-                    f"{out[below]}")
-    return out[tf], ""
+    row = (rungs or {}).get(tf) or {}
+    if not row.get("present"):
+        return "", f"the {tf} has not been read yet"
+    if not row.get("seeded", True):
+        return "", f"the {tf} bar's open was never seen"
+    q = row.get("qualified") or ""
+    if q not in SIDES:
+        return "", f"the {tf} is flat"
+    return q, ""
 
 
 def entry_side(tick: str, rungs: dict,
@@ -180,34 +177,41 @@ def entry_side(tick: str, rungs: dict,
         return "", (f"the tick bar is {tick} but the stack does not "
                     f"back it: {s_why}")
     if s_side != tick:
-        return "", (f"the tick bar is {tick} and the stack is "
-                    f"{s_side} -- they point apart")
+        return "", (f"the tick bar is {tick} and the "
+                    f"{traded_tf(period_s)} is {s_side} -- they "
+                    f"point apart")
     return tick, ""
 
 
-def holds(side: str, tick: str, rungs: dict,
+def holds(side: str, rungs: dict,
           period_s: float) -> tuple[bool, str]:
-    """Does the signal still back an open trade?
+    """Does the trade still stand?
 
-    THE MOMENT THEY DISAGREE, IT IS OVER. Chris: "auto close trades
-    the minute they disagree because right now its holding the
-    trades for no reason".
+    ONLY A FLIP OF THE TRADED TIMEFRAME ENDS IT. Chris: "a
+    disagreement is only when the primary timeframe that im trading
+    on flips".
 
-    A tick bar between bars has no direction, and that is not the
-    market turning -- it counts anyway, because he asked for the
-    minute they disagree, not the minute they oppose. With the
-    5-minute reset forced on the tick series this happens at every
-    boundary, so if exits cluster there, this is why.
+    THE TICK BAR IS NOT CONSULTED HERE AT ALL, and that is the
+    point. It gets you in; the traded timeframe keeps you in. It
+    closes on a count of prints, so between bars it has no
+    direction -- and with the 5-minute reset forced onto that
+    series, an exit that read it would fire on the clock at every
+    boundary rather than on the market. That was the live risk in
+    the previous version.
+
+    FLAT IS NOT A FLIP. A 5-minute candle sitting on its open has
+    gone nowhere; it has not turned. Closing on that would end
+    trades for an absence, which is the churn this rule has been
+    rewritten twice to remove. Only the OPPOSITE side ends it.
     """
     if side not in SIDES:
         return True, ""
-    now, why = entry_side(tick, rungs, period_s)
-    if now == side:
-        return True, ""
-    if now:
-        return False, (f"the signal turned {now} against your "
+    tf = traded_tf(period_s)
+    now, why = stack_side(rungs, period_s)
+    if now == _other(side):
+        return False, (f"the {tf} flipped {now} against your "
                        f"{side} trade")
-    return False, (why or "the signal no longer backs it")
+    return True, ""
 
 
 def state(win: dict | None, tick: str, rungs: dict | None,
@@ -274,6 +278,6 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         },
         "side": side,
         "why": why,
-        "say": (f"the tick bar and the {tf}/{below} stack are both "
-                f"{side}" if side else why),
+        "say": (f"the tick bar and the {tf} are both {side}"
+                if side else why),
     }
