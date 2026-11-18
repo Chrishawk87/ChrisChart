@@ -101,7 +101,9 @@ class Settings:
                 "tp_on": self.tp_on, "sl_on": self.sl_on,
                 "tp_ticks": self.tp_ticks, "sl_ticks": self.sl_ticks,
                 "window_s": self.window_s,
-                "window_label": ("5m" if self.window_s <= 300
+                "window_label": (window_label(self.window_s)
+                                 if self.window_s < 0 else
+                                 "5m" if self.window_s <= 300
                                  else "15m"),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
@@ -482,7 +484,14 @@ class Journal(ThreadedDB):
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
                  max(0.0, float(s.sl_ticks)),
-                 300.0 if float(s.window_s or 900) <= 300 else 900.0,
+                 # A TICK WINDOW IS STORED NEGATIVE. The clamp
+                 # below forced every value to 300 or 900, which
+                 # would have erased a tick size on the first save.
+                 # Negative is unambiguous: a window of seconds is
+                 # never below zero.
+                 (float(s.window_s)
+                  if float(s.window_s or 900) < 0 else
+                  300.0 if float(s.window_s or 900) <= 300 else 900.0),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 
@@ -904,6 +913,32 @@ STRATEGIES = {
     "stack": ("Stack + window -- all four of the window agree, then "
               "the traded row and the one below it"),
 }
+
+
+def window_label(window_s: float) -> str:
+    """What the traded chart is called: "5m", "15m" or "5000t".
+
+    Chris: "what if we traded the tick chart instead of the time
+    chart ... a tick chart is really no different then a time chart
+    only difference is a tick chart prints every other 5000ts".
+
+    He is right, and it is why this is a label rather than a second
+    rule: everything downstream wants an open, a high, a low, a
+    close and a volume, and it does not care whether the bar was cut
+    by a clock or by a count.
+
+    A TICK WINDOW IS STORED NEGATIVE. `window_s` is a REAL column
+    that was clamped to 300 or 900 on every save, so a tick size
+    needed a value that clamp could not destroy and that no window
+    of seconds can collide with.
+    """
+    try:
+        w = float(window_s or 0.0)
+    except (TypeError, ValueError):
+        return "15m"
+    if w < 0:
+        return f"{int(round(-w))}t"
+    return "5m" if w <= 300.0 else "15m"
 
 
 def window_signal(win: dict, strategy: str = "ofi",

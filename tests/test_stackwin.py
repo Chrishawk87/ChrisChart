@@ -462,7 +462,7 @@ class TestNoTradeAtTheTimeframesOpen:
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
-        i = src.index("_tf_name = (")
+        i = src.index("_tf_name = jn.window_label(")
         blk = src[i:i + 1400]
         assert "tf_ticks=" in blk, "the distance never reaches the rule"
         assert "_candle_now(rt_, _tf_name)" in blk
@@ -759,8 +759,10 @@ class TestTheWiring:
             "the time stop is wired back in"
         assert "intent=_tape_intent(" in blk, \
             "the volume reading never reaches the rule"
-        assert "_tick_now(rt_, 0, \"raw\", 0.0, 0, FUSION_RESET_S)" in blk, \
-            "gate 1 is not reading the Fusion panel's tick series"
+        assert '_tk = _tick_now(rt_, _g1, "raw", 0.0, 0, FUSION_RESET_S)' \
+            in blk, "gate 1 is not reading the continuous tick series"
+        assert "_g1 = 0" in blk, \
+            "a time window no longer defaults gate 1 to 5,000"
 
     def test_the_panel_labels_what_does_not_decide(self):
         import pathlib
@@ -932,7 +934,8 @@ class TestTheRuleDoesNotWaitForTheSlowRoute:
                / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step_un(")
         blk = src[i:i + 30000]
-        assert 'float(s.window_s or 900.0) <= 300.0' in blk
+        assert "jn.window_label(float(s.window_s or 900.0))" in blk, \
+            "the traded chart is named in more than one place"
 
     def test_a_failure_building_the_stack_does_not_take_the_step_down(self):
         import pathlib
@@ -1150,3 +1153,149 @@ class TestARefusedEntryIsNeverSilent:
                              window_rule=True, max_per_bar=2)
         assert act == "" and why, "it declined without saying why"
         assert "already taken its up" in why
+
+
+class TestATickChartCanBeTheTradedTimeframe:
+    """Chris: "what if we traded the tick chart instead of the time
+    chart ... reading the tick chart the same way we would read the
+    forming 5000t chart the same way it would for a forming 5 minute
+    chart ... a tick chart is really no different then a time chart
+    only difference is a tick chart prints every other 5000ts".
+
+    HE IS RIGHT, AND THAT IS WHY THIS IS SMALL. Everything
+    downstream of the candle wants an open, a high, a low, a close
+    and a volume. None of it cares whether the bar was cut by a
+    clock or by a count, so one reader learned to return a tick
+    bar's forming candle and the rule was left alone."""
+
+    def test_a_negative_window_names_a_tick_chart(self):
+        assert sw.traded_tf(-5000.0) == "5000t"
+        assert sw.traded_tf(-10000.0) == "10000t"
+
+    def test_the_time_windows_are_untouched(self):
+        assert sw.traded_tf(300.0) == "5m"
+        assert sw.traded_tf(900.0) == "15m"
+        assert sw.traded_tf(600.0) == "15m"
+
+    def test_the_journal_label_agrees_with_the_rule(self):
+        """Two names for one chart is how the gate, the row and the
+        panel end up disagreeing about what is being traded."""
+        from liqmap import journal as jn
+        for w in (300.0, 900.0, -5000.0, -10000.0):
+            assert jn.window_label(w) == sw.traded_tf(w), w
+
+    def test_a_tick_window_survives_being_saved(self, tmp_path):
+        """BEHAVIOURAL, because the source check was not enough.
+
+        `window_s` is a REAL column that was clamped to 300 or 900
+        on EVERY save, so a tick size would have been erased the
+        first time the row was written -- silently, and the rule
+        would have gone back to trading the 15m without saying so.
+
+        A mutation that kept the new branch and returned 900.0 from
+        it survived a test that only read the source."""
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", window_s=-5000.0))
+        assert j.settings("ES").window_s == -5000.0, \
+            "the clamp destroyed the tick window"
+        assert sw.traded_tf(j.settings("ES").window_s) == "5000t"
+        # And the time windows still clamp, which is why the clamp
+        # is there at all.
+        j.save_settings(Settings(coin="ES", window_s=301.0))
+        assert j.settings("ES").window_s == 900.0
+
+    def test_the_rule_runs_on_a_tick_row_exactly_as_on_a_time_row(self):
+        r = {"5000t": {"present": True, "qualified": U, "bps": 3.0}}
+        st = sw.state({}, U, r, -5000.0, tf_ticks=20.0,
+                      intent={"state": "continuation", "heavy": False},
+                      tf_intent={"depth": 0.1, "heavy": False})
+        assert st["stack"]["trading"] == "5000t"
+        assert st["regime"]["where"] == "continuation"
+        assert st["side"] == U
+
+    def test_the_same_refusals_apply(self):
+        r = {"5000t": {"present": True, "qualified": U, "bps": 3.0}}
+        # sitting on its open
+        assert sw.state({}, U, r, -5000.0, tf_ticks=1.0)["side"] == ""
+        # the tick chart's own push has gone
+        assert sw.state({}, U, r, -5000.0, tf_ticks=20.0,
+                        intent={"state": "pullback", "depth": 0.9,
+                                "heavy": True})["side"] == ""
+        # pulling back against it
+        assert sw.state({}, D, r, -5000.0, tf_ticks=20.0)["side"] == ""
+
+    def test_a_tick_window_has_no_row_below_it(self):
+        """`STACKS` is a map of TIME rows -- 15m takes 5m takes 1m.
+        A tick chart is not in it, and the row below is simply
+        absent, which the panel already knows how to draw."""
+        r = {"5000t": {"present": True, "qualified": U, "bps": 3.0}}
+        st = sw.state({}, U, r, -5000.0, tf_ticks=20.0)
+        assert st["stack"]["below"] == ""
+        assert "5000t" in st["stack"]["rows"]
+
+    def test_gate_one_is_always_faster_than_the_traded_chart(self):
+        """THE DEGENERATE CASE. Both sides reading one size is the
+        identical number agreeing with itself, and gate 2 becomes
+        decoration -- the same fault as asking a 5m window to agree
+        with a 5m row."""
+        from liqmap.tickbar import PER_BAR_CHOICES as P
+        for traded in (1000, 2000, 5000, 10000):
+            want = max(1, traded // 5)
+            g1 = min((n for n in P if n < traded),
+                     key=lambda n: abs(n - want), default=want)
+            assert g1 < traded, (traded, g1)
+
+    def test_the_route_sizes_gate_one_below_it(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("_traded_n = _pi3(_tf_name)")
+        blk = src[i:i + 500]
+        assert "n < _traded_n" in blk, \
+            "gate 1 can be the same size as the traded chart"
+        assert "_traded_n) // 5" in blk
+
+    def test_the_candle_reader_serves_both_kinds(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _candle_now(")
+        blk = src[i:src.index("\n    def ", i + 10)]
+        assert "_n = _pi(interval)" in blk, \
+            "a tick interval is never parsed, so the branch is dead"
+        assert "if _n is not None:" in blk
+        assert 'getattr(tape, "tickbars", None)' in blk, \
+            "it does not read the continuous tick series"
+        assert "tickbars_timed" not in blk, \
+            "it reads the clock-cut family, putting the clock back " \
+            "into a rule chosen to escape it"
+        # THE VALUE, NOT THE KEY. A mutation that zeroed all three
+        # on the tick branch survived a test that counted keys --
+        # the rule then read a retrace off a candle with no high,
+        # which is a pullback that can never fail.
+        for k in ("high", "low", "volume"):
+            assert blk.count(f'"{k}": float(getattr(c, "{k}"') == 2, \
+                f"{k} is not read off the bar for both kinds"
+
+    def test_the_stack_row_follows_the_window(self):
+        """A hardcoded name here would draw a 15m row while the rule
+        traded a tick chart -- the screen and the rule describing
+        different charts, which this panel has done three times."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("_tf_for = ")
+        blk = src[i:i + 900]
+        assert "jn.window_label(" in blk
+        assert '_tf_for = "15m"' not in blk and '_tf_for = "5m"' not in blk
+
+    def test_the_selector_offers_them(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index('id="jnlWin"')
+        blk = src[i:i + 1200]
+        assert 'value="-5000"' in blk and 'value="-10000"' in blk
+        assert 'value="300"' in blk and 'value="900"' in blk, \
+            "the time windows were dropped"

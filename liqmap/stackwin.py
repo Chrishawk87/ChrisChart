@@ -74,11 +74,23 @@ def _other(side: str) -> str:
 
 
 def traded_tf(period_s: float) -> str:
-    """Which stack row a window of this length is trading."""
+    """Which row a window of this length is trading.
+
+    A NEGATIVE WINDOW IS A TICK CHART. Chris: "what if we traded the
+    tick chart instead of the time chart ... a tick chart is really
+    no different then a time chart only difference is a tick chart
+    prints every other 5000ts".
+
+    `window_s` is a REAL column that was clamped to 300 or 900 on
+    every save, so a tick size is carried negative -- a window of
+    seconds is never below zero, and the clamp cannot destroy it.
+    """
     try:
         p = float(period_s or 0.0)
     except (TypeError, ValueError):
         return ""
+    if p < 0:
+        return f"{int(round(-p))}t"
     return TRADED_OF.get(p, "15m" if p >= 600.0 else "5m")
 
 

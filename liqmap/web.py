@@ -7278,6 +7278,48 @@ def create_app() -> FastAPI:
         tape = getattr(svc, "tape", None) if svc else None
         if tape is None:
             return {}
+        # A TICK INTERVAL IS A CANDLE TOO. Chris: "a tick chart is
+        # really no different then a time chart only difference is a
+        # tick chart prints every other 5000ts". He is right, and
+        # this is the one place that has to know it: everything
+        # downstream wants an open, a high, a low, a close and a
+        # volume and does not care what cut the bar.
+        #
+        # The CONTINUOUS series, the same builder the chart draws at
+        # 5000t -- not the clock-cut family. Pointing a tick window
+        # at bars that also reset on the clock would put the clock
+        # back into a rule chosen to escape it.
+        from .tickbar import parse_interval as _pi
+
+        _n = _pi(interval)
+        if _n is not None:
+            bars = getattr(tape, "tickbars", None)
+            if not bars:
+                return {}
+            bld = bars.get(int(_n))
+            if bld is None:
+                return {}
+            c = bld.current
+            if c is None:
+                return {}
+            try:
+                o, cl = float(c.open), float(c.close)
+            except (TypeError, ValueError):
+                return {}
+            if o <= 0 or cl <= 0:
+                return {}
+            return {
+                "dir": ("up" if cl > o else "down" if cl < o else "flat"),
+                "open": o, "close": cl,
+                "seconds": round(float(getattr(c, "seconds", 0.0)), 1),
+                "start_ts": float(getattr(c, "start_ts", 0.0) or 0.0),
+                "high": float(getattr(c, "high", 0.0) or 0.0),
+                "low": float(getattr(c, "low", 0.0) or 0.0),
+                "volume": float(getattr(c, "volume", 0.0) or 0.0),
+                "ticks": round((cl - o) / 0.25, 1),
+                "prints": int(getattr(c, "trades", 0) or 0),
+                "per_bar": int(_n),
+            }
         try:
             c = tape.candle(interval)
         except Exception:                               # noqa: BLE001
@@ -7699,10 +7741,27 @@ def create_app() -> FastAPI:
         from . import cascade as _csc
         _rungs = {}
         try:
-            _tf_for = ("5m" if float(s.window_s or 900.0) <= 300.0
-                       else "15m")
-            for _tf, _row in _csc.rows_from_candles(
-                    _tf_for, lambda tf: _candle_now(rt_, tf)).items():
+            _tf_for = jn.window_label(float(s.window_s or 900.0))
+            # A TICK WINDOW HAS NO STACK UNDER IT. `STACKS` is a map
+            # of time rows -- 15m takes 5m takes 1m -- and a tick
+            # chart is not in it. The traded row is built from the
+            # tick candle directly; the row below is simply absent,
+            # which it already knows how to draw. It decides nothing
+            # either way.
+            from .tickbar import parse_interval as _pi2
+
+            if _pi2(_tf_for) is not None:
+                _c = _candle_now(rt_, _tf_for) or {}
+                _o = float(_c.get("open") or 0.0)
+                _cl = float(_c.get("close") or 0.0)
+                _rows_src = ({_tf_for: ("none",
+                                        (_cl - _o) / _o * 10_000.0,
+                                        True, {})}
+                             if _o > 0 and _cl > 0 else {})
+            else:
+                _rows_src = _csc.rows_from_candles(
+                    _tf_for, lambda tf: _candle_now(rt_, tf))
+            for _tf, _row in _rows_src.items():
                 _rungs[_tf] = {
                     "timeframe": _tf, "present": True,
                     "qualified": ("up" if _row[1] > 0 else
@@ -7728,7 +7787,27 @@ def create_app() -> FastAPI:
             # chart draws at 5000t -- continuous, not clock-cut --
             # so the column he reads and the rule that fires cannot
             # be two different bars.
-            _tk = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
+            # GATE 1 IS A FASTER SERIES THAN THE TRADED CHART.
+            #
+            # Trading a time chart, that is the 5,000-tick bar. But
+            # if the TRADED chart is itself a tick series, gate 1
+            # cannot be the same size -- it would be the identical
+            # number on both sides, agreeing with itself, and gate 2
+            # would be decoration. A fifth, which is the ratio a 5m
+            # has inside a 15m, snapped to a size that exists.
+            from .tickbar import PER_BAR_CHOICES as _PBC2
+            from .tickbar import STRATEGY_PER_BAR as _SPB
+            from .tickbar import parse_interval as _pi3
+
+            _traded_n = _pi3(_tf_name)
+            if _traded_n is None:
+                _g1 = 0                       # the default, 5,000
+            else:
+                _want = max(1, int(_traded_n) // 5)
+                _g1 = min((n for n in _PBC2 if n < _traded_n),
+                          key=lambda n: abs(n - _want),
+                          default=max(1, int(_traded_n) // 5))
+            _tk = _tick_now(rt_, _g1, "raw", 0.0, 0, FUSION_RESET_S)
             # NO DWELL. Chris: "remove the 10 second hold
             # completely its not a factor in the opening anymore".
             # The tracker and its class are gone rather than left
@@ -7743,8 +7822,10 @@ def create_app() -> FastAPI:
             # its own open. The first says whether a pullback has
             # failed; the second is "no trades are ever taken at
             # the opening price of whatever timeframe i select".
-            _tf_name = ("5m" if float(s.window_s or 900.0) <= 300.0
-                        else "15m")
+            # THE TRADED CHART, by name. "5m", "15m" or "5000t" --
+            # one helper, so the gate, the stack row and the panel
+            # cannot each decide differently what is being traded.
+            _tf_name = jn.window_label(float(s.window_s or 900.0))
             _tfi = _tf_intent(rt_, _tf_name, _prev)
             _tfc = _candle_now(rt_, _tf_name) or {}
             fus = _sw.state(win, _bd, _rungs,
@@ -10655,6 +10736,13 @@ has to be running before the gate stops refusing.">spike
               style="margin:0 4px">
               <option value="300">5 minutes</option>
               <option value="900">15 minutes</option>
+              <!-- A TICK CHART IS A TIMEFRAME TOO. Carried negative
+                   because `window_s` is clamped to 300 or 900 on
+                   save and a tick size has to survive that. Gate 1
+                   drops to a fifth of whichever is picked, so the
+                   two sides are never the same number. -->
+              <option value="-5000">5000 ticks</option>
+              <option value="-10000">10000 ticks</option>
             </select></label>
           <label><input type="checkbox" id="jnlTpOn"
             onchange="jnlSet()"> take profit
