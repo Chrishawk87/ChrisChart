@@ -270,7 +270,7 @@ class TestItReachesThePanel:
         st = sw.state({}, "up", {}, 300.0,
                       intent={"state": "pullback", "depth": 0.4})
         assert st["intent"]["state"] == "pullback"
-        assert st["intent"]["decides"] is False
+        assert st["intent"]["decides"] is True
 
     def test_its_memory_rides_home_with_the_gates(self):
         from liqmap import stackwin as sw
@@ -309,39 +309,54 @@ class TestItReachesThePanel:
         assert "decides nothing" in WEB[i:i + 1600]
 
 
-class TestVolumeConfirmsButDoesNotDecide:
-    """IT DECIDED, FOR ONE REVISION, and does not now. A
-    volume-backed pullback was traded in the retrace's own
-    direction; measured against the timeframe gate it fired on 3%
-    of entries in chop and none at all in a trend, because a short
-    inside an up tick bar needs the timeframe down as well.
+class TestVolumeRefusesADeadPush:
+    """It has had three jobs in three revisions and this is the
+    right one.
 
-    It is back to the confirmation he first asked for: "we are
-    going to use volume to confirm tick bars continuation or pull
-    back"."""
+    It turned a trade round into the retrace -- measured at 3% of
+    entries, a special case wearing a rule's clothes. Then it
+    decided nothing at all, and the rule opened trades on a tick
+    bar that had given back 90% of its move on 1.71x the volume,
+    because the BODY still read up.
 
-    @pytest.mark.parametrize("heavy", [True, False])
-    def test_the_side_is_the_same_either_way(self, heavy):
+    It now refuses to call a dead push a continuation. It blocks an
+    entry; it never closes a trade and never reverses one."""
+
+    SCREENSHOT = {"state": "pullback", "depth": 0.90, "heavy": True}
+
+    def test_a_dead_push_blocks_the_entry(self):
         from liqmap import stackwin as sw
         r = {"5m": {"present": True, "qualified": "up"}}
-        st = sw.state({}, "up", r, 300.0,
-                      intent={"state": "pullback", "heavy": heavy})
-        assert st["side"] == "up"
+        st = sw.state({}, "up", r, 300.0, tf_ticks=20.0,
+                      intent=self.SCREENSHOT)
+        assert st["side"] == ""
 
-    def test_depth_does_not_turn_it_either(self):
+    def test_a_live_push_does_not(self):
         from liqmap import stackwin as sw
         r = {"5m": {"present": True, "qualified": "up"}}
-        st = sw.state({}, "up", r, 300.0,
-                      intent={"state": "pullback", "heavy": True,
-                              "depth": 0.95})
+        st = sw.state({}, "up", r, 300.0, tf_ticks=20.0,
+                      intent={"state": "continuation", "heavy": False})
         assert st["side"] == "up"
+
+    def test_it_never_returns_the_opposite_side(self):
+        """The job it had two revisions ago and must not get back."""
+        from liqmap import stackwin as sw
+        r = {"5m": {"present": True, "qualified": "up"}}
+        for intent in (self.SCREENSHOT,
+                       {"state": "pullback", "heavy": False},
+                       {"state": "continuation", "heavy": True}):
+            st = sw.state({}, "up", r, 300.0, tf_ticks=20.0,
+                          intent=intent)
+            assert st["side"] in ("up", "")
+
+    def test_it_never_closes_a_trade(self):
+        from liqmap import stackwin as sw
+        assert sw.holds("up", "up", "up") == (True, "")
 
     def test_the_reading_is_still_computed(self):
-        """Removed from the decision, not from the engine. The
-        panel draws it and he reads it."""
-        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7070.0,
-                    volume=1400.0, bar_ts=1.0,
-                    prev={"v_ext": 1000.0, "bar_ts": 1.0,
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7040.0,
+                    volume=800.0, bar_ts=1.0,
+                    prev={"v_ext": 500.0, "bar_ts": 1.0,
                           "bar_dir": "up"})
         assert r["state"] == "pullback"
         assert r["ratio"] > 0 and isinstance(r["heavy"], bool)

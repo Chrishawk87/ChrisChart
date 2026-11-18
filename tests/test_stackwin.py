@@ -159,49 +159,106 @@ class TestBothGatesMustAgree:
         assert "timeframe candle has no direction" in why
 
 
-class TestVolumeNoLongerTurnsATradeRound:
-    """IT DID, FOR ONE REVISION. A volume-backed pullback was traded
-    in the retrace's own direction. Measured against the timeframe
-    gate it fired on 3% of entries in chop and NONE in a trend,
-    because a short inside an up tick bar needs the timeframe down
-    as well -- so it was a special case wearing a rule's clothes.
+class TestTheTickBarsOwnPushMustStillBeAlive:
+    """Chris, on a screenshot of a trade taken against this: "the
+    chart book 5000t and the gate 1 tick bar are not synced at all
+    ... its taking trades on data that has already happened".
 
-    It is back to being the confirmation he first asked for: "we are
-    going to use volume to confirm tick bars continuation or pull
-    back". Confirming, and not deciding."""
+    IT WAS NOT A CLOCK. Both read the same 5,000 builder. `tick` is
+    the candle's BODY -- close against open, held through small
+    moves -- so a bar that ran twenty ticks up and gave back
+    eighteen still reads UP. It is not pushing. It is rolling over,
+    and the body is a summary of where it has BEEN.
 
-    @pytest.mark.parametrize("heavy", [True, False])
-    def test_the_side_is_the_same_either_way(self, heavy):
-        intent = {"state": "pullback", "heavy": heavy, "depth": 0.5}
-        assert sw.entry_side(U, U, intent=intent) == (U, "")
+    From his panel, with the trade taken on it:
 
-    def test_it_never_returns_the_opposite_side(self):
-        for tick in (U, D):
-            for st in ("pullback", "continuation", ""):
-                for heavy in (True, False):
-                    side, _ = sw.entry_side(
-                        tick, tick,
-                        intent={"state": st, "heavy": heavy})
-                    assert side == tick, (tick, st, heavy)
+        tick bar UP, +2 ticks from this candle's open
+        tape PULLBACK -- 90% given back, HEAVY, 1.71x the effort
+        THE TWO CHARTS TOGETHER: CONTINUATION
 
-    def test_the_state_agrees(self):
-        a = sw.state({}, U, rungs(**{"5m": U}), 300.0,
-                     intent={"state": "pullback", "heavy": True})
-        b = sw.state({}, U, rungs(**{"5m": U}), 300.0,
-                     intent={"state": "pullback", "heavy": False})
-        assert a["side"] == b["side"] == U
+    The reading that said the push was dead was two lines above the
+    one that called it a continuation, and it was marked as
+    deciding nothing.
 
-    def test_the_reading_is_still_carried_and_still_shown(self):
-        """Removed from the decision, not from the screen."""
-        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=40.0,
-                      intent={"state": "pullback", "heavy": True,
-                              "ratio": 1.9})
-        assert st["intent"]["heavy"] is True
-        assert st["intent"]["decides"] is False, \
-            "the TICK bar's own retrace is not what gates anything"
-        # What DOES decide is the regime block, read off the
-        # timeframe's retrace rather than the tick bar's.
-        assert st["regime"]["decides"] is True
+    VOLUME DECIDES AGAIN, but not the way it did two revisions ago.
+    It does not turn a trade round into the retrace; it refuses to
+    call a dead push a continuation."""
+
+    SCREENSHOT = {"state": "pullback", "depth": 0.90, "heavy": True,
+                  "ratio": 1.71}
+    ALIVE = {"state": "continuation", "depth": 0.0, "heavy": False}
+
+    def test_the_screenshot_is_no_longer_a_continuation(self):
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=20.0,
+                      intent=self.SCREENSHOT)
+        assert st["regime"]["where"] == "pullback"
+        assert st["regime"]["tick_failed"] is True
+        assert st["side"] == "", "it opened on a push that was over"
+        assert "rolling over" in st["why"]
+
+    def test_a_live_push_still_trades(self):
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=20.0,
+                      intent=self.ALIVE)
+        assert st["regime"]["where"] == "continuation"
+        assert st["side"] == U
+
+    def test_a_shallow_unpaid_for_dip_still_trades(self):
+        """The whole point of the previous revision was holding
+        through ordinary retraces. This must not undo it."""
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=20.0,
+                      intent={"state": "pullback", "depth": 0.2,
+                              "heavy": False})
+        assert st["regime"]["where"] == "continuation"
+        assert st["side"] == U
+
+    @pytest.mark.parametrize("depth,heavy,alive", [
+        (0.2, False, True), (0.5, False, True),
+        (0.7, False, False), (0.2, True, False),
+    ])
+    def test_it_uses_the_same_failure_test_as_the_timeframe(
+            self, depth, heavy, alive):
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=20.0,
+                      intent={"state": "pullback", "depth": depth,
+                              "heavy": heavy})
+        assert (st["regime"]["where"] == "continuation") is alive
+        assert sw.pullback_failed(depth, heavy) is (not alive)
+
+    def test_a_bar_at_its_extreme_is_never_a_dead_push(self):
+        """The guard that stops a retrace reading leaking onto a bar
+        that is EXTENDING. `depth` is 0 at the extreme, but a stray
+        `heavy` would otherwise fail a push that is making new
+        highs -- a mutation dropping the state check survived until
+        this test existed."""
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=20.0,
+                      intent={"state": "continuation", "depth": 0.0,
+                              "heavy": True})
+        assert st["regime"]["tick_failed"] is False
+        assert st["regime"]["where"] == "continuation"
+        assert st["side"] == U
+
+    def test_the_regime_function_takes_it_directly(self):
+        assert sw.regime(U, U) == "continuation"
+        assert sw.regime(U, U, tick_failed=True) == "pullback"
+        assert sw.regime(U, D, tick_failed=False) == "pullback"
+
+    def test_the_entry_reads_the_same_regime_the_panel_shows(self):
+        """It recomputed its own and they disagreed -- the box said
+        PULLBACK while the side still read UP."""
+        side, why = sw.entry_side(U, U, 20.0, tick_failed=True)
+        assert side == "" and "rolling over" in why
+
+    def test_the_reading_is_marked_as_deciding(self):
+        """It sat on the panel saying "shown only" while the rule
+        traded against it."""
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=20.0,
+                      intent=self.SCREENSHOT)
+        assert st["intent"]["decides"] is True
+
+    def test_a_dead_push_does_not_close_an_open_trade(self):
+        """It blocks an ENTRY. Closing on it would put the tick
+        bar's own retrace back in charge of exits, which is the
+        churn the previous revision removed."""
+        assert sw.holds(U, U, U) == (True, "")
 
 
 class TestWhatCameOut:
@@ -494,6 +551,10 @@ class TestTheRouteFeedsTheReasoning:
         assert "rg.tf_ticks" in blk, \
             "the distance off the timeframe open is invisible"
         assert "regimeBlock" in blk, "it is built and never drawn"
+        assert "rg.tick_failed" in blk, \
+            "a dead tick push is invisible -- it sat on this panel " \
+            "marked SHOWN ONLY while the rule traded against it"
+        assert "own push has gone" in blk
 
     def test_the_timeframe_reading_survives_between_polls(self):
         """It is a pure function with its memory held outside. A

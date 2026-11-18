@@ -16769,6 +16769,18 @@ function paintStackWin(SW) {
           : '')
       + '</div>'
       + '<div class="thin">' + esc(rg.say || '') + '</div>'
+      /* THE TICK BAR'S OWN PUSH. A positive body is not a push: a
+         bar that ran twenty ticks and gave back eighteen reads UP
+         and is rolling over. This line is why the two charts
+         agreeing is not always a continuation. */
+      + (rg.tick_failed
+          ? '<div class="thin"><b style="color:var(--down)">the tick '
+            + 'chart\u2019s own push has gone</b> &mdash; '
+            + Math.round((rg.tick_depth || 0) * 100) + '% of ITS move '
+            + 'given back'
+            + (rg.tick_heavy ? ', and paid for' : '')
+            + '</div>'
+          : '')
       + (rg.where === 'pullback'
           ? '<div class="thin">'
             + Math.round((rg.depth || 0) * 100) + '% of the '
