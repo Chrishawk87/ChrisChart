@@ -57,19 +57,6 @@ TRADED_OF = {300.0: "5m", 900.0: "15m"}
 # The four readings the window is built from, in the order a reason
 # names them.
 LEGS = ("candle", "OFI", "CVD", "footprint")
-# How long a tick-bar direction must stand before it can open a
-# trade. Chris: "a flip has to hold for 10 seconds before a trade is
-# taken that keeps us from taking wrong direction trades and flips
-# that lead to nothing".
-#
-# ENTRY ONLY. The exit stays immediate, and the asymmetry is the
-# point: a flip gets you OUT at once and only lets you back IN once
-# it has proved it meant something. Making the exit wait too would
-# hold a losing position for ten seconds to protect against a flip
-# that was right.
-DWELL_S = 10.0
-
-
 def _other(side: str) -> str:
     return "down" if side == "up" else "up" if side == "down" else ""
 
@@ -149,60 +136,6 @@ def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
     return q, ""
 
 
-class Dwell:
-    """How long the tick bar has pointed the way it currently does.
-
-    FLAT DOES NOT RESET IT, and that is deliberate. The tick series
-    is cut at every true 5-minute mark, so it has no direction for
-    the first prints of every bar -- counting that as a change would
-    restart the clock twelve times an hour and cost ten seconds of
-    every bar for nothing. A gap is not a turn. Only the OPPOSITE
-    direction restarts it.
-
-    Monotonic time is not required: the caller passes the same clock
-    it uses everywhere else, and a clock that jumps backwards makes
-    `held_s` zero rather than negative.
-    """
-
-    __slots__ = ("_dir", "_since", "flips")
-
-    def __init__(self) -> None:
-        self._dir = ""
-        self._since = 0.0
-        self.flips = 0
-
-    def on_tick(self, direction: str, now: float) -> None:
-        d = direction if direction in SIDES else ""
-        try:
-            t = float(now or 0.0)
-        except (TypeError, ValueError):
-            return
-        if not d or t <= 0:
-            return              # a gap, not a turn
-        if d != self._dir:
-            if self._dir:
-                self.flips += 1
-            self._dir = d
-            self._since = t
-
-    @property
-    def direction(self) -> str:
-        return self._dir
-
-    def held_s(self, now: float) -> float:
-        try:
-            t = float(now or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-        if not self._dir or self._since <= 0 or t <= 0:
-            return 0.0
-        return max(0.0, t - self._since)
-
-    def to_dict(self, now: float = 0.0) -> dict:
-        return {"dir": self._dir, "held_s": round(self.held_s(now), 1),
-                "flips": self.flips}
-
-
 def hold_dir(now: str, prev: str = "") -> str:
     """The direction to REPORT: this one, or the last real one.
 
@@ -233,158 +166,72 @@ def hold_dir(now: str, prev: str = "") -> str:
     return prev if prev in SIDES else ""
 
 
-def entry_side(tick: str, candle: str = "",
-               held_s: float | None = None,
-               min_hold_s: float = DWELL_S) -> tuple[str, str]:
+def entry_side(tick: str, intent: dict | None = None) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    TWO DIRECTIONS IN, ONE SIDE OUT. Both are already resolved by
-    the caller -- the tick candle's own direction and the traded
-    timeframe candle's -- so this function cannot disagree with the
-    panel about what either of them said. It used to take `rungs`
-    and dig the candle out itself, which meant the screen and the
-    rule each did their own extraction and could differ.
+    THE TICK BAR ALONE, AND WHAT ITS OWN VOLUME SAYS ABOUT IT.
+    Chris: "we will no longer use time as a entry point or exit at
+    all just what the tick bar is doing alone", and "we are going to
+    use volume to confirm tick bars continuation or pull back ... if
+    volume agrees with tick charts direction for a pull back a trade
+    should be taken in that pullback direction as well".
 
-    BOTH MUST POINT THE SAME WAY. Chris: "one always show what the
-    real 15 minute is doing and the other always what the tick chart
-    is doing when they agree thats the direction we take".
+    THREE SITUATIONS, NO FOURTH, AND NO DEAD ZONE.
 
-    A FLIP STILL HAS TO HOLD. Chris: "a flip has to hold for 10
-    seconds before a trade is taken ... flips that lead to nothing".
-    `held_s` is how long the tick candle has pointed this way, from
-    `Dwell`. None means the caller is not tracking it and the check
-    is skipped -- a caller that cannot measure the dwell must not be
-    silently blocked from ever trading.
+        AT THE EXTREME the bar is extending and the trade is its own
+        direction.
 
-    THE ORDER OF THE CHECKS IS THE ORDER OF THE REASONS, and it is
-    chosen rather than incidental. The tick candle is settled first
-    -- has it a direction, has it held -- and the timeframe candle
-    is asked last. A rule that reports whichever test failed first
-    is a DIFFERENT rule when the order changes: it fires on the same
-    trades and explains them differently, and every wrong
-    explanation in this engine has cost a day.
+        PULLING BACK ON LIGHT VOLUME the retrace is drift -- nobody
+        is paying for it -- so the push still stands and the trade
+        is still the bar's direction.
 
-    EXITS DO NOT CONSULT THE CANDLE. `holds` is untouched: a trade
-    still ends on the tick candle flipping, or on the caller's time
-    stop. A candle that turns mid-trade is the pullback being traded
-    into, and closing on it would be a second rule nobody asked for.
+        PULLING BACK ON HEAVY VOLUME the move is being fought at
+        more size per tick than it took to make it. That is not a
+        reason to stand aside; it is the trade, in the retrace's own
+        direction.
+
+    So there is always a side while the bar has a direction, which
+    is the property he has asked for three times now in three
+    different places: "the gate 1 should never say flat at all".
+
+    WHAT IS GONE FROM HERE, AND IT IS NOT AN OVERSIGHT:
+
+        THE TEN-SECOND HOLD. "remove the 10 second hold completely
+        its not a factor in the opening anymore".
+
+        THE TIMEFRAME CANDLE. It gated entries for two revisions and
+        it does not any more. It is still read and still drawn, and
+        it decides nothing.
+
+        THE FIVE-MINUTE TIME STOP, and with it the per-bar cap. "we
+        will no longer use time as a entry point or exit at all".
     """
     if tick not in SIDES:
         return "", "the tick candle has no direction yet"
-    if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
-        return "", (f"the tick candle turned {tick} {held_s:.0f}s ago "
-                    f"-- it has to hold {min_hold_s:.0f}s")
-    if candle not in SIDES:
-        return "", "the timeframe candle has no direction yet"
-    if candle != tick:
-        return "", (f"the tick candle is {tick} but the timeframe "
-                    f"candle is {candle}")
+    intent = intent or {}
+    if intent.get("state") == "pullback" and intent.get("heavy"):
+        return _other(tick), ""
     return tick, ""
 
 
-def holds(side: str, tick: str) -> tuple[bool, str]:
-    """Does the trade still stand?
+def _say(side: str, tick: str, intent: dict) -> str:
+    """Why the side is the side, in one line.
 
-    ONLY THE TICK BAR FLIPPING ENDS IT.
-
-    FLAT IS NOT A FLIP, and here that matters more than anywhere
-    else it has come up: the tick bar is cut at every true 5-minute
-    mark, so it has no direction for the first prints of every bar.
-    An exit that closed on flat would fire twelve times an hour on
-    the clock rather than on the market.
-
-    The five-minute boundary DOES end a trade, but as a time stop
-    applied by the caller -- not as a direction reading. The two are
-    different events and conflating them is what made the earlier
-    version close for an absence.
+    A rule that turns a trade round on a volume ratio has to say so
+    on the screen, or the reversal reads as the engine changing its
+    mind for no reason.
     """
-    if side not in SIDES:
-        return True, ""
-    if tick == _other(side):
-        return False, (f"the tick bar flipped {tick} against your "
-                       f"{side} trade")
-    return True, ""
-
-
-def bar_of(ts: float, period_s: float = 300.0) -> float:
-    """The TRUE wall-clock bar this instant falls in.
-
-    Unix time divides evenly into 300-second buckets from an epoch
-    on a minute boundary, so this lands on :00, :05, :10 of the hour
-    in every zone whose offset is a multiple of five minutes --
-    which is all of them.
-    """
-    try:
-        t = float(ts or 0.0)
-        p = float(period_s or 300.0)
-    except (TypeError, ValueError):
-        return 0.0
-    if t <= 0 or p <= 0:
-        return 0.0
-    return float(int(t // p) * p)
-
-
-def expired(bar_ts: float, now_ts: float,
-            period_s: float = 300.0) -> tuple[bool, str]:
-    """Has this trade outlived its 5-minute bar?
-
-    Chris: "no trade will ever last past a 5 minute timeframe".
-
-    A TIME STOP, NOT A DIRECTION READING, and the distinction is
-    the whole reason this is a separate function. The tick bar is
-    cut at the same boundary, so at that instant it also has no
-    direction -- and an exit that read flat as a reversal would
-    close for an absence, which is the churn this rule has been
-    rewritten twice to remove. One of these is the clock running
-    out; the other is the market turning. They get different
-    reasons in the log because they are different events.
-
-    A trade with no recorded bar is NOT expired. Zero is "we do not
-    know", and closing every such position at the first boundary
-    would be acting on missing data.
-    """
-    b = bar_of(bar_ts, period_s)
-    n = bar_of(now_ts, period_s)
-    if b <= 0 or n <= 0:
-        return False, ""
-    if n > b:
-        mins = int(period_s // 60) or 5
-        return True, (f"the {mins}-minute bar it was opened in has "
-                      f"ended")
-    return False, ""
-
-
-def exit_reason(side: str, tick: str, bar_ts: float, now_ts: float,
-                period_s: float = 300.0) -> str:
-    """Why this trade should end now, or "" to hold it.
-
-    ONE FUNCTION, IN ORDER, because the order carries meaning. The
-    clock is checked FIRST so a trade that outlived its bar is
-    logged as the bar ending rather than blamed on a tick bar that
-    is merely between bars at that same instant -- the tick series
-    is cut on the same boundary, so both are true and only one is
-    the reason.
-
-    WHY THIS IS NOT A FEW LINES IN THE ROUTE. It was, and a mutation
-    that deleted the time stop's effect broke no test: the route
-    checks lived in a closure reachable only through an HTTP
-    request. That is how the auto gate and the one-per-candle cap
-    were each removed without anything noticing. The policy is here
-    and the route calls it.
-    """
-    if side not in SIDES:
-        return ""
-    gone, why_gone = expired(bar_ts, now_ts, period_s)
-    if gone:
-        return why_gone
-    ok, why = holds(side, tick)
-    return "" if ok else why
+    if side != tick:
+        return (f"the {tick} move is being fought -- trading the "
+                f"{side} pullback")
+    if intent.get("state") == "pullback":
+        return (f"the tick candle is {side}; the pullback is light "
+                "and nobody is paying for it")
+    return f"the tick candle is {side} and extending"
 
 
 def state(win: dict | None, tick: str, rungs: dict | None,
           period_s: float, fp: str = "",
-          held_s: float | None = None, flips: int = 0,
-          min_hold_s: float = DWELL_S,
           pace: dict | None = None,
           roll: dict | None = None,
           intent: dict | None = None,
@@ -401,14 +248,23 @@ def state(win: dict | None, tick: str, rungs: dict | None,
     is a 5000t candle it should show the trading direction of that
     candle".
 
+    `intent` IS THE OTHER HALF OF THE RULE -- what the tape is
+    doing inside this bar and whether volume is paying for it. The
+    side comes from those two and nothing else.
+
+    THE TIMEFRAME CANDLE AND THE WINDOW ARE STILL BUILT HERE and
+    they decide nothing. Kept because a reading that silently stops
+    being collected is how a screen starts lying, and because he
+    has asked for each of them on screen at some point.
+
     `prev` IS THE MEMORY AND THIS FUNCTION STAYS PURE. It is the
     `held` block from the previous call, and the one returned by
-    this call is what the caller stores. Both gates hold their last
-    real direction through an exact tie, and holding it means
-    remembering it -- but a module that kept that memory inside
-    itself would hand two callers one history, which is how the
-    screen and the rule end up disagreeing. The caller owns the
-    memory; the rule owns the policy.
+    this call is what the caller stores. The tick direction holds
+    through an exact tie, and holding it means remembering it --
+    but a module that kept that memory inside itself would hand two
+    callers one history, which is how the screen and the rule end
+    up disagreeing. The caller owns the memory; the rule owns the
+    policy.
     """
     win = win or {}
     w_candle = str(win.get("mid_dir") or "")
@@ -429,8 +285,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
     tick = hold_dir(tick_raw, str(prev.get("tick") or ""))
     s_side = hold_dir(s_raw, str(prev.get("candle") or ""))
 
-    side, why = entry_side(tick, s_side,
-                           held_s=held_s, min_hold_s=min_hold_s)
+    side, why = entry_side(tick, intent or {})
 
     rows = {}
     for name in (tf, below):
@@ -464,16 +319,10 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             # How long it has pointed this way, and what it has to
             # reach. Shown so a blocked entry reads as waiting
             # rather than as nothing happening.
-            "held_s": (round(held_s, 1) if held_s is not None else None),
-            "min_hold_s": float(min_hold_s or 0.0),
-            "ready": bool(tick in SIDES
-                          and (held_s is None or min_hold_s <= 0
-                               or held_s >= min_hold_s)),
-            "flips": int(flips or 0),
-            # THE WINDOW THE DIRECTION CAME OUT OF. `side` above IS
-            # this window's reading -- the caller passes it in -- and
-            # this is the count behind it, so the panel can show a
-            # cold start as warming up rather than as a flat market.
+            # THE VOTE BEHIND THE CANDLE, as information. It was
+            # the direction once, behind a band and a floor that
+            # both produce flat; it is drawn beside the body and it
+            # decides nothing.
             "roll": dict(roll or {}),
         },
         "stack": {
@@ -485,18 +334,19 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "raw": s_raw,
             "held_through_flat": bool(s_side in SIDES
                                       and s_raw not in SIDES),
-            # ASKED AND DECIDING. The traded timeframe's candle is a
-            # gate on ENTRY -- both it and the tick bar have to point
-            # the same way. The row below it is still read and still
-            # drawn and still gates nothing.
+            # NEITHER ASKED NOR DECIDING, AGAIN. Chris: "we will no
+            # longer use time as a entry point or exit at all just
+            # what the tick bar is doing alone". It gated entries
+            # for two revisions; it is now read, drawn, and silent.
             #
             # These two flags are what the panel reads to decide
             # whether to draw this block as a gate or as a reading,
             # so they are not decoration: a screen that labelled a
             # live gate "shown, not used" is the exact failure this
-            # module was written after.
-            "asked": True,
-            "decides": True,
+            # module was written after, and the reverse is just as
+            # bad.
+            "asked": False,
+            "decides": False,
             "agrees": bool(s_side and tick in SIDES and s_side == tick),
         },
         # THE TICK CHART AGAINST THE CLOCK -- the push and the pull.
@@ -546,13 +396,23 @@ def state(win: dict | None, tick: str, rungs: dict | None,
                  # cannot know, and the second is what tells the next
                  # reading the geometry flipped and that number is
                  # now meaningless.
+                 # EVERY FIELD `tapeintent.read` NEEDS BACK. It is
+                 # a pure function with the memory held out here, so
+                 # a field dropped from this dict does not error --
+                 # it silently resets that part of the reading on
+                 # every poll. `heavy` is the hysteresis, `v_ext`
+                 # is where the push ended, `bar_ts` is how it knows
+                 # the bar changed; without them the flag chatters
+                 # and the volume mark is re-taken continuously.
                  "intent": {
                      "state": str((intent or {}).get("state") or ""),
                      "worst": float((intent or {}).get("worst") or 0.0),
-                     "bar_dir": str((intent or {}).get("bar_dir")
-                                    or "")}},
+                     "bar_dir": str((intent or {}).get("bar_dir") or ""),
+                     "heavy": bool((intent or {}).get("heavy")),
+                     "v_ext": float((intent or {}).get("v_ext") or 0.0),
+                     "bar_ts": float((intent or {}).get("bar_ts")
+                                     or 0.0)}},
         "side": side,
         "why": why,
-        "say": ((f"the tick candle and the {tf} candle are both {side}")
-                if side else why),
+        "say": (_say(side, tick, intent or {}) if side else why),
     }

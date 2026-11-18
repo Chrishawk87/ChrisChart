@@ -187,14 +187,20 @@ class TestTheGuardsTogetherStopTheReset:
     def _resets(band, frac, minv, bars=4, n=1200, seed=11):
         import random
         import liqmap.tickbar as tb
-        from liqmap.stackwin import Dwell
 
+        # COUNTED HERE RATHER THAN BY `Dwell`, which this used to
+        # borrow. The ten-second hold was removed from the rule, and
+        # the tracker with it -- but the measurement it made is
+        # still the one that justifies the two vote guards, so the
+        # counting moved in here rather than the test going away.
+        # Flat does not count as a turn, exactly as the tracker had
+        # it: a gap is not a reversal.
         ob, of, om = tb.PATH_BAND, tb.VOTE_FRACTION, tb.MIN_VOTES
         tb.PATH_BAND, tb.VOTE_FRACTION, tb.MIN_VOTES = band, frac, minv
         try:
             rng = random.Random(seed)
-            dw = Dwell()
             px, t, dt = 7000.0, 0.0, 300.0 / n
+            last, flips = "", 0
             for _ in range(bars):
                 b = tb.TickBars(per_bar=5000)
                 b.on_trade(t, px, 1.0, "B")
@@ -203,8 +209,12 @@ class TestTheGuardsTogetherStopTheReset:
                     px += 0.25 if rng.random() < 0.502 else -0.25
                     b.on_trade(t, px, 1.0, "B")
                     cur = b.current
-                    dw.on_tick(cur.path_dir if cur else "flat", t)
-            return dw.flips
+                    d = (cur.path_dir if cur else "flat")
+                    if d in ("up", "down"):
+                        if last and d != last:
+                            flips += 1
+                        last = d
+            return flips
         finally:
             tb.PATH_BAND, tb.VOTE_FRACTION, tb.MIN_VOTES = ob, of, om
 

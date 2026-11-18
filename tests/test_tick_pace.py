@@ -234,44 +234,30 @@ class TestItReachesThePanels:
 
 
 class TestItIsNotAllowedToTrade:
-    """The reading is new; the rule is not. Pinned, because an
-    informational panel reading that quietly acquires a vote is
-    exactly the failure these tests exist for."""
+    """The reading is informational; the rule is the tick bar and
+    its volume. Pinned, because an informational panel reading that
+    quietly acquires a vote is exactly the failure these tests
+    exist for."""
 
-    @staticmethod
-    def _rungs(d):
-        return {"5m": {"present": True, "qualified": d,
-                       "conflicted": False}}
+    PUSH = {"state": "continuation", "heavy": False}
 
     def test_the_entry_ignores_the_pace_entirely(self):
-        """The gates are the tick bar and the traded candle. The
-        pace sits beside them and is not one of them."""
         from liqmap import stackwin as sw
-        r = self._rungs("up")
-        fast = sw.state({}, "up", r, 300.0, held_s=99.0,
+        fast = sw.state({}, "up", {}, 300.0, intent=self.PUSH,
                         pace={"push": "fade", "ratio": 9.0})
-        slow = sw.state({}, "up", r, 300.0, held_s=99.0,
+        slow = sw.state({}, "up", {}, 300.0, intent=self.PUSH,
                         pace={"push": "push", "ratio": 0.1})
         assert fast["side"] == slow["side"] == "up"
-        assert fast["why"] == slow["why"]
+        assert fast["say"] == slow["say"]
 
-    def test_a_push_cannot_rescue_a_disagreeing_candle(self):
-        """The tempting bug: a very fast tape waved through a trade
-        the candle gate had refused."""
+    def test_a_push_cannot_rescue_a_heavy_pullback(self):
+        """The tempting bug: a very fast tape waved through the
+        trade the volume rule had turned round."""
         from liqmap import stackwin as sw
-        st = sw.state({}, "up", self._rungs("down"), 300.0,
-                      held_s=99.0,
+        st = sw.state({}, "up", {}, 300.0,
+                      intent={"state": "pullback", "heavy": True},
                       pace={"push": "push", "ratio": 0.05})
-        assert st["side"] == ""
-
-    def test_no_pace_at_all_changes_nothing(self):
-        from liqmap import stackwin as sw
-        r = self._rungs("down")
-        a = sw.state({}, "down", r, 300.0, held_s=99.0)
-        b = sw.state({}, "down", r, 300.0, held_s=99.0,
-                     pace={"push": "push"})
-        assert a["side"] == b["side"] == "down"
-        assert a["say"] == b["say"]
+        assert st["side"] == "down"
 
     def test_entry_side_does_not_take_a_pace_at_all(self):
         """The strongest form of the guarantee: the function that
@@ -280,8 +266,6 @@ class TestItIsNotAllowedToTrade:
 
         from liqmap import stackwin as sw
         assert "pace" not in inspect.signature(sw.entry_side).parameters
-        assert "pace" not in inspect.signature(sw.holds).parameters
-        assert "pace" not in inspect.signature(sw.exit_reason).parameters
 
     def test_nothing_here_submits_an_order(self):
         import ast

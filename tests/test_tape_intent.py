@@ -277,8 +277,10 @@ class TestItReachesThePanel:
         st = sw.state({}, "up", {}, 300.0,
                       intent={"state": "pullback", "worst": 0.6,
                               "bar_dir": "up"})
-        assert st["held"]["intent"] == {"state": "pullback",
-                                        "worst": 0.6, "bar_dir": "up"}
+        held = st["held"]["intent"]
+        assert held["state"] == "pullback"
+        assert held["worst"] == 0.6
+        assert held["bar_dir"] == "up"
 
     def test_the_route_feeds_the_memory_back_in(self):
         i = WEB.index("def _journal_step_un(")
@@ -307,23 +309,43 @@ class TestItReachesThePanel:
         assert "decides nothing" in WEB[i:i + 1600]
 
 
-class TestItDoesNotDecideAnything:
-    def test_the_entry_ignores_it_entirely(self):
-        from liqmap import stackwin as sw
-        r = {"5m": {"present": True, "qualified": "up"}}
-        a = sw.state({}, "up", r, 300.0, held_s=99.0,
-                     intent={"state": "pullback", "depth": 0.9})
-        b = sw.state({}, "up", r, 300.0, held_s=99.0,
-                     intent={"state": "continuation", "depth": 0.0})
-        assert a["side"] == b["side"] == "up"
-        assert a["why"] == b["why"]
+class TestVolumeDecidesTheSide:
+    """IT DECIDES NOW, AND THAT IS NEW. Chris: "if volume agrees
+    with tick charts direction for a pull back a trade should be
+    taken in that pullback direction as well". This reading was
+    shown-only for two revisions; the class that held it to that is
+    this one, rewritten rather than deleted so the reversal is
+    visible in the history."""
 
-    def test_entry_side_cannot_see_it(self):
-        import inspect
-
+    def test_a_heavy_pullback_turns_the_trade_round(self):
         from liqmap import stackwin as sw
-        assert "intent" not in inspect.signature(sw.entry_side).parameters
-        assert "intent" not in inspect.signature(sw.holds).parameters
+        st = sw.state({}, "up", {}, 300.0,
+                      intent={"state": "pullback", "heavy": True})
+        assert st["side"] == "down"
+
+    def test_a_light_pullback_leaves_it_alone(self):
+        from liqmap import stackwin as sw
+        st = sw.state({}, "up", {}, 300.0,
+                      intent={"state": "pullback", "heavy": False})
+        assert st["side"] == "up"
+
+    def test_depth_alone_does_not_turn_it(self):
+        """A deep pullback nobody is paying for is still drift."""
+        from liqmap import stackwin as sw
+        st = sw.state({}, "up", {}, 300.0,
+                      intent={"state": "pullback", "heavy": False,
+                              "depth": 0.95})
+        assert st["side"] == "up"
+
+    def test_the_ratio_is_what_sets_heavy(self):
+        assert ti.read("up", 7000, 7100, 6999, 7050,
+                       volume=100.0, bar_ts=1.0,
+                       prev={"v_ext": 20.0, "bar_ts": 1.0,
+                             "bar_dir": "up"})["heavy"] is True
+        assert ti.read("up", 7000, 7100, 6999, 7050,
+                       volume=100.0, bar_ts=1.0,
+                       prev={"v_ext": 95.0, "bar_ts": 1.0,
+                             "bar_dir": "up"})["heavy"] is False
 
     def test_nothing_here_submits_an_order(self):
         import ast
@@ -332,3 +354,183 @@ class TestItDoesNotDecideAnything:
                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
                and n.name in ("submit", "execute", "place", "order")]
         assert not bad, f"tapeintent.py grew {bad}"
+
+
+class TestTheVolumeMaths:
+    """Each of these was written after a mutation survived. The
+    comparison, the mark and the reset are three separate things and
+    breaking any one of them leaves the other two looking right."""
+
+    def test_it_is_effort_per_tick_not_raw_volume(self):
+        """THE CASE THAT SEPARATES THEM. A long push on big volume,
+        then a short retrace on a fraction of that volume -- but
+        over so little distance that it is costing MORE per tick
+        than the push did. Raw volume calls it light; effort calls
+        it heavy, and effort is the one that describes a fight."""
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7080.0,
+                    volume=1300.0, bar_ts=1.0,
+                    prev={"v_ext": 1000.0, "bar_ts": 1.0,
+                          "bar_dir": "up"})
+        assert r["impulse_v"] == 1000.0 and r["retrace_v"] == 300.0
+        assert r["depth"] >= ti.MIN_PULLBACK, "not a real retrace"
+        assert r["ratio"] == 1.5, r
+        assert r["heavy"] is True
+        # Raw volume would have read 0.30 and called it drift.
+        assert (r["retrace_v"] / r["impulse_v"]) < ti.HEAVY_RATIO
+
+    def test_the_ratio_is_scale_free(self):
+        """The price units cancel, so the same shape reads the same
+        on any instrument and no tick size is needed."""
+        a = ti.effort_ratio("up", 7000, 7100, 6999, 7090, 1000, 150)
+        b = ti.effort_ratio("up", 70000, 71000, 69990, 70900, 1000, 150)
+        assert a == b == 1.5
+
+    def test_the_mark_is_taken_at_the_extreme(self):
+        """Everything before it is the push, everything after is the
+        retrace. Without the mark there is no push to compare
+        against and nothing is ever heavy."""
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7100.0,
+                    volume=500.0, bar_ts=1.0)
+        assert r["at_extreme"] is True
+        assert r["v_ext"] == 500.0, "the push volume was not marked"
+        assert r["retrace_v"] == 0.0
+
+    def test_the_mark_is_re_taken_at_every_new_extreme(self):
+        first = ti.read("up", 7000.0, 7100.0, 6999.0, 7100.0,
+                        volume=500.0, bar_ts=1.0)
+        later = ti.read("up", 7000.0, 7200.0, 6999.0, 7200.0,
+                        volume=800.0, bar_ts=1.0,
+                        prev={"v_ext": first["v_ext"], "bar_ts": 1.0,
+                              "bar_dir": "up"})
+        assert later["v_ext"] == 800.0
+
+    def test_a_new_bar_clears_the_mark(self):
+        """Volume restarts at nought on a new bar. Carrying the old
+        mark forward makes the whole of the new bar look like a
+        retrace of a move that has left the screen."""
+        r = ti.read("up", 7000.0, 7010.0, 6999.0, 7005.0,
+                    volume=50.0, bar_ts=2.0,
+                    prev={"v_ext": 10.0, "bar_ts": 1.0,
+                          "bar_dir": "up", "worst": 0.9})
+        assert r["v_ext"] == 50.0, "the previous bar's mark survived"
+        assert r["retrace_v"] == 0.0
+        assert r["worst"] == 0.0
+
+    def test_the_same_bar_keeps_its_mark(self):
+        """The control for the test above -- a reset that fires
+        every poll is the same as no mark at all."""
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7050.0,
+                    volume=600.0, bar_ts=1.0,
+                    prev={"v_ext": 400.0, "bar_ts": 1.0,
+                          "bar_dir": "up"})
+        assert r["v_ext"] == 400.0
+        assert r["retrace_v"] == 200.0
+
+
+class TestTheRouteCarriesWhatTheMathsNeeds:
+    def test_the_tick_payload_has_volume_and_the_bar_id(self):
+        i = WEB.index("def _tick_now(")
+        blk = WEB[i:WEB.index("def _tape_intent(", i)]
+        main = blk[blk.index('"up_prints": cur.up_prints'):]
+        assert '"volume": cur.volume' in main, \
+            "no volume, so no pullback can ever read heavy"
+        assert '"start_ts": cur.start_ts' in main, \
+            "no bar id, so a new bar keeps the old volume mark"
+
+    def test_the_reading_is_handed_both(self):
+        i = WEB.index("def _tape_intent(")
+        blk = WEB[i:WEB.index("def _m5_now(", i)]
+        assert 'volume=float((tk_ or {}).get("volume")' in blk
+        assert 'bar_ts=float((tk_ or {}).get("start_ts")' in blk
+
+
+class TestTheFlagDoesNotChatter:
+    """Two defects found by MEASURING the rule, not by reading it.
+    Both were mine and both were invisible in a unit test."""
+
+    def test_a_bare_threshold_was_the_first_one(self):
+        """`heavy` was `ratio >= 1.0`. A number that moves
+        continuously flips every time it crosses, so the side
+        inverted about 1,250 times an hour on a simulated tape --
+        four out of five side changes were this one flag. The same
+        defect `PATH_BAND` was added to fix in the tick vote."""
+        assert ti.HEAVY_BAND > 0
+
+    @staticmethod
+    def _r(ratio_target, was, depth=0.5):
+        """A reading whose effort ratio is `ratio_target`."""
+        # push 100 on volume 100 -> 1.0 per unit; back = depth*100.
+        back = depth * 100.0
+        rv = ratio_target * 100.0 * back / 100.0
+        return ti.read("up", 7000.0, 7100.0, 6999.0, 7100.0 - back,
+                       volume=100.0 + rv, bar_ts=1.0,
+                       prev={"v_ext": 100.0, "bar_ts": 1.0,
+                             "bar_dir": "up", "heavy": was})
+
+    def test_it_takes_more_to_claim_heavy_than_to_keep_it(self):
+        assert self._r(1.1, was=False)["heavy"] is False
+        assert self._r(1.1, was=True)["heavy"] is True
+
+    def test_leaving_heavy_needs_the_lower_edge_not_the_middle(self):
+        """BOTH EDGES, OR IT IS HALF A BAND. A mutation that kept
+        the entry edge and dropped the exit one survived: 0.9 is
+        below 1.0 but inside the band, so it must still read heavy
+        once claimed. Without this the flag chatters on every pass
+        back through 1.0, which is the whole defect."""
+        assert self._r(0.9, was=True)["heavy"] is True
+        assert self._r(0.74, was=True)["heavy"] is False
+
+    def test_well_past_either_edge_is_unambiguous(self):
+        assert self._r(2.0, was=False)["heavy"] is True
+        assert self._r(0.2, was=True)["heavy"] is False
+
+    def test_a_tiny_retrace_can_never_be_heavy(self):
+        """THE SECOND DEFECT, and the tell was that a TRENDING tape
+        produced more side changes than a choppy one -- backwards.
+        The ratio divides by how far price has come back, so one
+        tick off the high with any volume read as the move being
+        fought, and a trend makes dozens of those."""
+        r = self._r(99.0, was=False, depth=0.01)
+        assert r["depth"] < ti.MIN_PULLBACK
+        assert r["heavy"] is False, "a one-tick retrace turned the trade"
+
+    def test_it_is_still_called_a_pullback_though(self):
+        """The depth floor gates the VOLUME verdict only. Naming the
+        pullback stays instant -- that was the whole last fix."""
+        r = self._r(99.0, was=False, depth=0.01)
+        assert r["state"] == "pullback"
+
+    def test_a_real_retrace_is_judged_normally(self):
+        r = self._r(2.0, was=False, depth=ti.MIN_PULLBACK + 0.05)
+        assert r["heavy"] is True
+
+
+class TestTheMemoryCarriesEverythingTheReadingNeeds:
+    def test_the_state_hands_back_every_field(self):
+        """`read` is pure with its memory held outside, so a field
+        missing from `held` does not error -- it silently resets
+        that part of the reading on every poll."""
+        from liqmap import stackwin as sw
+        intent = ti.read("up", 7000.0, 7100.0, 6999.0, 7050.0,
+                         volume=600.0, bar_ts=7.0,
+                         prev={"v_ext": 400.0, "bar_ts": 7.0,
+                               "bar_dir": "up", "heavy": True})
+        st = sw.state({}, "up", {}, 300.0, intent=intent)
+        held = st["held"]["intent"]
+        for k in ("state", "worst", "bar_dir", "heavy", "v_ext",
+                  "bar_ts"):
+            assert k in held, f"{k} is dropped between polls"
+        assert held["heavy"] is True
+        assert held["v_ext"] == 400.0
+        assert held["bar_ts"] == 7.0
+
+    def test_a_round_trip_through_the_memory_is_stable(self):
+        from liqmap import stackwin as sw
+        prev = {}
+        for _ in range(3):
+            intent = ti.read("up", 7000.0, 7100.0, 6999.0, 7050.0,
+                             volume=600.0, bar_ts=7.0, prev=prev)
+            prev = sw.state({}, "up", {}, 300.0,
+                            intent=intent)["held"]["intent"]
+        assert prev["v_ext"] == 600.0 or prev["v_ext"] == 400.0
+        assert isinstance(prev["heavy"], bool)

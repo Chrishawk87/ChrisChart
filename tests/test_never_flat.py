@@ -67,6 +67,9 @@ D, U = "down", "up"
 WEB = (pathlib.Path(__file__).resolve().parents[1]
        / "liqmap" / "web.py").read_text()
 
+# An extending bar: the rule's neutral input.
+PUSH = {"state": "continuation", "heavy": False}
+
 
 def rungs(**kw) -> dict:
     out = {}
@@ -117,9 +120,9 @@ class TestGateOneIsTheCandle:
         # is exactly what was being reported as the direction.
         assert b.current.path_dir == "flat"
 
-    def test_the_panel_names_what_gate_one_shows(self):
-        assert "GATE 1 &mdash; THE 5000T CANDLE" in WEB
-        assert "close vs open, as the chart draws it" in WEB
+    def test_the_panel_names_what_the_rule_reads(self):
+        assert "THE 5000T CANDLE AND ITS VOLUME" in WEB
+        assert "this is the whole rule" in WEB
 
     def test_the_vote_is_still_drawn_beside_it(self):
         """It is not deleted. When it disagrees with the body that
@@ -146,38 +149,38 @@ class TestNeitherGateEverReportsFlat:
         assert sw.hold_dir("", "") == ""
         assert sw.hold_dir("flat", "sideways") == ""
 
-    def test_gate_one_holds_its_direction(self):
-        st = sw.state({}, "flat", rungs(**{"5m": U}), 300.0,
-                      held_s=99.0, prev={"tick": U})
+    def test_the_tick_direction_holds_through_a_tie(self):
+        st = sw.state({}, "flat", {}, 300.0, intent=PUSH,
+                      prev={"tick": U})
         assert st["tick"]["side"] == U
         assert st["tick"]["raw"] == "flat"
         assert st["tick"]["held_through_flat"] is True
         assert st["side"] == U, "the held direction did not reach the rule"
 
-    def test_gate_two_holds_its_direction(self):
+    def test_the_timeframe_row_still_holds_its_direction_on_screen(self):
+        """It decides nothing now, but it is still drawn, and a row
+        that blinks out reads as a dead market."""
         st = sw.state({}, U, rungs(**{"5m": "flat"}), 300.0,
-                      held_s=99.0, prev={"candle": U})
+                      intent=PUSH, prev={"candle": U})
         assert st["stack"]["side"] == U
         assert st["stack"]["raw"] == ""
         assert st["stack"]["held_through_flat"] is True
-        assert st["side"] == U
 
-    def test_a_tie_on_both_at_once_still_trades(self):
-        """THE CASE HE WAS WATCHING. Two gates that each blank for
-        an instant can never agree if either blanking cancels the
-        entry."""
+    def test_a_tie_everywhere_still_trades(self):
+        """THE CASE HE WAS WATCHING, and it cannot come back now
+        that only one reading gates at all."""
         st = sw.state({}, "flat", rungs(**{"5m": "flat"}), 300.0,
-                      held_s=99.0, prev={"tick": D, "candle": D})
+                      intent=PUSH, prev={"tick": D, "candle": D})
         assert st["side"] == D
 
     def test_the_hold_is_not_marked_when_nothing_is_held(self):
-        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, held_s=99.0,
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, intent=PUSH,
                       prev={"tick": U, "candle": U})
         assert st["tick"]["held_through_flat"] is False
         assert st["stack"]["held_through_flat"] is False
 
     def test_a_flip_is_not_blocked_by_the_held_direction(self):
-        st = sw.state({}, D, rungs(**{"5m": D}), 300.0, held_s=99.0,
+        st = sw.state({}, D, rungs(**{"5m": D}), 300.0, intent=PUSH,
                       prev={"tick": U, "candle": U})
         assert st["tick"]["side"] == D
         assert st["stack"]["side"] == D
@@ -201,9 +204,9 @@ class TestTheMemoryIsTheCallersCom:
         assert st["held"]["candle"] == D
 
     def test_feeding_it_back_carries_the_direction(self):
-        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, held_s=99.0)
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, intent=PUSH)
         nxt = sw.state({}, "flat", rungs(**{"5m": "flat"}), 300.0,
-                       held_s=99.0, prev=st["held"])
+                       intent=PUSH, prev=st["held"])
         assert nxt["side"] == U
 
     def test_the_route_stores_it_and_hands_it_back(self):
@@ -214,12 +217,12 @@ class TestTheMemoryIsTheCallersCom:
         assert "prev=_prev" in blk
         assert "rt_._gate_held = fus.get(\"held\")" in blk
 
-    def test_the_dwell_is_fed_the_held_direction(self):
-        """Feeding it the raw reading would restart the hold at
-        every tie -- the same reset, one layer down."""
+    def test_there_is_no_dwell_left_to_feed(self):
+        """Chris: "remove the 10 second hold completely". Pinned in
+        the negative -- it has been re-wired here before."""
         i = WEB.index("def _journal_step_un(")
         blk = WEB[i:i + 30000]
-        assert "_dw.on_tick(_sw.hold_dir(_bd," in blk
+        assert "_dw." not in blk and "Dwell" not in blk
 
 
 class TestGateTwoIsTheRealLiveCandle:
@@ -236,14 +239,15 @@ class TestGateTwoIsTheRealLiveCandle:
                       "qualified": ("up" if row[1] > 0 else
                                     "down" if row[1] < 0 else None),
                       "seeded": True, "bps": round(row[1], 3)}
-        return sw.state({}, U, rg, period, held_s=99.0, prev=prev)
+        return sw.state({}, U, rg, period, intent=PUSH, prev=prev)
 
     def test_a_live_candle_above_its_open_reads_up(self):
+        """It no longer gates, but it still has to READ correctly --
+        it is on the screen and he compares it against Ironbeam."""
         st = self._chain({"15m": {"open": 7000.0, "close": 7012.0},
                           "5m": {"open": 7008.0, "close": 7012.0},
                           "1m": {"open": 7011.0, "close": 7012.0}})
         assert st["stack"]["side"] == U
-        assert st["side"] == U, "the agreement was not recognised"
 
     def test_one_tick_above_the_open_is_enough(self):
         """No band, no minimum. `qualified` is the sign of the move
@@ -262,9 +266,9 @@ class TestGateTwoIsTheRealLiveCandle:
         screen rather than guessed at."""
         assert "open_px" in WEB and "last_px" in WEB
 
-    def test_the_panel_says_it_is_the_real_live_candle(self):
-        assert "GATE 2 &mdash; THE REAL " in WEB
-        assert "close vs open, live" in WEB
+    def test_the_panel_says_the_timeframe_candle_is_shown_only(self):
+        assert "THE REAL ' + esc(st.trading" in WEB
+        assert "shown only, it does not gate anything" in WEB
 
     def test_the_panel_arrow_shows_what_the_gate_uses(self):
         """An arrow reading "flat" beside a verdict reading AGREES
@@ -275,20 +279,15 @@ class TestGateTwoIsTheRealLiveCandle:
 
 
 class TestWhatDidNotChange:
-    def test_the_dwell_still_gates_entries(self):
-        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, held_s=4.0)
-        assert st["side"] == ""
-        assert "has to hold 10s" in st["why"]
+    def test_the_dwell_no_longer_gates_entries(self):
+        """It did, for two revisions. Chris removed it."""
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, intent=PUSH)
+        assert st["side"] == U
+        assert not hasattr(sw, "DWELL_S")
 
-    def test_the_exit_is_still_the_tick_flip_alone(self):
-        import inspect
-        assert list(inspect.signature(sw.holds).parameters) == \
-            ["side", "tick"]
-        assert sw.holds(D, U)[0] is False
-        assert sw.holds(D, "")[0] is True
-
-    def test_the_time_stop_is_untouched(self):
-        assert "TRADE_BAR_S = 300.0" in WEB
+    def test_the_time_stop_is_gone(self):
+        assert "TRADE_BAR_S = " not in WEB
+        assert not hasattr(sw, "exit_reason")
 
     def test_it_does_not_trade(self):
         import ast

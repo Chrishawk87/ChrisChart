@@ -61,6 +61,58 @@ SIDES = ("up", "down")
 # rounding artefact, not a retrace.
 EPS = 1e-9
 
+# WHEN A PULLBACK IS BEING PAID FOR. Chris: "we are going to use
+# volume to confirm tick bars continuation or pull back ... if volume
+# agrees with tick charts direction for a pull back a trade should be
+# taken in that pullback direction as well".
+#
+# The comparison is EFFORT, not raw volume: how much size it took to
+# move price one tick on the way into the extreme, against how much
+# it is taking to move it one tick on the way back. Raw volume would
+# favour whichever leg has run longer, and a retrace that has only
+# gone a tenth of the way would read light however hard it was
+# fought.
+#
+# At 1.0 the retrace is being bought or sold as hard as the push was.
+# Above it, harder -- the move is being fought and the pullback is
+# the real trade. Below it the push is unopposed and drifting back,
+# which is the continuation still standing.
+HEAVY_RATIO = 1.0
+
+# AND IT NEEDS A BAND, FOR THE SAME REASON THE VOTE DID.
+#
+# A bare threshold on a number that moves continuously flips every
+# time it crosses. Measured on a simulated hour at 5,000 prints a
+# bar: the heavy/light flag turned over about 1,250 times, against
+# roughly 300 from the candle itself -- so four out of five side
+# changes were this one number chattering around 1.0, and each one
+# of them is a round trip.
+#
+# This is the identical defect `PATH_BAND` was added to fix in the
+# tick vote, and it was found the same way. Claiming HEAVY needs
+# the ratio above 1.25; losing it needs a drop below 0.75. A state
+# is harder to leave than it was to enter, which is the property
+# that stops flapping, and nothing in between changes anything.
+HEAVY_BAND = 0.25
+
+# AND THE RETRACE HAS TO BE A RETRACE BEFORE ANY OF IT MEANS
+# ANYTHING.
+#
+# `effort_ratio` divides by the distance price has come back. As
+# that distance goes to nothing the ratio goes to infinity, so one
+# tick off the high with any volume behind it reads as the move
+# being fought -- and on a TRENDING tape, which makes dozens of
+# one-tick retraces, that is constant. Measured before this line
+# existed: a strong trend produced 2,659 side changes an hour
+# against 791 on a choppy one, which is backwards and was the tell.
+#
+# Below this depth the comparison is not wrong, it is undefined:
+# there is no retrace yet to weigh the volume against. The reading
+# still says PULLBACK -- that part is instant and stays instant --
+# it just cannot turn the trade round on arithmetic that has not
+# got a denominator yet.
+MIN_PULLBACK = 0.15
+
 
 def depth(direction: str, open_px: float, high: float, low: float,
           close: float) -> float:
@@ -104,37 +156,101 @@ def hold(now: str, prev: str = "") -> str:
     return now if now else (prev or "")
 
 
+def effort_ratio(bar_dir: str, open_px: float, high: float, low: float,
+                 close: float, impulse_v: float,
+                 retrace_v: float) -> float:
+    """How hard the retrace is being fought, against the push.
+
+    Volume per unit of price moved, on each leg, as a ratio. The
+    units cancel, so no tick size is needed and the number means the
+    same thing on any instrument.
+
+    0.0 means "cannot say" -- no push, no retrace, or no volume
+    behind one of them. It is never guessed at, because a fabricated
+    1.0 would read as a perfectly balanced fight.
+    """
+    try:
+        o, h, lo, c = (float(open_px or 0.0), float(high or 0.0),
+                       float(low or 0.0), float(close or 0.0))
+        iv, rv = float(impulse_v or 0.0), float(retrace_v or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if bar_dir == "up":
+        push, back = h - o, h - c
+    elif bar_dir == "down":
+        push, back = o - lo, c - lo
+    else:
+        return 0.0
+    if push <= EPS or back <= EPS or iv <= 0 or rv <= 0:
+        return 0.0
+    return (rv * push) / (iv * back)
+
+
 def read(bar_dir: str, open_px: float, high: float, low: float,
-         close: float, prev: dict | None = None) -> dict:
+         close: float, volume: float = 0.0, bar_ts: float = 0.0,
+         prev: dict | None = None) -> dict:
     """What the tape is doing inside this bar, right now.
 
     `bar_dir` is the bar's own direction, close against open -- the
-    same number gate 1 reports, not a second opinion about it.
+    same number the rule reads, not a second opinion about it.
 
-    THE REFERENCE IS THE BAR'S EXTREME, AND THAT IS THE WHOLE FIX.
-    Price off the high of an up bar is a pullback the instant it
-    happens, because the high is a fact about this bar and not a
-    point a fixed distance back in the tape.
+    THE REFERENCE IS THE BAR'S EXTREME, AND THAT IS WHAT MAKES IT
+    IMMEDIATE. Price off the high of an up bar is a pullback the
+    instant it happens, because the high is a fact about this bar
+    and not a point a fixed distance back in the tape.
 
-    `prev` carries the deepest retrace reached since the current
-    extreme, because "is this pullback still going or is it
-    recovering" cannot be read from one instant. The caller keeps
-    that memory and hands it back, exactly as `stackwin.state`
-    does, so one module cannot hand the panel and the rule two
-    different histories.
+    VOLUME SAYS WHETHER THE PULLBACK IS BEING PAID FOR. The size
+    behind the push into the extreme against the size behind the
+    retrace out of it, per unit of price moved. A retrace nobody is
+    paying for is drift and the push still stands; one that costs
+    more per tick than the push did is the move being fought, and
+    that is a trade in the retrace's own direction.
+
+    `prev` carries what one instant cannot know: the deepest this
+    retrace has been, and the bar's volume at the moment the extreme
+    was last made. The caller keeps that memory and hands it back,
+    exactly as `stackwin.state` does, so one module cannot hand the
+    panel and the rule two different histories.
     """
     prev = prev or {}
     d = depth(bar_dir, open_px, high, low, close)
     at_extreme = d <= EPS
+    vol = max(0.0, float(volume or 0.0))
 
-    # THE DEEPEST THIS PULLBACK HAS BEEN. Cleared the moment a new
-    # extreme is made, because at that point there is no pullback
-    # left to be recovering from. Also cleared when the bar's own
-    # direction turns over, since the geometry is then measured off
-    # the other end of the bar and the old number means nothing.
+    # A NEW BAR WIPES ALL OF IT. Volume restarts at nought and the
+    # extremes belong to a bar that has closed, so a retrace depth
+    # or a volume mark carried across the boundary is a number about
+    # a move that is no longer on the screen.
+    fresh = float(bar_ts or 0.0) != float(prev.get("bar_ts") or 0.0)
     turned = bar_dir != str(prev.get("bar_dir") or bar_dir)
-    worst = 0.0 if (at_extreme or turned) else max(
+    reset = fresh or turned
+
+    worst = 0.0 if (at_extreme or reset) else max(
         d, float(prev.get("worst") or 0.0))
+
+    # THE VOLUME MARK IS TAKEN AT THE EXTREME. Everything before it
+    # is the push; everything after is the retrace. Re-marked every
+    # time a new extreme is made, which is also when the retrace
+    # ceases to exist.
+    if at_extreme or reset:
+        v_ext = vol
+    else:
+        v_ext = min(vol, float(prev.get("v_ext") or 0.0))
+    impulse_v = v_ext
+    retrace_v = max(0.0, vol - v_ext)
+
+    ratio = effort_ratio(bar_dir, open_px, high, low, close,
+                         impulse_v, retrace_v)
+    # HYSTERESIS, not a second threshold. `prev` already carries
+    # the state, so entering and leaving simply use the two edges
+    # of the band.
+    was = bool(prev.get("heavy"))
+    if ratio <= 0 or d < MIN_PULLBACK:
+        heavy = False
+    elif was:
+        heavy = ratio > HEAVY_RATIO - HEAVY_BAND
+    else:
+        heavy = ratio >= HEAVY_RATIO + HEAVY_BAND
 
     state = "continuation" if at_extreme else "pullback"
     if bar_dir not in SIDES:
@@ -155,17 +271,27 @@ def read(bar_dir: str, open_px: float, high: float, low: float,
         "recovering": recovering,
         "at_extreme": bool(at_extreme),
         "bar_dir": bar_dir,
+        # THE VOLUME BEHIND EACH LEG, and the ratio between them.
+        # Shown as well as used, because a rule that turns a trade
+        # round on a number nobody can see is a rule nobody can
+        # argue with.
+        "impulse_v": round(impulse_v, 2),
+        "retrace_v": round(retrace_v, 2),
+        "ratio": round(ratio, 3),
+        "heavy": heavy,
+        # The memory the caller stores and hands back.
+        "v_ext": round(v_ext, 2),
+        "bar_ts": float(bar_ts or 0.0),
         # Said here so the panel does not decide what the numbers
         # mean, and so the wording lives in one place.
-        "say": _words(state, d, worst, recovering, at_extreme, bar_dir),
-        # NEVER AN INPUT TO A TRADE. Carried on the reading itself
-        # so it travels with it into any payload that reshapes.
-        "decides": False,
+        "say": _words(state, d, worst, recovering, at_extreme, bar_dir,
+                      ratio, heavy),
     }
 
 
 def _words(state: str, d: float, worst: float, recovering: bool,
-           at_extreme: bool, bar_dir: str) -> str:
+           at_extreme: bool, bar_dir: str, ratio: float = 0.0,
+           heavy: bool = False) -> str:
     """Plain English, or an honest refusal."""
     if not state or bar_dir not in SIDES:
         return "no direction in the bar yet"
@@ -173,7 +299,14 @@ def _words(state: str, d: float, worst: float, recovering: bool,
     if state == "continuation" or at_extreme:
         return f"extending the {way} move, at its best price"
     pct = int(round(d * 100))
+    if ratio <= 0:
+        vol = "no volume read on the pullback yet"
+    elif heavy:
+        vol = (f"HEAVY -- {ratio:.2f}x the effort of the push, it is "
+               "being fought")
+    else:
+        vol = f"light -- {ratio:.2f}x the push, nobody is paying for it"
+    base = f"pulling back on the {way} move -- {pct}% given back, {vol}"
     if recovering:
-        return (f"pulling back on the {way} move -- {pct}% given back, "
-                f"recovering from {int(round(worst * 100))}%")
-    return f"pulling back on the {way} move -- {pct}% given back"
+        return base + f" (recovering from {int(round(worst * 100))}%)"
+    return base

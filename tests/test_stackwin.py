@@ -1,24 +1,43 @@
-"""The footprint gates, then the stack confirms. In that order.
+"""The tick bar alone, and what its own volume says about it.
 
-Chris:
+Chris: "we are going to remove the 10 second hold completely its not
+a factor in the opening anymore we are going to use volume to confirm
+tick bars continuation or pull back we will no longer use time as a
+entry point or exit at all just what the tick bar is doing alone" --
+and, on what a volume-backed pullback means, "if volume agrees with
+tick charts direction for a pull back a trade should be taken in that
+pullback direction as well".
 
-    "we are just going to use the stack and the footprint thats all
-    the make entry and exits you are going to auto close trades the
-    minute they disagree because right now its holding the trades
-    for no reason"
+THE RULE, WHOLE:
 
-    "on a 5 minute the 5 min and 1 minute must agree ... and on the
-    15 min the 15 and 5 must agree"
+    The 5,000-tick candle's direction is close against open, held
+    through the instant close sits on its open so it never blanks.
 
-He first watched all four of candle/OFI/CVD/footprint read DOWN and
-no trade follow. Nothing was broken: NO STRATEGY ASKED FOR ALL
-FOUR. `ofi` wants three, `footprint` wants two, and the two
-intrabar rules return before the window is read. That became this
-strategy -- and then the four legs became two, because two readings
-he trusts beat four he has to reconcile.
+    AT ITS EXTREME, the bar is extending: trade its direction.
 
-The candle, OFI and CVD are still read and still shown. They decide
-nothing, and a test below holds them to that.
+    PULLING BACK ON LIGHT VOLUME, the retrace is drift and the push
+    still stands: trade its direction.
+
+    PULLING BACK ON HEAVY VOLUME -- more size per tick to push it
+    back than it took to make the move -- the move is being fought:
+    trade the RETRACE'S direction.
+
+    There is always a side while the bar has a direction, which is
+    what he has now asked for three times in three places.
+
+WHAT CAME OUT, AND EACH OF THEM IS TESTED IN THE NEGATIVE BELOW
+because every one of these has been silently re-wired in this file
+before:
+
+    THE TEN-SECOND HOLD, with its tracker and its constant.
+    THE TIMEFRAME CANDLE GATE -- still read, still drawn, silent.
+    THE FIVE-MINUTE TIME STOP.
+    THE PER-BAR CAP, which was never meant to be there at all.
+
+THE ONLY SIGNAL EXIT IS THE RULE'S OWN SIDE TURNING OVER. One number
+opens a trade and the same number ends it, which is what stops the
+engine opening a long on one reading and closing it on another --
+it did exactly that until this revision.
 """
 
 from __future__ import annotations
@@ -46,6 +65,16 @@ def rungs(**kw) -> dict:
                        "conflicted": False, "bps": -1.3}
     return out
 
+
+def pull(heavy: bool) -> dict:
+    """An intent reading that is pulling back, paid for or not."""
+    return {"state": "pullback", "heavy": heavy, "depth": 0.3,
+            "ratio": 1.8 if heavy else 0.3}
+
+
+def push() -> dict:
+    return {"state": "continuation", "heavy": False, "depth": 0.0,
+            "ratio": 0.0}
 
 class TestTheStackIsTheTradedRowAlone:
     def test_five_minutes_reads_the_5m(self):
@@ -93,217 +122,146 @@ class TestTheStackIsTheTradedRowAlone:
         assert side == "" and "open was never seen" in why
 
 
-class TestBothMustAgreeToOpen:
-    """Chris: "the tick bar should be a continuous direction tracking
-    with the timeframe candle tracing at the same time thats how im
-    going to be making trades".
-
-    THE CANDLE IS A GATE AGAIN. It was one, he removed it, and he
-    has now put it back -- so these tests are the previous rule's
-    tests rewritten rather than deleted, and the pair below pins the
-    reversal itself so nobody re-derives the old behaviour from the
-    old docstrings.
-
-    EXIT IS UNCHANGED. The tick bar flipping, or the time stop. The
-    candle has no say in closing, which is tested in its own class.
-    """
+class TestTheTickBarIsTheWholeRuleAgain:
+    @pytest.mark.parametrize("d", [U, D])
+    def test_extending_trades_the_bars_direction(self, d):
+        assert sw.entry_side(d, push()) == (d, "")
 
     @pytest.mark.parametrize("d", [U, D])
-    def test_agreement_is_an_entry(self, d):
-        assert sw.entry_side(d, d) == (d, "")
+    def test_a_light_pullback_trades_it_too(self, d):
+        """Nobody is paying for the retrace, so the push stands."""
+        assert sw.entry_side(d, pull(heavy=False)) == (d, "")
 
-    def test_no_direction_is_no_entry(self):
-        side, why = sw.entry_side("", U)
+    @pytest.mark.parametrize("d,other", [(U, D), (D, U)])
+    def test_a_heavy_pullback_trades_the_other_way(self, d, other):
+        """Chris: "if volume agrees with tick charts direction for a
+        pull back a trade should be taken in that pullback direction
+        as well". It is not a block, it is the trade."""
+        assert sw.entry_side(d, pull(heavy=True)) == (other, "")
+
+    def test_no_tick_direction_is_the_only_no_trade(self):
+        side, why = sw.entry_side("", push())
         assert side == "" and "tick candle has no direction" in why
 
     @pytest.mark.parametrize("junk", [None, "flat", "UP", 7])
     def test_junk_is_never_a_side(self, junk):
-        assert sw.entry_side(junk, U)[0] == ""
+        assert sw.entry_side(junk, push())[0] == ""
 
-    @pytest.mark.parametrize("tick,candle", [(U, D), (D, U)])
-    def test_a_disagreeing_candle_blocks_it(self, tick, candle):
-        side, why = sw.entry_side(tick, candle)
-        assert side == ""
-        assert f"the tick candle is {tick}" in why
-        assert f"the timeframe candle is {candle}" in why
+    def test_there_is_no_dead_zone(self):
+        """Every reachable combination returns a side. A state that
+        returns nothing is the blank he has rejected three times."""
+        for d in (U, D):
+            for intent in (push(), pull(True), pull(False), {},
+                           {"state": "pullback"}, {"heavy": True}):
+                assert sw.entry_side(d, intent)[0] in (U, D), intent
 
-    @pytest.mark.parametrize("junk", ["", "flat", None, "UP", 7])
-    def test_no_candle_direction_blocks_it(self, junk):
-        """A caller that cannot supply the candle must not trade on
-        the tick candle alone. It used to, because the argument was
-        accepted and ignored."""
-        side, why = sw.entry_side(U, junk)
-        assert side == ""
-        assert "timeframe candle has no direction" in why
+    def test_heavy_without_a_pullback_changes_nothing(self):
+        """Volume only turns the trade round while price is OFF the
+        extreme. At the extreme there is no retrace to be paying
+        for, and a stray flag must not invert an extending bar."""
+        assert sw.entry_side(U, {"state": "continuation",
+                                 "heavy": True}) == (U, "")
 
-    def test_it_takes_two_directions_not_a_stack(self):
-        """BOTH ARE RESOLVED BY THE CALLER. While this function dug
-        the candle out of `rungs` itself, the panel did its own
-        extraction and the two could differ about what the same row
-        said. One extraction, in `state`, feeding both."""
+    def test_it_takes_the_tick_bar_and_the_tape_and_nothing_else(self):
         import inspect
         names = list(inspect.signature(sw.entry_side).parameters)
-        assert names[:2] == ["tick", "candle"]
-        assert "rungs" not in names and "period_s" not in names
+        assert names == ["tick", "intent"]
 
 
-class TestTheStateResolvesTheCandle:
-    """`state` is where a stack row becomes a direction, so that the
-    screen and the rule cannot extract it differently."""
+class TestWhatCameOut:
+    """Each in the negative. Every one of these has been removed and
+    quietly re-wired in this file before."""
 
-    def test_it_reads_the_traded_row(self):
-        st = sw.state({}, D, rungs(**{"5m": D, "1m": U}), 300.0)
-        assert st["side"] == "down"
-
-    def test_the_row_below_still_gates_nothing(self):
-        """Chris: "paying no attention to the 1 minute at all"."""
-        for below in (U, D, None, "conflict"):
-            r = rungs(**{"5m": D, "1m": below})
-            assert sw.state({}, D, r, 300.0)["side"] == "down", below
-
-    def test_fifteen_minutes_gates_on_the_15m(self):
-        assert sw.state({}, D, rungs(**{"15m": D, "5m": U}),
-                        900.0)["side"] == "down"
-        assert sw.state({}, D, rungs(**{"15m": U, "5m": D}),
-                        900.0)["side"] == ""
-
-    def test_an_unread_candle_blocks_it(self):
-        st = sw.state({}, U, rungs(**{"5m": None}), 300.0)
-        assert st["side"] == ""
-        assert "has not been read" in st["stack"]["why"]
-
-    def test_the_state_marks_the_stack_as_deciding(self):
-        """THE SCREEN HAS TO SAY WHICH THINGS DECIDE. The panel
-        reads these flags to choose whether to draw the row as a
-        gate or under "shown only", and a live gate drawn as
-        scenery is the exact fault this panel was rebuilt after."""
-        r = rungs(**{"5m": U, "1m": U})
-        st = sw.state({"mid_dir": U, "ofi_dir": U, "cvd_dir": U}, U,
-                      r, 300.0, fp=U)
-        assert st["side"] == "up"
-        assert st["stack"]["decides"] is True
-        assert st["stack"]["asked"] is True
-        assert st["stack"]["agrees"] is True
-        # The four window legs did NOT come back with it.
-        assert st["context"]["decides"] is False
-
-    def test_the_state_blocks_when_they_disagree(self):
-        r = rungs(**{"5m": U, "1m": U})
-        st = sw.state({}, D, r, 300.0)
-        assert st["side"] == ""
-        assert st["stack"]["agrees"] is False
-        assert "the timeframe candle is up" in st["why"]
-
-    def test_the_stack_is_still_reported(self):
-        r = rungs(**{"5m": U, "1m": D})
-        st = sw.state({}, D, r, 300.0)
-        assert st["stack"]["rows"]["5m"]["dir"] == "up"
-        assert st["stack"]["side"] == "up"
-
-    def test_the_verdict_names_both(self):
-        st = sw.state({}, U, rungs(**{"5m": U}), 300.0)
-        assert "tick candle" in st["say"] and "5m candle" in st["say"]
-
-    def test_the_footprint_reads_exactly_as_it_did(self):
-        """Chris: "we will not change the way the footprint reads on
-        this strategy"."""
-        st = sw.state({}, D, {}, 300.0, fp=U)
-        assert st["context"]["footprint"] == "up"
-
-
-class TestOnlyTheTickBarFlippingEndsIt:
-    def test_it_holds_while_the_tick_bar_agrees(self):
-        assert sw.holds(D, D) == (True, "")
-
-    def test_the_opposite_direction_ends_it(self):
-        ok, why = sw.holds(D, U)
-        assert ok is False
-        assert "the tick bar flipped up against your down trade" in why
-
-    def test_FLAT_IS_NOT_A_FLIP(self):
-        """It matters more here than anywhere else it has come up.
-        The tick bar is cut at every true 5-minute mark, so it has
-        no direction for the first prints of every bar. An exit on
-        flat would fire twelve times an hour on the clock."""
-        assert sw.holds(D, "") == (True, "")
-        assert sw.holds(U, "") == (True, "")
-
-    def test_it_is_symmetric(self):
-        assert sw.holds(U, U)[0] is True
-        assert sw.holds(U, D)[0] is False
-
-    def test_no_open_side_is_never_an_exit(self):
-        assert sw.holds("", U)[0] is True
-
-    def test_the_stack_is_not_an_argument_any_more(self):
-        """Pinned by signature so it cannot quietly come back."""
+    def test_the_dwell_is_gone_entirely(self):
+        assert not hasattr(sw, "Dwell"), "the tracker is still here"
+        assert not hasattr(sw, "DWELL_S")
         import inspect
-        assert list(inspect.signature(sw.holds).parameters) == \
-            ["side", "tick"]
+        src = inspect.getsource(sw)
+        for gone in ("held_s", "min_hold_s", "has to hold"):
+            assert gone not in src, f"{gone} survived"
 
+    def test_the_time_stop_is_gone(self):
+        for gone in ("exit_reason", "expired", "bar_of", "holds"):
+            assert not hasattr(sw, gone), f"{gone} is still here"
 
-class TestNoTradeOutlivesItsFiveMinuteBar:
-    """Chris: "no trade will ever last past a 5 minute timeframe"."""
-
-    @staticmethod
-    def at(h, m, s=0):
-        import datetime as dt
-        tz = dt.timezone(dt.timedelta(hours=-5))
-        return dt.datetime(2026, 11, 17, h, m, s, tzinfo=tz).timestamp()
-
-    def test_it_survives_inside_its_own_bar(self):
-        assert sw.expired(self.at(7, 1), self.at(7, 4, 59))[0] is False
-
-    def test_the_boundary_ends_it(self):
-        gone, why = sw.expired(self.at(7, 1), self.at(7, 5))
-        assert gone is True and "bar it was opened in has ended" in why
-
-    def test_a_trade_opened_a_second_before_the_boundary_still_ends(self):
-        assert sw.expired(self.at(7, 4, 59), self.at(7, 5))[0] is True
-
-    def test_the_buckets_are_true_wall_clock_marks(self):
-        import datetime as dt
-        tz = dt.timezone(dt.timedelta(hours=-5))
-        for h, m in ((7, 0), (7, 5), (7, 10), (13, 35)):
-            b = sw.bar_of(self.at(h, m, 30))
-            opened = dt.datetime.fromtimestamp(b, tz)
-            assert (opened.minute % 5, opened.second) == (0, 0)
-
-    def test_a_trade_with_no_recorded_bar_is_not_expired(self):
-        """Zero is "we do not know". Closing every such position at
-        the first boundary would be acting on missing data."""
-        assert sw.expired(0.0, self.at(7, 5))[0] is False
-        assert sw.expired(self.at(7, 1), 0.0)[0] is False
-
-    def test_fifteen_minutes_works_too(self):
-        assert sw.expired(self.at(7, 1), self.at(7, 5), 900.0)[0] is False
-        assert sw.expired(self.at(7, 1), self.at(7, 15), 900.0)[0] is True
-
-    def test_the_clock_is_checked_before_the_direction(self):
-        """So the log says the bar ended rather than blaming a tick
-        bar that is merely between bars at that same instant. Held
-        by behaviour now rather than by the order of two lines in a
-        route -- see TestTheExitPolicyIsOneFunction."""
-        import datetime as dt
-        tz = dt.timezone(dt.timedelta(hours=-5))
-        at = lambda h, m: dt.datetime(2026, 11, 17, h, m,
-                                      tzinfo=tz).timestamp()
-        why = sw.exit_reason(D, U, at(7, 1), at(7, 5))
-        assert "bar it was opened in has ended" in why
-        assert "flipped" not in why
-
-    def test_the_route_stamps_the_bar_a_trade_opened_in(self):
+    def test_the_trade_is_not_stamped_with_a_bar(self):
+        """THE CAP THAT WAS NEVER MEANT TO BE THERE. The stamp fed
+        `sides_in_bar`, and `decide` turns a 0 cap into
+        MAX_PER_BAR -- so `agree in taken` blocked a second trade
+        the same way inside one 5-minute bar while the comment
+        above it read NO CAP. A zero bar id is what no cap actually
+        looks like."""
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
-        # TRADE_BAR_S, not FUSION_RESET_S. The two were one
-        # constant doing two jobs -- the tick series' reset and the
-        # trade time stop -- and making the series continuous would
-        # have silently switched the time stop off with it.
-        assert "_swb.bar_of(time.time(), TRADE_BAR_S)" in blk
-        assert "bar_ts=bar_ts" in blk
+        i = src.index('if strat == "stack":', src.index("cap = 0"))
+        blk = src[i:i + 1400]
+        assert "bar_ts = 0.0" in blk, "the trade is stamped again"
+        assert "bar_of(" not in blk, "a clock bar is back in the stamp"
+
+    def test_nothing_but_the_side_turning_ends_a_stack_trade(self):
+        """The only signal exit is the rule's own side flipping,
+        which `should_close` handles as `flip`. A reason string
+        invented here would be a second way out that the entry
+        knows nothing about -- which is how the engine came to open
+        a long on one reading and close it on another."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index('elif strat == "stack" and t is not None and t.open:')
+        blk = src[i:i + 1600]
+        assert 'disagreed = ""' in blk, "a disagreement is set again"
+        assert "exit_reason" not in blk.split("disagreed =")[1][:200]
+
+    def test_the_route_has_no_time_stop_left(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        assert "TRADE_BAR_S = " not in src, \
+            "the five-minute constant is still defined"
+        assert "_sw.exit_reason(" not in src
+        assert "_sw.Dwell()" not in src
+
+    def test_the_timeframe_candle_no_longer_gates(self):
+        """It is read and drawn and silent. A heavy-handed way to
+        say it: the stack row can point the other way and the trade
+        still opens."""
+        st = sw.state({}, U, rungs(**{"5m": D}), 300.0, intent=push())
+        assert st["side"] == U, "the timeframe candle still gated it"
+        assert st["stack"]["side"] == D, "and it is still being read"
+        assert st["stack"]["decides"] is False
+        assert st["stack"]["asked"] is False
+
+    def test_an_empty_stack_cannot_block_anything_now(self):
+        """The server-side stepper saw {} with no browser open. That
+        could not open a trade while the candle gated; it must never
+        be able to stop one again."""
+        assert sw.state({}, U, {}, 300.0, intent=push())["side"] == U
+
+
+class TestTheStateCarriesTheRule:
+    def test_the_side_comes_from_the_tick_and_the_tape(self):
+        assert sw.state({}, U, {}, 300.0,
+                        intent=pull(True))["side"] == D
+        assert sw.state({}, U, {}, 300.0,
+                        intent=pull(False))["side"] == U
+
+    def test_the_verdict_says_why_it_turned_round(self):
+        st = sw.state({}, U, {}, 300.0, intent=pull(True))
+        assert "being fought" in st["say"]
+        assert "down pullback" in st["say"]
+
+    def test_the_verdict_says_why_it_did_not(self):
+        st = sw.state({}, U, {}, 300.0, intent=pull(False))
+        assert "light" in st["say"]
+        st2 = sw.state({}, U, {}, 300.0, intent=push())
+        assert "extending" in st2["say"]
+
+    def test_the_tick_direction_still_holds_through_a_tie(self):
+        st = sw.state({}, "", {}, 300.0, intent=push(),
+                      prev={"tick": D})
+        assert st["tick"]["side"] == D
+        assert st["side"] == D
 
 
 class TestItStillTakesAsManyTradesAsTheTapeGives:
@@ -333,7 +291,7 @@ class TestTheEdges:
     @pytest.mark.parametrize("bad", [None, 0, "", "x"])
     def test_junk_never_produces_a_side(self, bad):
         assert sw.traded_tf(bad) in ("", "5m", "15m")
-        assert sw.entry_side(bad, U)[0] == ""
+        assert sw.entry_side(bad, push())[0] == ""
 
     def test_no_rungs_at_all_is_a_reason_not_a_crash(self):
         side, why = sw.stack_side({}, 300.0)
@@ -345,7 +303,8 @@ class TestTheEdges:
         assert st["tick"]["true"] is False
         # The gate is always consulted now, so `asked` is always
         # true. What an empty stack must still do is BLOCK.
-        assert st["stack"]["asked"] is True
+        # The timeframe candle is neither asked nor deciding now.
+        assert st["stack"]["asked"] is False
         assert st["stack"]["agrees"] is False
 
 
@@ -391,7 +350,10 @@ class TestTheWiring:
         assert 'strat == "stack"' in blk, "the route never builds it"
         assert "_sw.state(" in blk
         assert '"stackwin"' in blk, "it never reaches the payload"
-        assert "_sw.exit_reason(" in blk, "the exit is not wired"
+        assert "_sw.exit_reason(" not in blk, \
+            "the time stop is wired back in"
+        assert "intent=_tape_intent(" in blk, \
+            "the volume reading never reaches the rule"
         assert "_tick_now(rt_, 0, \"raw\", 0.0, 0, FUSION_RESET_S)" in blk, \
             "gate 1 is not reading the Fusion panel's tick series"
 
@@ -408,13 +370,12 @@ class TestTheWiring:
         assert "style.display = 'none'" in blk
         assert "none of this decides" in blk, \
             "the shown-only block is unlabelled"
-        assert "GATE 1" in blk and "GATE 2" in blk, \
-            "the two gates are not marked as gates"
-        # The row that gates is OUT of the shown-only block.
-        tail = blk[blk.index("none of this decides"):]
-        assert "row(st.trading)" not in tail, \
-            "the deciding row is drawn under SHOWN ONLY"
-        assert "row(st.below)" in tail
+        assert "this is the whole rule" in blk, \
+            "the tick bar is not marked as the rule"
+        assert "shown only, it does not gate anything" in blk, \
+            "the timeframe candle is not marked as deciding nothing"
+        assert "GATE 1" not in blk and "GATE 2" not in blk, \
+            "there is only one reading that gates now"
 
     def test_the_dropdown_offers_it(self):
         import pathlib
@@ -524,23 +485,22 @@ class TestTheRuleDoesNotWaitForTheSlowRoute:
     never pass, and this strategy could not open a trade at all.
     """
 
-    def test_an_empty_stack_blocks_again_and_that_is_the_danger(self):
-        """THE ORIGINAL BUG IS LIVE AGAIN BY DESIGN, so the test
-        that found it has to stay pointed at it.
+    def test_an_empty_stack_costs_nothing_again(self):
+        """THE ORIGINAL BUG, KEPT IN VIEW. The server-side stepper
+        calls the journal step with an EMPTY dict, so with no
+        browser open the rungs were {} -- and while the timeframe
+        candle gated entries, that meant this strategy could not
+        open a trade at all.
 
-        While the tick bar was the whole rule an empty stack cost
-        nothing. The candle is a gate again, so {} means no trade --
-        exactly the state the server-side stepper was in when it
-        could not open a trade at all with the browser closed.
-
-        What stops it this time is the NEXT test: the step builds
-        its own rows from candles instead of waiting for the route
-        to hand them over. These two belong together and neither is
-        sufficient alone.
+        The candle no longer gates, so {} cannot stop anything. The
+        row is still reported honestly as unread, and the NEXT test
+        keeps the step building its own rows, because the panel
+        still has to show them and a blank row reads as a dead
+        market.
         """
         assert sw.stack_side({}, 300.0)[0] == ""
-        st = sw.state({}, D, {}, 300.0)
-        assert st["side"] == "", "an empty stack opened a trade"
+        st = sw.state({}, D, {}, 300.0, intent=push())
+        assert st["side"] == D, "an empty stack stopped a trade"
         assert "has not been read" in st["stack"]["why"]
 
     def test_the_step_builds_its_own_rows_from_candles(self):
@@ -614,232 +574,3 @@ class TestTheRowsShowRealPrices:
         assert st["stack"]["rows"]["5m"]["ticks"] == -21.0
 
 
-class TestTheExitPolicyIsOneFunction:
-    """A mutation deleting the time stop's effect in the route broke
-    no test, because the checks lived in a closure reachable only
-    through an HTTP request -- the same shape that let the auto gate
-    and the one-per-candle cap each be removed unnoticed."""
-
-    @staticmethod
-    def at(h, m, s=0):
-        import datetime as dt
-        tz = dt.timezone(dt.timedelta(hours=-5))
-        return dt.datetime(2026, 11, 17, h, m, s, tzinfo=tz).timestamp()
-
-    def test_a_healthy_trade_holds(self):
-        assert sw.exit_reason(D, D, self.at(7, 1), self.at(7, 3)) == ""
-
-    def test_a_flipped_tick_bar_ends_it(self):
-        why = sw.exit_reason(D, U, self.at(7, 1), self.at(7, 3))
-        assert "flipped up" in why
-
-    def test_the_bar_ending_ends_it(self):
-        why = sw.exit_reason(D, D, self.at(7, 1), self.at(7, 5))
-        assert "bar it was opened in has ended" in why
-
-    def test_the_clock_wins_when_both_are_true(self):
-        """At the boundary the tick series is cut too, so it has no
-        direction and could also look like a reason. The log must
-        say the bar ended."""
-        why = sw.exit_reason(D, U, self.at(7, 1), self.at(7, 5))
-        assert "bar it was opened in has ended" in why
-        assert "flipped" not in why
-
-    def test_a_flat_tick_bar_inside_the_bar_holds(self):
-        assert sw.exit_reason(D, "", self.at(7, 1), self.at(7, 3)) == ""
-
-    def test_no_open_side_never_exits(self):
-        assert sw.exit_reason("", U, self.at(7, 1), self.at(7, 9)) == ""
-
-    def test_the_route_delegates_to_it(self):
-        import pathlib
-        src = (pathlib.Path(__file__).resolve().parents[1]
-               / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
-        assert "_sw.exit_reason(" in blk, "the policy is inline again"
-
-
-class TestAFlipHasToHoldBeforeItTrades:
-    """Chris: "a flip has to hold for 10 seconds before a trade is
-    taken that keeps us from taking wrong direction trades and flips
-    that lead to nothing"."""
-
-    def test_the_default_is_ten_seconds(self):
-        assert sw.DWELL_S == 10.0
-
-    @pytest.mark.parametrize("held,opens", [
-        (0.0, False), (4.0, False), (9.9, False),
-        (10.0, True), (37.0, True),
-    ])
-    def test_it_waits_for_the_full_dwell(self, held, opens):
-        side, why = sw.entry_side(D, D, held_s=held)
-        assert bool(side) is opens
-        if not opens:
-            assert "has to hold 10s" in why
-
-    def test_the_reason_says_how_long_it_has_held(self):
-        assert "turned down 4s ago" in sw.entry_side(
-            D, D, held_s=4.0)[1]
-
-    def test_no_tracking_means_no_check(self):
-        """A caller that cannot measure the dwell must not be
-        silently blocked from ever trading."""
-        assert sw.entry_side(D, D, held_s=None) == ("down", "")
-
-    def test_a_zero_minimum_disables_it(self):
-        assert sw.entry_side(D, D, held_s=0.0,
-                             min_hold_s=0.0) == ("down", "")
-
-    def test_the_exit_is_NOT_delayed(self):
-        """The asymmetry is the point: a flip gets you OUT at once
-        and only lets you back IN once it has proved it meant
-        something. Making the exit wait would hold a losing position
-        for ten seconds to protect against a flip that was right."""
-        import inspect
-        assert "held" not in str(inspect.signature(sw.holds))
-        assert sw.holds(D, U)[0] is False
-
-
-class TestTheDwellTracker:
-    def test_it_times_from_the_turn(self):
-        d = sw.Dwell()
-        d.on_tick("down", 1000.0)
-        assert d.direction == "down"
-        assert d.held_s(1004.0) == 4.0
-
-    def test_the_opposite_direction_restarts_it(self):
-        d = sw.Dwell()
-        d.on_tick("down", 1000.0)
-        d.on_tick("up", 1020.0)
-        assert d.direction == "up"
-        assert d.held_s(1021.0) == 1.0
-        assert d.flips == 1
-
-    def test_FLAT_DOES_NOT_RESET_IT(self):
-        """The tick series is cut at every true 5-minute mark, so it
-        has no direction for the first prints of every bar. Counting
-        that as a turn would restart the clock twelve times an hour
-        and cost ten seconds of every bar for nothing. A gap is not
-        a turn."""
-        d = sw.Dwell()
-        d.on_tick("down", 1000.0)
-        d.on_tick("", 1005.0)
-        d.on_tick("down", 1006.0)
-        assert d.held_s(1010.0) == 10.0, "the gap restarted the clock"
-        assert d.flips == 0
-
-    def test_the_same_direction_repeated_does_not_restart_it(self):
-        d = sw.Dwell()
-        for t in range(1000, 1010):
-            d.on_tick("up", float(t))
-        assert d.held_s(1010.0) == 10.0
-
-    def test_nothing_held_reads_zero(self):
-        d = sw.Dwell()
-        assert d.direction == "" and d.held_s(1000.0) == 0.0
-        d.on_tick("", 1000.0)
-        assert d.held_s(1001.0) == 0.0
-
-    def test_a_clock_going_backwards_is_zero_not_negative(self):
-        d = sw.Dwell()
-        d.on_tick("up", 1000.0)
-        assert d.held_s(990.0) == 0.0
-
-    @pytest.mark.parametrize("junk", [None, "flat", "UP", 7, ""])
-    def test_junk_is_not_a_direction(self, junk):
-        d = sw.Dwell()
-        d.on_tick(junk, 1000.0)
-        assert d.direction == ""
-
-    def test_a_junk_clock_does_not_corrupt_it(self):
-        d = sw.Dwell()
-        d.on_tick("up", 1000.0)
-        d.on_tick("up", None)
-        d.on_tick("up", "x")
-        assert d.held_s(1005.0) == 5.0
-
-
-class TestTheDwellReachesTheRuleAndThePanel:
-    def test_the_state_reports_it(self):
-        st = sw.state({}, D, {}, 300.0, held_s=4.0, flips=3)
-        assert st["side"] == "", "it traded before the dwell was met"
-        assert st["tick"]["held_s"] == 4.0
-        assert st["tick"]["ready"] is False
-        assert st["tick"]["min_hold_s"] == 10.0
-        assert st["tick"]["flips"] == 3
-
-    def test_a_held_direction_reads_ready(self):
-        st = sw.state({}, D, rungs(**{"5m": D}), 300.0, held_s=30.0)
-        assert st["side"] == "down"
-        assert st["tick"]["ready"] is True
-
-    def test_an_untracked_dwell_is_ready(self):
-        st = sw.state({}, D, rungs(**{"5m": D}), 300.0)
-        assert st["tick"]["ready"] is True
-        assert st["side"] == "down"
-
-    def test_the_route_keeps_ONE_tracker_on_the_runtime(self):
-        """A second instance would let the screen show a dwell the
-        rule never saw -- the fault the 5-minute cell and the OFI
-        bar both had."""
-        import pathlib
-        src = (pathlib.Path(__file__).resolve().parents[1]
-               / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
-        assert 'getattr(rt_, "_tick_dwell", None)' in blk
-        assert "_dw.on_tick(" in blk
-        assert "held_s=_dw.held_s(" in blk
-        assert blk.count("_sw.Dwell()") == 1, "more than one tracker"
-
-    def test_the_panel_shows_waiting_rather_than_nothing(self):
-        import pathlib
-        src = (pathlib.Path(__file__).resolve().parents[1]
-               / "liqmap" / "web.py").read_text()
-        i = src.index("function paintStackWin(")
-        blk = src[i:i + 6000]
-        assert "HOLDING " in blk, "a waiting entry looks like no signal"
-        assert "f.ready === false" in blk
-
-
-class TestTheTwoFiveMinutesAreSeparate:
-    """`FUSION_RESET_S` cut the tick series AND set the period of
-    the trade time stop. Making the series continuous would have
-    silently switched off "no trade will ever last past a 5 minute
-    timeframe" -- a safety rule disappearing as a side effect of a
-    display change."""
-
-    def test_the_tick_series_is_continuous(self):
-        import liqmap.web as web
-        assert web.FUSION_RESET_S == 0.0
-
-    def test_the_time_stop_is_still_five_minutes(self):
-        import liqmap.web as web
-        assert web.TRADE_BAR_S == 300.0
-
-    def test_they_are_different_constants(self):
-        import liqmap.web as web
-        assert web.FUSION_RESET_S != web.TRADE_BAR_S
-
-    def test_the_time_stop_still_fires(self):
-        """The behaviour, not the constant. A trade opened in one
-        5-minute bar must not survive into the next."""
-        import datetime as dt
-        tz = dt.timezone(dt.timedelta(hours=-5))
-        at = lambda h, m: dt.datetime(2026, 11, 17, h, m,
-                                      tzinfo=tz).timestamp()
-        import liqmap.web as web
-        assert sw.expired(at(7, 1), at(7, 5), web.TRADE_BAR_S)[0] is True
-        assert sw.expired(at(7, 1), at(7, 4), web.TRADE_BAR_S)[0] is False
-
-    def test_gate_one_reads_the_continuous_bar(self):
-        """The same series the 5000t chart draws, so what he watches
-        and what trades are one bar."""
-        import pathlib
-        src = (pathlib.Path(__file__).resolve().parents[1]
-               / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
-        assert '_tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)' in blk
-        assert "FUSION_RESET_S = 0.0" in src

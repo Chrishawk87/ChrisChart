@@ -3293,9 +3293,11 @@ def _flow_snapshot(tape, interval: str) -> dict:
 # continuous bar that happens once, at startup.
 FUSION_RESET_S = 0.0
 
-# NO TRADE OUTLIVES THIS, whatever the bar is doing. Separate from
-# the series above on purpose -- see the note.
-TRADE_BAR_S = 300.0
+# THE FIVE-MINUTE TIME STOP IS GONE. Chris: "we will no longer use
+# time as a entry point or exit at all just what the tick bar is
+# doing alone". The constant is removed rather than set to zero, so
+# nothing can read it back by accident -- a dead dial left on the
+# board gets turned.
 # Defined at MODULE level, not inside create_app. A default
 # argument is evaluated when the `def` runs, so a constant set
 # further down the same scope is unbound at that moment -- the
@@ -7185,6 +7187,12 @@ def create_app() -> FastAPI:
                 # happens -- the high is a fact about this bar, not
                 # a point a fixed distance back in the tape.
                 "high": cur.high, "low": cur.low,
+                # VOLUME AND THE BAR'S IDENTITY. The first is what
+                # says whether a pullback is being paid for; the
+                # second is how the reading knows a new bar has
+                # started and the old marks are about a move that
+                # is no longer on the screen.
+                "volume": cur.volume, "start_ts": cur.start_ts,
                 "prints": cur.trades, "open": cur.open,
                 "close": cur.close, "seconds": round(cur.seconds, 1),
                 "ticks": round((cur.close - cur.open) / 0.25, 1)
@@ -7216,6 +7224,8 @@ def create_app() -> FastAPI:
             float((tk_ or {}).get("high") or 0.0),
             float((tk_ or {}).get("low") or 0.0),
             float((tk_ or {}).get("close") or 0.0),
+            volume=float((tk_ or {}).get("volume") or 0.0),
+            bar_ts=float((tk_ or {}).get("start_ts") or 0.0),
             prev=(prev_ or {}).get("intent") or {})
 
     def _m5_now(rt_) -> dict:
@@ -7675,54 +7685,25 @@ def create_app() -> FastAPI:
             # this takes the same rows rather than computing a
             # second opinion about the same timeframes.
             from . import stackwin as _sw
-            # GATE 1 IS THE TICK BAR. The same series the Fusion
-            # panel's tick column shows -- same size, same forced
-            # 5-minute reset -- so the column he reads and the gate
-            # that fires cannot be two different bars.
+            # THE TICK SERIES THE RULE READS. The same one the
+            # Fusion panel's tick column shows and the same one the
+            # chart draws at 5000t -- continuous, not clock-cut --
+            # so the column he reads and the rule that fires cannot
+            # be two different bars.
             _tk = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
-            # HOW LONG THE TICK BAR HAS POINTED THIS WAY. One
-            # tracker on the runtime, so the stepper and the panel
-            # read the same clock -- a second instance would let
-            # the screen show a dwell the rule never saw, which is
-            # the fault the 5-minute cell and the OFI bar both had.
-            _dw = getattr(rt_, "_tick_dwell", None)
-            if _dw is None:
-                _dw = _sw.Dwell()
-                try:
-                    rt_._tick_dwell = _dw
-                except Exception:                       # noqa: BLE001
-                    pass
+            # NO DWELL. Chris: "remove the 10 second hold
+            # completely its not a factor in the opening anymore".
+            # The tracker and its class are gone rather than left
+            # wired to nothing -- dead rule-code in this path has
+            # twice been silently brought back.
             _now_s = time.time()
-            # GATE 1 IS THE 5,000-TICK CANDLE'S OWN DIRECTION --
-            # close against open, exactly what the chart colours.
-            #
-            # Chris: "the gate 1 should never say flat at all as
-            # long as there is a 5000t candle it should show the
-            # trading direction of that candle".
-            #
-            # It read a VOTE before this: how many prints moved
-            # price up against how many moved it down, behind a
-            # margin band and a minimum count. Both of those produce
-            # FLAT, and flat is what he was watching the panel
-            # report while the chart in front of him showed a plain
-            # green candle. The vote is still computed and still
-            # shown; it is not the direction.
-            #
-            # `_sw.state` holds the last real direction through the
-            # instant a candle sits exactly on its open, so the gate
-            # never blanks while a candle exists. The memory lives
-            # on the runtime and is handed back in, because a module
-            # keeping it would serve the panel and the rule from one
-            # history and they would drift.
+            # THE 5,000-TICK CANDLE'S OWN DIRECTION, close against
+            # open, held through the instant close sits on open.
             _prev = getattr(rt_, "_gate_held", None) or {}
             _bd = _tk.get("body_dir") or ""
-            _dw.on_tick(_sw.hold_dir(_bd, str(_prev.get("tick") or "")),
-                        _now_s)
             fus = _sw.state(win, _bd, _rungs,
                             float(s.window_s or 900.0),
                             fp=fpi.get("side") or "",
-                            held_s=_dw.held_s(_now_s),
-                            flips=_dw.flips,
                             pace=_tk.get("pace") or {},
                             roll=_tk.get("roll") or {},
                             intent=_tape_intent(_tk, _prev),
@@ -7783,12 +7764,26 @@ def create_app() -> FastAPI:
         # impossible -- the ceiling is twelve an hour.
         cap = 0
         if strat == "stack":
-            # NO CAP, and the bar is stamped so the time stop below
-            # can tell when a trade has outlived it. Chris: "the
-            # auto trader can trade as many times as need as long as
-            # the directional signal confirms direction".
-            from . import stackwin as _swb
-            bar_ts = _swb.bar_of(time.time(), TRADE_BAR_S)
+            # NO CAP, AND NOW ACTUALLY NO CAP.
+            #
+            # This stamped the trade with its 5-minute bar so the
+            # time stop could tell when it had outlived one. Both
+            # are gone: "we will no longer use time as a entry
+            # point or exit at all just what the tick bar is doing
+            # alone".
+            #
+            # THE STAMP WAS ALSO A CAP NOBODY INTENDED. `decide`
+            # reads `cap = max(1, max_per_bar or MAX_PER_BAR)`, so
+            # the 0 passed below became 2 -- and `agree in taken`
+            # blocked a second trade the same way inside one bar.
+            # The comment above said NO CAP while the code allowed
+            # one trade per direction per five minutes, against
+            # "the auto trader can trade as many times as need as
+            # long as the directional signal confirms direction".
+            #
+            # A zero bar id makes `sides_in_bar` return nothing,
+            # which is what no cap actually looks like.
+            bar_ts = 0.0
         if strat in ("fused", "timed"):
             # ONE TRADE PER 5-MINUTE CANDLE, for both rules, counted
             # against that candle rather than the 15-minute window.
@@ -7833,40 +7828,23 @@ def create_app() -> FastAPI:
             if rev:
                 disagreed = why_rev
         elif strat == "stack" and t is not None and t.open:
-            # ALL FOUR THE OTHER WAY, not merely losing agreement.
-            # Chris picked this over the tighter exit, and he has
-            # paid for the difference twice: closing the moment
-            # agreement breaks took twelve trades in an afternoon at
-            # two to five ticks each, none of them a decision about
-            # the market. A reading gone quiet is not a reading gone
-            # against you.
-            # THE MINUTE THEY DISAGREE. Chris: "you are going to
-            # auto close trades the minute they disagree because
-            # right now its holding the trades for no reason".
+            # NOTHING EXTRA ENDS A STACK TRADE ANY MORE.
             #
-            # This is the tight exit and it has a history -- it
-            # closed twelve trades in an afternoon at two to five
-            # ticks each and was replaced twice. What is different
-            # is the entry: those came from a four-leg window where
-            # one leg going quiet broke agreement constantly. Two
-            # readings break less often than four. If it churns,
-            # this is where to look, and the reason string says so.
-            # ONLY A FLIP OF THE TRADED TIMEFRAME ENDS IT. The
-            # tick bar is not read here at all -- it gets you in,
-            # the traded timeframe keeps you in. Reading it would
-            # close trades at every 5-minute boundary, where a tick
-            # bar between bars has no direction.
-            from . import stackwin as _sw
-            # THE CLOCK FIRST. "no trade will ever last past a 5
-            # minute timeframe" -- and it is checked ahead of the
-            # direction so the log says the bar ended rather than
-            # blaming a tick bar that is merely between bars at
-            # that same instant. Two different events, two reasons.
-            _tk_x = _tick_now(rt_, 0, "raw", 0.0, 0, FUSION_RESET_S)
-            disagreed = _sw.exit_reason(
-                t.side, (_tk_x.get("dir") or ""),
-                float(getattr(t, "bar_ts", 0.0) or 0.0),
-                time.time(), TRADE_BAR_S) or disagreed
+            # It called `exit_reason`, which checked a 5-minute time
+            # stop and then a tick-bar flip -- and it read the flip
+            # off `dir`, the VOTE, while the entry had been moved to
+            # `body_dir`, the candle. The two can point opposite ways
+            # on the same bar, so the rule could open a long and
+            # close it on the same poll.
+            #
+            # Both problems go away by deleting this: the only
+            # signal exit is now the rule's OWN side turning over,
+            # which `should_close` already handles as `flip` --
+            # `agree` is this strategy's computed side, so one
+            # number opens the trade and the same number ends it.
+            # A stop or a target still fires; those are his
+            # settings, not a clock.
+            disagreed = ""
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -16430,42 +16408,30 @@ function paintClockWindows(d) {
    It renders only for this strategy and hides itself otherwise,
    because a box that shows stale readings from a rule you are not
    running is worse than no box. */
-/* THE TICK BAR GATES, THEN THE STACK. In that order.
+/* THE 5000T CANDLE, ALONE, AND WHAT ITS VOLUME SAYS.
 
-   The 5-minute came out of the hybrid Chris asked for because
-   GATE 2 ALREADY CHECKS IT -- on a 5m window the stack is 5m + 1m,
-   so a 5m here would have to agree with itself and the rule would
-   take exactly the same trades. Gate 1 contributes what nothing
-   else in this rule does: PRINTS RATHER THAN TIME.
+   Chris: "we will no longer use time as a entry point or exit at
+   all just what the tick bar is doing alone", and "if volume
+   agrees with tick charts direction for a pull back a trade should
+   be taken in that pullback direction as well".
 
-   The order is not presentation. When the tick bar has no
-   direction the stack is NOT consulted, and this box says so
-   rather than showing a stack verdict the rule never asked for.
+   ONE READING DECIDES. The candle's direction is close against
+   open, held through the instant close sits on its open. At its
+   extreme it is extending and the trade is that direction. Off the
+   extreme it is pulling back, and the VOLUME behind the retrace
+   against the volume behind the push decides whether that is drift
+   -- in which case the push still stands -- or the move being
+   fought, in which case the trade is the retrace's own direction.
 
-   The candle, OFI and CVD are still drawn, under a heading that
-   says they decide nothing. Deleting them would make the panel
-   quieter and the rule less checkable -- and a leg that silently
-   stops counting is exactly what made the old window look broken.
+   EVERYTHING ELSE IN THIS BOX IS A READING. The timeframe candle,
+   the row below it, the window's four legs, the vote, the pace.
+   Each is labelled, because every reading here that went in
+   unlabelled ended up being read as part of the rule.
 
-   It renders only for this strategy and hides itself otherwise. */
-/* THE TICK BAR IS THE WHOLE RULE.
-
-   In on its direction, out on its flip, and never past the
-   5-minute bar it opened in. Chris: "the entry and exit strategy
-   to be based on the tick bar in gate one ... no trade will ever
-   last past a 5 minute timeframe".
-
-   Everything else -- the stack, the candle, the OFI, the CVD, the
-   footprint -- is drawn and decides nothing. None of it is deleted,
-   because a reading that silently stops being collected is how a
-   screen starts lying, and he has already watched four readings
-   agree and drive nothing.
-
-   THE TIME STOP IS NOT A DIRECTION READING. The tick bar is cut at
-   the same 5-minute mark, so at that instant it also has no
-   direction -- and an exit that read flat as a reversal would close
-   for an absence. The clock running out and the market turning get
-   different reasons in the log because they are different events. */
+   NO CLOCK ANYWHERE. No ten-second hold, no five-minute time stop,
+   no per-bar cap -- each of those was removed by name and each is
+   held out by a test in the negative, because all three have been
+   silently re-wired in this file before. */
 function paintStackWin(SW) {
   const box = $('jnlStackWin');
   if (!box) return;
@@ -16483,38 +16449,26 @@ function paintStackWin(SW) {
     '<span style="display:inline-block;min-width:118px">'
     + '<span class="thin">' + name + '</span> ' + arrow(d) + '</span>';
 
-  const gate1 =
+  const ruleBlock =
       '<div style="border-left:3px solid var(--'
     + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 1 &mdash; THE 5000T CANDLE '
-    + '(close vs open, as the chart draws it)</div>'
-    + '<div style="margin:4px 0">' + leg('direction', f.side) + '</div>'
-    /* THE WINDOW BEHIND THE DIRECTION.
-
-       It is the last N prints, slid forward one print at a time,
-       and it does NOT restart when a bar closes -- that restart is
-       what blinked the direction out roughly every 5,000 prints and
-       took the dwell with it. Showing the count means a cold start
-       reads as warming up rather than as a market with nothing in
-       it, which is the same mistake the per-bar version made twelve
-       times an hour. */
+    + '<div class="thin">THE 5000T CANDLE AND ITS VOLUME '
+    + '&mdash; this is the whole rule</div>'
+    + '<div style="margin:4px 0">' + leg('tick bar', f.side) + '</div>'
     /* HELD THROUGH THE TIE, AND SAID SO. The candle sits exactly
-       on its open for an instant and has no body to read. The gate
+       on its open for an instant and has no body to read. The rule
        keeps its last real direction rather than reporting flat --
-       flat was never a reading, it was an absence, and reporting it
-       made this panel claim no direction while the chart showed a
-       plain green candle. */
+       flat was never a reading, it was an absence. */
     + (f.held_through_flat
-        ? '<div class="thin">price is exactly on this candle’s open '
+        ? '<div class="thin">price is exactly on this candle\u2019s open '
           + '&mdash; holding ' + esc(f.side || '').toUpperCase()
           + ' until it moves</div>'
         : '')
     /* The vote, as information. It used to BE the direction, behind
        a margin band and a minimum count, and both of those produce
-       flat. It is kept because a reading that silently stops being
-       collected is how a screen starts lying -- and because when it
-       disagrees with the body that is worth seeing. */
+       flat. Kept because when it disagrees with the body that is
+       worth seeing -- it is just not the direction. */
     + ((f.roll && f.roll.window)
         ? '<div class="thin">prints: '
           + Number(f.roll.up_prints || 0).toLocaleString() + ' up '
@@ -16526,37 +16480,21 @@ function paintStackWin(SW) {
               : '')
           + '</div>'
         : '')
-    /* A HELD DIRECTION AND A FRESH ONE LOOK THE SAME WITHOUT THIS.
-       A flip has to stand for its full dwell before it can open a
-       trade, so an entry that has not fired yet is WAITING, not
-       absent -- and the two call for very different reactions. */
-    + (f.side
-        ? (f.ready === false
-            ? '<b class="short">HOLDING ' + f.side.toUpperCase()
-              + ' &mdash; ' + Number(f.held_s || 0).toFixed(0) + 's of '
-              + Number(f.min_hold_s || 0).toFixed(0) + 's</b>'
-              + ' <span class="thin">a flip has to stand before it '
-              + 'can open a trade</span>'
-            : '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
-              + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
-              + ' <span class="thin">held '
-              + Number(f.held_s || 0).toFixed(0) + 's &mdash; in on '
-              + 'this, out when it flips</span>')
+    /* THE SIDE, AND WHY IT IS THAT SIDE.
+
+       A rule that turns a trade round on a volume ratio has to say
+       so on the screen, or the reversal reads as the engine
+       changing its mind for no reason. Chris: "if volume agrees
+       with tick charts direction for a pull back a trade should be
+       taken in that pullback direction as well". */
+    + (SW.side
+        ? '<b class="' + (SW.side === 'up' ? 'long' : 'short') + '">'
+          + 'TRADE ' + SW.side.toUpperCase() + '</b>'
+          + (SW.side !== f.side
+              ? ' <span class="flag late">AGAINST THE CANDLE</span>' : '')
+          + ' <span class="thin">' + esc(SW.say || '') + '</span>'
         : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
-    /* THE PUSH AND THE PULL, UNDER THE DIRECTION IT DOES NOT DECIDE.
-
-       The same tick bar, read for SPEED rather than side: its
-       projected span against the median of recent closed ones.
-       Under 1 the prints are arriving faster than lately and this
-       series is running ahead of the time chart; over 1 it is
-       dragging behind it. That difference is the hybrid reading --
-       one number off one feed, rather than two charts and an eye.
-
-       It decides nothing. The entry above is still the vote alone,
-       and this line is drawn under a label that says so, because
-       every reading on this panel that was not labelled ended up
-       being read as part of the rule. */
     /* THE TAPE LINE: IS THIS BAR CONTINUING, OR PULLING BACK?
 
        Chris: "down at the bottom of the tick bar there is the tape
@@ -16632,45 +16570,21 @@ function paintStackWin(SW) {
 
   const mins = Math.round((cx.period_s || 0) / 60) || 5;
 
-  /* GATE 2 -- THE TRADED TIMEFRAME'S CANDLE, WHICH NOW DECIDES.
-
-     Chris: "the tick bar should be a continuous direction tracking
-     with the timeframe candle tracing at the same time thats how im
-     going to be making trades".
-
-     IT IS DRAWN AS A GATE BECAUSE IT IS ONE. This row used to sit
-     inside the SHOWN ONLY block below, and leaving it there would
-     have put a live gate under a heading saying it decides nothing
-     -- a screen that labels the rule wrongly is the fault this
-     whole panel was rebuilt after, and it has happened here twice.
-
-     The timeframe is NAMED on the line rather than implied. Which
-     row gates depends on the window setting, and "the candle"
-     without a name is how you end up gated on a 15m while reading
-     a 5m. */
   const g2side = st.side || '';
-  const gate2 =
-      '<div style="margin-top:8px;border-left:3px solid var(--'
-    + (g2side ? (g2side === 'up' ? 'up' : 'down') : 'line')
-    + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 2 &mdash; THE REAL ' + esc(st.trading || '')
-    .toUpperCase() + ' CANDLE (close vs open, live) &mdash; it must '
-    + 'agree to open</div>'
+  /* THE TIMEFRAME CANDLE, DEMOTED BACK TO A READING.
+
+     It gated entries for two revisions. Chris: "we will no longer
+     use time as a entry point or exit at all just what the tick bar
+     is doing alone". It is still built, still correct, still drawn
+     -- he compares it against Ironbeam -- and it decides nothing,
+     which the heading has to say or the panel is lying about the
+     rule again. */
+  const tfBlock =
+      '<div style="margin-top:8px;padding:6px 0 6px 13px;opacity:.55;'
+    + 'border-left:3px solid var(--line)">'
+    + '<div class="thin">THE REAL ' + esc(st.trading || '').toUpperCase()
+    + ' CANDLE &mdash; shown only, it does not gate anything</div>'
     + '<div style="margin:4px 0">' + row(st.trading, g2side) + '</div>'
-    + (st.held_through_flat
-        ? '<div class="thin">price is exactly on the '
-          + esc(st.trading || '') + ' open &mdash; holding '
-          + esc(g2side || '').toUpperCase() + ' until it moves</div>'
-        : '')
-    + (st.agrees
-        ? '<b class="' + (g2side === 'up' ? 'long' : 'short') + '">'
-          + 'AGREES &mdash; both ' + esc(g2side).toUpperCase() + '</b>'
-        : (g2side
-            ? '<b class="short">DISAGREES</b> <span class="thin">the '
-              + esc(st.trading || '') + ' candle is '
-              + esc(g2side).toUpperCase() + '</span>'
-            : '<b class="short">NO DIRECTION</b> <span class="thin">'
-              + esc(st.why || '') + '</span>'))
     + '</div>';
 
   const context =
@@ -16693,19 +16607,12 @@ function paintStackWin(SW) {
       + esc(SW.why || '') + '</span>';
 
   box.innerHTML =
-      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
-    + '&amp; THE ' + esc(st.trading || '').toUpperCase() + ' CANDLE'
-    /* NO BARE APOSTROPHE IN A SINGLE-QUOTED STRING. Escaping it in
-       the PYTHON source produces a raw ' in the JavaScript, which
-       ends the string and breaks the whole page -- caught by the
-       node parse in test_clockwin, not by anything reading this
-       file as text. */
-    + '</b> &mdash; both must agree to open. Out on the tick '
-    + 'bar&rsquo;s flip alone, and never past the ' + mins
-    + '-minute bar it opened in. As many trades as the tape gives.'
-    + '</div>'
-    + gate1
-    + gate2
+      '<div class="thin" style="margin-bottom:4px"><b>THE 5000T '
+    + 'CANDLE, ALONE</b> &mdash; in on its direction, or against it '
+    + 'when volume says the pullback is being paid for. Out when '
+    + 'that answer turns over. No clock, no hold, no cap.</div>'
+    + ruleBlock
+    + tfBlock
     + '<div style="margin-top:8px">' + verdict + '</div>'
     + context;
 }
