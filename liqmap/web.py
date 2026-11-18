@@ -7764,26 +7764,33 @@ def create_app() -> FastAPI:
         # impossible -- the ceiling is twelve an hour.
         cap = 0
         if strat == "stack":
-            # NO CAP, AND NOW ACTUALLY NO CAP.
+            # TWO TRADES A FIVE-MINUTE BAR, AND THE BAR IS A
+            # COUNTER RATHER THAN A CLOCK ON THE TRADE.
             #
-            # This stamped the trade with its 5-minute bar so the
-            # time stop could tell when it had outlived one. Both
-            # are gone: "we will no longer use time as a entry
-            # point or exit at all just what the tick bar is doing
-            # alone".
+            # Chris: "we need to set a rule for no more then 2
+            # trades on a 5 minute timeframe and rules have to be
+            # met before a entry".
             #
-            # THE STAMP WAS ALSO A CAP NOBODY INTENDED. `decide`
-            # reads `cap = max(1, max_per_bar or MAX_PER_BAR)`, so
-            # the 0 passed below became 2 -- and `agree in taken`
-            # blocked a second trade the same way inside one bar.
-            # The comment above said NO CAP while the code allowed
-            # one trade per direction per five minutes, against
-            # "the auto trader can trade as many times as need as
-            # long as the directional signal confirms direction".
+            # FIVE MINUTES WHATEVER THE WINDOW SAYS. The selector
+            # can read 15m, and counting against the traded row
+            # would quietly make this three times looser than he
+            # asked for.
             #
-            # A zero bar id makes `sides_in_bar` return nothing,
-            # which is what no cap actually looks like.
-            bar_ts = 0.0
+            # NOTHING EXPIRES BECAUSE OF THIS STAMP. The time stop
+            # was removed and stays removed -- `holds` is still the
+            # only thing that ends a trade on a signal. The stamp
+            # answers one question: how many trades has this five
+            # minutes already had.
+            #
+            # `decide` ALSO blocks a repeat in the same direction,
+            # which is the half of this that actually bites: the
+            # churn is a trade closing on a pullback and reopening
+            # the same way moments later. Two trades a bar
+            # therefore means at most one long and one short.
+            from . import stackwin as _swb
+            bar_ts = _swb.bar_of(time.time(), _swb.CAP_BAR_S)
+            cap = _swb.MAX_TRADES_PER_BAR
+            taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
         if strat in ("fused", "timed"):
             # ONE TRADE PER 5-MINUTE CANDLE, for both rules, counted
             # against that candle rather than the 15-minute window.
@@ -7828,12 +7835,16 @@ def create_app() -> FastAPI:
             if rev:
                 disagreed = why_rev
         elif strat == "stack" and t is not None and t.open:
-            # THE TICK BAR TURNING OVER, AND NOTHING ELSE.
+            # THE TICK BAR TURNING OVER, OR THE TIMEFRAME CANDLE
+            # TURNING AGAINST THE TRADE.
             #
-            # Chris: "we will no longer use time as a entry point or
-            # exit at all just what the tick bar is doing alone".
-            # Putting the timeframe gate back on ENTRY does not take
-            # that back -- it gets you in, the tick bar keeps you in.
+            # Chris: "the timeframe is also going to be a exit rule
+            # disagree means exit". The timeframe gated the entry
+            # and now keeps gating while the trade is open, so a
+            # position cannot outlive the condition that opened it.
+            #
+            # STILL NO CLOCK. The five-minute stamp above counts
+            # trades; it does not end them.
             #
             # THE SAME NUMBER THE ENTRY READ. This once called
             # `exit_reason` with `dir`, the tick bar's VOTE, while
@@ -7843,7 +7854,9 @@ def create_app() -> FastAPI:
             # body direction is read here, exactly as above, and no
             # clock is consulted at all.
             _ok_hold, _why_hold = _sw.holds(
-                t.side, _sw.hold_dir(_bd, str(_prev.get("tick") or "")))
+                t.side,
+                _sw.hold_dir(_bd, str(_prev.get("tick") or "")),
+                (fus.get("stack") or {}).get("side") or "")
             if not _ok_hold:
                 disagreed = _why_hold
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can

@@ -217,8 +217,16 @@ class TestWhatCameOut:
         assert "_dw." not in blk and "Dwell" not in blk
 
     def test_the_time_stop_is_gone(self):
-        for gone in ("exit_reason", "expired", "bar_of"):
+        """`bar_of` is back and is NOT a time stop -- it stamps
+        which five minutes a trade opened in so the cap can count
+        them. What stays gone is anything that ENDS a trade on a
+        clock."""
+        for gone in ("exit_reason", "expired"):
             assert not hasattr(sw, gone), f"{gone} is still here"
+        import inspect
+        src = inspect.getsource(sw.bar_of)
+        assert "counter" in src.lower(), \
+            "bar_of is not documented as a counter"
 
     def test_the_route_has_no_clock_left(self):
         import pathlib
@@ -228,47 +236,66 @@ class TestWhatCameOut:
             "the five-minute constant is still defined"
         assert "_sw.exit_reason(" not in src
 
-    def test_the_trade_is_not_stamped_with_a_bar(self):
-        """THE CAP THAT WAS NEVER MEANT TO BE THERE. The stamp fed
-        `sides_in_bar`, and `decide` turns a 0 cap into
-        MAX_PER_BAR -- so `agree in taken` blocked a second trade
-        the same way inside one 5-minute bar while the comment
-        above it read NO CAP."""
+    def test_the_cap_is_explicit_rather_than_inherited(self):
+        """THE BUG THAT MADE THIS WORTH A TEST. The stack branch
+        once passed `cap = 0` under a comment reading NO CAP, and
+        `decide` does `max(1, max_per_bar or MAX_PER_BAR)` -- so 0
+        became 2 and nobody meant it to. Whatever the cap is, it
+        has to be said out loud here."""
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index('if strat == "stack":', src.index("cap = 0"))
-        blk = src[i:i + 1400]
-        assert "bar_ts = 0.0" in blk, "the trade is stamped again"
-        assert "bar_of(" not in blk, "a clock bar is back in the stamp"
+        blk = src[i:i + 1800]
+        assert "cap = _swb.MAX_TRADES_PER_BAR" in blk, \
+            "the cap is inherited from journal.decide again"
 
 
-class TestTheExitIsTheTickBarAlone:
-    """Chris: "we will no longer use time as a entry point or exit
-    at all just what the tick bar is doing alone". Putting the entry
-    gate back does not take that back -- the timeframe candle gets
-    you in, the tick bar keeps you in."""
+class TestTheExitIsEitherGateTurningAgainstIt:
+    """Chris: "the timeframe is also going to be a exit rule
+    disagree means exit because the strategy isnt accounting for the
+    tick charts pull backs".
 
-    def test_it_holds_while_the_tick_bar_agrees(self):
+    This reverses "we will no longer use time as a entry point or
+    exit at all" from one revision ago. Stated here so nobody
+    re-derives the older rule from the older docstrings."""
+
+    def test_it_holds_while_both_agree(self):
+        assert sw.holds(D, D, D) == (True, "")
+
+    def test_the_tick_bar_flipping_ends_it(self):
+        ok, why = sw.holds(D, U, D)
+        assert ok is False
+        assert "tick bar flipped up against your down trade" in why
+
+    def test_the_timeframe_candle_turning_ends_it_too(self):
+        ok, why = sw.holds(D, D, U)
+        assert ok is False
+        assert "timeframe candle turned up against your down" in why
+
+    def test_the_tick_bar_is_blamed_first_when_both_turned(self):
+        """The order of the checks is the order of the reasons. A
+        log blaming the timeframe for a tick-bar exit sends you to
+        the wrong chart."""
+        ok, why = sw.holds(D, U, U)
+        assert ok is False and "tick bar" in why
+
+    @pytest.mark.parametrize("tick,candle", [
+        ("", D), (D, ""), ("", ""), ("flat", "flat"),
+    ])
+    def test_FLAT_IS_NOT_A_DISAGREEMENT(self, tick, candle):
+        """On either of them. Exits firing on absences is the churn
+        this rule has been rewritten three times to remove."""
+        assert sw.holds(D, tick, candle) == (True, "")
+
+    def test_an_absent_candle_argument_still_works(self):
+        """The old two-argument call must not become an exit."""
         assert sw.holds(D, D) == (True, "")
 
-    def test_the_opposite_direction_ends_it(self):
-        ok, why = sw.holds(D, U)
-        assert ok is False
-        assert "flipped up against your down trade" in why
-
-    def test_FLAT_IS_NOT_A_FLIP(self):
-        assert sw.holds(D, "") == (True, "")
-
     def test_no_open_side_is_never_an_exit(self):
-        assert sw.holds("", U) == (True, "")
+        assert sw.holds("", U, U) == (True, "")
 
-    def test_the_timeframe_candle_cannot_close_a_trade(self):
-        import inspect
-        names = list(inspect.signature(sw.holds).parameters)
-        assert names == ["side", "tick"], names
-
-    def test_the_route_reads_the_same_number_the_entry_read(self):
+    def test_the_route_passes_both_and_reads_what_the_entry_read(self):
         """THE BUG THIS REPLACES. It called `exit_reason` with
         `dir`, the tick bar's VOTE, while the entry took
         `body_dir`, the candle -- they can point opposite ways on
@@ -278,11 +305,79 @@ class TestTheExitIsTheTickBarAlone:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index('elif strat == "stack" and t is not None and t.open:')
-        blk = src[i:i + 1600]
+        blk = src[i:i + 1800]
         assert "_sw.holds(" in blk, "nothing ends a stack trade"
         assert "_sw.hold_dir(_bd," in blk, \
             "the exit is reading something other than the candle"
-        assert '_tk_x' not in blk, "a second tick reading is back"
+        assert '(fus.get("stack") or {}).get("side")' in blk, \
+            "the timeframe candle is not an exit"
+        assert "_tk_x" not in blk, "a second tick reading is back"
+
+
+class TestTwoTradesAFiveMinuteBar:
+    """Chris: "we need to set a rule for no more then 2 trades on a
+    5 minute timeframe and rules have to be met before a entry"."""
+
+    def test_the_cap_is_two(self):
+        assert sw.MAX_TRADES_PER_BAR == 2
+
+    def test_the_bar_is_five_minutes_whatever_the_window_is(self):
+        """He said five. The window selector can read 15m, and
+        counting against the traded row would make the cap three
+        times looser than he asked for."""
+        assert sw.CAP_BAR_S == 300.0
+
+    def test_the_buckets_are_true_wall_clock_marks(self):
+        b = sw.bar_of(1_700_000_000.0)
+        assert b % 300.0 == 0.0, "not on a five-minute mark"
+        assert sw.bar_of(b) == b
+        assert sw.bar_of(b + 299.0) == b
+        assert sw.bar_of(b + 300.0) == b + 300.0
+
+    @pytest.mark.parametrize("bad", [0, -1, None, "", "x"])
+    def test_junk_is_not_a_bar(self, bad):
+        assert sw.bar_of(bad) == 0.0
+
+    def test_the_route_stamps_and_caps(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index('if strat == "stack":', src.index("cap = 0"))
+        blk = src[i:i + 1800]
+        assert "_swb.bar_of(time.time(), _swb.CAP_BAR_S)" in blk, \
+            "the trade is not stamped, so nothing can count it"
+        assert "cap = _swb.MAX_TRADES_PER_BAR" in blk, \
+            "the cap is not applied"
+        assert "strict=True" in blk, \
+            "an unidentifiable bar would permit an entry every poll"
+
+    def test_the_cap_reaches_the_re_entry_path_too(self):
+        """It did not once, so after a close the rule fell back to
+        the default and could turn round inside the same bar."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        # THE ONE INSIDE THE JOURNAL STEP. There is another
+        # `if act == "close":` in a hand-trading route further up,
+        # and a plain `index` finds that one -- a whole-file search
+        # that lands on the wrong block is how the earlier route
+        # test passed while the thing it named was untouched.
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        j = blk.index('if act == "close":')
+        assert "max_per_bar=cap" in blk[j:j + 1200]
+
+    def test_nothing_expires_because_of_the_stamp(self):
+        """IT IS A COUNTER, NOT A CLOCK ON THE TRADE. The time stop
+        was removed and stays removed -- `holds` is the only thing
+        that ends a trade on a signal."""
+        import inspect
+        import pathlib
+        assert "expired" not in inspect.getsource(sw)
+        assert not hasattr(sw, "exit_reason")
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        assert "TRADE_BAR_S" not in src
 
 
 class TestTheStateCarriesTheRule:

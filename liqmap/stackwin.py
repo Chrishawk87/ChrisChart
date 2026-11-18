@@ -50,6 +50,18 @@ Nothing in this module places, sizes, routes or times an order.
 from __future__ import annotations
 
 SIDES = ("up", "down")
+# THE BAR THE TRADE CAP COUNTS AGAINST. Chris: "we need to set a
+# rule for no more then 2 trades on a 5 minute timeframe".
+#
+# FIVE MINUTES WHATEVER THE WINDOW IS SET TO. He said five, and the
+# window selector can read 15m -- counting against the traded row
+# would quietly make the cap three times looser than he asked for.
+#
+# This is a counter, not a time stop. Nothing expires because of
+# it; the only question it answers is how many trades this
+# five minutes has already had.
+CAP_BAR_S = 300.0
+MAX_TRADES_PER_BAR = 2
 # The row each traded timeframe takes its confirmation from.
 BELOW_OF = {"15m": "5m", "5m": "1m"}
 # Which row the window's period is trading.
@@ -208,35 +220,75 @@ def entry_side(tick: str, candle: str = "",
     return tick, ""
 
 
-def holds(side: str, tick: str) -> tuple[bool, str]:
+def holds(side: str, tick: str, candle: str = "") -> tuple[bool, str]:
     """Does the trade still stand?
 
-    ONLY THE TICK BAR TURNING OVER ENDS IT. Chris: "we will no
-    longer use time as a entry point or exit at all just what the
-    tick bar is doing alone" -- said about exits, and restoring the
-    entry gate does not take it back.
+    TWO WAYS OUT NOW, AND THE TIMEFRAME ONE IS NEW. Chris: "the
+    timeframe is also going to be a exit rule disagree means exit
+    because the strategy isnt accounting for the tick charts pull
+    backs".
 
-    THE TIMEFRAME CANDLE IS NOT READ HERE. It gets you in; the tick
-    bar keeps you in. A candle that turns mid-trade is the pullback
-    being traded through, and closing on it would be a second way
-    out that the entry knows nothing about.
+    THE TICK BAR TURNING OVER still ends it -- that is what gets
+    you out of a move that has actually reversed.
 
-    FLAT IS NOT A FLIP. The direction fed here is the HELD one, so
-    it never blanks -- but a caller that passes a raw reading must
-    not have an absence read as a reversal, which is the churn this
-    rule has been rewritten twice to remove.
+    THE TIMEFRAME CANDLE TURNING AGAINST YOU now ends it too. It
+    gated the entry and it keeps gating while the trade is open, so
+    a position cannot survive the condition that opened it going
+    away. This reverses "no longer use time as a entry point or
+    exit at all" from one revision ago, by name and on purpose.
 
-    IT MUST BE THE SAME NUMBER THE ENTRY READ. This once took the
+    FLAT IS NOT A DISAGREEMENT, on either of them. Both directions
+    arrive here HELD, so neither blanks in normal running -- but a
+    caller that passes a raw reading must not have an absence read
+    as a reversal. Exits firing on absences is the churn this rule
+    has been rewritten three times to remove, and it is the single
+    most expensive mistake in this file's history.
+
+    THE ORDER IS THE ORDER OF THE REASONS. The tick bar is asked
+    first because it is the faster of the two and the one that
+    usually fires; a log that blamed the timeframe for a tick-bar
+    exit would send you looking at the wrong chart.
+
+    IT MUST BE THE SAME NUMBERS THE ENTRY READ. This once took the
     tick bar's VOTE while the entry took the candle's body, and the
     two can point opposite ways on one bar -- the engine opened a
     long and closed it on the same poll.
     """
     if side not in SIDES:
         return True, ""
-    if tick == _other(side):
+    other = _other(side)
+    if tick == other:
         return False, (f"the tick bar flipped {tick} against your "
                        f"{side} trade")
+    if candle == other:
+        return False, (f"the timeframe candle turned {candle} against "
+                       f"your {side} trade")
     return True, ""
+
+
+def bar_of(ts: float, period_s: float = CAP_BAR_S) -> float:
+    """The TRUE wall-clock bar this instant falls in.
+
+    Unix time divides evenly into 300-second buckets from an epoch
+    on a minute boundary, so this lands on :00, :05, :10 of the hour
+    in every zone whose offset is a multiple of five minutes --
+    which is all of them.
+
+    THIS IS A COUNTER, NOT A CLOCK ON THE TRADE. It stamps which
+    five minutes a trade was opened in so the cap can count them.
+    Nothing expires because of it: the time stop was removed and
+    stays removed. Chris asked for "no more then 2 trades on a 5
+    minute timeframe", which needs a bar to count against and
+    nothing more.
+    """
+    try:
+        t = float(ts or 0.0)
+        p = float(period_s or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if t <= 0 or p <= 0:
+        return 0.0
+    return float(int(t // p) * int(p))
 
 
 def _say(side: str, tf: str, intent: dict) -> str:
