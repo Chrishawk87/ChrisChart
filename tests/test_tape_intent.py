@@ -3,36 +3,48 @@
 Chris: "down at the bottom of the tick bar there is the tape what we
 are going to do with that is show tape intent at that moment during
 the tick bar kinda the same way a 1 minute shows the 5 minute candles
-intent".
+intent" -- and, on which measurement, "which ever one will show tick
+chart pullbacks and continuations thats what i actually need".
 
-Asked which measurement it should be -- who is crossing the spread,
-where the recent slice went, or both with the disagreement flagged --
-he answered the question behind the question: "which ever one will
-show tick chart pullbacks and continuations thats what i actually
-need".
+THE FIRST VERSION LAGGED, AND THE LAG WAS STRUCTURAL.
 
-SO THE TEST OF THIS READING IS WHETHER IT NAMES THOSE TWO STATES, and
-that is what this file checks. Price, not aggression: a pullback on a
-tick chart IS a price event, and buy-against-sell volume can only
-imply one. The aggression disagreement is absorption, which this
-engine already measures and already labels as deciding nothing.
+    It compared price against a point 1,000 prints back -- the last
+    fifth of a bar's worth, the 1m-inside-a-5m ratio. A window like
+    that can only report a turn once the turn is BIGGER THAN THE
+    WINDOW'S OWN PRIOR MOVE, so a pullback stayed invisible until
+    it had undone everything the window had seen.
 
-WHAT THE LINE SHOWED BEFORE. Its projected span against a median --
-how FAST the bar was forming. That is a real measurement and it is
-kept, as the tail of the line, because a reading that silently stops
-being collected is how a screen starts lying. It is not intent: a bar
-can quicken while price gives the whole move back, and those two
-sentences describe opposite trades.
+    Measured on a tape that pushed up 1,200 prints and then
+    reversed: 200 ticks -- fifty points -- off the high and it
+    still read CONTINUATION. It did not flip until 42% of the move
+    was already gone.
 
-TWO NUMBERS, BOTH NEEDED.
+    Chris: "price and tick bar are obviously pulling back but it
+    shows a continuation like its making its determination after
+    the move has already happened". Exactly right, and no tuning of
+    the window would have fixed it -- a shorter one lags less and
+    still lags, and a very short one is noise.
 
-    DEPTH alone cannot tell a pullback that is still running from one
-    that has already turned -- the first says wait, the second says
-    the continuation has resumed.
+THE REFERENCE IS NOW THE BAR'S OWN EXTREME.
 
-    THE SLICE alone cannot say what the pullback has cost. One tick
-    off the high and half the move given back are the same slice
-    direction and very different markets.
+    Price off the high of an up bar is a retrace THE INSTANT IT
+    HAPPENS, because the high is a fact about this bar and not a
+    moving point in the tape. One tick off reads PULLBACK with a
+    depth of 1%, which is honest in both directions: it is a
+    pullback, and it is a trivial one, and the number says so.
+
+    Depth alone still cannot tell a pullback that is running from
+    one that has turned, so the deepest retrace since the extreme
+    is carried in the caller's memory. RECOVERING is a qualifier on
+    the pullback, not a state of its own: it stays a pullback until
+    a new extreme is made, because calling it a continuation before
+    that would be predicting the resumption rather than reporting
+    it -- the same mistake in the other direction.
+
+PRICE, NOT AGGRESSION. A pullback on a tick chart IS a price event;
+buy-against-sell volume can only imply one. Their disagreement is
+absorption, which this engine already measures and already labels as
+deciding nothing.
 """
 
 from __future__ import annotations
@@ -48,39 +60,87 @@ WEB = (pathlib.Path(__file__).resolve().parents[1]
        / "liqmap" / "web.py").read_text()
 
 
-class TestItNamesTheTwoStates:
-    def test_the_slice_going_with_the_bar_is_a_continuation(self):
-        r = ti.read("up", 7000, 7010, 6999, 7010, "up", 1000)
-        assert r["state"] == "continuation"
+def bar(up_prints: int, back_prints: int, per_bar: int = 5000):
+    """A bar that pushed one way and then retraced, through the real
+    builder. Returns the forming bar."""
+    b = TickBars(per_bar=per_bar)
+    t, px = 0.0, 7000.0
+    b.on_trade(t, px, 1.0, "B")
+    for _ in range(up_prints):
+        t += 1.0
+        px += 0.25
+        b.on_trade(t, px, 1.0, "B")
+    for _ in range(back_prints):
+        t += 1.0
+        px -= 0.25
+        b.on_trade(t, px, 1.0, "B")
+    return b.current
 
-    def test_the_slice_going_against_it_is_a_pullback(self):
-        r = ti.read("up", 7000, 7010, 6999, 7006, "down", 1000)
-        assert r["state"] == "pullback"
+
+def run(c, prev=None):
+    return ti.read(c.direction, c.open, c.high, c.low, c.close, prev=prev)
+
+
+class TestItNamesTheTwoStates:
+    def test_a_bar_at_its_extreme_is_a_continuation(self):
+        assert run(bar(400, 0))["state"] == "continuation"
+
+    def test_a_bar_off_its_extreme_is_a_pullback(self):
+        assert run(bar(400, 100))["state"] == "pullback"
 
     def test_it_is_symmetric_on_a_down_bar(self):
-        assert ti.read("down", 7000, 7001, 6990, 6990,
-                       "down", 1000)["state"] == "continuation"
-        assert ti.read("down", 7000, 7001, 6990, 6994,
-                       "up", 1000)["state"] == "pullback"
+        b = TickBars(per_bar=5000)
+        t, px = 0.0, 7000.0
+        b.on_trade(t, px, 1.0, "B")
+        for _ in range(400):
+            t += 1.0
+            px -= 0.25
+            b.on_trade(t, px, 1.0, "B")
+        assert run(b.current)["state"] == "continuation"
+        for _ in range(100):
+            t += 1.0
+            px += 0.25
+            b.on_trade(t, px, 1.0, "B")
+        c = b.current
+        assert c.direction == "down"
+        assert run(c)["state"] == "pullback"
 
-    def test_a_pullback_is_called_early_not_once_it_is_deep(self):
-        """One tick off the high with the tape still selling is a
-        pullback that has just started. Waiting for depth before
-        naming it is what makes the reading useless -- by then it is
-        on the screen anyway."""
-        r = ti.read("up", 7000, 7010, 6999, 7009.75, "down", 1000)
-        assert r["state"] == "pullback"
-        assert r["depth"] < 0.05
 
-    def test_a_resumed_continuation_is_not_called_a_pullback(self):
-        """THE CASE DEPTH ALONE CANNOT SEE. Price is still well off
-        the high, so depth says a pullback happened -- but the tape
-        has turned back up, which is the continuation resuming and
-        the opposite trade."""
-        r = ti.read("up", 7000, 7010, 6999, 7006, "up", 1000)
-        assert r["state"] == "continuation"
-        assert r["depth"] == 0.4
-        assert "turned back" in r["say"]
+class TestTheLagIsGone:
+    """THE DEFECT THIS VERSION EXISTS TO FIX, pinned as a number so
+    it cannot creep back."""
+
+    def test_one_tick_off_the_high_is_already_a_pullback(self):
+        c = bar(400, 1)
+        r = run(c)
+        assert r["state"] == "pullback", \
+            "it is still waiting for the move to finish"
+        assert r["depth"] < 0.02, "and it says the retrace is trivial"
+
+    @pytest.mark.parametrize("back", [1, 5, 20, 50, 200])
+    def test_it_calls_it_at_every_depth_not_just_a_deep_one(self, back):
+        assert run(bar(400, back))["state"] == "pullback", back
+
+    def test_the_old_window_would_have_missed_these(self):
+        """The control. A 1,000-print slice on this tape is still
+        net-up after a 200-print retrace, which is what produced
+        CONTINUATION while price was fifty points off the high.
+        Stated here so the fix is measured against the fault rather
+        than asserted."""
+        c = bar(1200, 200)
+        # What the window WOULD have said: price now against price
+        # 1,000 prints ago.
+        assert c.close > c.open, "the bar is still up overall"
+        # What this reading says.
+        assert run(c)["state"] == "pullback"
+        assert run(c)["depth"] > 0.1
+
+    def test_no_fixed_window_remains_anywhere_in_the_reading(self):
+        import inspect
+        src = inspect.getsource(ti)
+        for gone in ("SLICE_FRACTION", "slice_prints", "MIN_SLICE",
+                     "slice_dir"):
+            assert gone not in src, f"{gone} is still in the reading"
 
 
 class TestHowDeepThePullbackIs:
@@ -112,8 +172,6 @@ class TestHowDeepThePullbackIs:
         assert ti.depth("up", 7000, 7010, 6990, 6980) == 1.0
 
     def test_a_bar_with_no_move_is_not_a_retrace(self):
-        """A flat bar dividing by zero would make every reading
-        either a crash or a 100% pullback."""
         assert ti.depth("up", 7000, 7000, 7000, 7000) == 0.0
         assert ti.depth("", 7000, 7010, 6990, 7005) == 0.0
 
@@ -122,110 +180,67 @@ class TestHowDeepThePullbackIs:
         assert ti.depth("up", junk, junk, junk, junk) == 0.0
 
 
+class TestRecoveringIsAQualifierNotAState:
+    def test_it_marks_a_pullback_that_has_turned(self):
+        deep = run(bar(400, 200))
+        prev = {"state": deep["state"], "worst": deep["worst"],
+                "bar_dir": deep["bar_dir"]}
+        # Same bar, price recovered half of the retrace.
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7075.0, prev=prev)
+        assert r["recovering"] is True
+        assert r["state"] == "pullback", \
+            "it called the continuation before a new extreme"
+        assert "recovering" in r["say"]
+
+    def test_a_new_extreme_is_what_ends_the_pullback(self):
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7100.0,
+                    prev={"state": "pullback", "worst": 0.5,
+                          "bar_dir": "up"})
+        assert r["state"] == "continuation"
+        assert r["worst"] == 0.0, "the old retrace was not cleared"
+        assert r["recovering"] is False
+
+    def test_a_deepening_pullback_is_not_recovering(self):
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7050.0,
+                    prev={"state": "pullback", "worst": 0.5,
+                          "bar_dir": "up"})
+        assert r["recovering"] is False
+        assert r["worst"] == 0.5
+
+    def test_the_worst_is_remembered_not_recomputed(self):
+        """One instant cannot know how deep a pullback has been.
+        Without the memory, a recovery looks like a shallow
+        pullback and RECOVERING never appears."""
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7075.0, prev={})
+        assert r["recovering"] is False
+        assert r["worst"] == 0.25
+
+    def test_a_bar_turning_over_clears_the_memory(self):
+        """The geometry is then measured off the other end of the
+        bar, and a retrace depth from the old direction is a number
+        about a move that is no longer the one being read."""
+        r = ti.read("down", 7000.0, 7001.0, 6900.0, 6950.0,
+                    prev={"state": "pullback", "worst": 0.9,
+                          "bar_dir": "up"})
+        assert r["worst"] == 0.0
+
+
 class TestItNeverBlanks:
-    """The fault that took two goes to get out of the gates
-    themselves. A line that blinks out gets read as an absence."""
-
     def test_a_tie_holds_the_last_state(self):
-        prev = {"state": "pullback", "slice_dir": "down"}
-        r = ti.read("", 7000, 7000, 7000, 7000, "", 1000, prev=prev)
+        r = ti.read("", 7000, 7000, 7000, 7000,
+                    prev={"state": "pullback", "bar_dir": "up"})
         assert r["state"] == "pullback"
-        assert r["slice_dir"] == "down"
-
-    def test_a_flat_slice_holds_its_direction(self):
-        r = ti.read("up", 7000, 7010, 6999, 7006, "", 1000,
-                    prev={"state": "pullback", "slice_dir": "down"})
-        assert r["slice_dir"] == "down"
 
     def test_nothing_is_invented_at_the_start(self):
-        r = ti.read("", 0, 0, 0, 0, "", 0)
-        assert r["state"] == "" and r["slice_dir"] == ""
+        r = ti.read("", 0, 0, 0, 0)
+        assert r["state"] == ""
         assert "no direction" in r["say"]
 
     def test_a_real_change_passes_straight_through(self):
-        r = ti.read("up", 7000, 7010, 6999, 7010, "up", 1000,
-                    prev={"state": "pullback", "slice_dir": "down"})
+        r = ti.read("up", 7000, 7010, 6999, 7010,
+                    prev={"state": "pullback", "worst": 0.5,
+                          "bar_dir": "up"})
         assert r["state"] == "continuation"
-        assert r["slice_dir"] == "up"
-
-
-class TestTheSliceIsAFifthOfTheBar:
-    """Chris's own analogy: "the same way a 1 minute shows the 5
-    minute candles intent". A fifth, so it means the same thing at
-    every bar size and nothing has to be retuned."""
-
-    def test_it_scales_with_the_bar(self):
-        assert ti.slice_prints(5000) == 1000
-        assert ti.slice_prints(2000) == 400
-        assert ti.slice_prints(10000) == 2000
-
-    def test_a_small_bar_gets_the_floor(self):
-        assert ti.slice_prints(50) == ti.MIN_SLICE
-        assert ti.slice_prints(0) == ti.MIN_SLICE
-
-    def test_the_builder_sizes_its_slice_to_itself(self):
-        assert TickBars(per_bar=5000)._slice.maxlen == 1000
-        assert TickBars(per_bar=2000)._slice.maxlen == 400
-
-
-class TestTheSliceComesOffRealPrints:
-    def test_it_reads_close_against_open_on_the_slice(self):
-        b = TickBars(per_bar=100)       # slice of 20
-        t, px = 0.0, 7000.0
-        for _ in range(60):             # drive it up
-            t += 1.0
-            px += 0.25
-            b.on_trade(t, px, 1.0, "B")
-        s = b.slice_read()
-        assert s["dir"] == "up" and s["n"] == 20
-        assert s["close"] > s["open"]
-        assert s["ticks"] == 19.0
-
-    def test_the_slice_turns_before_the_bar_does(self):
-        """THE WHOLE POINT. The bar is still up on the session while
-        the last twenty prints have turned down -- which is a
-        pullback, and is invisible to anything reading the bar
-        alone."""
-        # The slice is sized FROM `per_bar`, so the down leg has to
-        # be longer than the slice or the window still spans the up
-        # move -- which is the whole reason a fifth is a fifth.
-        b = TickBars(per_bar=1000)      # slice of 200
-        t, px = 0.0, 7000.0
-        for _ in range(400):
-            t += 1.0
-            px += 0.25
-            b.on_trade(t, px, 1.0, "B")
-        for _ in range(250):
-            t += 1.0
-            px -= 0.25
-            b.on_trade(t, px, 1.0, "B")
-        cur = b.current
-        assert cur.direction == "up", "the bar is no longer up"
-        assert b.slice_read()["dir"] == "down"
-        r = ti.read(cur.direction, cur.open, cur.high, cur.low,
-                    cur.close, b.slice_read()["dir"])
-        assert r["state"] == "pullback"
-        assert 0.0 < r["depth"] < 1.0
-
-    def test_the_slice_does_not_restart_at_a_bar_boundary(self):
-        """The same rule the gate's direction follows. A slice that
-        emptied at every close would blink the line out once a bar,
-        which is the fault this panel has already had twice."""
-        b = TickBars(per_bar=10)        # slice floors at MIN_SLICE
-        t, px = 0.0, 7000.0
-        for _ in range(205):
-            t += 1.0
-            px += 0.25
-            b.on_trade(t, px, 1.0, "B")
-        assert b.current.trades == 5, "not mid-bar; the setup moved"
-        s = b.slice_read()
-        assert s["n"] == ti.MIN_SLICE, "the slice emptied at a close"
-        assert s["dir"] == "up"
-
-    def test_too_few_prints_is_not_a_direction(self):
-        b = TickBars(per_bar=100)
-        b.on_trade(1.0, 7000.0, 1.0, "B")
-        assert b.slice_read()["dir"] == ""
 
 
 class TestItReachesThePanel:
@@ -235,26 +250,20 @@ class TestItReachesThePanel:
         assert "_ti.read(" in blk
         assert 'tk_ or {}).get("body_dir")' in blk, \
             "it is not reading the bar's own direction"
-        assert 'sl.get("dir")' in blk
+        assert "slice" not in blk, "the lagging window is still wired in"
 
-    def test_it_uses_the_bars_own_direction_not_the_held_one(self):
-        """THE GEOMETRY HAS TO MATCH THE PRICES. `depth` measures
-        against high-minus-open on an up bar, so a direction the bar
-        does not currently have would measure a retrace off the
-        wrong extreme. The hold happens on the VERDICT instead."""
-        i = WEB.index("def _tape_intent(")
-        blk = WEB[i:WEB.index("def _m5_now(", i)]
-        assert "_bd" not in blk.split('_ti.read(')[1][:200], \
-            "the gate's held direction was fed to the geometry"
-
-    def test_the_tick_route_carries_the_slice_and_the_extremes(self):
+    def test_the_tick_route_carries_the_extremes(self):
         i = WEB.index("def _tick_now(")
         blk = WEB[i:WEB.index("def _tape_intent(", i)]
-        assert "bld.slice_read()" in blk
         main = blk[blk.index('"up_prints": cur.up_prints'):]
-        assert '"slice": sl' in main
         assert '"high": cur.high' in main, \
             "no extreme to measure the retrace against"
+        assert '"low": cur.low' in main
+
+    def test_the_builder_no_longer_keeps_a_slice(self):
+        b = TickBars(per_bar=5000)
+        assert not hasattr(b, "_slice")
+        assert not hasattr(b, "slice_read")
 
     def test_the_state_carries_it(self):
         from liqmap import stackwin as sw
@@ -266,20 +275,25 @@ class TestItReachesThePanel:
     def test_its_memory_rides_home_with_the_gates(self):
         from liqmap import stackwin as sw
         st = sw.state({}, "up", {}, 300.0,
-                      intent={"state": "pullback", "slice_dir": "down"})
+                      intent={"state": "pullback", "worst": 0.6,
+                              "bar_dir": "up"})
         assert st["held"]["intent"] == {"state": "pullback",
-                                        "slice_dir": "down"}
+                                        "worst": 0.6, "bar_dir": "up"}
 
     def test_the_route_feeds_the_memory_back_in(self):
         i = WEB.index("def _journal_step_un(")
         blk = WEB[i:i + 30000]
         assert "intent=_tape_intent(_tk, _prev)" in blk
         j = WEB.index("def _tape_intent(")
-        assert 'prev_ or {}).get("intent")' in WEB[j:j + 1600]
+        assert 'prev_ or {}).get("intent")' in WEB[j:j + 1800]
 
     def test_the_panel_draws_the_two_states(self):
         assert "'PULLBACK'" in WEB and "'CONTINUATION'" in WEB
         assert "SW.intent && SW.intent.state" in WEB
+
+    def test_the_panel_marks_a_pullback_that_has_turned(self):
+        assert "SW.intent.recovering" in WEB
+        assert "TURNING BACK" in WEB
 
     def test_the_panel_keeps_the_speed_as_a_tail(self):
         """It is not deleted. It is just no longer the headline."""

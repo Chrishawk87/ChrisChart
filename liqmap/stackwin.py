@@ -541,10 +541,16 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         # so its memory rides home with the gates' rather than in a
         # second place the caller has to remember to carry.
         "held": {"tick": tick, "candle": s_side,
+                 # `worst` and `bar_dir` ride home too: the first is
+                 # how deep this pullback has been, which one instant
+                 # cannot know, and the second is what tells the next
+                 # reading the geometry flipped and that number is
+                 # now meaningless.
                  "intent": {
                      "state": str((intent or {}).get("state") or ""),
-                     "slice_dir": str((intent or {}).get("slice_dir")
-                                      or "")}},
+                     "worst": float((intent or {}).get("worst") or 0.0),
+                     "bar_dir": str((intent or {}).get("bar_dir")
+                                    or "")}},
         "side": side,
         "why": why,
         "say": ((f"the tick candle and the {tf} candle are both {side}")

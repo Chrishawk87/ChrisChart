@@ -57,27 +57,9 @@ from __future__ import annotations
 
 SIDES = ("up", "down")
 
-# THE SLICE, AS A FRACTION OF THE BAR. A fifth, because that is the
-# ratio he described: a 1-minute candle inside a 5-minute one. It
-# scales, so the slice means the same thing at 1,000 prints a bar as
-# at 10,000 and nothing has to be retuned when the size changes.
-SLICE_FRACTION = 0.2
-# Below this many prints a slice is a handful of trades and its
-# direction is noise. It only ever applies at a cold start.
-MIN_SLICE = 20
-
 # Float dust. Prices are quarter-points; anything under this is a
 # rounding artefact, not a retrace.
 EPS = 1e-9
-
-
-def slice_prints(per_bar: int) -> int:
-    """How many prints the recent slice holds, for this bar size."""
-    try:
-        n = int(per_bar or 0)
-    except (TypeError, ValueError):
-        return MIN_SLICE
-    return max(MIN_SLICE, int(n * SLICE_FRACTION))
 
 
 def depth(direction: str, open_px: float, high: float, low: float,
@@ -123,66 +105,75 @@ def hold(now: str, prev: str = "") -> str:
 
 
 def read(bar_dir: str, open_px: float, high: float, low: float,
-         close: float, slice_dir: str, slice_n: int = 0,
-         prev: dict | None = None) -> dict:
+         close: float, prev: dict | None = None) -> dict:
     """What the tape is doing inside this bar, right now.
 
     `bar_dir` is the bar's own direction, close against open -- the
     same number gate 1 reports, not a second opinion about it.
-    `slice_dir` is the recent slice's direction, close against open
-    on the last N prints.
 
-    `prev` is the previous reading, and holding a state means
-    remembering it. This function stays pure and the caller keeps
-    the memory, exactly as `stackwin.state` does, so one module
-    cannot hand the panel and the rule two different histories.
+    THE REFERENCE IS THE BAR'S EXTREME, AND THAT IS THE WHOLE FIX.
+    Price off the high of an up bar is a pullback the instant it
+    happens, because the high is a fact about this bar and not a
+    point a fixed distance back in the tape.
+
+    `prev` carries the deepest retrace reached since the current
+    extreme, because "is this pullback still going or is it
+    recovering" cannot be read from one instant. The caller keeps
+    that memory and hands it back, exactly as `stackwin.state`
+    does, so one module cannot hand the panel and the rule two
+    different histories.
     """
     prev = prev or {}
     d = depth(bar_dir, open_px, high, low, close)
     at_extreme = d <= EPS
 
-    state = ""
-    if bar_dir in SIDES and slice_dir in SIDES:
-        # WITH the bar is a continuation; AGAINST it is a pullback.
-        # Depth is how much it has cost, not what it is called --
-        # a bar one tick off its high with the tape still selling
-        # is a pullback that has just started, and saying so early
-        # is the entire point of watching the slice.
-        state = "continuation" if slice_dir == bar_dir else "pullback"
+    # THE DEEPEST THIS PULLBACK HAS BEEN. Cleared the moment a new
+    # extreme is made, because at that point there is no pullback
+    # left to be recovering from. Also cleared when the bar's own
+    # direction turns over, since the geometry is then measured off
+    # the other end of the bar and the old number means nothing.
+    turned = bar_dir != str(prev.get("bar_dir") or bar_dir)
+    worst = 0.0 if (at_extreme or turned) else max(
+        d, float(prev.get("worst") or 0.0))
 
+    state = "continuation" if at_extreme else "pullback"
+    if bar_dir not in SIDES:
+        state = ""
     state = hold(state, str(prev.get("state") or ""))
-    slice_dir = hold(slice_dir if slice_dir in SIDES else "",
-                     str(prev.get("slice_dir") or ""))
+
+    # RECOVERING IS A QUALIFIER, NOT A STATE. Price coming back off
+    # the pullback's own low is worth seeing, but it is not a
+    # continuation until a new extreme is made -- calling it one
+    # early would be predicting the resumption rather than
+    # reporting it, which is the mistake in the other direction.
+    recovering = bool(not at_extreme and worst > 0.0 and d < worst - EPS)
 
     return {
         "state": state,
         "depth": round(d, 3),
+        "worst": round(worst, 3),
+        "recovering": recovering,
         "at_extreme": bool(at_extreme),
-        "slice_dir": slice_dir,
         "bar_dir": bar_dir,
-        "slice_n": int(slice_n or 0),
         # Said here so the panel does not decide what the numbers
         # mean, and so the wording lives in one place.
-        "say": _words(state, d, at_extreme, bar_dir),
+        "say": _words(state, d, worst, recovering, at_extreme, bar_dir),
         # NEVER AN INPUT TO A TRADE. Carried on the reading itself
         # so it travels with it into any payload that reshapes.
         "decides": False,
     }
 
 
-def _words(state: str, d: float, at_extreme: bool, bar_dir: str) -> str:
+def _words(state: str, d: float, worst: float, recovering: bool,
+           at_extreme: bool, bar_dir: str) -> str:
     """Plain English, or an honest refusal."""
     if not state or bar_dir not in SIDES:
         return "no direction in the bar yet"
     way = bar_dir.upper()
+    if state == "continuation" or at_extreme:
+        return f"extending the {way} move, at its best price"
     pct = int(round(d * 100))
-    if state == "continuation":
-        if at_extreme:
-            return f"extending the {way} move, at its best price"
-        return (f"the tape has turned back {way} -- {pct}% of the "
-                f"move still given back")
-    if at_extreme:
-        # Possible for an instant: price at the extreme while the
-        # slice already points the other way.
-        return f"turning away from the {way} high"
+    if recovering:
+        return (f"pulling back on the {way} move -- {pct}% given back, "
+                f"recovering from {int(round(worst * 100))}%")
     return f"pulling back on the {way} move -- {pct}% given back"
