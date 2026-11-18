@@ -462,8 +462,12 @@ class TestNoTradeAtTheTimeframesOpen:
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
-        i = src.index("_tf_name = jn.window_label(")
-        blk = src[i:i + 1400]
+        # From the STATE call, not from wherever `_tf_name` is now
+        # assigned -- that moved when the gate-1 sizing was added
+        # above it, and a fixed slice from the wrong anchor stopped
+        # covering the lines it names.
+        i = src.index("fus = _sw.state(win, _bd, _rungs,")
+        blk = src[max(0, i - 900):i + 900]
         assert "tf_ticks=" in blk, "the distance never reaches the rule"
         assert "_candle_now(rt_, _tf_name)" in blk
 
@@ -1299,3 +1303,75 @@ class TestATickChartCanBeTheTradedTimeframe:
         assert 'value="-5000"' in blk and 'value="-10000"' in blk
         assert 'value="300"' in blk and 'value="900"' in blk, \
             "the time windows were dropped"
+
+
+# ---------------------------------------------------------------------
+# THE STEP HAS TO ACTUALLY RUN.
+#
+# Everything above this line reads the route as TEXT. That is useful
+# for pinning which number a rule reads, and it is blind to the one
+# class of fault that has now shipped three times in this file:
+#
+#     FUSION_RESET_S  -- a constant used as a default argument before
+#                        the line that defined it
+#     MAX_PER_BAR     -- the same, in `journal.decide`
+#     _tf_name        -- assigned thirty lines BELOW the gate that
+#                        read it, so every step raised
+#                        UnboundLocalError the moment a tick window
+#                        was selected
+#
+# None of those is visible to a substring check and every one of them
+# dies on the first execution. `/api/read` catches the exception and
+# puts it in `journal.error`, so nothing crashes loudly -- which is
+# exactly why the third one reached Chris's screen.
+# ---------------------------------------------------------------------
+
+from tests.test_cme_panels import _cme, client  # noqa: E402,F401
+
+AUTH = {"Authorization": "Bearer t0ken"}
+
+
+class TestEveryWindowSettingActuallySteps:
+    @pytest.mark.parametrize("window_s,label", [
+        (300.0, "5m"), (900.0, "15m"),
+        (-5000.0, "5000t"), (-10000.0, "10000t"),
+    ])
+    def test_the_journal_step_runs_without_raising(
+            self, client, monkeypatch, window_s, label):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "stack"
+        s.window_s = window_s
+        rt.journal.save_settings(s)
+        assert rt.journal.settings("ES").window_s == window_s, \
+            "the window did not survive the save"
+
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, (
+            f"the step raised on a {label} window: {jr.get('error')}")
+
+    def test_a_tick_window_reaches_the_gates(self, client, monkeypatch):
+        """Not merely "it did not raise": the payload has to describe
+        the tick chart, or the window silently did nothing."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "stack"
+        s.window_s = -5000.0
+        rt.journal.save_settings(s)
+
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        sw_ = ((d.get("journal") or {}).get("stackwin")) or {}
+        assert sw_, "the stack payload is missing entirely"
+        assert (sw_.get("stack") or {}).get("trading") == "5000t", \
+            "the rule is still trading a time chart"

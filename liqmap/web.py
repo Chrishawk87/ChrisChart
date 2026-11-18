@@ -7796,9 +7796,16 @@ def create_app() -> FastAPI:
             # would be decoration. A fifth, which is the ratio a 5m
             # has inside a 15m, snapped to a size that exists.
             from .tickbar import PER_BAR_CHOICES as _PBC2
-            from .tickbar import STRATEGY_PER_BAR as _SPB
             from .tickbar import parse_interval as _pi3
 
+            # NAMED BEFORE IT IS USED, and that is not a formality:
+            # this was assigned thirty lines further down and gate 1
+            # read it here, so every step raised UnboundLocalError
+            # the moment the branch ran. The same shape as the
+            # `FUSION_RESET_S` and `MAX_PER_BAR` faults -- a name
+            # defined after its first reader, which no amount of
+            # reading the source catches and one execution does.
+            _tf_name = jn.window_label(float(s.window_s or 900.0))
             _traded_n = _pi3(_tf_name)
             if _traded_n is None:
                 _g1 = 0                       # the default, 5,000
@@ -7825,7 +7832,6 @@ def create_app() -> FastAPI:
             # THE TRADED CHART, by name. "5m", "15m" or "5000t" --
             # one helper, so the gate, the stack row and the panel
             # cannot each decide differently what is being traded.
-            _tf_name = jn.window_label(float(s.window_s or 900.0))
             _tfi = _tf_intent(rt_, _tf_name, _prev)
             _tfc = _candle_now(rt_, _tf_name) or {}
             fus = _sw.state(win, _bd, _rungs,
