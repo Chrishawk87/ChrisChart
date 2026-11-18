@@ -309,33 +309,42 @@ class TestItReachesThePanel:
         assert "decides nothing" in WEB[i:i + 1600]
 
 
-class TestVolumeDecidesTheSide:
-    """IT DECIDES NOW, AND THAT IS NEW. Chris: "if volume agrees
-    with tick charts direction for a pull back a trade should be
-    taken in that pullback direction as well". This reading was
-    shown-only for two revisions; the class that held it to that is
-    this one, rewritten rather than deleted so the reversal is
-    visible in the history."""
+class TestVolumeConfirmsButDoesNotDecide:
+    """IT DECIDED, FOR ONE REVISION, and does not now. A
+    volume-backed pullback was traded in the retrace's own
+    direction; measured against the timeframe gate it fired on 3%
+    of entries in chop and none at all in a trend, because a short
+    inside an up tick bar needs the timeframe down as well.
 
-    def test_a_heavy_pullback_turns_the_trade_round(self):
-        from liqmap import stackwin as sw
-        st = sw.state({}, "up", {}, 300.0,
-                      intent={"state": "pullback", "heavy": True})
-        assert st["side"] == "down"
+    It is back to the confirmation he first asked for: "we are
+    going to use volume to confirm tick bars continuation or pull
+    back"."""
 
-    def test_a_light_pullback_leaves_it_alone(self):
+    @pytest.mark.parametrize("heavy", [True, False])
+    def test_the_side_is_the_same_either_way(self, heavy):
         from liqmap import stackwin as sw
-        st = sw.state({}, "up", {}, 300.0,
-                      intent={"state": "pullback", "heavy": False})
+        r = {"5m": {"present": True, "qualified": "up"}}
+        st = sw.state({}, "up", r, 300.0,
+                      intent={"state": "pullback", "heavy": heavy})
         assert st["side"] == "up"
 
-    def test_depth_alone_does_not_turn_it(self):
-        """A deep pullback nobody is paying for is still drift."""
+    def test_depth_does_not_turn_it_either(self):
         from liqmap import stackwin as sw
-        st = sw.state({}, "up", {}, 300.0,
-                      intent={"state": "pullback", "heavy": False,
+        r = {"5m": {"present": True, "qualified": "up"}}
+        st = sw.state({}, "up", r, 300.0,
+                      intent={"state": "pullback", "heavy": True,
                               "depth": 0.95})
         assert st["side"] == "up"
+
+    def test_the_reading_is_still_computed(self):
+        """Removed from the decision, not from the engine. The
+        panel draws it and he reads it."""
+        r = ti.read("up", 7000.0, 7100.0, 6999.0, 7070.0,
+                    volume=1400.0, bar_ts=1.0,
+                    prev={"v_ext": 1000.0, "bar_ts": 1.0,
+                          "bar_dir": "up"})
+        assert r["state"] == "pullback"
+        assert r["ratio"] > 0 and isinstance(r["heavy"], bool)
 
     def test_the_ratio_is_what_sets_heavy(self):
         assert ti.read("up", 7000, 7100, 6999, 7050,

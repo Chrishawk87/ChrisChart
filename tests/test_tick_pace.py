@@ -241,23 +241,26 @@ class TestItIsNotAllowedToTrade:
 
     PUSH = {"state": "continuation", "heavy": False}
 
+    RUNGS = {"5m": {"present": True, "qualified": "up"}}
+
     def test_the_entry_ignores_the_pace_entirely(self):
         from liqmap import stackwin as sw
-        fast = sw.state({}, "up", {}, 300.0, intent=self.PUSH,
+        fast = sw.state({}, "up", self.RUNGS, 300.0, intent=self.PUSH,
                         pace={"push": "fade", "ratio": 9.0})
-        slow = sw.state({}, "up", {}, 300.0, intent=self.PUSH,
+        slow = sw.state({}, "up", self.RUNGS, 300.0, intent=self.PUSH,
                         pace={"push": "push", "ratio": 0.1})
         assert fast["side"] == slow["side"] == "up"
         assert fast["say"] == slow["say"]
 
-    def test_a_push_cannot_rescue_a_heavy_pullback(self):
-        """The tempting bug: a very fast tape waved through the
-        trade the volume rule had turned round."""
+    def test_a_push_cannot_rescue_a_disagreeing_candle(self):
+        """The tempting bug: a very fast tape waved through a trade
+        the timeframe gate had refused."""
         from liqmap import stackwin as sw
-        st = sw.state({}, "up", {}, 300.0,
-                      intent={"state": "pullback", "heavy": True},
+        st = sw.state({}, "up",
+                      {"5m": {"present": True, "qualified": "down"}},
+                      300.0, intent=self.PUSH,
                       pace={"push": "push", "ratio": 0.05})
-        assert st["side"] == "down"
+        assert st["side"] == ""
 
     def test_entry_side_does_not_take_a_pace_at_all(self):
         """The strongest form of the guarantee: the function that

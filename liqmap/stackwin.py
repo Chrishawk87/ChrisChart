@@ -166,68 +166,87 @@ def hold_dir(now: str, prev: str = "") -> str:
     return prev if prev in SIDES else ""
 
 
-def entry_side(tick: str, intent: dict | None = None) -> tuple[str, str]:
+def entry_side(tick: str, candle: str = "",
+               intent: dict | None = None) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    THE TICK BAR ALONE, AND WHAT ITS OWN VOLUME SAYS ABOUT IT.
-    Chris: "we will no longer use time as a entry point or exit at
-    all just what the tick bar is doing alone", and "we are going to
-    use volume to confirm tick bars continuation or pull back ... if
-    volume agrees with tick charts direction for a pull back a trade
-    should be taken in that pullback direction as well".
+    TWO READINGS, BOTH POINTING THE SAME WAY. Chris, restating the
+    rule he wants back: "Gate 1 -- the 5000t candle's direction ...
+    Gate 2 -- the real live timeframe candle ... Both gates point
+    the same way. That side is the trade."
 
-    THREE SITUATIONS, NO FOURTH, AND NO DEAD ZONE.
+    Both are already resolved by the caller and both are held
+    through an exact tie, so this cannot disagree with the panel
+    about what either of them said.
 
-        AT THE EXTREME the bar is extending and the trade is its own
-        direction.
+    `intent` IS ACCEPTED AND DOES NOT DECIDE. It was allowed to
+    turn a trade round for one revision -- a volume-backed pullback
+    traded in the retrace's own direction. Measured against the
+    timeframe gate, that fired on 3% of entries in chop and none at
+    all in a trend, because a short inside an up tick bar needs the
+    timeframe down as well. A rule that fires three times in a
+    hundred is not a rule, it is a special case, and it is better
+    off as the reading it started as. It stays in the signature so
+    that `state` can pass it without the caller having to know, and
+    a test holds it to changing nothing.
 
-        PULLING BACK ON LIGHT VOLUME the retrace is drift -- nobody
-        is paying for it -- so the push still stands and the trade
-        is still the bar's direction.
+    WHAT IS NOT HERE:
 
-        PULLING BACK ON HEAVY VOLUME the move is being fought at
-        more size per tick than it took to make it. That is not a
-        reason to stand aside; it is the trade, in the retrace's own
-        direction.
+        THE TEN-SECOND HOLD. "lets add back the timeframe section
+        without the 10 second hold".
 
-    So there is always a side while the bar has a direction, which
-    is the property he has asked for three times now in three
-    different places: "the gate 1 should never say flat at all".
-
-    WHAT IS GONE FROM HERE, AND IT IS NOT AN OVERSIGHT:
-
-        THE TEN-SECOND HOLD. "remove the 10 second hold completely
-        its not a factor in the opening anymore".
-
-        THE TIMEFRAME CANDLE. It gated entries for two revisions and
-        it does not any more. It is still read and still drawn, and
-        it decides nothing.
-
-        THE FIVE-MINUTE TIME STOP, and with it the per-bar cap. "we
-        will no longer use time as a entry point or exit at all".
+        ANY CLOCK. No time stop, no per-bar cap. Exits are the tick
+        bar turning over, or his own stop and target.
     """
     if tick not in SIDES:
         return "", "the tick candle has no direction yet"
-    intent = intent or {}
-    if intent.get("state") == "pullback" and intent.get("heavy"):
-        return _other(tick), ""
+    if candle not in SIDES:
+        return "", "the timeframe candle has no direction yet"
+    if candle != tick:
+        return "", (f"the tick candle is {tick} but the timeframe "
+                    f"candle is {candle}")
     return tick, ""
 
 
-def _say(side: str, tick: str, intent: dict) -> str:
-    """Why the side is the side, in one line.
+def holds(side: str, tick: str) -> tuple[bool, str]:
+    """Does the trade still stand?
 
-    A rule that turns a trade round on a volume ratio has to say so
-    on the screen, or the reversal reads as the engine changing its
-    mind for no reason.
+    ONLY THE TICK BAR TURNING OVER ENDS IT. Chris: "we will no
+    longer use time as a entry point or exit at all just what the
+    tick bar is doing alone" -- said about exits, and restoring the
+    entry gate does not take it back.
+
+    THE TIMEFRAME CANDLE IS NOT READ HERE. It gets you in; the tick
+    bar keeps you in. A candle that turns mid-trade is the pullback
+    being traded through, and closing on it would be a second way
+    out that the entry knows nothing about.
+
+    FLAT IS NOT A FLIP. The direction fed here is the HELD one, so
+    it never blanks -- but a caller that passes a raw reading must
+    not have an absence read as a reversal, which is the churn this
+    rule has been rewritten twice to remove.
+
+    IT MUST BE THE SAME NUMBER THE ENTRY READ. This once took the
+    tick bar's VOTE while the entry took the candle's body, and the
+    two can point opposite ways on one bar -- the engine opened a
+    long and closed it on the same poll.
     """
-    if side != tick:
-        return (f"the {tick} move is being fought -- trading the "
-                f"{side} pullback")
+    if side not in SIDES:
+        return True, ""
+    if tick == _other(side):
+        return False, (f"the tick bar flipped {tick} against your "
+                       f"{side} trade")
+    return True, ""
+
+
+def _say(side: str, tf: str, intent: dict) -> str:
+    """Why the side is the side, in one line."""
+    base = f"the tick candle and the {tf or 'timeframe'} candle are "
     if intent.get("state") == "pullback":
-        return (f"the tick candle is {side}; the pullback is light "
-                "and nobody is paying for it")
-    return f"the tick candle is {side} and extending"
+        word = "heavy" if intent.get("heavy") else "light"
+        return (base + f"both {side} -- pulling back, {word} "
+                "(shown, it does not decide)")
+    return base + f"both {side} and extending"
 
 
 def state(win: dict | None, tick: str, rungs: dict | None,
@@ -285,7 +304,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
     tick = hold_dir(tick_raw, str(prev.get("tick") or ""))
     s_side = hold_dir(s_raw, str(prev.get("candle") or ""))
 
-    side, why = entry_side(tick, intent or {})
+    side, why = entry_side(tick, s_side, intent or {})
 
     rows = {}
     for name in (tf, below):
@@ -334,10 +353,10 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "raw": s_raw,
             "held_through_flat": bool(s_side in SIDES
                                       and s_raw not in SIDES),
-            # NEITHER ASKED NOR DECIDING, AGAIN. Chris: "we will no
-            # longer use time as a entry point or exit at all just
-            # what the tick bar is doing alone". It gated entries
-            # for two revisions; it is now read, drawn, and silent.
+            # ASKED AND DECIDING ON ENTRY. Chris: "lets add back
+            # the timeframe section without the 10 second hold".
+            # It does NOT decide exits -- it gets you in, the tick
+            # bar keeps you in.
             #
             # These two flags are what the panel reads to decide
             # whether to draw this block as a gate or as a reading,
@@ -345,8 +364,8 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             # live gate "shown, not used" is the exact failure this
             # module was written after, and the reverse is just as
             # bad.
-            "asked": False,
-            "decides": False,
+            "asked": True,
+            "decides": True,
             "agrees": bool(s_side and tick in SIDES and s_side == tick),
         },
         # THE TICK CHART AGAINST THE CLOCK -- the push and the pull.
@@ -414,5 +433,5 @@ def state(win: dict | None, tick: str, rungs: dict | None,
                                      or 0.0)}},
         "side": side,
         "why": why,
-        "say": (_say(side, tick, intent or {}) if side else why),
+        "say": (_say(side, tf, intent or {}) if side else why),
     }

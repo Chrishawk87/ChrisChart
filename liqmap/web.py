@@ -7828,23 +7828,24 @@ def create_app() -> FastAPI:
             if rev:
                 disagreed = why_rev
         elif strat == "stack" and t is not None and t.open:
-            # NOTHING EXTRA ENDS A STACK TRADE ANY MORE.
+            # THE TICK BAR TURNING OVER, AND NOTHING ELSE.
             #
-            # It called `exit_reason`, which checked a 5-minute time
-            # stop and then a tick-bar flip -- and it read the flip
-            # off `dir`, the VOTE, while the entry had been moved to
-            # `body_dir`, the candle. The two can point opposite ways
-            # on the same bar, so the rule could open a long and
-            # close it on the same poll.
+            # Chris: "we will no longer use time as a entry point or
+            # exit at all just what the tick bar is doing alone".
+            # Putting the timeframe gate back on ENTRY does not take
+            # that back -- it gets you in, the tick bar keeps you in.
             #
-            # Both problems go away by deleting this: the only
-            # signal exit is now the rule's OWN side turning over,
-            # which `should_close` already handles as `flip` --
-            # `agree` is this strategy's computed side, so one
-            # number opens the trade and the same number ends it.
-            # A stop or a target still fires; those are his
-            # settings, not a clock.
-            disagreed = ""
+            # THE SAME NUMBER THE ENTRY READ. This once called
+            # `exit_reason` with `dir`, the tick bar's VOTE, while
+            # the entry had moved to `body_dir`, the candle. They
+            # can point opposite ways on one bar, so the rule could
+            # open a long and close it on the same poll. The held
+            # body direction is read here, exactly as above, and no
+            # clock is consulted at all.
+            _ok_hold, _why_hold = _sw.holds(
+                t.side, _sw.hold_dir(_bd, str(_prev.get("tick") or "")))
+            if not _ok_hold:
+                disagreed = _why_hold
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -16408,29 +16409,33 @@ function paintClockWindows(d) {
    It renders only for this strategy and hides itself otherwise,
    because a box that shows stale readings from a rule you are not
    running is worse than no box. */
-/* THE 5000T CANDLE, ALONE, AND WHAT ITS VOLUME SAYS.
+/* THE TICK BAR GATES, AND THE TIMEFRAME CANDLE CONFIRMS.
 
-   Chris: "we will no longer use time as a entry point or exit at
-   all just what the tick bar is doing alone", and "if volume
-   agrees with tick charts direction for a pull back a trade should
-   be taken in that pullback direction as well".
+   Chris: "lets add back the timeframe section without the 10
+   second hold", restating the rule he wants: "Gate 1 -- the 5000t
+   candle's direction ... Gate 2 -- the real live timeframe candle
+   ... Both gates point the same way. That side is the trade."
 
-   ONE READING DECIDES. The candle's direction is close against
-   open, held through the instant close sits on its open. At its
-   extreme it is extending and the trade is that direction. Off the
-   extreme it is pulling back, and the VOLUME behind the retrace
-   against the volume behind the push decides whether that is drift
-   -- in which case the push still stands -- or the move being
-   fought, in which case the trade is the retrace's own direction.
+   GATE 1 is the 5,000-tick candle, close against open, exactly
+   what the chart colours -- held through the instant close sits on
+   its open so it never blanks.
 
-   EVERYTHING ELSE IN THIS BOX IS A READING. The timeframe candle,
-   the row below it, the window's four legs, the vote, the pace.
-   Each is labelled, because every reading here that went in
-   unlabelled ended up being read as part of the rule.
+   GATE 2 is the real forming 15m or 5m candle, close against open,
+   no threshold, one tick decides it. Which one depends on the
+   window setting, so this box NAMES it.
 
-   NO CLOCK ANYWHERE. No ten-second hold, no five-minute time stop,
-   no per-bar cap -- each of those was removed by name and each is
-   held out by a test in the negative, because all three have been
+   THE EXIT IS GATE 1 ALONE. The timeframe candle gets you in; the
+   tick bar keeps you in. Nothing in gate 2 closes a trade, and no
+   clock does either.
+
+   EVERYTHING BELOW THE GATES IS A READING: the row under the
+   traded one, the window's four legs, the vote, the pace, and the
+   tape's pullback-and-volume line. Each is labelled, because every
+   reading here that went in unlabelled ended up being read as part
+   of the rule.
+
+   NO HOLD, NO CLOCK, NO CAP. Each was removed by name and each is
+   held out by a test in the negative -- all three have been
    silently re-wired in this file before. */
 function paintStackWin(SW) {
   const box = $('jnlStackWin');
@@ -16453,8 +16458,8 @@ function paintStackWin(SW) {
       '<div style="border-left:3px solid var(--'
     + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">THE 5000T CANDLE AND ITS VOLUME '
-    + '&mdash; this is the whole rule</div>'
+    + '<div class="thin">GATE 1 &mdash; THE 5000T CANDLE '
+    + '(close vs open, as the chart draws it)</div>'
     + '<div style="margin:4px 0">' + leg('tick bar', f.side) + '</div>'
     /* HELD THROUGH THE TIE, AND SAID SO. The candle sits exactly
        on its open for an instant and has no body to read. The rule
@@ -16487,12 +16492,10 @@ function paintStackWin(SW) {
        changing its mind for no reason. Chris: "if volume agrees
        with tick charts direction for a pull back a trade should be
        taken in that pullback direction as well". */
-    + (SW.side
-        ? '<b class="' + (SW.side === 'up' ? 'long' : 'short') + '">'
-          + 'TRADE ' + SW.side.toUpperCase() + '</b>'
-          + (SW.side !== f.side
-              ? ' <span class="flag late">AGAINST THE CANDLE</span>' : '')
-          + ' <span class="thin">' + esc(SW.say || '') + '</span>'
+    + (f.side
+        ? '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
+          + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
+          + ' <span class="thin">in on this, out when it flips</span>'
         : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
     /* THE TAPE LINE: IS THIS BAR CONTINUING, OR PULLING BACK?
@@ -16571,20 +16574,42 @@ function paintStackWin(SW) {
   const mins = Math.round((cx.period_s || 0) / 60) || 5;
 
   const g2side = st.side || '';
-  /* THE TIMEFRAME CANDLE, DEMOTED BACK TO A READING.
+  /* GATE 2 -- THE REAL TIMEFRAME CANDLE, DECIDING AGAIN.
 
-     It gated entries for two revisions. Chris: "we will no longer
-     use time as a entry point or exit at all just what the tick bar
-     is doing alone". It is still built, still correct, still drawn
-     -- he compares it against Ironbeam -- and it decides nothing,
-     which the heading has to say or the panel is lying about the
-     rule again. */
+     Chris: "lets add back the timeframe section without the 10
+     second hold". It gates ENTRIES only: it gets you in, the tick
+     bar keeps you in, and nothing here closes a trade.
+
+     IT IS DRAWN AS A GATE BECAUSE IT IS ONE. It has been demoted
+     and restored twice now, and both times the heading had to move
+     with it -- a screen that labels a live gate "shown only", or a
+     dead one as a gate, is the fault this panel was rebuilt after.
+
+     The timeframe is NAMED rather than implied. Which row gates
+     depends on the window setting, and "the candle" without a name
+     is how you end up gated on a 15m while reading a 5m. */
   const tfBlock =
-      '<div style="margin-top:8px;padding:6px 0 6px 13px;opacity:.55;'
-    + 'border-left:3px solid var(--line)">'
-    + '<div class="thin">THE REAL ' + esc(st.trading || '').toUpperCase()
-    + ' CANDLE &mdash; shown only, it does not gate anything</div>'
+      '<div style="margin-top:8px;border-left:3px solid var(--'
+    + (g2side ? (g2side === 'up' ? 'up' : 'down') : 'line')
+    + ');padding:6px 0 6px 10px">'
+    + '<div class="thin">GATE 2 &mdash; THE REAL '
+    + esc(st.trading || '').toUpperCase() + ' CANDLE (close vs open, '
+    + 'live) &mdash; it must agree to open</div>'
     + '<div style="margin:4px 0">' + row(st.trading, g2side) + '</div>'
+    + (st.held_through_flat
+        ? '<div class="thin">price is exactly on the '
+          + esc(st.trading || '') + ' open &mdash; holding '
+          + esc(g2side || '').toUpperCase() + ' until it moves</div>'
+        : '')
+    + (st.agrees
+        ? '<b class="' + (g2side === 'up' ? 'long' : 'short') + '">'
+          + 'AGREES &mdash; both ' + esc(g2side).toUpperCase() + '</b>'
+        : (g2side
+            ? '<b class="short">DISAGREES</b> <span class="thin">the '
+              + esc(st.trading || '') + ' candle is '
+              + esc(g2side).toUpperCase() + '</span>'
+            : '<b class="short">NO DIRECTION</b> <span class="thin">'
+              + esc(st.why || '') + '</span>'))
     + '</div>';
 
   const context =
@@ -16607,10 +16632,10 @@ function paintStackWin(SW) {
       + esc(SW.why || '') + '</span>';
 
   box.innerHTML =
-      '<div class="thin" style="margin-bottom:4px"><b>THE 5000T '
-    + 'CANDLE, ALONE</b> &mdash; in on its direction, or against it '
-    + 'when volume says the pullback is being paid for. Out when '
-    + 'that answer turns over. No clock, no hold, no cap.</div>'
+      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
+    + '&amp; THE ' + esc(st.trading || '').toUpperCase() + ' CANDLE'
+    + '</b> &mdash; both must agree to open. Out on the tick '
+    + 'bar&rsquo;s flip alone. No hold, no clock, no cap.</div>'
     + ruleBlock
     + tfBlock
     + '<div style="margin-top:8px">' + verdict + '</div>'

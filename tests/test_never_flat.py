@@ -120,9 +120,9 @@ class TestGateOneIsTheCandle:
         # is exactly what was being reported as the direction.
         assert b.current.path_dir == "flat"
 
-    def test_the_panel_names_what_the_rule_reads(self):
-        assert "THE 5000T CANDLE AND ITS VOLUME" in WEB
-        assert "this is the whole rule" in WEB
+    def test_the_panel_names_what_gate_one_reads(self):
+        assert "GATE 1 &mdash; THE 5000T CANDLE" in WEB
+        assert "close vs open, as the chart draws it" in WEB
 
     def test_the_vote_is_still_drawn_beside_it(self):
         """It is not deleted. When it disagrees with the body that
@@ -150,8 +150,8 @@ class TestNeitherGateEverReportsFlat:
         assert sw.hold_dir("flat", "sideways") == ""
 
     def test_the_tick_direction_holds_through_a_tie(self):
-        st = sw.state({}, "flat", {}, 300.0, intent=PUSH,
-                      prev={"tick": U})
+        st = sw.state({}, "flat", rungs(**{"5m": U}), 300.0,
+                      intent=PUSH, prev={"tick": U})
         assert st["tick"]["side"] == U
         assert st["tick"]["raw"] == "flat"
         assert st["tick"]["held_through_flat"] is True
@@ -266,9 +266,10 @@ class TestGateTwoIsTheRealLiveCandle:
         screen rather than guessed at."""
         assert "open_px" in WEB and "last_px" in WEB
 
-    def test_the_panel_says_the_timeframe_candle_is_shown_only(self):
-        assert "THE REAL ' + esc(st.trading" in WEB
-        assert "shown only, it does not gate anything" in WEB
+    def test_the_panel_says_it_is_the_real_live_candle_gate(self):
+        assert "GATE 2 &mdash; THE REAL " in WEB
+        assert "close vs open, " in WEB
+        assert "it must agree to open" in WEB
 
     def test_the_panel_arrow_shows_what_the_gate_uses(self):
         """An arrow reading "flat" beside a verdict reading AGREES

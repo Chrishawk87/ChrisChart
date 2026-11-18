@@ -293,7 +293,9 @@ class TestItReachesTheRule:
 
     def test_the_window_decides_nothing(self):
         from liqmap import stackwin as sw
-        up = sw.state({}, "down", {}, 300.0,
+        up = sw.state({}, "down",
+                      {"5m": {"present": True, "qualified": "down"}},
+                      300.0,
                       intent={"state": "continuation", "heavy": False},
                       roll={"dir": "up", "window": 5000})
         assert up["side"] == "down", "the vote overruled the candle"
