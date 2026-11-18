@@ -183,6 +183,31 @@ def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
 TICK = 0.25
 MIN_TURN_TICKS = 4.0
 
+# NO TRADE WHILE THE TIMEFRAME IS SITTING ON ITS OPEN.
+#
+# Chris: "no trades are ever taken at the opening price of whatever
+# timeframe i select on my auto trader".
+#
+# A candle whose close is a tick from its open has not said
+# anything yet -- its direction is one print old and will be the
+# other way as often as not. This is the same objection as the
+# newborn tick bar, one timeframe up.
+MIN_OPEN_TICKS = 4.0
+
+# WHEN A PULLBACK HAS STOPPED BEING A PULLBACK.
+#
+# Chris: "tick chart pushing opposite direction of time is a
+# pullback and vic versa a continuation when they both agree on
+# direction" -- and, asked what should then close a trade,
+# "Timeframe, or a pullback that fails".
+#
+# Measured against the TIMEFRAME's own move, not the tick bar's: a
+# retrace that has given back this much of what the candle made is
+# no longer a pause in the move, whatever the tick chart is doing.
+# Volume failing it is the other half, and that test lives in
+# `tapeintent` where the effort comparison already is.
+PULLBACK_FAILS_AT = 0.6
+
 
 def body_dir(open_px: float, close_px: float, prev: str = "",
              min_ticks: float = MIN_TURN_TICKS) -> str:
@@ -258,91 +283,139 @@ def hold_dir(now: str, prev: str = "") -> str:
     return prev if prev in SIDES else ""
 
 
+def regime(tick: str, candle: str) -> str:
+    """Where this move is: "continuation", "pullback", or "".
+
+    Chris: "using the tick chart to confirm what the timeframe is
+    actually doing tick chart pushing opposite direction of time is
+    a pullback and vic versa a continuation when they both agree on
+    direction".
+
+    THIS IS THE SENTENCE THAT CHANGES THE RULE. The tick bar
+    disagreeing with the timeframe was being read as the signal
+    failing, and closed the trade. It is not a failure, it is a
+    PULLBACK -- a normal part of a move that is still going -- and
+    treating it as an exit is what turned every retrace into a
+    realised loss.
+    """
+    if tick not in SIDES or candle not in SIDES:
+        return ""
+    return "continuation" if tick == candle else "pullback"
+
+
+def pullback_failed(depth: float, heavy: bool = False,
+                    fails_at: float = PULLBACK_FAILS_AT) -> bool:
+    """Has this retrace stopped being a pause and become a turn?
+
+    Two ways, and either is enough:
+
+        DEPTH -- it has given back `fails_at` of what the timeframe
+        candle made. Past that the move it was pausing in is mostly
+        gone.
+
+        VOLUME -- it is being paid for. `heavy` comes from
+        `tapeintent`, which compares the size behind the retrace
+        against the size behind the push, per unit of price moved,
+        and already refuses to call a trivial retrace heavy.
+
+    A shallow retrace nobody is leaning on is neither, and that is
+    the case this whole revision exists to hold through.
+    """
+    try:
+        d = float(depth or 0.0)
+        f = float(fails_at)
+    except (TypeError, ValueError):
+        return False
+    return bool(d >= f or heavy)
+
+
 def entry_side(tick: str, candle: str = "",
+               tf_ticks: float | None = None,
+               min_open_ticks: float = MIN_OPEN_TICKS,
                intent: dict | None = None) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
-    TWO READINGS, BOTH POINTING THE SAME WAY. Chris, restating the
-    rule he wants back: "Gate 1 -- the 5000t candle's direction ...
-    Gate 2 -- the real live timeframe candle ... Both gates point
-    the same way. That side is the trade."
+    A CONTINUATION, AND NOTHING ELSE. Chris: both gates pointing the
+    same way is a continuation and that is the trade; the tick chart
+    pushing the other way is a PULLBACK, and asked whether to enter
+    during one he chose "No entry during a pullback" -- it is a
+    state you hold through, not one you open in.
 
-    Both are already resolved by the caller and both are held
-    through an exact tie, so this cannot disagree with the panel
-    about what either of them said.
+    `tf_ticks` is how far the timeframe candle sits from its own
+    open. Chris: "no trades are ever taken at the opening price of
+    whatever timeframe i select on my auto trader". None means the
+    caller cannot measure it and the check is skipped -- a caller
+    that cannot see the distance must not be silently blocked from
+    ever trading.
 
-    `intent` IS ACCEPTED AND DOES NOT DECIDE. It was allowed to
-    turn a trade round for one revision -- a volume-backed pullback
-    traded in the retrace's own direction. Measured against the
-    timeframe gate, that fired on 3% of entries in chop and none at
-    all in a trend, because a short inside an up tick bar needs the
-    timeframe down as well. A rule that fires three times in a
-    hundred is not a rule, it is a special case, and it is better
-    off as the reading it started as. It stays in the signature so
-    that `state` can pass it without the caller having to know, and
-    a test holds it to changing nothing.
+    `intent` is accepted and decides nothing on ENTRY. It is what
+    tells an open trade whether a pullback has failed, and it lives
+    in `holds`.
 
-    WHAT IS NOT HERE:
-
-        THE TEN-SECOND HOLD. "lets add back the timeframe section
-        without the 10 second hold".
-
-        ANY CLOCK. No time stop, no per-bar cap. Exits are the tick
-        bar turning over, or his own stop and target.
+    WHAT IS NOT HERE: the ten-second hold, and any clock. The
+    five-minute stamp the caller applies is a counter for the
+    two-trades cap, not a gate and not a stop.
     """
     if tick not in SIDES:
         return "", "the tick candle has no direction yet"
     if candle not in SIDES:
         return "", "the timeframe candle has no direction yet"
-    if candle != tick:
-        return "", (f"the tick candle is {tick} but the timeframe "
-                    f"candle is {candle}")
+    where = regime(tick, candle)
+    if where != "continuation":
+        return "", (f"pulling back -- the tick candle is {tick} "
+                    f"against a {candle} timeframe")
+    if tf_ticks is not None and abs(float(tf_ticks)) < float(
+            min_open_ticks or 0.0):
+        return "", (f"the timeframe candle is {abs(tf_ticks):.0f} "
+                    f"ticks off its open -- nothing is taken within "
+                    f"{min_open_ticks:.0f}")
     return tick, ""
 
 
-def holds(side: str, tick: str, candle: str = "") -> tuple[bool, str]:
+def holds(side: str, tick: str, candle: str = "",
+          failed: bool = False) -> tuple[bool, str]:
     """Does the trade still stand?
 
-    TWO WAYS OUT NOW, AND THE TIMEFRAME ONE IS NEW. Chris: "the
-    timeframe is also going to be a exit rule disagree means exit
-    because the strategy isnt accounting for the tick charts pull
-    backs".
+    A TICK-BAR FLIP NO LONGER ENDS IT, and that is the whole point
+    of this revision. Chris: "every trade that im loosing is because
+    of flips", and then the reason -- "tick chart pushing opposite
+    direction of time is a pullback". The tick bar turning against
+    the timeframe is a PULLBACK. It was being read as the signal
+    failing and it closed the trade, which turned every retrace into
+    a realised loss.
 
-    THE TICK BAR TURNING OVER still ends it -- that is what gets
-    you out of a move that has actually reversed.
+    TWO THINGS END IT, and he chose both:
 
-    THE TIMEFRAME CANDLE TURNING AGAINST YOU now ends it too. It
-    gated the entry and it keeps gating while the trade is open, so
-    a position cannot survive the condition that opened it going
-    away. This reverses "no longer use time as a entry point or
-    exit at all" from one revision ago, by name and on purpose.
+        THE TIMEFRAME TURNING AGAINST THE TRADE. That is the move
+        itself reversing, not pausing.
 
-    FLAT IS NOT A DISAGREEMENT, on either of them. Both directions
-    arrive here HELD, so neither blanks in normal running -- but a
-    caller that passes a raw reading must not have an absence read
-    as a reversal. Exits firing on absences is the churn this rule
-    has been rewritten three times to remove, and it is the single
-    most expensive mistake in this file's history.
+        A PULLBACK THAT FAILED -- too deep, or being paid for in
+        volume. A retrace becoming a reversal before the timeframe
+        has caught up. `failed` comes from `pullback_failed`, read
+        off the TIMEFRAME's own retrace.
 
-    THE ORDER IS THE ORDER OF THE REASONS. The tick bar is asked
-    first because it is the faster of the two and the one that
-    usually fires; a log that blamed the timeframe for a tick-bar
-    exit would send you looking at the wrong chart.
+    A pullback that is merely happening is held through, which is
+    the behaviour he can do by hand and the engine could not.
 
-    IT MUST BE THE SAME NUMBERS THE ENTRY READ. This once took the
-    tick bar's VOTE while the entry took the candle's body, and the
-    two can point opposite ways on one bar -- the engine opened a
-    long and closed it on the same poll.
+    FLAT IS NOT A DISAGREEMENT, on either reading. Both arrive held,
+    so neither blanks in normal running -- but an absence must never
+    be read as a reversal. That is the most expensive mistake in
+    this file's history and it has been made three times.
+
+    THE ORDER IS THE ORDER OF THE REASONS. The timeframe is asked
+    first because it is the stronger statement; a log blaming a
+    failed pullback when the trend itself had turned would send you
+    to the wrong chart.
     """
     if side not in SIDES:
         return True, ""
     other = _other(side)
-    if tick == other:
-        return False, (f"the tick bar flipped {tick} against your "
-                       f"{side} trade")
     if candle == other:
         return False, (f"the timeframe candle turned {candle} against "
                        f"your {side} trade")
+    if tick == other and failed:
+        return False, (f"the pullback against your {side} trade went "
+                       f"too far to still be a pullback")
     return True, ""
 
 
@@ -371,14 +444,27 @@ def bar_of(ts: float, period_s: float = CAP_BAR_S) -> float:
     return float(int(t // p) * int(p))
 
 
+def _regime_say(where: str, candle: str, tick: str, depth: float,
+                heavy: bool, failed: bool) -> str:
+    """What the two charts say about each other, in one line."""
+    if not where:
+        return "one of the two has no direction yet"
+    if where == "continuation":
+        return (f"the tick chart is pushing {tick} with a {candle} "
+                "timeframe -- a continuation")
+    pct = int(round(depth * 100))
+    base = (f"the tick chart is pushing {tick} against a {candle} "
+            f"timeframe -- a pullback, {pct}% of the move given back")
+    if failed:
+        why = "being paid for" if heavy else "too deep"
+        return base + f" and FAILING ({why})"
+    return base + ", holding through it"
+
+
 def _say(side: str, tf: str, intent: dict) -> str:
     """Why the side is the side, in one line."""
     base = f"the tick candle and the {tf or 'timeframe'} candle are "
-    if intent.get("state") == "pullback":
-        word = "heavy" if intent.get("heavy") else "light"
-        return (base + f"both {side} -- pulling back, {word} "
-                "(shown, it does not decide)")
-    return base + f"both {side} and extending"
+    return base + f"both {side} -- a continuation"
 
 
 def state(win: dict | None, tick: str, rungs: dict | None,
@@ -387,6 +473,8 @@ def state(win: dict | None, tick: str, rungs: dict | None,
           pace: dict | None = None,
           roll: dict | None = None,
           intent: dict | None = None,
+          tf_intent: dict | None = None,
+          tf_ticks: float | None = None,
           prev: dict | None = None) -> dict:
     """Everything the rule and the panel need, from one place.
 
@@ -452,7 +540,18 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         tick = hold_dir(tick_raw, prev_tick)
     s_side = hold_dir(s_raw, str(prev.get("candle") or ""))
 
-    side, why = entry_side(tick, s_side, intent or {})
+    # WHERE THIS MOVE IS, from the two gates together. Agreement
+    # is a continuation; the tick chart pushing the other way is a
+    # pullback, not a failure.
+    tf_intent = tf_intent or {}
+    where = regime(tick, s_side)
+    tf_depth = float(tf_intent.get("depth") or 0.0)
+    tf_heavy = bool(tf_intent.get("heavy"))
+    failed = bool(where == "pullback"
+                  and pullback_failed(tf_depth, tf_heavy))
+
+    side, why = entry_side(tick, s_side, tf_ticks,
+                           intent=intent or {})
 
     rows = {}
     for name in (tf, below):
@@ -554,6 +653,22 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         # block that decides everything is how this engine has twice
         # traded something nobody meant it to.
         "intent": {**(intent or {}), "decides": False},
+        # WHERE THE MOVE IS, AND WHETHER THE PULLBACK HAS FAILED.
+        # This block DOES decide: it is what holds a trade through
+        # a retrace and what closes one when the retrace stops
+        # being a retrace.
+        "regime": {
+            "where": where,
+            "depth": round(tf_depth, 3),
+            "heavy": tf_heavy,
+            "failed": failed,
+            "fails_at": float(PULLBACK_FAILS_AT),
+            "tf_ticks": tf_ticks,
+            "min_open_ticks": float(MIN_OPEN_TICKS),
+            "decides": True,
+            "say": _regime_say(where, s_side, tick, tf_depth,
+                               tf_heavy, failed),
+        },
         # SHOWN, NOT USED. Under its own heading so there is no
         # chance of reading any of it as part of the decision.
         "context": {

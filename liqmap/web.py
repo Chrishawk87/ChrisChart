@@ -7228,6 +7228,35 @@ def create_app() -> FastAPI:
             bar_ts=float((tk_ or {}).get("start_ts") or 0.0),
             prev=(prev_ or {}).get("intent") or {})
 
+    def _tf_intent(rt_, tf: str, prev_: dict | None = None) -> dict:
+        """Is the TIMEFRAME pulling back, and is it being paid for?
+
+        The same module that reads a tick bar's retrace, pointed one
+        timeframe up. Chris: "tick chart pushing opposite direction
+        of time is a pullback" -- and a pullback only ends a trade
+        when it FAILS, which is a question about the timeframe's own
+        move, not the tick bar's.
+
+        One implementation, two scales. A second copy of "how far
+        has this come back" is a second thing to keep correct, and
+        the first time they disagreed the screen and the rule would
+        be telling different stories about one retrace.
+        """
+        from . import tapeintent as _ti
+
+        c = _candle_now(rt_, tf) or {}
+        if not c:
+            return {}
+        return _ti.read(
+            str(c.get("dir") or ""),
+            float(c.get("open") or 0.0),
+            float(c.get("high") or 0.0),
+            float(c.get("low") or 0.0),
+            float(c.get("close") or 0.0),
+            volume=float(c.get("volume") or 0.0),
+            bar_ts=float(c.get("start_ts") or 0.0),
+            prev=(prev_ or {}).get("tf_intent") or {})
+
     def _m5_now(rt_) -> dict:
         """The forming FIVE-MINUTE candle. One line, one reader.
 
@@ -7266,6 +7295,15 @@ def create_app() -> FastAPI:
         return {"dir": ("up" if cl > o else "down" if cl < o else "flat"),
                 "open": o, "close": cl, "seconds": round(age, 1),
                 "start_ts": float(c.start_ts),
+                # THE EXTREMES AND THE SIZE BEHIND THEM. A retrace
+                # is measured off this candle's own high or low, and
+                # whether it is being paid for comes from the volume
+                # either side of that extreme. Without these the
+                # rule cannot tell a pullback from a reversal, which
+                # is the whole of what it is now asked to do.
+                "high": float(getattr(c, "high", 0.0) or 0.0),
+                "low": float(getattr(c, "low", 0.0) or 0.0),
+                "volume": float(getattr(c, "volume", 0.0) or 0.0),
                 "ticks": round((cl - o) / 0.25, 1) if o else 0.0}
 
     def _timed_now(rt_) -> dict:
@@ -7701,17 +7739,35 @@ def create_app() -> FastAPI:
             # open, held through the instant close sits on open.
             _prev = getattr(rt_, "_gate_held", None) or {}
             _bd = _tk.get("body_dir") or ""
+            # THE TIMEFRAME'S OWN RETRACE, and how far it sits from
+            # its own open. The first says whether a pullback has
+            # failed; the second is "no trades are ever taken at
+            # the opening price of whatever timeframe i select".
+            _tf_name = ("5m" if float(s.window_s or 900.0) <= 300.0
+                        else "15m")
+            _tfi = _tf_intent(rt_, _tf_name, _prev)
+            _tfc = _candle_now(rt_, _tf_name) or {}
             fus = _sw.state(win, _bd, _rungs,
                             float(s.window_s or 900.0),
                             tick_open=float(_tk.get("open") or 0.0),
                             tick_close=float(_tk.get("close") or 0.0),
+                            tf_intent=_tfi,
+                            tf_ticks=(float(_tfc.get("ticks") or 0.0)
+                                      if _tfc else None),
                             fp=fpi.get("side") or "",
                             pace=_tk.get("pace") or {},
                             roll=_tk.get("roll") or {},
                             intent=_tape_intent(_tk, _prev),
                             prev=_prev)
             try:
-                rt_._gate_held = fus.get("held") or {}
+                rt_._gate_held = {**(fus.get("held") or {}),
+                                  "tf_intent": {
+                                      "state": _tfi.get("state") or "",
+                                      "worst": _tfi.get("worst") or 0.0,
+                                      "bar_dir": _tfi.get("bar_dir") or "",
+                                      "heavy": bool(_tfi.get("heavy")),
+                                      "v_ext": _tfi.get("v_ext") or 0.0,
+                                      "bar_ts": _tfi.get("bar_ts") or 0.0}}
             except Exception:                           # noqa: BLE001
                 pass
         else:
@@ -7837,13 +7893,18 @@ def create_app() -> FastAPI:
             if rev:
                 disagreed = why_rev
         elif strat == "stack" and t is not None and t.open:
-            # THE TICK BAR TURNING OVER, OR THE TIMEFRAME CANDLE
-            # TURNING AGAINST THE TRADE.
+            # THE TIMEFRAME TURNING, OR A PULLBACK THAT FAILED.
             #
-            # Chris: "the timeframe is also going to be a exit rule
-            # disagree means exit". The timeframe gated the entry
-            # and now keeps gating while the trade is open, so a
-            # position cannot outlive the condition that opened it.
+            # A TICK-BAR FLIP NO LONGER CLOSES ANYTHING. Chris:
+            # "every trade that im loosing is because of flips ...
+            # tick chart pushing opposite direction of time is a
+            # pullback". It was being read as the signal failing,
+            # and it turned every retrace into a realised loss.
+            #
+            # What closes a trade now is the move itself reversing
+            # -- the timeframe candle turning -- or a retrace that
+            # has gone too deep or is being paid for in volume,
+            # measured off the TIMEFRAME's own move.
             #
             # STILL NO CLOCK. The five-minute stamp above counts
             # trades; it does not end them.
@@ -7861,7 +7922,8 @@ def create_app() -> FastAPI:
             _ok_hold, _why_hold = _sw.holds(
                 t.side,
                 (fus.get("tick") or {}).get("side") or "",
-                (fus.get("stack") or {}).get("side") or "")
+                (fus.get("stack") or {}).get("side") or "",
+                failed=bool((fus.get("regime") or {}).get("failed")))
             if not _ok_hold:
                 disagreed = _why_hold
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
@@ -16671,6 +16733,60 @@ function paintStackWin(SW) {
     + leg('footprint', cx.footprint)
     + '</div></div>';
 
+  /* THE TWO CHARTS READ AGAINST EACH OTHER.
+
+     Chris: "using the tick chart to confirm what the timeframe is
+     actually doing tick chart pushing opposite direction of time is
+     a pullback and vic versa a continuation when they both agree on
+     direction".
+
+     THIS IS THE REASONING AND IT IS THE PART THAT WAS MISSING. The
+     two gates disagreeing was read as the signal failing and it
+     closed the trade -- so every retrace became a realised loss.
+     It is a PULLBACK, and a pullback is held through unless it has
+     gone too deep or is being paid for in volume, both measured
+     off the TIMEFRAME's own move.
+
+     IT IS DRAWN AS A DECIDER BECAUSE IT IS ONE. */
+  const rg = SW.regime || {};
+  const regimeBlock = rg.where
+    ? '<div style="margin-top:8px;border-left:3px solid var(--'
+      + (rg.where === 'continuation'
+          ? (SW.side === 'down' ? 'down' : 'up')
+          : (rg.failed ? 'down' : 'line'))
+      + ');padding:6px 0 6px 10px">'
+      + '<div class="thin">THE TWO CHARTS TOGETHER &mdash; this '
+      + 'decides whether a trade is viable</div>'
+      + '<div style="margin:4px 0">'
+      + '<b class="' + (rg.where === 'continuation'
+          ? (SW.side === 'down' ? 'short' : 'long') : 'short') + '">'
+      + (rg.where === 'continuation' ? 'CONTINUATION' : 'PULLBACK')
+      + '</b>'
+      + (rg.where === 'pullback'
+          ? (rg.failed
+              ? ' <span class="flag late">FAILING</span>'
+              : ' <span class="thin">holding through it</span>')
+          : '')
+      + '</div>'
+      + '<div class="thin">' + esc(rg.say || '') + '</div>'
+      + (rg.where === 'pullback'
+          ? '<div class="thin">'
+            + Math.round((rg.depth || 0) * 100) + '% of the '
+            + esc(st.trading || '') + ' move given back &middot; fails '
+            + 'at ' + Math.round((rg.fails_at || 0) * 100) + '%'
+            + (rg.heavy ? ' &middot; <b>volume is paying for it</b>'
+                        : ' &middot; nobody is paying for it')
+            + '</div>'
+          : '')
+      + (rg.tf_ticks != null
+          ? '<div class="thin">' + (rg.tf_ticks > 0 ? '+' : '')
+            + rg.tf_ticks + ' ticks off the ' + esc(st.trading || '')
+            + ' open &middot; nothing opens within '
+            + rg.min_open_ticks + '</div>'
+          : '')
+      + '</div>'
+    : '';
+
   /* THE RULE'S VERDICT, AND THE JOURNAL'S ANSWER TO IT.
 
      These are two different questions and this box used to answer
@@ -16694,10 +16810,12 @@ function paintStackWin(SW) {
   box.innerHTML =
       '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
     + '&amp; THE ' + esc(st.trading || '').toUpperCase() + ' CANDLE'
-    + '</b> &mdash; both must agree to open. Out on the tick '
-    + 'bar&rsquo;s flip alone. No hold, no clock, no cap.</div>'
+    + '</b> &mdash; they agree, it is a continuation and a trade; '
+    + 'they disagree, it is a pullback and you hold. Out when the '
+    + 'timeframe turns or the pullback fails.</div>'
     + ruleBlock
     + tfBlock
+    + regimeBlock
     + '<div style="margin-top:8px">' + verdict + '</div>'
     + context;
 }

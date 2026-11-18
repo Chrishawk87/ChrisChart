@@ -215,7 +215,8 @@ class TestTheMemoryIsTheCallersCom:
         assert 'getattr(rt_, "_gate_held", None)' in blk, \
             "the route keeps no memory, so nothing can be held"
         assert "prev=_prev" in blk
-        assert "rt_._gate_held = fus.get(\"held\")" in blk
+        assert 'rt_._gate_held = {**(fus.get("held")' in blk, \
+            "the gates' memory is no longer stored"
 
     def test_there_is_no_dwell_left_to_feed(self):
         """Chris: "remove the 10 second hold completely". Pinned in

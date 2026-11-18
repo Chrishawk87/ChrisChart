@@ -143,11 +143,15 @@ class TestBothGatesMustAgree:
         assert sw.entry_side(U, junk)[0] == ""
 
     @pytest.mark.parametrize("tick,candle", [(U, D), (D, U)])
-    def test_a_disagreeing_candle_blocks_it(self, tick, candle):
+    def test_a_disagreeing_candle_is_a_pullback_not_an_entry(
+            self, tick, candle):
+        """It blocks the ENTRY and it does not close a trade --
+        that distinction is the whole of this revision."""
         side, why = sw.entry_side(tick, candle)
         assert side == ""
+        assert "pulling back" in why
         assert f"the tick candle is {tick}" in why
-        assert f"the timeframe candle is {candle}" in why
+        assert f"{candle} timeframe" in why
 
     def test_no_candle_direction_blocks_it(self):
         side, why = sw.entry_side(U, "")
@@ -169,14 +173,15 @@ class TestVolumeNoLongerTurnsATradeRound:
     @pytest.mark.parametrize("heavy", [True, False])
     def test_the_side_is_the_same_either_way(self, heavy):
         intent = {"state": "pullback", "heavy": heavy, "depth": 0.5}
-        assert sw.entry_side(U, U, intent) == (U, "")
+        assert sw.entry_side(U, U, intent=intent) == (U, "")
 
     def test_it_never_returns_the_opposite_side(self):
         for tick in (U, D):
             for st in ("pullback", "continuation", ""):
                 for heavy in (True, False):
                     side, _ = sw.entry_side(
-                        tick, tick, {"state": st, "heavy": heavy})
+                        tick, tick,
+                        intent={"state": st, "heavy": heavy})
                     assert side == tick, (tick, st, heavy)
 
     def test_the_state_agrees(self):
@@ -188,12 +193,15 @@ class TestVolumeNoLongerTurnsATradeRound:
 
     def test_the_reading_is_still_carried_and_still_shown(self):
         """Removed from the decision, not from the screen."""
-        st = sw.state({}, U, rungs(**{"5m": U}), 300.0,
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=40.0,
                       intent={"state": "pullback", "heavy": True,
                               "ratio": 1.9})
         assert st["intent"]["heavy"] is True
-        assert st["intent"]["decides"] is False
-        assert "heavy" in st["say"] and "does not decide" in st["say"]
+        assert st["intent"]["decides"] is False, \
+            "the TICK bar's own retrace is not what gates anything"
+        # What DOES decide is the regime block, read off the
+        # timeframe's retrace rather than the tick bar's.
+        assert st["regime"]["decides"] is True
 
 
 class TestWhatCameOut:
@@ -251,71 +259,253 @@ class TestWhatCameOut:
             "the cap is inherited from journal.decide again"
 
 
-class TestTheExitIsEitherGateTurningAgainstIt:
-    """Chris: "the timeframe is also going to be a exit rule
-    disagree means exit because the strategy isnt accounting for the
-    tick charts pull backs".
+class TestAPullbackDoesNotCloseATrade:
+    """THE CHANGE THIS REVISION EXISTS FOR.
 
-    This reverses "we will no longer use time as a entry point or
-    exit at all" from one revision ago. Stated here so nobody
-    re-derives the older rule from the older docstrings."""
+    Chris: "every trade that im loosing is because of flips" -- and
+    then the reason, which is the sentence that rewrote the rule:
+    "tick chart pushing opposite direction of time is a pullback and
+    vic versa a continuation when they both agree on direction".
 
-    def test_it_holds_while_both_agree(self):
-        assert sw.holds(D, D, D) == (True, "")
+    The tick bar turning against the timeframe was being read as the
+    signal failing, and it closed the trade. It is a PULLBACK. Every
+    retrace became a realised loss, which is exactly what he was
+    watching and could not do by hand.
+    """
 
-    def test_the_tick_bar_flipping_ends_it(self):
-        ok, why = sw.holds(D, U, D)
+    def test_a_tick_flip_alone_is_held_through(self):
+        assert sw.holds(D, U, D) == (True, "")
+        assert sw.holds(U, D, U) == (True, "")
+
+    def test_a_tick_flip_that_has_failed_does_close_it(self):
+        ok, why = sw.holds(D, U, D, failed=True)
         assert ok is False
-        assert "tick bar flipped up against your down trade" in why
+        assert "went too far to still be a pullback" in why
 
-    def test_the_timeframe_candle_turning_ends_it_too(self):
+    def test_the_timeframe_turning_closes_it(self):
         ok, why = sw.holds(D, D, U)
         assert ok is False
         assert "timeframe candle turned up against your down" in why
 
-    def test_the_tick_bar_is_blamed_first_when_both_turned(self):
-        """The order of the checks is the order of the reasons. A
-        log blaming the timeframe for a tick-bar exit sends you to
-        the wrong chart."""
-        ok, why = sw.holds(D, U, U)
-        assert ok is False and "tick bar" in why
+    def test_the_timeframe_is_blamed_before_the_pullback(self):
+        """A log blaming a failed pullback when the trend itself
+        had turned sends you to the wrong chart."""
+        ok, why = sw.holds(D, U, U, failed=True)
+        assert ok is False and "timeframe candle turned" in why
+
+    def test_it_holds_while_both_agree(self):
+        assert sw.holds(D, D, D) == (True, "")
 
     @pytest.mark.parametrize("tick,candle", [
         ("", D), (D, ""), ("", ""), ("flat", "flat"),
     ])
     def test_FLAT_IS_NOT_A_DISAGREEMENT(self, tick, candle):
-        """On either of them. Exits firing on absences is the churn
-        this rule has been rewritten three times to remove."""
         assert sw.holds(D, tick, candle) == (True, "")
 
-    def test_an_absent_candle_argument_still_works(self):
-        """The old two-argument call must not become an exit."""
-        assert sw.holds(D, D) == (True, "")
+    def test_a_failed_flag_without_a_flip_changes_nothing(self):
+        """`failed` describes a pullback. With the tick bar still
+        with you there is no pullback for it to describe."""
+        assert sw.holds(D, D, D, failed=True) == (True, "")
 
     def test_no_open_side_is_never_an_exit(self):
-        assert sw.holds("", U, U) == (True, "")
+        assert sw.holds("", U, U, failed=True) == (True, "")
 
-    def test_the_route_passes_both_and_reads_what_the_entry_read(self):
-        """THE BUG THIS REPLACES. It called `exit_reason` with
-        `dir`, the tick bar's VOTE, while the entry took
-        `body_dir`, the candle -- they can point opposite ways on
-        one bar, so the engine opened a long and closed it on the
-        same poll."""
+
+class TestWhenAPullbackStopsBeingOne:
+    def test_too_deep_fails_it(self):
+        assert sw.pullback_failed(0.7) is True
+        assert sw.pullback_failed(0.3) is False
+
+    def test_the_threshold_is_named(self):
+        assert sw.PULLBACK_FAILS_AT == 0.6
+        assert sw.pullback_failed(sw.PULLBACK_FAILS_AT) is True
+
+    def test_volume_fails_it_at_any_depth(self):
+        """`heavy` already refuses to call a trivial retrace heavy
+        -- `tapeintent` floors it at MIN_PULLBACK -- so this does
+        not need a second depth test in front of it."""
+        assert sw.pullback_failed(0.2, heavy=True) is True
+
+    def test_shallow_and_unpaid_for_is_the_case_we_hold(self):
+        assert sw.pullback_failed(0.2, heavy=False) is False
+
+    @pytest.mark.parametrize("junk", [None, "x", object()])
+    def test_junk_does_not_fail_a_pullback(self, junk):
+        assert sw.pullback_failed(junk) is False
+
+
+class TestTheRegimeReading:
+    def test_agreement_is_a_continuation(self):
+        assert sw.regime(U, U) == "continuation"
+        assert sw.regime(D, D) == "continuation"
+
+    def test_disagreement_is_a_pullback(self):
+        assert sw.regime(U, D) == "pullback"
+        assert sw.regime(D, U) == "pullback"
+
+    @pytest.mark.parametrize("a,b", [("", U), (U, ""), ("flat", U)])
+    def test_an_incomplete_pair_is_neither(self, a, b):
+        assert sw.regime(a, b) == ""
+
+    def test_the_state_reports_it_and_says_it_decides(self):
+        st = sw.state({}, U, rungs(**{"5m": D}), 300.0,
+                      tf_ticks=40.0,
+                      tf_intent={"depth": 0.2, "heavy": False})
+        assert st["regime"]["where"] == "pullback"
+        assert st["regime"]["failed"] is False
+        assert st["regime"]["decides"] is True
+        assert "pullback" in st["regime"]["say"]
+        assert "holding through it" in st["regime"]["say"]
+
+    def test_the_state_marks_a_failing_pullback(self):
+        st = sw.state({}, U, rungs(**{"5m": D}), 300.0,
+                      tf_ticks=40.0,
+                      tf_intent={"depth": 0.8, "heavy": False})
+        assert st["regime"]["failed"] is True
+        assert "FAILING" in st["regime"]["say"]
+
+    def test_a_continuation_is_never_marked_failed(self):
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0,
+                      tf_ticks=40.0,
+                      tf_intent={"depth": 0.9, "heavy": True})
+        assert st["regime"]["where"] == "continuation"
+        assert st["regime"]["failed"] is False, \
+            "a retrace reading leaked onto a bar that is extending"
+
+
+class TestNoTradeAtTheTimeframesOpen:
+    """Chris: "no trades are ever taken at the opening price of
+    whatever timeframe i select on my auto trader"."""
+
+    def test_the_minimum_is_named(self):
+        assert sw.MIN_OPEN_TICKS == 4.0
+
+    @pytest.mark.parametrize("ticks", [0.0, 1.0, -1.0, 3.9, -3.9])
+    def test_sitting_on_the_open_is_no_entry(self, ticks):
+        side, why = sw.entry_side(U, U, ticks)
+        assert side == ""
+        assert "off its open" in why
+
+    @pytest.mark.parametrize("ticks", [4.0, -4.0, 40.0, -40.0])
+    def test_clear_of_the_open_is_fine(self, ticks):
+        assert sw.entry_side(U, U, ticks) == (U, "")
+
+    def test_an_unmeasurable_distance_does_not_block_it(self):
+        """A caller that cannot see the distance must not be
+        silently stopped from ever trading."""
+        assert sw.entry_side(U, U, None) == (U, "")
+
+    def test_the_state_applies_it(self):
+        assert sw.state({}, U, rungs(**{"5m": U}), 300.0,
+                        tf_ticks=1.0)["side"] == ""
+        assert sw.state({}, U, rungs(**{"5m": U}), 300.0,
+                        tf_ticks=12.0)["side"] == U
+
+    def test_the_route_measures_it_off_the_traded_candle(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("_tf_name = (")
+        blk = src[i:i + 1400]
+        assert "tf_ticks=" in blk, "the distance never reaches the rule"
+        assert "_candle_now(rt_, _tf_name)" in blk
+
+
+class TestTheRouteFeedsTheReasoning:
+    def test_the_timeframe_candle_exposes_its_extremes(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _candle_now(")
+        # To the NEXT def, whatever it is. `_tf_intent` sits above
+        # this one, so slicing to it ran backwards and raised.
+        blk = src[i:src.index("\n    def ", i + 10)]
+        # THE VALUE, NOT THE KEY. Asserting on the key alone let a
+        # mutation that zeroed every one of them survive -- the
+        # rule then read a retrace of nothing off a candle with no
+        # high, which is a pullback that can never fail.
+        for k in ("high", "low", "volume"):
+            assert f'"{k}": float(getattr(c, "{k}"' in blk, \
+                f"{k} is not read off the candle"
+
+    def test_a_timeframe_candle_reading_carries_real_numbers(self):
+        """The guarantee the source check cannot make: a candle
+        that has run up and come back must produce a retrace the
+        rule can act on."""
+        from liqmap import tapeintent as ti
+        r = ti.read("up", 7000.0, 7100.0, 6995.0, 7040.0,
+                    volume=800.0, bar_ts=1.0,
+                    prev={"v_ext": 500.0, "bar_ts": 1.0,
+                          "bar_dir": "up"})
+        assert r["depth"] == 0.6, r
+        assert sw.pullback_failed(r["depth"], r["heavy"]) is True
+        shallow = ti.read("up", 7000.0, 7100.0, 6995.0, 7090.0,
+                          volume=520.0, bar_ts=1.0,
+                          prev={"v_ext": 500.0, "bar_ts": 1.0,
+                                "bar_dir": "up"})
+        assert shallow["depth"] == 0.1
+        assert sw.pullback_failed(shallow["depth"],
+                                  shallow["heavy"]) is False
+
+    def test_one_retrace_reader_serves_both_scales(self):
+        """A second copy of "how far has this come back" is a second
+        thing to keep correct, and the first time they disagreed the
+        screen and the rule would describe one retrace differently."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _tf_intent(")
+        blk = src[i:src.index("def _m5_now(", i)]
+        assert "_ti.read(" in blk
+        assert "tapeintent" in blk
+
+    def test_the_rule_is_handed_the_timeframes_retrace(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("fus = _sw.state(win, _bd, _rungs,")
+        blk = src[i:i + 900]
+        assert "tf_intent=_tfi" in blk
+
+    def test_the_exit_is_handed_the_failed_flag(self):
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index('elif strat == "stack" and t is not None and t.open:')
-        blk = src[i:i + 1800]
-        assert "_sw.holds(" in blk, "nothing ends a stack trade"
-        assert '(fus.get("tick") or {}).get("side")' in blk, \
-            "the exit recomputes gate 1 instead of reading it"
-        assert '(fus.get("stack") or {}).get("side")' in blk, \
-            "the timeframe candle is not an exit"
-        assert "_tk_x" not in blk, "a second tick reading is back"
-        assert "hold_dir(" not in blk, \
-            "the exit resolves its own direction again -- it must " \
-            "read the one `state` already resolved, or the minimum " \
-            "turn applies to the entry and not the exit"
+        blk = src[i:i + 2000]
+        assert 'failed=bool((fus.get("regime") or {}).get("failed"))' \
+            in blk, "a pullback can never fail, so nothing closes early"
+
+    def test_the_panel_draws_the_reasoning(self):
+        """"invisible" has been half of every complaint on this
+        panel. A rule that holds a trade through a retrace has to
+        show that it is doing so."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("function paintStackWin(")
+        blk = src[i:src.index("function paintJournal(", i)]
+        assert "SW.regime" in blk, "the reasoning never reaches the box"
+        assert "'CONTINUATION'" in blk and "'PULLBACK'" in blk
+        assert "holding through it" in blk, \
+            "a held pullback is silent -- the exact complaint"
+        assert "FAILING" in blk
+        assert "move given back" in blk and "fails " in blk
+        assert "rg.tf_ticks" in blk, \
+            "the distance off the timeframe open is invisible"
+        assert "regimeBlock" in blk, "it is built and never drawn"
+
+    def test_the_timeframe_reading_survives_between_polls(self):
+        """It is a pure function with its memory held outside. A
+        field dropped from the carry-over does not error -- it
+        silently resets that part of the reading every poll."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("rt_._gate_held = ")
+        blk = src[i:i + 700]
+        for k in ("v_ext", "bar_ts", "heavy", "worst"):
+            assert k in blk, f"{k} is not carried for the timeframe"
 
 
 class TestTwoTradesAFiveMinuteBar:

@@ -206,7 +206,7 @@ class TestItReachesThePanels:
 
     def test_the_route_hands_it_the_tick_readings_pace(self):
         i = WEB.index("fus = _sw.state(")
-        assert 'pace=_tk.get("pace")' in WEB[i:i + 400]
+        assert 'pace=_tk.get("pace")' in WEB[i:i + 900]
 
     def test_the_fusion_panel_draws_it(self):
         """SCOPED TO `paintFusion`. This test passed for the wrong
