@@ -387,6 +387,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
           min_hold_s: float = DWELL_S,
           pace: dict | None = None,
           roll: dict | None = None,
+          intent: dict | None = None,
           prev: dict | None = None) -> dict:
     """Everything the rule and the panel need, from one place.
 
@@ -514,6 +515,16 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         # everything is how this engine has twice ended up trading
         # something nobody meant it to.
         "pace": {**(pace or {}), "decides": False},
+        # IS THIS BAR CONTINUING OR PULLING BACK. Chris: "show tape
+        # intent at that moment during the tick bar". Built in
+        # `tapeintent` from the bar's own prices and the last fifth
+        # of a bar's worth of prints.
+        #
+        # SHOWN, NOT USED, under its own key for the same reason the
+        # pace is: a field that decides nothing sitting inside the
+        # block that decides everything is how this engine has twice
+        # traded something nobody meant it to.
+        "intent": {**(intent or {}), "decides": False},
         # SHOWN, NOT USED. Under its own heading so there is no
         # chance of reading any of it as part of the decision.
         "context": {
@@ -526,7 +537,14 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         # THE MEMORY THE CALLER STORES AND HANDS BACK AS `prev`.
         # Returned rather than kept, so one module cannot serve two
         # callers one history.
-        "held": {"tick": tick, "candle": s_side},
+        # The tape reading holds its own last state through a tie,
+        # so its memory rides home with the gates' rather than in a
+        # second place the caller has to remember to carry.
+        "held": {"tick": tick, "candle": s_side,
+                 "intent": {
+                     "state": str((intent or {}).get("state") or ""),
+                     "slice_dir": str((intent or {}).get("slice_dir")
+                                      or "")}},
         "side": side,
         "why": why,
         "say": ((f"the tick candle and the {tf} candle are both {side}")

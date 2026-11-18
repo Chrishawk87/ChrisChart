@@ -186,7 +186,8 @@ class TestNeitherGateEverReportsFlat:
     def test_an_empty_start_is_still_empty(self):
         st = sw.state({}, "", {}, 300.0)
         assert st["side"] == ""
-        assert st["held"] == {"tick": "", "candle": ""}
+        assert st["held"]["tick"] == ""
+        assert st["held"]["candle"] == ""
 
 
 class TestTheMemoryIsTheCallersCom:
@@ -196,7 +197,8 @@ class TestTheMemoryIsTheCallersCom:
 
     def test_the_state_returns_what_it_held(self):
         st = sw.state({}, U, rungs(**{"5m": D}), 300.0)
-        assert st["held"] == {"tick": U, "candle": D}
+        assert st["held"]["tick"] == U
+        assert st["held"]["candle"] == D
 
     def test_feeding_it_back_carries_the_direction(self):
         st = sw.state({}, U, rungs(**{"5m": U}), 300.0, held_s=99.0)

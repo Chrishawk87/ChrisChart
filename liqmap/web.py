@@ -7124,9 +7124,17 @@ def create_app() -> FastAPI:
             roll = bld.roll.as_dict()
         except Exception:
             roll = {}
+        # THE RECENT SLICE, for the pullback reading. Raw here --
+        # the caller turns it into CONTINUATION or PULLBACK, because
+        # that needs the bar's own direction beside it and the
+        # memory of what it said last.
+        try:
+            sl = bld.slice_read()
+        except Exception:
+            sl = {}
         if cur is None:
             return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
-                    "smooth": sm, "pace": pace, "roll": roll,
+                    "smooth": sm, "pace": pace, "roll": roll, "slice": sl,
                     "reset_s": getattr(bld, "period_s", 0.0),
                     "by_clock": bool(getattr(bld, "last_by_clock", False)),
                     "clock_cuts": getattr(bld, "_clock_cuts", 0),
@@ -7180,10 +7188,43 @@ def create_app() -> FastAPI:
                 "smooth": sm,
                 "pace": pace,
                 "roll": roll,
+                "slice": sl,
+                "high": cur.high, "low": cur.low,
                 "prints": cur.trades, "open": cur.open,
                 "close": cur.close, "seconds": round(cur.seconds, 1),
                 "ticks": round((cur.close - cur.open) / 0.25, 1)
                 if cur.open else 0.0}
+
+    def _tape_intent(tk_: dict, prev_: dict | None = None) -> dict:
+        """Is this tick bar continuing, or pulling back?
+
+        Chris: "show tape intent at that moment during the tick bar
+        kinda the same way a 1 minute shows the 5 minute candles
+        intent" -- and, on which measurement, "which ever one will
+        show tick chart pullbacks and continuations thats what i
+        actually need".
+
+        THE BAR'S OWN DIRECTION, NOT THE GATE'S HELD ONE. The
+        geometry has to match the prices: `depth` measures against
+        high-minus-open on an up bar, so feeding it a direction the
+        bar does not currently have would measure a retrace off the
+        wrong extreme. The HOLD still happens -- `tapeintent.read`
+        carries the last state through the instant a bar sits on
+        its open -- it just holds the verdict rather than faking
+        the geometry.
+        """
+        from . import tapeintent as _ti
+
+        sl = (tk_ or {}).get("slice") or {}
+        return _ti.read(
+            str((tk_ or {}).get("body_dir") or ""),
+            float((tk_ or {}).get("open") or 0.0),
+            float((tk_ or {}).get("high") or 0.0),
+            float((tk_ or {}).get("low") or 0.0),
+            float((tk_ or {}).get("close") or 0.0),
+            str(sl.get("dir") or ""),
+            slice_n=int(sl.get("n") or 0),
+            prev=(prev_ or {}).get("intent") or {})
 
     def _m5_now(rt_) -> dict:
         """The forming FIVE-MINUTE candle. One line, one reader.
@@ -7692,6 +7733,7 @@ def create_app() -> FastAPI:
                             flips=_dw.flips,
                             pace=_tk.get("pace") or {},
                             roll=_tk.get("roll") or {},
+                            intent=_tape_intent(_tk, _prev),
                             prev=_prev)
             try:
                 rt_._gate_held = fus.get("held") or {}
@@ -16523,21 +16565,49 @@ function paintStackWin(SW) {
        and this line is drawn under a label that says so, because
        every reading on this panel that was not labelled ended up
        being read as part of the rule. */
-    + ((SW.pace && SW.pace.push)
+    /* THE TAPE LINE: IS THIS BAR CONTINUING, OR PULLING BACK?
+
+       Chris: "down at the bottom of the tick bar there is the tape
+       what we are going to do with that is show tape intent at that
+       moment during the tick bar kinda the same way a 1 minute
+       shows the 5 minute candles intent" -- and, on which
+       measurement to use, "which ever one will show tick chart
+       pullbacks and continuations thats what i actually need".
+
+       Two numbers, both off price. HOW FAR price has come back from
+       the bar's extreme, as a fraction of the move it made to get
+       there; and WHICH WAY the last fifth of a bar's worth of
+       prints went. The slice going with the bar is a continuation,
+       against it is a pullback, and the depth says what the
+       pullback has cost so far.
+
+       This line used to show SPEED -- the bar's projected span
+       against a median. That is still true and still drawn, as the
+       tail of this line, but it is not intent: a bar can quicken
+       while price gives the whole move back.
+
+       IT DECIDES NOTHING. The entry is the two gates above, and
+       this is drawn under a label that says so, because every
+       reading on this panel that went in unlabelled ended up being
+       read as part of the rule. */
+    + ((SW.intent && SW.intent.state)
         ? '<div class="thin" style="margin-top:4px">tape '
-          + '<b class="' + (SW.pace.push === 'push' ? 'long'
-              : (SW.pace.push === 'fade' ? 'short' : '')) + '">'
-          + esc(SW.pace.push).toUpperCase() + '</b> &mdash; '
-          + Number(SW.pace.projected_s || 0).toFixed(0) + 's projected vs '
-          + Number(SW.pace.median_s || 0).toFixed(0) + 's median ('
-          + Number(SW.pace.ratio || 0).toFixed(2) + '&times;) '
-          + '&mdash; shown, decides nothing</div>'
-        : ((SW.pace && SW.pace.bars_measured != null)
-            ? '<div class="thin" style="margin-top:4px">tape pace: '
-              + Number(SW.pace.bars_measured).toLocaleString()
-              + ' closed bars to compare against &mdash; not enough yet'
-              + '</div>'
-            : ''))
+          + '<b class="' + (SW.intent.state === 'continuation'
+              ? (f.side === 'down' ? 'short' : 'long') : '') + '">'
+          + (SW.intent.state === 'pullback' ? 'PULLBACK' : 'CONTINUATION')
+          + '</b> &mdash; ' + esc(SW.intent.say || '')
+          + (SW.intent.slice_n
+              ? ' <span style="opacity:.7">(last '
+                + Number(SW.intent.slice_n).toLocaleString()
+                + ' prints)</span>' : '')
+          + ((SW.pace && SW.pace.push)
+              ? ' <span style="opacity:.7">&middot; tape '
+                + esc(SW.pace.push) + ' at '
+                + Number(SW.pace.ratio || 0).toFixed(2) + '&times;</span>'
+              : '')
+          + ' &mdash; shown, decides nothing</div>'
+        : '<div class="thin" style="margin-top:4px">tape: '
+          + 'no direction in the bar yet</div>')
     + '</div>';
 
   const rows = st.rows || {};

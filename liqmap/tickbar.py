@@ -544,7 +544,7 @@ class TickBars:
 
     __slots__ = ("per_bar", "keep", "period_s", "done", "_cur",
                  "_prints", "_unknown", "_bars_built", "_clock_cuts",
-                 "_last_by_clock", "roll", "_last_px")
+                 "_last_by_clock", "roll", "_last_px", "_slice")
 
     def __init__(self, per_bar: int = DEFAULT_PER_BAR,
                  keep: int = KEEP, period_s: float = 0.0) -> None:
@@ -589,6 +589,17 @@ class TickBars:
         # inside that bar; the rolling window does, and it is the
         # last print of the bar before.
         self._last_px = 0.0
+        # THE RECENT SLICE: the last fifth of a bar's worth of
+        # prices, for the pullback reading. A 1-minute candle inside
+        # a 5-minute one, in prints.
+        #
+        # It does NOT restart at a bar boundary, for the same reason
+        # the rolling window does not: a reading that restarts on
+        # bookkeeping blinks out, and a blink gets read as an
+        # absence. "At that moment" is the last N prints, which is
+        # always now.
+        from .tapeintent import slice_prints as _sp
+        self._slice: deque[float] = deque(maxlen=_sp(self.per_bar))
 
     # -- feeding ---------------------------------------------------------
 
@@ -681,6 +692,7 @@ class TickBars:
         # the last N prints.
         self.roll.on_print(p - self._last_px if self._last_px > 0 else 0.0)
         self._last_px = p
+        self._slice.append(p)
         b.close = p
         b.ts_last = t
         b.volume += sz
@@ -737,6 +749,29 @@ class TickBars:
         if include_live and self._cur is not None:
             out.append(self._cur.to_dict())
         return out
+
+    def slice_read(self) -> dict:
+        """The recent slice: where the last N prints went.
+
+        Close against open on the slice, which is the same question
+        the bar answers about itself one scale up. Returns the
+        direction and the two prices it came from, so a panel can
+        show the numbers rather than only the verdict.
+        """
+        n = len(self._slice)
+        if n < 2:
+            return {"dir": "", "n": n, "open": 0.0, "close": 0.0,
+                    "ticks": 0.0, "window": self._slice.maxlen or 0}
+        o = float(self._slice[0])
+        c = float(self._slice[-1])
+        return {
+            "dir": "up" if c > o else "down" if c < o else "",
+            "n": n,
+            "open": round(o, 4),
+            "close": round(c, 4),
+            "ticks": round((c - o) / 0.25, 1),
+            "window": self._slice.maxlen or 0,
+        }
 
     def pace(self, lookback: int = 30) -> dict:
         """How fast bars are closing, and how fast this one is running.

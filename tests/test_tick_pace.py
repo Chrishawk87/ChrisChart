@@ -209,9 +209,21 @@ class TestItReachesThePanels:
         assert 'pace=_tk.get("pace")' in WEB[i:i + 400]
 
     def test_the_fusion_panel_draws_it(self):
-        assert "tape ${esc(pc_.push)}" in WEB, \
+        """SCOPED TO `paintFusion`. This test passed for the wrong
+        reason: the phrase it looked for lived in the STACK+WINDOW
+        painter, not this one -- the fusion panel builds the same
+        sentence across two template-literal lines, so the
+        contiguous string was never in it. Replacing the other
+        panel's line is what exposed it.
+
+        Same class as the route test that passed while the main
+        return carried no pace at all: a whole-file substring check
+        cannot say WHICH panel it found."""
+        i = WEB.index("function paintFusion(")
+        blk = WEB[i:WEB.index("function ", i + 10)]
+        assert "tape ${esc(pc_.push)}" in blk, \
             "the fusion panel does not show the pace"
-        assert "closed bars to compare against" in WEB, \
+        assert "bars_measured" in blk and "not enough yet" in blk, \
             "a cold start goes blank instead of saying why"
 
     def test_the_stackwin_panel_draws_it(self):
