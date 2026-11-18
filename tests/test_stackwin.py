@@ -307,11 +307,15 @@ class TestTheExitIsEitherGateTurningAgainstIt:
         i = src.index('elif strat == "stack" and t is not None and t.open:')
         blk = src[i:i + 1800]
         assert "_sw.holds(" in blk, "nothing ends a stack trade"
-        assert "_sw.hold_dir(_bd," in blk, \
-            "the exit is reading something other than the candle"
+        assert '(fus.get("tick") or {}).get("side")' in blk, \
+            "the exit recomputes gate 1 instead of reading it"
         assert '(fus.get("stack") or {}).get("side")' in blk, \
             "the timeframe candle is not an exit"
         assert "_tk_x" not in blk, "a second tick reading is back"
+        assert "hold_dir(" not in blk, \
+            "the exit resolves its own direction again -- it must " \
+            "read the one `state` already resolved, or the minimum " \
+            "turn applies to the entry and not the exit"
 
 
 class TestTwoTradesAFiveMinuteBar:
@@ -729,3 +733,169 @@ class TestTheRowsShowRealPrices:
         assert st["stack"]["rows"]["5m"]["ticks"] == -21.0
 
 
+
+
+class TestOneTickCannotTurnGateOne:
+    """Chris: "every trade that im loosing is because of flips ...
+    it gets in when both agree then immediately exits for a loss of
+    several ticks ... it just exits on its own with no visable
+    disagreement at all".
+
+    MEASURED, AND IT WAS A BAR-BIRTH PROBLEM. Gate 1 is the
+    5,000-tick candle's body. A bar that has just opened has close
+    EQUAL to open, so the very next print decided its direction --
+    one tick, after which the gate had turned and the trade was
+    closed. The first fifty prints are 1% of a bar's life and
+    produced 9% of direction changes on a choppy simulated tape,
+    29% trending and 63% in a strong trend: about 170 times the
+    per-print rate of the rest of the bar.
+
+    AND IT WAS INVISIBLE, which is the other half of the complaint.
+    The flip was over in a handful of prints and the panel had
+    repainted before anyone looked."""
+
+    def test_a_single_tick_does_not_turn_it(self):
+        assert sw.body_dir(7000.0, 6999.75, U) == U
+        assert sw.body_dir(7000.0, 7000.25, D) == D
+
+    def test_the_full_distance_does(self):
+        assert sw.body_dir(7000.0, 6999.00, U) == D
+        assert sw.body_dir(7000.0, 7001.00, D) == U
+
+    def test_it_is_four_ticks_one_point_on_es(self):
+        assert sw.MIN_TURN_TICKS == 4.0
+        assert sw.TICK == 0.25
+
+    def test_the_tick_size_matches_the_fill_module(self):
+        """Two tick sizes in one engine is a bug waiting for a
+        contract change."""
+        from liqmap import quote
+        assert sw.TICK == quote.TICK
+
+    @pytest.mark.parametrize("ticks", [3.0, 3.9, -3.0, -3.9])
+    def test_just_inside_the_threshold_holds(self, ticks):
+        assert sw.body_dir(7000.0, 7000.0 + ticks * 0.25, U) == U
+
+    @pytest.mark.parametrize("ticks", [4.0, 4.1, 9.0])
+    def test_at_the_threshold_it_turns(self, ticks):
+        assert sw.body_dir(7000.0, 7000.0 - ticks * 0.25, U) == D
+
+    def test_it_never_reads_flat(self):
+        """Inside the threshold the standing direction is returned,
+        NOT an absence. He has rejected a blank gate three times."""
+        for raw in (7000.0, 7000.25, 6999.75):
+            assert sw.body_dir(7000.0, raw, U) == U
+            assert sw.body_dir(7000.0, raw, D) == D
+
+    def test_nothing_is_invented_before_the_first_direction(self):
+        assert sw.body_dir(7000.0, 7000.25, "") == ""
+        assert sw.body_dir(7000.0, 7001.00, "") == U
+
+    @pytest.mark.parametrize("o,c", [(0, 7000), (7000, 0), (None, None),
+                                     ("x", "y")])
+    def test_junk_prices_hold_rather_than_turn(self, o, c):
+        assert sw.body_dir(o, c, U) == U
+
+    def test_the_distance_is_reported(self):
+        assert sw.turn_ticks(7000.0, 7001.00) == 4.0
+        assert sw.turn_ticks(7000.0, 6999.00) == -4.0
+        assert sw.turn_ticks(0.0, 7000.0) == 0.0
+
+    def test_the_state_applies_it_when_given_the_prices(self):
+        st = sw.state({}, D, rungs(**{"5m": U}), 300.0,
+                      tick_open=7000.0, tick_close=6999.75,
+                      prev={"tick": U, "candle": U})
+        assert st["tick"]["raw"] == D, "the candle really did read down"
+        assert st["tick"]["side"] == U, "one tick turned the gate"
+        assert st["tick"]["held_for_want_of_move"] is True
+        assert st["tick"]["moved_ticks"] == -1.0
+
+    def test_the_state_lets_a_real_turn_through(self):
+        st = sw.state({}, D, rungs(**{"5m": D}), 300.0,
+                      tick_open=7000.0, tick_close=6999.00,
+                      prev={"tick": U, "candle": D})
+        assert st["tick"]["side"] == D
+        assert st["tick"]["held_for_want_of_move"] is False
+        assert st["side"] == D
+
+    def test_without_prices_the_old_behaviour_stands(self):
+        """A caller that cannot measure a distance must not be
+        silently given a rule it is not applying."""
+        st = sw.state({}, D, rungs(**{"5m": D}), 300.0,
+                      prev={"tick": U, "candle": D})
+        assert st["tick"]["side"] == D
+
+    def test_the_route_hands_over_the_candles_prices(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("fus = _sw.state(win, _bd, _rungs,")
+        blk = src[i:i + 700]
+        assert 'tick_open=float(_tk.get("open")' in blk, \
+            "no open, so there is no distance to measure"
+        assert 'tick_close=float(_tk.get("close")' in blk
+
+    def test_the_panel_shows_the_distance_and_the_hold(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("function paintStackWin(")
+        blk = src[i:src.index("function paintJournal(", i)]
+        assert "f.moved_ticks" in blk, \
+            "the distance from the open is invisible again"
+        assert "f.min_turn_ticks" in blk and "to turn" in blk
+        assert "f.held_for_want_of_move" in blk, \
+            "a withheld turn is silent -- the exact complaint"
+
+
+class TestARefusedEntryIsNeverSilent:
+    """Chris: "on some trades tick bar and 5 or 15 min can actually
+    be up and no trade it taken like its invisible".
+
+    IT WAS INVISIBLE. `idle` -- the journal's reason for not opening
+    -- is drawn by the JOURNAL painter. The stack+window box, the
+    one showing the two gates, said TRADE UP and never mentioned
+    that the cap had refused it. Two boxes, one of them telling half
+    the story, which is the fault this panel has now had three
+    times in three different forms."""
+
+    def test_the_route_carries_the_refusal_into_the_gate_payload(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index('"stackwin": (')
+        blk = src[i:i + 400]
+        assert '"blocked_by": idle_why' in blk, \
+            "the journal's refusal never reaches the gate panel"
+
+    def test_the_refusal_is_set_whenever_nothing_opens(self):
+        """`idle_why` is blank only when a trade actually opened or
+        closed, so a silent no-trade is not reachable."""
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert blk.count('idle_why = arg if act == "" else ""') >= 2, \
+            "a path through decide leaves the reason unset"
+
+    def test_the_panel_draws_it_under_the_verdict(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("function paintStackWin(")
+        blk = src[i:src.index("function paintJournal(", i)]
+        assert "SW.blocked_by" in blk, \
+            "the gate panel still cannot say why nothing opened"
+        assert "NO TRADE" in blk
+
+    def test_the_journal_always_gives_a_reason(self):
+        """The policy end of it: `decide` never returns an empty
+        reason when it declines."""
+        from liqmap import journal as jn
+        s_ = jn.Settings()
+        s_.auto = True
+        act, why = jn.decide(None, s_, 7000.0, "up", ("up",),
+                             window_rule=True, max_per_bar=2)
+        assert act == "" and why, "it declined without saying why"
+        assert "already taken its up" in why

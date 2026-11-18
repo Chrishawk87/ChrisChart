@@ -7703,6 +7703,8 @@ def create_app() -> FastAPI:
             _bd = _tk.get("body_dir") or ""
             fus = _sw.state(win, _bd, _rungs,
                             float(s.window_s or 900.0),
+                            tick_open=float(_tk.get("open") or 0.0),
+                            tick_close=float(_tk.get("close") or 0.0),
                             fp=fpi.get("side") or "",
                             pace=_tk.get("pace") or {},
                             roll=_tk.get("roll") or {},
@@ -7853,9 +7855,12 @@ def create_app() -> FastAPI:
             # open a long and close it on the same poll. The held
             # body direction is read here, exactly as above, and no
             # clock is consulted at all.
+            # THE SAME NUMBER `state` RESOLVED, not a second copy.
+            # Recomputing it here is how the exit once ended up
+            # reading the vote while the entry read the body.
             _ok_hold, _why_hold = _sw.holds(
                 t.side,
-                _sw.hold_dir(_bd, str(_prev.get("tick") or "")),
+                (fus.get("tick") or {}).get("side") or "",
                 (fus.get("stack") or {}).get("side") or "")
             if not _ok_hold:
                 disagreed = _why_hold
@@ -7924,7 +7929,17 @@ def create_app() -> FastAPI:
             # eventually disagrees with the rule beside it, which
             # has happened here with the 5-minute cell and with the
             # OFI bar already.
-            "stackwin": (fus if strat == "stack" else None),
+            # THE JOURNAL'S REFUSAL TRAVELS WITH THE GATES.
+            #
+            # Chris: "on some trades tick bar and 5 or 15 min can
+            # actually be up and no trade it taken like its
+            # invisible". It was: `idle` is drawn by the JOURNAL
+            # painter, and the stack+window box -- the one showing
+            # the two gates -- said TRADE UP and never mentioned
+            # that the cap had refused it. Two boxes, one of them
+            # telling half the story.
+            "stackwin": ({**fus, "blocked_by": idle_why}
+                         if strat == "stack" else None),
             "quote": jn_quote.read(
                 (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
                 (getattr(rt_, "ofi", None)), _last or px, _age),
@@ -16478,11 +16493,30 @@ function paintStackWin(SW) {
        on its open for an instant and has no body to read. The rule
        keeps its last real direction rather than reporting flat --
        flat was never a reading, it was an absence. */
-    + (f.held_through_flat
-        ? '<div class="thin">price is exactly on this candle\u2019s open '
-          + '&mdash; holding ' + esc(f.side || '').toUpperCase()
-          + ' until it moves</div>'
-        : '')
+    /* HOW FAR THIS CANDLE IS FROM ITS OWN OPEN, and what it has to
+       reach before it may turn the gate over.
+
+       A newborn bar has close EQUAL to open, so one print used to
+       decide its direction -- and that flip was over in a handful
+       of prints, long before the panel repainted. Chris: "it just
+       exits on its own with no visable disagreement at all". The
+       disagreement was real and it was never on the screen. */
+    + ((f.moved_ticks != null && f.min_turn_ticks)
+        ? '<div class="thin">'
+          + (f.moved_ticks > 0 ? '+' : '') + f.moved_ticks
+          + ' ticks from this candle\u2019s open &middot; needs '
+          + f.min_turn_ticks + ' to turn'
+          + (f.held_for_want_of_move
+              ? ' &mdash; <b style="color:var(--dim)">the candle reads '
+                + esc(f.raw || '').toUpperCase() + ', holding '
+                + esc(f.side || '').toUpperCase() + '</b>'
+              : '')
+          + '</div>'
+        : (f.held_through_flat
+            ? '<div class="thin">price is exactly on this candle\u2019s '
+              + 'open &mdash; holding ' + esc(f.side || '').toUpperCase()
+              + ' until it moves</div>'
+            : ''))
     /* The vote, as information. It used to BE the direction, behind
        a margin band and a minimum count, and both of those produce
        flat. Kept because when it disagrees with the body that is
@@ -16637,10 +16671,23 @@ function paintStackWin(SW) {
     + leg('footprint', cx.footprint)
     + '</div></div>';
 
+  /* THE RULE'S VERDICT, AND THE JOURNAL'S ANSWER TO IT.
+
+     These are two different questions and this box used to answer
+     only the first. Chris: "on some trades tick bar and 5 or 15 min
+     can actually be up and no trade it taken like its invisible".
+     It was invisible: the refusal is drawn by the JOURNAL painter,
+     in a different box, so this one said TRADE UP while the cap had
+     quietly said no. */
   const verdict = SW.side
     ? '<b class="' + (SW.side === 'up' ? 'long' : 'short') + '">'
       + SW.side.toUpperCase() + '</b> <span class="thin">'
       + esc(SW.say || '') + '</span>'
+      + (SW.blocked_by
+          ? '<div class="thin" style="margin-top:2px">'
+            + '<b style="color:var(--down)">NO TRADE</b> &mdash; '
+            + esc(SW.blocked_by) + '</div>'
+          : '')
     : '<b class="short">NO SIDE</b> <span class="thin">'
       + esc(SW.why || '') + '</span>';
 

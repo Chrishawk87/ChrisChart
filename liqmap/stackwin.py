@@ -148,6 +148,86 @@ def stack_side(rungs: dict, period_s: float) -> tuple[str, str]:
     return q, ""
 
 
+# ONE TICK MUST NOT BE ABLE TO TURN THE GATE OVER.
+#
+# Chris: "every trade that im loosing is because of flips ... it
+# gets in when both agree then immediately exits for a loss of
+# several ticks ... a lot of the disagrees that happen price
+# actually travels that direction it just exits on its own with no
+# visable disagreement at all".
+#
+# MEASURED, AND IT IS A BAR-BIRTH PROBLEM. Gate 1 is the 5,000-tick
+# candle's body, close against open. A bar that has just opened has
+# close EQUAL to open, so the very next print decides its
+# direction -- one tick, after which the gate has turned and the
+# trade is closed.
+#
+# Counted over a simulated hour: the first fifty prints are 1% of a
+# bar's life and produced 9% of all direction changes on a choppy
+# tape, 29% trending and 63% in a strong trend -- roughly 170 times
+# the per-print rate of the rest of the bar. And it is INVISIBLE,
+# because the flip is over in a handful of prints and the panel has
+# repainted by the time anyone looks, which is exactly the "no
+# visable disagreement" he is describing.
+#
+# So the bar has to have gone somewhere before its body is allowed
+# to overrule the direction already standing. This is a distance,
+# not a clock and not a count -- he removed both of those by name.
+# Under it the previous direction simply stands, so the gate never
+# reads flat, which he has insisted on three times.
+#
+# FOUR TICKS IS ONE FULL POINT ON ES and is the knee of the
+# measured curve: direction changes an hour fall 359 -> 86 on a
+# choppy tape, 108 -> 25 trending, 44 -> 12 in a strong trend. It
+# is one line to change and the panel shows the number.
+TICK = 0.25
+MIN_TURN_TICKS = 4.0
+
+
+def body_dir(open_px: float, close_px: float, prev: str = "",
+             min_ticks: float = MIN_TURN_TICKS) -> str:
+    """Gate 1: which way this candle has gone, once it has gone far.
+
+    `prev` is the direction already standing. Inside the threshold
+    it is returned unchanged -- NOT flat. An absence is not a
+    reading, and reporting one here is the fault this gate has
+    already been rebuilt twice to remove.
+
+    This replaces a bare `hold_dir(close > open)`, which held the
+    direction only through an EXACT tie -- a single print's worth of
+    protection, at the one moment in a bar's life when a single
+    print is all it takes.
+    """
+    try:
+        o, c = float(open_px or 0.0), float(close_px or 0.0)
+        m = max(0.0, float(min_ticks))
+    except (TypeError, ValueError):
+        return prev if prev in SIDES else ""
+    if o <= 0 or c <= 0:
+        return prev if prev in SIDES else ""
+    moved = (c - o) / TICK
+    if moved >= m and moved > 0:
+        return "up"
+    if moved <= -m and moved < 0:
+        return "down"
+    return prev if prev in SIDES else ""
+
+
+def turn_ticks(open_px: float, close_px: float) -> float:
+    """How far this candle sits from its own open, in ticks.
+
+    Shown beside the gate so a direction being HELD for want of
+    movement is visible rather than silent.
+    """
+    try:
+        o, c = float(open_px or 0.0), float(close_px or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if o <= 0 or c <= 0:
+        return 0.0
+    return round((c - o) / TICK, 1)
+
+
 def hold_dir(now: str, prev: str = "") -> str:
     """The direction to REPORT: this one, or the last real one.
 
@@ -303,6 +383,7 @@ def _say(side: str, tf: str, intent: dict) -> str:
 
 def state(win: dict | None, tick: str, rungs: dict | None,
           period_s: float, fp: str = "",
+          tick_open: float = 0.0, tick_close: float = 0.0,
           pace: dict | None = None,
           roll: dict | None = None,
           intent: dict | None = None,
@@ -349,11 +430,26 @@ def state(win: dict | None, tick: str, rungs: dict | None,
     w_side, w_why = window_side(w_candle, ofi, cvd, fp)
     s_raw, s_why = stack_side(rungs or {}, period_s)
 
-    # NEITHER GATE REPORTS FLAT ONCE IT HAS HAD A DIRECTION. The
-    # raw readings are kept beside the held ones so the moment a
-    # gate is being carried is visible rather than silent.
+    # NEITHER GATE REPORTS FLAT ONCE IT HAD A DIRECTION. The raw
+    # readings are kept beside the held ones so the moment a gate
+    # is being carried is visible rather than silent.
     prev = prev or {}
-    tick = hold_dir(tick_raw, str(prev.get("tick") or ""))
+    prev_tick = str(prev.get("tick") or "")
+    # GATE 1 NEEDS THE BAR TO HAVE GONE SOMEWHERE. Given the
+    # candle's prices, the direction only turns once it is
+    # `MIN_TURN_TICKS` from its own open -- a newborn bar's body is
+    # otherwise decided by one print, which is what was closing
+    # trades a few ticks after opening them.
+    #
+    # Without the prices there is no distance to measure, so the
+    # old behaviour stands: hold through an exact tie and nothing
+    # more. A caller that cannot supply them is not silently given
+    # a rule it is not applying.
+    moved = turn_ticks(tick_open, tick_close)
+    if tick_open and tick_close:
+        tick = body_dir(tick_open, tick_close, prev_tick)
+    else:
+        tick = hold_dir(tick_raw, prev_tick)
     s_side = hold_dir(s_raw, str(prev.get("candle") or ""))
 
     side, why = entry_side(tick, s_side, intent or {})
@@ -387,6 +483,18 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "raw": tick_raw,
             "held_through_flat": bool(tick in SIDES
                                       and tick_raw not in SIDES),
+            # HOW FAR THIS CANDLE IS FROM ITS OWN OPEN, and what it
+            # has to reach before it may turn the gate over. Drawn,
+            # because a direction being HELD for want of movement
+            # was invisible -- the flip was over in a handful of
+            # prints and the panel had repainted by the time anyone
+            # looked. Chris: "it just exits on its own with no
+            # visable disagreement at all".
+            "moved_ticks": moved,
+            "min_turn_ticks": float(MIN_TURN_TICKS),
+            "held_for_want_of_move": bool(
+                tick in SIDES and tick_raw in SIDES
+                and tick_raw != tick),
             # How long it has pointed this way, and what it has to
             # reach. Shown so a blocked entry reads as waiting
             # rather than as nothing happening.
