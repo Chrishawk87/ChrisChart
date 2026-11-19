@@ -114,19 +114,35 @@ class TestTheExit:
         engine has made, three times over."""
         assert tt.exit_reason(U, "") == ""
 
-    def test_the_confirmation_is_silent_unless_switched_on(self):
-        assert tt.exit_reason(U, U, D) == ""
-        assert tt.exit_reason(U, U, D, False) == ""
-
-    def test_switched_on_the_confirmation_closes_it_too(self):
-        why = tt.exit_reason(U, U, D, True)
+    @pytest.mark.parametrize("side,against", [(U, D), (D, U)])
+    def test_the_confirmation_flipping_ends_it_too(self, side, against):
+        """Chris: "when confirmation disagrees with lead it does not
+        exit the trade for a long time leading to massive losses".
+        It did what it was told -- the confirmation had no say, so
+        the trade rode until the LEAD turned, which on a 5,000-tick
+        bar is a very long way."""
+        why = tt.exit_reason(side, side, against)
+        assert why
         assert "confirming chart" in why
 
-    def test_switched_on_a_flat_confirmation_is_still_not_a_flip(self):
-        assert tt.exit_reason(U, U, "", True) == ""
+    def test_no_switch_can_turn_the_confirmation_off(self):
+        """IT IS THE RULE NOW, NOT A SETTING. An exit that can be
+        silently disabled is the thing that cost him."""
+        import inspect
+        sig = inspect.signature(tt.exit_reason)
+        assert "confirm_exits" not in sig.parameters
+        assert list(sig.parameters) == ["side", "lead", "confirm"]
+        assert tt.exit_reason(U, U, D), \
+            "the confirmation flipped against the trade and it held"
+
+    def test_a_flat_confirmation_is_still_not_a_flip(self):
+        """THE REASON THIS IS NOT `confirm != lead`. A forming bar
+        sits exactly on its open constantly; exiting on that would
+        close trades on nothing at all."""
+        assert tt.exit_reason(U, U, "") == ""
 
     def test_the_lead_keeps_the_blame_when_both_flip(self):
-        why = tt.exit_reason(U, D, D, True)
+        why = tt.exit_reason(U, D, D)
         assert "lead chart" in why
         assert "confirming" not in why
 
@@ -205,14 +221,20 @@ class TestTheState:
                        confirm_bar=2000, held_s=9.0)
         assert out["confirm"]["same_as_lead"] is True
 
-    def test_the_switch_reaches_the_panel(self):
-        off = tt.state(lead_raw=U, confirm_raw=U, held_s=9.0)
-        on = tt.state(lead_raw=U, confirm_raw=U, held_s=9.0,
-                      confirm_exits=True)
-        assert off["confirm"]["exits"] is False
-        assert on["confirm"]["exits"] is True
-        assert "confirming chart flips" not in off["say"]
-        assert "confirming chart flips" in on["say"]
+    def test_the_panel_is_told_both_charts_close_trades(self):
+        """A PANEL THAT DESCRIBES AN EXIT THE RULE DOES NOT HAVE is
+        how a trade ends for no visible reason -- and how one
+        failed to end for a very visible one."""
+        out = tt.state(lead_raw=U, confirm_raw=U, held_s=9.0)
+        assert out["lead"]["exits"] is True
+        assert out["confirm"]["exits"] is True
+        assert out["exits_on"] == ["lead", "confirm"]
+        assert "either chart flips" in out["say"]
+
+    def test_state_takes_no_switch_either(self):
+        import inspect
+        assert "confirm_exits" not in inspect.signature(
+            tt.state).parameters
 
     def test_an_agreement_is_spent_once_and_not_before(self):
         out = tt.state(lead_raw=U, confirm_raw=U, held_s=9.0)
@@ -325,7 +347,18 @@ class TestItIsWiredThrough:
         seg = blk[i:i + 500]
         assert '(fus.get("lead") or {}).get("side")' in seg
         assert '(fus.get("confirm") or {}).get("side")' in seg
-        assert 'getattr(s, "tick3_exit", False)' in seg
+
+    def test_the_exit_reads_no_switch(self):
+        """THE `g3 exit` SWITCH DOES NOT REACH THIS STRATEGY. It
+        governs gate 3 under Stack + window, where a timeframe
+        leads and a clock bounds the trade; here there is neither,
+        and running with the confirmation silent is what produced
+        the long losing rides."""
+        blk = self._step()
+        head = blk.index('strat == "ticks"')
+        tail = blk.index('strat == "stack" and t is not None')
+        assert "tick3_exit" not in blk[head:tail], \
+            "the switch can still silence the confirmation"
 
     def test_the_exit_consults_no_clock(self):
         """"Gate 2's flip only, no clock"."""
@@ -356,8 +389,10 @@ class TestItIsWiredThrough:
         i = src.index("function paintTwoTick(")
         fn = src[i:src.index("\nfunction ", i + 10)]
         assert "TT.lead" in fn and "TT.confirm" in fn
-        assert "C.exits" in fn, \
-            "the panel cannot say whether the confirmation closes trades"
+        assert "its flip closes a trade too" in fn, \
+            "the panel does not say the confirmation closes trades"
+        assert "g3 exit" in fn, \
+            "the panel leaves a ticked switch looking inert"
         assert "No clock ends a trade" in fn, \
             "the panel does not say the clock is gone"
 

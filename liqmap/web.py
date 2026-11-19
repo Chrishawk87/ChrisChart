@@ -7984,7 +7984,6 @@ def create_app() -> FastAPI:
                 confirm_raw=(_conf.get("body_dir") or ""),
                 lead_bar=_lead_n, confirm_bar=_conf_n,
                 held_s=_tdw.held_s(_now_t),
-                confirm_exits=bool(getattr(s, "tick3_exit", False)),
                 lead_roll=(_lead.get("roll") or {}),
                 confirm_roll=(_conf.get("roll") or {}),
                 prev=_tprev)
@@ -8136,12 +8135,18 @@ def create_app() -> FastAPI:
             if rev:
                 disagreed = why_rev
         elif strat == "ticks" and t is not None and t.open:
-            # THE LEAD CHART TURNING, AND NOTHING ELSE BY DEFAULT.
-            # Asked what should close a trade in this strategy,
-            # Chris picked "Gate 2's flip only, no clock" -- so no
-            # time stop is consulted here at all. The confirming
-            # chart closes it too only when the `g3 exit` switch is
-            # on.
+            # EITHER CHART TURNING AGAINST THE POSITION. Still no
+            # clock -- "Gate 2's flip only, no clock" -- but the
+            # confirmation is no longer silent on the way out.
+            #
+            # THE `g3 exit` SWITCH IS NOT READ HERE. It governs
+            # gate 3 under Stack + window, where a timeframe leads
+            # and a clock bounds the trade. This strategy has
+            # neither, and running it with the switch off is what
+            # produced the long losing rides: "when confirmation
+            # disagrees with lead it does not exit the trade for a
+            # long time leading to massive losses". The panel says
+            # so rather than leaving a ticked box looking inert.
             #
             # THE HELD DIRECTIONS `state` RESOLVED, not a second
             # copy. Recomputing them here is how the exit once
@@ -8151,8 +8156,8 @@ def create_app() -> FastAPI:
             disagreed = _tte.exit_reason(
                 t.side,
                 (fus.get("lead") or {}).get("side") or "",
-                (fus.get("confirm") or {}).get("side") or "",
-                bool(getattr(s, "tick3_exit", False))) or disagreed
+                (fus.get("confirm") or {}).get("side")
+                or "") or disagreed
         elif strat == "stack" and t is not None and t.open:
             # THE TIMEFRAME TURNING, OR A PULLBACK THAT FAILED.
             #
@@ -16951,7 +16956,7 @@ function paintTwoTick(TT) {
       '<div style="' + edge(L.side) + '">'
     + '<div class="thin">LEAD &mdash; THE ' + size(L)
     + ' CANDLE (close vs open, as the chart draws it) &mdash; it '
-    + 'names the direction, and its flip is what closes a trade'
+    + 'names the direction, and its flip closes a trade'
     + '</div>'
     + '<div style="margin:4px 0">' + leg('lead', L.side) + '</div>'
     + (L.held_through_flat
@@ -16984,10 +16989,17 @@ function paintTwoTick(TT) {
   const confBlock =
       '<div style="margin-top:8px;' + edge(C.side) + '">'
     + '<div class="thin">CONFIRMATION &mdash; THE ' + size(C)
-    + ' CANDLE &mdash; it must agree, and hold '
-    + Number(C.min_hold_s || 0).toFixed(0) + 's before anything opens'
-    + (C.exits ? '. It closes a trade too' : '')
+    + ' CANDLE &mdash; it must agree, hold '
+    + Number(C.min_hold_s || 0).toFixed(0) + 's before anything opens, '
+    + 'and its flip closes a trade too'
     + '</div>'
+    /* THE SWITCH DOES NOT REACH THIS STRATEGY, and a control that
+       looks inert is worse than one that is absent -- so the panel
+       says where it does apply instead of leaving him to wonder
+       why ticking it changed nothing here. */
+    + '<div class="thin">the <b>g3 exit</b> switch is for Stack + '
+    + 'window; in this strategy the confirmation always closes a '
+    + 'trade</div>'
     + '<div style="margin:4px 0">' + leg('confirm', C.side) + '</div>'
     + (C.held_through_flat
         ? '<div class="thin">price is exactly on this candle\u2019s '
@@ -17043,10 +17055,8 @@ function paintTwoTick(TT) {
       '<div class="thin" style="margin-bottom:4px"><b>TWO TICK '
     + 'CHARTS</b> &mdash; the lead names the direction, the '
     + 'confirmation has to agree and hold '
-    + Number(C.min_hold_s || 0).toFixed(0) + 's. Out when the lead '
-    + 'flips'
-    + (C.exits ? ', or when the confirmation flips' : '')
-    + '. No clock ends a trade.</div>'
+    + Number(C.min_hold_s || 0).toFixed(0) + 's. Out when either '
+    + 'chart flips. No clock ends a trade.</div>'
     + leadBlock
     + confBlock
     + '<div style="margin-top:8px">' + verdict + '</div>';

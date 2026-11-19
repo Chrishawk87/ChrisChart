@@ -12,10 +12,23 @@ the time stop all go with it -- not demoted to "shown only",
 ACTUALLY GONE, because the thing they were measured against is not
 here. What is left is two cuts of the same tape:
 
-    GATE 2  the lead. It names the direction and its flip is the
-            only thing that closes a trade.
-    GATE 3  the confirmation. It has to agree, and its agreement
-            has to stand five seconds before anything opens.
+    GATE 2  the lead. It names the direction, and its flip ends
+            the trade.
+    GATE 3  the confirmation. It has to agree, its agreement has
+            to stand five seconds before anything opens, and its
+            flip ends the trade too.
+
+EITHER CHART TURNING IS THE EXIT, AND THAT IS NOT OPTIONAL HERE.
+It was, for one revision, behind the same `g3 exit` switch the
+stack rule uses -- and Chris ran it with the switch off: "when
+confirmation disagrees with lead it does not exit the trade for a
+long time leading to massive losses". It did exactly what it was
+told: the confirmation turning had no say, so the trade rode until
+the LEAD's body turned, which on a 5,000-tick bar is a very long
+way. The switch no longer reaches this strategy. It still governs
+gate 3 under Stack + window, where the timeframe is the lead and a
+clock bounds the trade; here there is neither, so the second chart
+is the only thing between a trade and the next tick stop.
 
 WHAT IS THE SAME. The body of the bar, close against open, held
 through the instant close sits on open. One trade per agreement.
@@ -89,54 +102,50 @@ def entry_side(lead: str, confirm: str,
     return lead, ""
 
 
-def exit_reason(side: str, lead: str, confirm: str = "",
-                confirm_exits: bool = False) -> str:
+def exit_reason(side: str, lead: str, confirm: str = "") -> str:
     """Why this trade should end now, or "" to hold it.
 
-    THE LEAD TURNING, AND NOTHING ELSE BY DEFAULT. Asked what
-    should close a trade here, Chris picked "Gate 2's flip only, no
-    clock". There is no time stop in this rule: a trade runs until
-    the chart that opened it points the other way.
+    EITHER CHART TURNING AGAINST THE POSITION ENDS IT. There is
+    still no time stop -- Chris: "Gate 2's flip only, no clock" --
+    but the no-clock half of that is what survived. The
+    confirmation having no say was tried and cost him: "when
+    confirmation disagrees with lead it does not exit the trade for
+    a long time leading to massive losses".
 
-    THE CONFIRMATION CLOSES TOO ONLY IF THE SWITCH IS ON -- the
-    same `g3 exit` switch the stack rule uses, read LAST so that
-    with it off this returns exactly what the lead alone decided.
-    The switch is honoured here rather than ignored because a
-    control that does nothing in one strategy and something in
-    another is worse than either behaviour on its own.
+    THE LEAD IS READ FIRST, so when both turn on the same poll the
+    log says what opened the trade is what closed it. The order
+    carries meaning and only one of them can be the reason.
 
     FLAT IS NOT A FLIP, on either chart. An absence must never read
     as a reversal; that is the most expensive mistake this engine
-    has made and it has made it three times.
+    has made and it has made it three times. It is the reason this
+    is `holds` twice rather than `confirm != lead`: a forming bar
+    sits exactly on its open constantly, and exiting on that would
+    close trades on nothing at all.
     """
     if side not in SIDES:
         return ""
     ok, why = holds(side, lead)
     if not ok:
         return why.replace("the tick bar", "the lead chart")
-    if confirm_exits:
-        ok3, why3 = holds(side, confirm)
-        if not ok3:
-            return why3.replace("the tick bar", "the confirming chart")
+    ok3, why3 = holds(side, confirm)
+    if not ok3:
+        return why3.replace("the tick bar", "the confirming chart")
     return ""
 
 
-def _say(side: str, why: str, confirm_exits: bool) -> str:
+def _say(side: str, why: str) -> str:
     """One sentence for the panel, in the rule's own words."""
     if side not in SIDES:
         return why or "waiting on the two tick charts"
-    out = "out when the lead chart flips"
-    if confirm_exits:
-        out += " or the confirming chart flips"
     return (f"both tick charts are {side} and the confirmation has "
-            f"held -- in on this, {out}")
+            f"held -- in on this, out when either chart flips")
 
 
 def state(lead_raw: str = "", confirm_raw: str = "",
           lead_bar: int = 0, confirm_bar: int = 0,
           held_s: float | None = None,
           min_hold_s: float = DWELL_S,
-          confirm_exits: bool = False,
           lead_roll: dict | None = None,
           confirm_roll: dict | None = None,
           episode_taken: bool = False,
@@ -167,6 +176,10 @@ def state(lead_raw: str = "", confirm_raw: str = "",
     side, why = entry_side(lead, confirm, held_s=held_s,
                            min_hold_s=min_hold_s,
                            episode_taken=spent)
+    # WHAT ACTUALLY CLOSES THIS TRADE, answered here so the panel
+    # cannot describe an exit the rule does not have. There is no
+    # switch to read: both charts close a trade in this strategy.
+    exits = ["lead", "confirm"]
 
     ready = not (held_s is not None and min_hold_s > 0
                  and held_s < min_hold_s)
@@ -174,11 +187,13 @@ def state(lead_raw: str = "", confirm_raw: str = "",
         "mode": "ticks",
         "side": side,
         "why": why,
-        "say": _say(side, why, confirm_exits),
+        "say": _say(side, why),
+        "exits_on": exits,
         # THE LEAD. Its flip is the exit, so it is drawn first and
         # labelled with the job it does rather than its number.
         "lead": {
             "side": lead,
+            "exits": True,
             "raw": str(lead_raw or ""),
             "per_bar": int(lead_bar or 0),
             "true": lead in SIDES,
@@ -207,7 +222,11 @@ def state(lead_raw: str = "", confirm_raw: str = "",
             "same_as_lead": bool(lead_bar and confirm_bar
                                  and int(lead_bar) == int(confirm_bar)),
             "roll": dict(confirm_roll or {}),
-            "exits": bool(confirm_exits),
+            # ALWAYS. The `g3 exit` switch governs gate 3 under
+            # Stack + window and does not reach this strategy --
+            # running this one with the confirmation silent is what
+            # produced the long losing rides.
+            "exits": True,
             "decides": True,
         },
         "episode": {
