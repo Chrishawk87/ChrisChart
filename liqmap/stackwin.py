@@ -465,7 +465,14 @@ def entry_side(tick: str, candle: str = "",
                tick_failed: bool = False,
                episode_taken: bool = False,
                held_s: float | None = None,
-               min_hold_s: float = DWELL_S) -> tuple[str, str]:
+               min_hold_s: float = DWELL_S,
+               # GATE 3 GOES LAST, BY KEYWORD. Every existing caller
+               # passes the first few positionally; slotting a new
+               # argument in among them silently re-reads `tf_ticks`
+               # as a direction, which is how a no-trade band turns
+               # into a blocked gate with nothing to show for it.
+               tick3: str = "", tick3_on: bool = False,
+               ) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
     THE ORDER IS CHRIS'S, and the order is the rule:
@@ -479,7 +486,20 @@ def entry_side(tick: str, candle: str = "",
         5. THE FIVE-SECOND HOLD on GATE 1's direction. Chris: "the
            5 second hold should be on the time frame not tick
            chart".
-        6. Both point the same way. That side is the trade.
+        6. GATE 3 -- a second tick chart, on its own size. Chris:
+           "we are going to use the 3rd gate for entries only when
+           they all agree a trade will be taken".
+        7. All of them point the same way. That side is the trade.
+
+    GATE 3 IS ENTRY-ONLY. "the exit will remain the same as it is
+    for now" -- the exit is still the clock and gate 2's flip, and
+    `holds` has never heard of gate 3.
+
+    `tick3_on` SAYS WHETHER A THIRD GATE IS RUNNING AT ALL, and it
+    is separate from its direction on purpose. An empty `tick3`
+    would otherwise mean both "no third gate" and "the third gate
+    has nothing to say", and those are opposite answers: the first
+    must not block an entry and the second must.
 
     "Nothing else votes. The footprint, OFI, CVD, the window's four
     legs, the 1m row, the vote, the pace, the pullback reading --
@@ -506,6 +526,12 @@ def entry_side(tick: str, candle: str = "",
     if candle != tick:
         return "", (f"the tick candle is {tick} but the timeframe "
                     f"candle is {candle}")
+    if tick3_on or tick3:
+        if tick3 not in SIDES:
+            return "", "the third gate has no direction yet"
+        if tick3 != tick:
+            return "", (f"the third gate is {tick3} against a {tick} "
+                        "entry")
     if episode_taken:
         return "", ("this agreement has already been traded -- they "
                     "have to disagree before another is taken")
@@ -539,7 +565,8 @@ def holds(side: str, tick: str) -> tuple[bool, str]:
 
 
 def exit_reason(side: str, tick: str, bar_ts: float, now_ts: float,
-                period_s: float = TRADE_BAR_S) -> str:
+                period_s: float = TRADE_BAR_S,
+                tick3: str = "", tick3_exit: bool = False) -> str:
     """Why this trade should end now, or "" to hold it.
 
     ONE FUNCTION, IN ORDER, because the order carries meaning.
@@ -559,7 +586,21 @@ def exit_reason(side: str, tick: str, bar_ts: float, now_ts: float,
     if gone:
         return why_gone
     ok, why = holds(side, tick)
-    return "" if ok else why
+    if not ok:
+        return why
+    # GATE 3, ONLY IF THE SWITCH IS ON. Chris: "we can also make it
+    # for exits as well but allow that to be a option a button we
+    # can switch on and off". It is read LAST, so with the switch
+    # off nothing about the exit changes -- this returns exactly
+    # what it returned before gate 3 existed.
+    #
+    # THE SAME FLAT RULE. An absent direction is not a reversal.
+    # `holds` is reused rather than re-written here for that reason.
+    if tick3_exit:
+        ok3, why3 = holds(side, tick3)
+        if not ok3:
+            return why3.replace("the tick bar", "gate 3")
+    return ""
 
 
 def bar_of(ts: float, period_s: float = CAP_BAR_S) -> float:
@@ -621,6 +662,8 @@ def state(win: dict | None, tick: str, rungs: dict | None,
           roll: dict | None = None,
           intent: dict | None = None,
           tf_intent: dict | None = None,
+          tick3: str = "", tick3_raw: str = "", tick3_bar: int = 0,
+          tick3_exit: bool = False,
           tf_ticks: float | None = None,
           episode_taken: bool = False,
           held_s: float | None = None,
@@ -719,7 +762,10 @@ def state(win: dict | None, tick: str, rungs: dict | None,
     same_run = bool(agreeing and prev_ep.get("side") == tick)
     spent = bool(episode_taken or (same_run and prev_ep.get("taken")))
 
+    tick3 = hold_dir(str(tick3_raw or tick3 or ""),
+                     str(prev.get("tick3") or ""))
     side, why = entry_side(tick, s_side, tf_ticks,
+                           tick3=tick3, tick3_on=bool(tick3_bar),
                            intent=intent or {},
                            tick_failed=tick_failed,
                            episode_taken=spent,
@@ -863,6 +909,33 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "side": w_side, "why": w_why,
             "decides": False,
         },
+        # GATE 3 -- A SECOND TICK CHART. It has to agree before
+        # anything opens, always. Whether it also CLOSES a trade is
+        # a switch: "we can also make it for exits as well but
+        # allow that to be a option a button we can switch on and
+        # off". Off is the default -- "the exit will remain the
+        # same as it is for now".
+        "tick3": {
+            "side": tick3,
+            "raw": str(tick3_raw or ""),
+            "per_bar": int(tick3_bar or 0),
+            "true": tick3 in SIDES,
+            "agrees": bool(tick3 in SIDES and tick3 == tick
+                           and tick in SIDES),
+            # A SIZE THAT MATCHES GATE 2 IS THE SAME READING TWICE.
+            # It will agree by construction and decide nothing --
+            # drawn rather than blocked, because it is a legitimate
+            # thing to want to see and a silent no-op is not.
+            "same_as_gate2": bool(tick3_bar and roll
+                                  and int(tick3_bar)
+                                  == int((roll or {}).get("window") or 0)),
+            "decides": True,
+            # WHETHER IT ALSO CLOSES. The panel has to be able to
+            # say which, because an exit rule that is sometimes on
+            # and invisible is how a trade ends for no stated
+            # reason.
+            "exits": bool(tick3_exit),
+        },
         # THE RUN OF AGREEMENT, and whether it has been spent.
         # `taken` is set by the CALLER when a trade actually opens,
         # because only the caller knows whether the journal accepted
@@ -882,7 +955,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         # The tape reading holds its own last state through a tie,
         # so its memory rides home with the gates' rather than in a
         # second place the caller has to remember to carry.
-        "held": {"tick": tick, "candle": s_side,
+        "held": {"tick": tick, "candle": s_side, "tick3": tick3,
                  "episode": {"side": tick if agreeing else "",
                              "taken": spent},
                  # `worst` and `bar_dir` ride home too: the first is

@@ -1480,3 +1480,326 @@ class TestEveryWindowSettingActuallySteps:
         assert sw_, "the stack payload is missing entirely"
         assert (sw_.get("stack") or {}).get("trading") == "5000t", \
             "the rule is still trading a time chart"
+
+
+class TestGateThree:
+    """A THIRD CHART, AND IT HAS TO AGREE.
+
+    Chris: "add a 3rd gate that is going to help with entries
+    another tick chart we are going to use the 3rd gate for entries
+    only when they all agree a trade will be taken the exit will
+    remain the same as it is for now" -- and then: "we can also
+    make it for exits as well but allow that to be a option a
+    button we can switch on and off".
+    """
+
+    @pytest.mark.parametrize("side", [U, D])
+    def test_all_three_agreeing_opens(self, side):
+        assert sw.entry_side(side, side, 40.0,
+                             tick3=side, tick3_on=True) == (side, "")
+
+    @pytest.mark.parametrize("side", [U, D])
+    def test_the_third_gate_against_blocks(self, side):
+        other = D if side == U else U
+        got, why = sw.entry_side(side, side, 40.0,
+                                 tick3=other, tick3_on=True)
+        assert got == ""
+        assert "third gate" in why
+
+    def test_a_blank_third_gate_blocks_when_it_is_on(self):
+        """ON AND SILENT IS NOT THE SAME AS OFF.
+
+        An empty direction once meant both, so switching gate 3 on
+        before its first bar had a body let trades through
+        ungated.
+        """
+        got, why = sw.entry_side(U, U, 40.0, tick3="", tick3_on=True)
+        assert got == ""
+        # THE REASON, NOT JUST THE REFUSAL. A missing direction
+        # read as a disagreement produces "the third gate is
+        # against a up entry" -- a blank where a side should be,
+        # which is how an absence gets read as a reversal.
+        assert "no direction" in why, why
+        assert "against" not in why, why
+
+    def test_off_it_changes_nothing(self):
+        assert sw.entry_side(U, U, 40.0) == (U, "")
+        assert sw.entry_side(U, U, 40.0,
+                             tick3="", tick3_on=False) == (U, "")
+
+    def test_it_cannot_rescue_a_blocked_entry(self):
+        """IT IS A GATE, NOT A VOTE. Agreeing does not overrule the
+        other two, the hold, or the no-trade band."""
+        assert sw.entry_side(U, D, 40.0, tick3=U, tick3_on=True)[0] == ""
+        assert sw.entry_side(U, U, 1.0, tick3=U, tick3_on=True)[0] == ""
+        assert sw.entry_side(U, U, 40.0, tick3=U, tick3_on=True,
+                             held_s=1.0, min_hold_s=5.0)[0] == ""
+
+    def test_state_carries_the_third_gate_home_held(self):
+        """A TIE MUST NOT READ AS A REVERSAL. Gate 3 holds its last
+        real direction exactly as the other two do."""
+        out = sw.state({}, U, {}, 300.0, tick_open=1.0, tick_close=2.0,
+                       tick3_raw=U, tick3_bar=1000)
+        assert (out["held"] or {}).get("tick3") == U
+        out2 = sw.state({}, U, {}, 300.0, tick_open=1.0, tick_close=2.0,
+                        tick3_raw="", tick3_bar=1000,
+                        prev=out["held"])
+        assert (out2["tick3"] or {}).get("side") == U
+
+    def test_the_payload_says_whether_it_is_on_and_whether_it_exits(self):
+        out = sw.state({}, U, {}, 300.0, tick_open=1.0, tick_close=2.0,
+                       tick3_raw=U, tick3_bar=1000)
+        g3 = out["tick3"]
+        assert g3["per_bar"] == 1000
+        assert g3["decides"] is True
+        assert g3["exits"] is False
+        on = sw.state({}, U, {}, 300.0, tick_open=1.0, tick_close=2.0,
+                      tick3_raw=U, tick3_bar=1000, tick3_exit=True)
+        assert on["tick3"]["exits"] is True
+
+
+class TestGateThreeOnTheExit:
+    """THE SWITCH. Chris: "we can also make it for exits as well but
+    allow that to be a option a button we can switch on and off"."""
+
+    NOW = 1_700_000_000.0
+
+    def _exit(self, **kw):
+        return sw.exit_reason(U, kw.pop("tick", U), self.NOW,
+                              self.NOW + 1.0, 300.0, **kw)
+
+    def test_off_the_exit_is_exactly_what_it_was(self):
+        """THE DEFAULT CHANGES NOTHING. "the exit will remain the
+        same as it is for now"."""
+        assert self._exit(tick3=D) == ""
+        assert self._exit(tick3=D, tick3_exit=False) == ""
+        assert sw.exit_reason(U, U, self.NOW, self.NOW + 1.0, 300.0) == ""
+
+    def test_on_a_flip_against_the_trade_closes_it(self):
+        why = self._exit(tick3=D, tick3_exit=True)
+        assert "gate 3" in why
+        assert "down" in why
+
+    def test_on_a_flat_gate_three_is_not_a_flip(self):
+        """FLAT IS NOT A FLIP -- the most expensive mistake in this
+        file's history, and gate 3 does not get to make it again."""
+        assert self._exit(tick3="", tick3_exit=True) == ""
+
+    def test_on_agreement_holds_the_trade(self):
+        assert self._exit(tick3=U, tick3_exit=True) == ""
+
+    def test_gate_two_keeps_the_blame_when_both_flip(self):
+        """ORDER CARRIES MEANING. Gate 3 is read last, so the log
+        says what it has always said when the tick bar turned."""
+        why = self._exit(tick="down", tick3=D, tick3_exit=True)
+        assert "tick bar" in why
+        assert "gate 3" not in why
+
+    def test_the_clock_still_comes_first(self):
+        why = sw.exit_reason(U, U, self.NOW - 400.0, self.NOW, 300.0,
+                             tick3=D, tick3_exit=True)
+        assert "gate 3" not in why
+        assert why
+
+
+class TestGateThreeIsWiredThrough:
+    """The rule can be right and the screen still never reach it.
+    Every one of these has been broken at least once: a column that
+    existed but was never written, a selector with no route
+    parameter behind it, a route that read a setting the page never
+    sent."""
+
+    WANTED = (250, 500, 1000, 1500, 2000, 3000, 4000, 5000,
+              6000, 7000, 8000, 9000, 10000)
+
+    def _src(self):
+        import pathlib
+        return (pathlib.Path(__file__).resolve().parents[1]
+                / "liqmap" / "web.py").read_text()
+
+    def test_the_settings_carry_both(self):
+        from liqmap.journal import Settings
+        s = Settings()
+        assert s.tick_bar_3 == 1000
+        assert s.tick3_exit is False
+        d = s.to_dict()
+        assert d["tick_bar_3"] == 1000
+        assert d["tick3_exit"] is False
+
+    def test_they_survive_being_saved(self, tmp_path):
+        """A COLUMN THAT IS NOT IN THE INSERT SILENTLY REVERTS. That
+        is exactly what gate 2's size did before anyone looked."""
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", tick_bar_3=3000,
+                                 tick3_exit=True))
+        got = j.settings("ES")
+        assert got.tick_bar_3 == 3000
+        assert got.tick3_exit is True
+        j.save_settings(Settings(coin="ES", tick_bar_3=250,
+                                 tick3_exit=False))
+        got = j.settings("ES")
+        assert got.tick_bar_3 == 250
+        assert got.tick3_exit is False
+
+    def test_the_other_settings_still_round_trip(self):
+        """A new column in the INSERT is where the old ones get
+        knocked out of line with their placeholders."""
+        from liqmap.journal import Journal, Settings
+        import tempfile
+        import pathlib
+        with tempfile.TemporaryDirectory() as d:
+            j = Journal(pathlib.Path(d) / "j.db")
+            j.save_settings(Settings(coin="ES", auto=True, tp_on=True,
+                                     sl_on=True, tp_ticks=12.0,
+                                     sl_ticks=6.0, window_s=300.0,
+                                     tick_bar=2000, tick_bar_3=500,
+                                     tick3_exit=True, strategy="stack"))
+            g = j.settings("ES")
+            assert (g.auto, g.tp_on, g.sl_on) == (True, True, True)
+            assert (g.tp_ticks, g.sl_ticks) == (12.0, 6.0)
+            assert g.window_s == 300.0
+            assert (g.tick_bar, g.tick_bar_3) == (2000, 500)
+            assert g.tick3_exit is True
+            assert g.strategy == "stack"
+
+    def test_the_selector_offers_every_size(self):
+        import re
+        src = self._src()
+        i = src.index('id="jnlTick3"')
+        box = src[i:src.index("</select>", i)]
+        shown = tuple(sorted(int(m) for m in
+                             re.findall(r'value="(\d+)"', box)))
+        assert shown == self.WANTED
+
+    def test_there_is_a_switch_for_the_exit(self):
+        src = self._src()
+        assert 'id="jnlT3Ex"' in src
+        i = src.index('id="jnlT3Ex"')
+        assert 'onchange="jnlSet()"' in src[i:i + 200], \
+            "the switch does not save when it is clicked"
+
+    def test_the_page_sends_both_and_reflects_them_back(self):
+        src = self._src()
+        assert "tick_bar_3: $('jnlTick3')" in src
+        assert "tick3_exit: ($('jnlT3Ex')" in src
+        assert "S.tick_bar_3" in src
+        assert "S.tick3_exit" in src, \
+            "the switch never shows the saved state"
+
+    def test_the_route_takes_both(self):
+        src = self._src()
+        assert "tick_bar_3: int | None = None," in src
+        assert "tick3_exit: bool | None = None," in src
+        i = src.index("tick3_exit: bool | None = None,")
+        blk = src[i:i + 2000]
+        assert "tick3_exit=(bool(getattr(cur" in blk, \
+            "the route takes the parameter and drops it"
+
+    def test_the_route_reads_gate_three_and_snaps_it(self):
+        src = self._src()
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        assert 'getattr(s, "tick_bar_3", 0)' in blk
+        assert "_g3 not in _PBC2" in blk, \
+            "a size with no builder behind it is not snapped"
+        assert "_tk3 = _tick_now(" in blk, \
+            "gate 3 has no series behind it"
+        assert "tick3_raw=(_tk3.get" in blk, \
+            "gate 3's direction never reaches the rule"
+
+    def test_the_exit_is_handed_the_held_direction_not_a_copy(self):
+        """READING IT TWICE IS HOW A TRADE ONCE OPENED AND CLOSED ON
+        ONE POLL -- the entry read the body and the exit read the
+        vote."""
+        src = self._src()
+        i = src.index("disagreed = _sw.exit_reason(")
+        seg = src[i:i + 900]
+        assert '(fus.get("tick3") or {}).get("side")' in seg
+        assert 'getattr(s, "tick3_exit", False)' in seg
+
+    def test_the_panel_draws_gate_three(self):
+        src = self._src()
+        i = src.index("function paintStackWin(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "SW.tick3" in fn, "gate 3 is never read by the painter"
+        assert "GATE 3" in fn, "gate 3 has no heading"
+        assert "g3Block" in fn
+        j = fn.index("box.innerHTML")
+        assert "g3Block" in fn[j:], \
+            "the block is built and then never shown"
+        assert "g3.exits" in fn, \
+            "the panel cannot say whether gate 3 closes trades"
+
+
+class TestGateThreeActuallyStepsAndSaves:
+    """EXECUTION, NOT SOURCE TEXT. A source-text test cannot see an
+    UnboundLocalError, and this route has produced three of them --
+    each one broke every window and was swallowed into
+    `journal.error` where nothing was looking."""
+
+    @pytest.mark.parametrize("g3,exit_on", [
+        (250, False), (1000, False), (10000, True), (5000, True),
+    ])
+    def test_the_step_runs_with_gate_three_set(
+            self, client, monkeypatch, g3, exit_on):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "stack"
+        s.tick_bar_3 = g3
+        s.tick3_exit = exit_on
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, (
+            f"the step raised with gate 3 at {g3}: {jr.get('error')}")
+
+    def test_the_payload_describes_gate_three(self, client, monkeypatch):
+        """Not merely "it did not raise": gate 3 has to appear, with
+        the size that was asked for, or the setting did nothing."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "stack"
+        s.tick_bar_3 = 2000
+        s.tick3_exit = True
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        g3 = (((d.get("journal") or {}).get("stackwin")) or {}).get("tick3")
+        assert g3, "gate 3 is missing from the payload"
+        assert g3.get("per_bar") == 2000
+        assert g3.get("decides") is True
+        assert g3.get("exits") is True
+
+    def test_the_settings_route_takes_them(self, client):
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "tick_bar_3": "3000",
+                                "tick3_exit": "true"},
+                        headers=AUTH).json()
+        s = d.get("settings") or d
+        assert int(s.get("tick_bar_3")) == 3000
+        assert s.get("tick3_exit") is True
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "tick3_exit": "false"},
+                        headers=AUTH).json()
+        s = d.get("settings") or d
+        assert s.get("tick3_exit") is False
+        assert int(s.get("tick_bar_3")) == 3000, \
+            "a setting the call did not mention was reset"
+
+    def test_a_junk_size_is_snapped_not_trusted(self, client):
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "tick_bar_3": "7"},
+                        headers=AUTH).json()
+        from liqmap.tickbar import PER_BAR_CHOICES as P
+        s = d.get("settings") or d
+        assert int(s.get("tick_bar_3")) in P

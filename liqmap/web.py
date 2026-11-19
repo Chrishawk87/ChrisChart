@@ -5695,6 +5695,8 @@ def create_app() -> FastAPI:
                              sl_ticks: float | None = None,
                              window_s: float | None = None,
                              tick_bar: int | None = None,
+                             tick_bar_3: int | None = None,
+                             tick3_exit: bool | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5718,6 +5720,11 @@ def create_app() -> FastAPI:
                 tick_bar=(int(getattr(cur, "tick_bar", 5000) or 5000)
                           if tick_bar is None
                           else _snap_per_bar(int(tick_bar))),
+                tick_bar_3=(int(getattr(cur, "tick_bar_3", 1000) or 1000)
+                            if tick_bar_3 is None
+                            else _snap_per_bar(int(tick_bar_3))),
+                tick3_exit=(bool(getattr(cur, "tick3_exit", False))
+                            if tick3_exit is None else bool(tick3_exit)),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7842,6 +7849,18 @@ def create_app() -> FastAPI:
                 _g1 = max((n for n in _PBC2 if n < int(_traded_n)),
                           default=max(1, int(_traded_n) // 2))
             _tk = _tick_now(rt_, _g1, "raw", 0.0, 0, FUSION_RESET_S)
+            # GATE 3 -- A SECOND TICK CHART, ENTRY ONLY. Chris:
+            # "add a 3rd gate that is going to help with entries
+            # another tick chart ... only when they all agree a
+            # trade will be taken. the exit will remain the same".
+            #
+            # The same continuous family gate 2 reads, on its own
+            # size, so the two are the same tape cut two ways
+            # rather than two different feeds.
+            _g3 = int(getattr(s, "tick_bar_3", 0) or 0) or 1000
+            if _g3 not in _PBC2:
+                _g3 = min(_PBC2, key=lambda n: abs(n - _g3))
+            _tk3 = _tick_now(rt_, _g3, "raw", 0.0, 0, FUSION_RESET_S)
             # THE FIVE-SECOND HOLD ON GATE 2. Chris restored it by
             # name. ONE tracker on the runtime, so the stepper and
             # the panel read the same clock -- a second instance
@@ -7892,6 +7911,10 @@ def create_app() -> FastAPI:
                             tick_open=float(_tk.get("open") or 0.0),
                             tick_close=float(_tk.get("close") or 0.0),
                             held_s=_dw.held_s(_now_s),
+                            tick3_raw=(_tk3.get("body_dir") or ""),
+                            tick3_bar=_g3,
+                            tick3_exit=bool(
+                                getattr(s, "tick3_exit", False)),
                             tf_intent=_tfi,
                             tf_ticks=(float(_tfc.get("ticks") or 0.0)
                                       if _tfc else None),
@@ -8079,7 +8102,16 @@ def create_app() -> FastAPI:
                 t.side,
                 (fus.get("tick") or {}).get("side") or "",
                 float(getattr(t, "bar_ts", 0.0) or 0.0),
-                time.time(), _sw.TRADE_BAR_S) or disagreed
+                time.time(), _sw.TRADE_BAR_S,
+                # GATE 3 ON THE EXIT, ONLY WITH THE SWITCH ON.
+                # Chris: "we can also make it for exits as well but
+                # allow that to be a option a button we can switch
+                # on and off". The held direction `state` resolved,
+                # not a second copy -- reading gate 3 twice is the
+                # same mistake that once let a trade open and close
+                # on one poll.
+                (fus.get("tick3") or {}).get("side") or "",
+                bool(getattr(s, "tick3_exit", False))) or disagreed
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -10857,6 +10889,27 @@ has to be running before the gate stops refusing.">spike
               <option value="9000">9000t</option>
               <option value="10000">10000t</option>
             </select></label>
+          <!-- GATE 3: a second tick chart, entry only. -->
+          <label>gate 3
+            <select id="jnlTick3" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="250">250t</option>
+              <option value="500">500t</option>
+              <option value="1000" selected>1000t</option>
+              <option value="1500">1500t</option>
+              <option value="2000">2000t</option>
+              <option value="3000">3000t</option>
+              <option value="4000">4000t</option>
+              <option value="5000">5000t</option>
+              <option value="6000">6000t</option>
+              <option value="7000">7000t</option>
+              <option value="8000">8000t</option>
+              <option value="9000">9000t</option>
+              <option value="10000">10000t</option>
+            </select></label>
+          <label title="gate 3 also closes a trade when it flips"
+            ><input type="checkbox" id="jnlT3Ex" onchange="jnlSet()"
+            > g3 exit</label>
           <label><input type="checkbox" id="jnlTpOn"
             onchange="jnlSet()"> take profit
             <input type="number" id="jnlTp" value="16" min="0" step="1"
@@ -15847,6 +15900,8 @@ async function jnlSet() {
     jnlSl: $('jnlSl').value || 0,
     jnlWin: $('jnlWin') ? String(Math.round($('jnlWin').value || 900)) : undefined,
     jnlTick: $('jnlTick') ? String(Math.round($('jnlTick').value || 5000)) : undefined,
+    jnlTick3: $('jnlTick3') ? String(Math.round($('jnlTick3').value || 1000)) : undefined,
+    jnlT3Ex: $('jnlT3Ex') ? ($('jnlT3Ex').checked ? '1' : '0') : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -15858,6 +15913,8 @@ async function jnlSet() {
     sl_ticks: $('jnlSl').value || 0,
     window_s: $('jnlWin') ? $('jnlWin').value : 900,
     tick_bar: $('jnlTick') ? $('jnlTick').value : 5000,
+    tick_bar_3: $('jnlTick3') ? $('jnlTick3').value : 1000,
+    tick3_exit: ($('jnlT3Ex') && $('jnlT3Ex').checked) ? 'true' : 'false',
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -17017,6 +17074,55 @@ function paintStackWin(SW) {
       + '</div>'
     : '';
 
+  /* GATE 3 -- THE SECOND TICK CHART.
+
+     Chris: "add a 3rd gate that is going to help with entries
+     another tick chart we are going to use the 3rd gate for
+     entries only when they all agree a trade will be taken", then:
+     "we can also make it for exits as well but allow that to be a
+     option a button we can switch on and off".
+
+     IT IS DRAWN AS A GATE BECAUSE IT IS ONE, and the heading says
+     whether it closes trades too, because an exit rule that is
+     sometimes on and never stated is how a trade ends for no
+     visible reason -- the exact complaint this panel was rebuilt
+     after. */
+  const g3 = SW.tick3 || {};
+  const g3side = g3.side || '';
+  const g3Block = g3.per_bar
+    ? '<div style="margin-top:8px;border-left:3px solid var(--'
+      + (g3side ? (g3side === 'up' ? 'up' : 'down') : 'line')
+      + ');padding:6px 0 6px 10px">'
+      + '<div class="thin">GATE 3 &mdash; THE '
+      + Number(g3.per_bar).toLocaleString() + 'T CANDLE (close vs '
+      + 'open, as the chart draws it) &mdash; it must agree to open'
+      + (g3.exits
+          ? ', and it closes a trade when it flips'
+          : '. It does not close a trade')
+      + '</div>'
+      + '<div style="margin:4px 0">' + leg('gate 3', g3side) + '</div>'
+      /* A SIZE THAT MATCHES GATE 2 IS THE SAME READING TWICE. It
+         agrees by construction and decides nothing -- said out
+         loud rather than silently blocked, because picking it is
+         a legitimate thing to do and a silent no-op is not. */
+      + (g3.same_as_gate2
+          ? '<div class="thin"><b style="color:var(--dim)">SAME SIZE '
+            + 'AS GATE 2</b> &mdash; it is the same reading twice, '
+            + 'so it agrees by construction and decides nothing</div>'
+          : '')
+      + (g3side
+          ? (g3.agrees
+              ? '<b class="' + (g3side === 'up' ? 'long' : 'short')
+                + '">AGREES &mdash; ' + esc(g3side).toUpperCase()
+                + '</b>'
+              : '<b class="short">DISAGREES</b> <span class="thin">'
+                + 'gate 3 is ' + esc(g3side).toUpperCase()
+                + '</span>')
+          : '<b class="short">NO DIRECTION</b> <span class="thin">'
+            + 'nothing opens until gate 3 has one</span>')
+      + '</div>'
+    : '';
+
   /* THE RULE'S VERDICT, AND THE JOURNAL'S ANSWER TO IT.
 
      These are two different questions and this box used to answer
@@ -17047,11 +17153,15 @@ function paintStackWin(SW) {
       '<div class="thin" style="margin-bottom:4px"><b>THE '
     + esc(st.trading || '').toUpperCase() + ' CANDLE &amp; THE TICK '
     + 'CHART'
-    + '</b> &mdash; both must agree to open, and the timeframe\u2019s '
-    + 'direction has to hold 5s first. Out on the tick bar\u2019s flip, '
-    + 'or when the 5-minute bar it opened in ends.</div>'
+    + '</b> &mdash; '
+    + (g3.per_bar ? 'all three gates' : 'both')
+    + ' must agree to open, and the timeframe\u2019s '
+    + 'direction has to hold 5s first. Out on the tick bar\u2019s flip'
+    + (g3.exits ? ', on gate 3\u2019s flip' : '')
+    + ', or when the 5-minute bar it opened in ends.</div>'
     + tfBlock
     + ruleBlock
+    + g3Block
     + regimeBlock
     + '<div style="margin-top:8px">' + verdict + '</div>'
     + context;
@@ -17109,6 +17219,8 @@ function paintJournal(d) {
   set('jnlTp', S.tp_ticks); set('jnlSl', S.sl_ticks);
   set('jnlWin', String(Math.round(S.window_s || 900)));
   set('jnlTick', String(Math.round(S.tick_bar || 5000)));
+  set('jnlTick3', String(Math.round(S.tick_bar_3 || 1000)));
+  if ($('jnlT3Ex')) $('jnlT3Ex').checked = !!S.tick3_exit;
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =

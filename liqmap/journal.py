@@ -99,6 +99,18 @@ class Settings:
     # gate 1 -- which is no use when gate 1 is a time candle and has
     # no fifth.
     tick_bar: int = 5000
+    # GATE 3'S CHART. Chris: "add a 3rd gate that is going to help
+    # with entries another tick chart ... only when they all agree
+    # a trade will be taken". A faster series than gate 2 by
+    # default, because a second copy of the same size would agree
+    # with the first by construction and decide nothing.
+    tick_bar_3: int = 1000
+    # GATE 3 ON THE EXIT, AS A SWITCH. Chris: "we can also make it
+    # for exits as well but allow that to be a option a button we
+    # can switch on and off". OFF is the shipped default, because
+    # his exit rule is the one thing he asked to leave alone when
+    # gate 3 went in -- turning it on is a deliberate act.
+    tick3_exit: bool = False
     strategy: str = "ofi"
 
     def to_dict(self) -> dict:
@@ -108,6 +120,8 @@ class Settings:
                 "window_s": self.window_s,
                 "window_label": window_label(self.window_s),
                 "tick_bar": int(self.tick_bar or 5000),
+                "tick_bar_3": int(self.tick_bar_3 or 1000),
+                "tick3_exit": bool(self.tick3_exit),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
                                                  self.strategy),
@@ -413,6 +427,8 @@ _ADDED_SETTINGS = (
     ("window_s", "REAL NOT NULL DEFAULT 900"),
     ("strategy", "TEXT NOT NULL DEFAULT 'ofi'"),
     ("tick_bar", "INTEGER NOT NULL DEFAULT 5000"),
+    ("tick_bar_3", "INTEGER NOT NULL DEFAULT 1000"),
+    ("tick3_exit", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -472,6 +488,8 @@ class Journal(ThreadedDB):
                         sl_ticks=float(r["sl_ticks"]),
                         window_s=float(r["window_s"] or 900.0),
                         tick_bar=int(r["tick_bar"] or 5000),
+                        tick_bar_3=int(r["tick_bar_3"] or 1000),
+                        tick3_exit=bool(r["tick3_exit"]),
                         strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
@@ -479,14 +497,17 @@ class Journal(ThreadedDB):
             conn.execute(
                 "INSERT INTO journal_settings"
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
-                "  window_s, tick_bar, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?)"
+                "  window_s, tick_bar, tick_bar_3, tick3_exit,"
+                "  strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
                 " sl_ticks=excluded.sl_ticks,"
                 " window_s=excluded.window_s,"
                 " tick_bar=excluded.tick_bar,"
+                " tick_bar_3=excluded.tick_bar_3,"
+                " tick3_exit=excluded.tick3_exit,"
                 " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
@@ -503,6 +524,8 @@ class Journal(ThreadedDB):
                  # It erased tick windows once already.
                  _clamp_window(s.window_s),
                  max(1, int(s.tick_bar or 5000)),
+                 max(1, int(s.tick_bar_3 or 1000)),
+                 int(bool(s.tick3_exit)),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 
