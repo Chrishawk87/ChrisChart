@@ -210,10 +210,28 @@ class TestWhatIsBackAndWhatStaysOut:
         i = src.index("def _journal_step_un(")
         blk = src[i:i + 30000]
         assert "_sw.Dwell()" in blk, "nothing measures the hold"
-        assert "_dw.on_tick(_sw.hold_dir(_bd," in blk, \
+        assert "_dw.on_tick(_cand, _now_s)" in blk, \
+            "the hold is not on the timeframe"
+        assert "_sw.hold_dir(" in blk and "_sw.stack_side(" in blk, \
             "the hold is fed a reading that blanks, so it restarts " \
             "on an absence and never elapses"
         assert "held_s=_dw.held_s(" in blk, "the rule never sees it"
+
+    def test_the_route_and_the_rule_resolve_the_same_direction(self):
+        """The dwell has to be fed before `state` runs and `state`
+        is pure, so the route makes the same two calls itself. Two
+        places computing one number is how the screen and the rule
+        have disagreed before -- this holds them to agreeing."""
+        rg = rungs(**{"5m": U})
+        route = sw.hold_dir(sw.stack_side(rg, 300.0)[0], "")
+        st = sw.state({}, U, rg, 300.0, tf_ticks=20.0)
+        assert route == st["stack"]["side"]
+        # and through a tie, where the held value is the whole point
+        flat = rungs(**{"5m": "flat"})
+        route2 = sw.hold_dir(sw.stack_side(flat, 300.0)[0], U)
+        st2 = sw.state({}, U, flat, 300.0, tf_ticks=20.0,
+                       prev={"candle": U})
+        assert route2 == st2["stack"]["side"] == U
 
     def test_the_time_stop_is_back(self):
         assert sw.TRADE_BAR_S == 300.0
@@ -962,16 +980,57 @@ class TestTheFourTickMinimumIsOut:
                       tick_open=7000.0, tick_close=7000.75)
         assert st["tick"]["moved_ticks"] == 3.0
 
-    def test_the_hold_is_what_debounces_it_now(self):
-        """The flip gets through to the DIRECTION immediately and is
-        stopped from becoming a TRADE until it has stood five
-        seconds. That is the trade Chris asked for."""
+    def test_the_hold_is_on_the_timeframe_not_the_tick_chart(self):
+        """Chris: "the 5 second hold should be on the time frame not
+        tick chart". Pinned both ways round, because it has been on
+        the tick bar twice."""
+        # the tick candle just turned: not blocked by the hold
         st = sw.state({}, D, rungs(**{"5m": D}), 300.0, tf_ticks=20.0,
                       tick_open=7000.0, tick_close=6999.75,
-                      held_s=1.0, prev={"tick": U, "candle": D})
+                      held_s=99.0, prev={"tick": U, "candle": D})
+        assert st["side"] == D, "the hold is still on the tick chart"
+        # the timeframe just turned: blocked
+        st2 = sw.state({}, D, rungs(**{"5m": D}), 300.0, tf_ticks=20.0,
+                       held_s=1.0)
+        assert st2["side"] == ""
+        assert "the timeframe candle turned" in st2["why"]
+
+    def test_the_hold_reads_on_gate_ones_block(self):
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, tf_ticks=20.0,
+                      held_s=2.0)
+        assert st["stack"]["ready"] is False
+        # READY IS ABOUT GATE 1, not gate 2. A mutation reading the
+        # tick side here survived, because in this case they agree
+        # -- so the case that separates them is the one to assert.
+        st2 = sw.state({}, U, rungs(**{"5m": "flat"}), 300.0,
+                       tf_ticks=20.0, held_s=99.0)
+        assert st2["tick"]["side"] == U, "the tick side is still up"
+        assert st2["stack"]["side"] == "", "the timeframe has none"
+        assert st2["stack"]["ready"] is False, \
+            "ready reports the tick chart, not the timeframe"
+        assert st["stack"]["held_s"] == 2.0
+        assert st["stack"]["min_hold_s"] == 5.0
+        assert "held_s" not in st["tick"], \
+            "the tick block still carries a hold it does not have"
+
+    def test_the_panel_draws_it_on_gate_one(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("const tfBlock =")
+        blk = src[i:i + 2400]
+        assert "st.ready === false" in blk, \
+            "a timeframe waiting out its hold is silent"
+        assert "st.held_s" in blk and "st.min_hold_s" in blk
+
+    def test_the_old_min_turn_debounce_stays_out(self):
+        """Gate 2 turns on one tick again; the four-tick band is
+        gone and the hold on gate 1 is the only debounce."""
+        st = sw.state({}, D, rungs(**{"5m": D}), 300.0, tf_ticks=20.0,
+                      tick_open=7000.0, tick_close=6999.75,
+                      held_s=99.0, prev={"tick": U, "candle": D})
         assert st["tick"]["side"] == D
-        assert st["side"] == "", "a one-second-old flip opened a trade"
-        assert "has to hold 5s" in st["why"]
+        assert st["side"] == D
 
 
 class TestARefusedEntryIsNeverSilent:

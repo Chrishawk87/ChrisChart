@@ -60,17 +60,18 @@ SIDES = ("up", "down")
 # This is a counter, not a time stop. Nothing expires because of
 # it; the only question it answers is how many trades this
 # five minutes has already had.
-# HOW LONG GATE 2'S DIRECTION MUST STAND BEFORE IT CAN OPEN.
+# HOW LONG GATE 1'S DIRECTION MUST STAND BEFORE IT CAN OPEN.
 #
-# Chris, restoring the rule: "The 5-second hold on that direction".
-# It was ten seconds, then it came out entirely, and it is back at
-# five -- on the TICK chart, which is gate 2 now.
+# Chris: "the 5 second hold should be on the time frame not tick
+# chart". It was ten seconds on the tick bar, then it came out
+# entirely, and it is back at five -- on the TIMEFRAME.
 #
-# IT IS THE ONLY THING DEBOUNCING GATE 2. Its direction is held
-# through an exact tie and nothing wider, so a bar one tick off its
-# open reads a direction; the hold is what stops that becoming a
-# trade. That was `MIN_TURN_TICKS`' job and he has asked for the
-# hold instead.
+# THE TIMEFRAME IS WHERE IT BITES HARDEST. Gate 1 is close against
+# open with NO threshold at all -- one tick decides it, by his
+# instruction -- so a candle sitting near its open flips as readily
+# as the tick chart ever did, and on the trend side that is the
+# more expensive flip. The hold is what stops either from becoming
+# a trade before it means anything.
 DWELL_S = 5.0
 
 # NO TRADE OUTLIVES THIS. "Time stop -- the trade has outlived the
@@ -472,10 +473,12 @@ def entry_side(tick: str, candle: str = "",
         3. GATE 2 -- the tick candle's direction, close against
            open, held through the instant close sits on its open so
            it never blanks.
-        4. THE FIVE-SECOND HOLD on that direction.
-        5. GATE 1 -- the real live timeframe candle, close against
+        4. GATE 1 -- the real live timeframe candle, close against
            open, no threshold, one tick decides it, also held
            through ties.
+        5. THE FIVE-SECOND HOLD on GATE 1's direction. Chris: "the
+           5 second hold should be on the time frame not tick
+           chart".
         6. Both point the same way. That side is the trade.
 
     "Nothing else votes. The footprint, OFI, CVD, the window's four
@@ -494,11 +497,12 @@ def entry_side(tick: str, candle: str = "",
     """
     if tick not in SIDES:
         return "", "the tick candle has no direction yet"
-    if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
-        return "", (f"the tick candle turned {tick} {held_s:.0f}s ago "
-                    f"-- it has to hold {min_hold_s:.0f}s")
     if candle not in SIDES:
         return "", "the timeframe candle has no direction yet"
+    if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
+        return "", (f"the timeframe candle turned {candle} "
+                    f"{held_s:.0f}s ago -- it has to hold "
+                    f"{min_hold_s:.0f}s")
     if candle != tick:
         return "", (f"the tick candle is {tick} but the timeframe "
                     f"candle is {candle}")
@@ -758,15 +762,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             # looked. Chris: "it just exits on its own with no
             # visable disagreement at all".
             "moved_ticks": moved,
-            # HOW LONG IT HAS POINTED THIS WAY, and what it has to
-            # reach. Shown so a blocked entry reads as WAITING
-            # rather than as nothing happening -- the two call for
-            # very different reactions.
-            "held_s": (round(held_s, 1) if held_s is not None else None),
-            "min_hold_s": float(min_hold_s or 0.0),
-            "ready": bool(tick in SIDES
-                          and (held_s is None or min_hold_s <= 0
-                               or held_s >= min_hold_s)),
+
             # How long it has pointed this way, and what it has to
             # reach. Shown so a blocked entry reads as waiting
             # rather than as nothing happening.
@@ -785,6 +781,15 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "raw": s_raw,
             "held_through_flat": bool(s_side in SIDES
                                       and s_raw not in SIDES),
+            # HOW LONG THIS CANDLE HAS POINTED THIS WAY, and what
+            # it has to reach. Shown so a blocked entry reads as
+            # WAITING rather than as nothing happening -- the two
+            # call for very different reactions.
+            "held_s": (round(held_s, 1) if held_s is not None else None),
+            "min_hold_s": float(min_hold_s or 0.0),
+            "ready": bool(s_side in SIDES
+                          and (held_s is None or min_hold_s <= 0
+                               or held_s >= min_hold_s)),
             # ASKED AND DECIDING ON ENTRY. Chris: "lets add back
             # the timeframe section without the 10 second hold".
             # It does NOT decide exits -- it gets you in, the tick

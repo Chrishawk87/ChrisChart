@@ -222,14 +222,16 @@ class TestTheMemoryIsTheCallersCom:
         assert 'rt_._gate_held = {**(fus.get("held")' in blk, \
             "the gates' memory is no longer stored"
 
-    def test_the_dwell_is_fed_the_held_direction(self):
-        """Chris restored it at five seconds. Feeding it the RAW
-        reading would restart the hold at every tie -- the same
-        reset, one layer down, which is why the ten-second version
-        never elapsed."""
+    def test_the_dwell_is_fed_the_held_timeframe_direction(self):
+        """Chris: "the 5 second hold should be on the time frame not
+        tick chart". Feeding it the RAW reading would restart the
+        hold at every tie -- the same reset, one layer down, which
+        is why the ten-second version never elapsed."""
         i = WEB.index("def _journal_step_un(")
         blk = WEB[i:i + 30000]
-        assert "_dw.on_tick(_sw.hold_dir(_bd," in blk
+        assert "_dw.on_tick(_cand, _now_s)" in blk
+        assert "_sw.stack_side(_rungs," in blk, \
+            "the hold is still measuring the tick chart"
 
 
 class TestGateTwoIsTheRealLiveCandle:

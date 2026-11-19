@@ -7860,12 +7860,24 @@ def create_app() -> FastAPI:
             # open, held through the instant close sits on open.
             _prev = getattr(rt_, "_gate_held", None) or {}
             _bd = _tk.get("body_dir") or ""
+            # THE HOLD IS ON GATE 1 -- THE TIMEFRAME. Chris: "the 5
+            # second hold should be on the time frame not tick
+            # chart".
+            #
+            # Resolved HERE because the dwell has to be fed before
+            # `state` runs and `state` is pure. It is the same two
+            # calls `state` makes, on the same inputs, so they
+            # cannot disagree -- and a test asserts exactly that
+            # rather than trusting it.
+            #
             # The HELD direction, not the raw one: feeding it a
             # reading that blanks at a tie would restart the hold on
-            # an absence, which is how the old ten-second version
-            # never elapsed.
-            _dw.on_tick(_sw.hold_dir(_bd, str(_prev.get("tick") or "")),
-                        _now_s)
+            # an absence, which is how the ten-second version never
+            # elapsed.
+            _cand = _sw.hold_dir(
+                _sw.stack_side(_rungs, float(s.window_s or 900.0))[0],
+                str(_prev.get("candle") or ""))
+            _dw.on_tick(_cand, _now_s)
             # THE TIMEFRAME'S OWN RETRACE, and how far it sits from
             # its own open. The first says whether a pullback has
             # failed; the second is "no trades are ever taken at
@@ -16791,21 +16803,11 @@ function paintStackWin(SW) {
        changing its mind for no reason. Chris: "if volume agrees
        with tick charts direction for a pull back a trade should be
        taken in that pullback direction as well". */
-    /* A HELD DIRECTION AND A FRESH ONE LOOK THE SAME WITHOUT THIS.
-       A flip has to stand for its full hold before it can open a
-       trade, so an entry that has not fired yet is WAITING, not
-       absent -- and the two call for very different reactions. */
     + (f.side
-        ? (f.ready === false
-            ? '<b class="short">HOLDING ' + f.side.toUpperCase()
-              + ' &mdash; ' + Number(f.held_s || 0).toFixed(0) + 's of '
-              + Number(f.min_hold_s || 0).toFixed(0) + 's</b>'
-              + ' <span class="thin">a flip has to stand before it '
-              + 'can open a trade</span>'
-            : '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
-              + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
-              + ' <span class="thin">in on this, out when it flips '
-              + 'or the 5-minute bar ends</span>')
+        ? '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
+          + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
+          + ' <span class="thin">in on this, out when it flips '
+          + 'or the 5-minute bar ends</span>'
         : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
     /* THE TAPE LINE: IS THIS BAR CONTINUING, OR PULLING BACK?
@@ -16914,6 +16916,17 @@ function paintStackWin(SW) {
         ? '<div class="thin">price is exactly on the '
           + esc(st.trading || '') + ' open &mdash; holding '
           + esc(g2side || '').toUpperCase() + ' until it moves</div>'
+        : '')
+    /* A HELD DIRECTION AND A FRESH ONE LOOK THE SAME WITHOUT THIS.
+       A flip has to stand for its full hold before it can open a
+       trade, so an entry that has not fired yet is WAITING, not
+       absent -- and the two call for very different reactions. */
+    + ((st.ready === false && g2side)
+        ? '<div class="thin"><b class="short">HOLDING '
+          + esc(g2side).toUpperCase() + ' &mdash; '
+          + Number(st.held_s || 0).toFixed(0) + 's of '
+          + Number(st.min_hold_s || 0).toFixed(0) + 's</b> '
+          + 'a turn has to stand before it can open a trade</div>'
         : '')
     + (st.agrees
         ? '<b class="' + (g2side === 'up' ? 'long' : 'short') + '">'
@@ -17034,7 +17047,7 @@ function paintStackWin(SW) {
       '<div class="thin" style="margin-bottom:4px"><b>THE '
     + esc(st.trading || '').toUpperCase() + ' CANDLE &amp; THE TICK '
     + 'CHART'
-    + '</b> &mdash; both must agree to open, and the tick candle\u2019s '
+    + '</b> &mdash; both must agree to open, and the timeframe\u2019s '
     + 'direction has to hold 5s first. Out on the tick bar\u2019s flip, '
     + 'or when the 5-minute bar it opened in ends.</div>'
     + tfBlock
