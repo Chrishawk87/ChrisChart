@@ -7842,16 +7842,30 @@ def create_app() -> FastAPI:
                 _g1 = max((n for n in _PBC2 if n < int(_traded_n)),
                           default=max(1, int(_traded_n) // 2))
             _tk = _tick_now(rt_, _g1, "raw", 0.0, 0, FUSION_RESET_S)
-            # NO DWELL. Chris: "remove the 10 second hold
-            # completely its not a factor in the opening anymore".
-            # The tracker and its class are gone rather than left
-            # wired to nothing -- dead rule-code in this path has
-            # twice been silently brought back.
+            # THE FIVE-SECOND HOLD ON GATE 2. Chris restored it by
+            # name. ONE tracker on the runtime, so the stepper and
+            # the panel read the same clock -- a second instance
+            # would let the screen show a dwell the rule never saw,
+            # which is the fault the 5-minute cell and the OFI bar
+            # both had.
+            _dw = getattr(rt_, "_tick_dwell", None)
+            if _dw is None:
+                _dw = _sw.Dwell()
+                try:
+                    rt_._tick_dwell = _dw
+                except Exception:                       # noqa: BLE001
+                    pass
             _now_s = time.time()
             # THE 5,000-TICK CANDLE'S OWN DIRECTION, close against
             # open, held through the instant close sits on open.
             _prev = getattr(rt_, "_gate_held", None) or {}
             _bd = _tk.get("body_dir") or ""
+            # The HELD direction, not the raw one: feeding it a
+            # reading that blanks at a tie would restart the hold on
+            # an absence, which is how the old ten-second version
+            # never elapsed.
+            _dw.on_tick(_sw.hold_dir(_bd, str(_prev.get("tick") or "")),
+                        _now_s)
             # THE TIMEFRAME'S OWN RETRACE, and how far it sits from
             # its own open. The first says whether a pullback has
             # failed; the second is "no trades are ever taken at
@@ -7865,6 +7879,7 @@ def create_app() -> FastAPI:
                             float(s.window_s or 900.0),
                             tick_open=float(_tk.get("open") or 0.0),
                             tick_close=float(_tk.get("close") or 0.0),
+                            held_s=_dw.held_s(_now_s),
                             tf_intent=_tfi,
                             tf_ticks=(float(_tfc.get("ticks") or 0.0)
                                       if _tfc else None),
@@ -8033,13 +8048,26 @@ def create_app() -> FastAPI:
             # THE SAME NUMBER `state` RESOLVED, not a second copy.
             # Recomputing it here is how the exit once ended up
             # reading the vote while the entry read the body.
-            _ok_hold, _why_hold = _sw.holds(
+            # THE CLOCK FIRST, THEN THE TICK BAR. Chris: "Time
+            # stop -- the trade has outlived the 5-minute bar it
+            # opened in. Checked before direction, so the log says
+            # the bar ended rather than blaming the tick bar."
+            #
+            # THE TIMEFRAME NO LONGER CLOSES ANYTHING. It closed
+            # trades for one revision; his list has four exits and
+            # it is not among them. It gets you in; gate 2 takes
+            # you out.
+            #
+            # THE SAME NUMBER THE ENTRY READ -- the direction
+            # `state` resolved, not a second copy. Recomputing it
+            # here is how the exit once ended up reading the vote
+            # while the entry read the body, opening a long and
+            # closing it on the same poll.
+            disagreed = _sw.exit_reason(
                 t.side,
                 (fus.get("tick") or {}).get("side") or "",
-                (fus.get("stack") or {}).get("side") or "",
-                failed=bool((fus.get("regime") or {}).get("failed")))
-            if not _ok_hold:
-                disagreed = _why_hold
+                float(getattr(t, "bar_ts", 0.0) or 0.0),
+                time.time(), _sw.TRADE_BAR_S) or disagreed
         # AN OPEN POSITION IS MARKED AT ITS EXIT PRICE. A long can
         # only leave into the bid and a short can only leave into
         # the ask, so that is the only price a stop or a target can
@@ -16727,30 +16755,20 @@ function paintStackWin(SW) {
        on its open for an instant and has no body to read. The rule
        keeps its last real direction rather than reporting flat --
        flat was never a reading, it was an absence. */
-    /* HOW FAR THIS CANDLE IS FROM ITS OWN OPEN, and what it has to
-       reach before it may turn the gate over.
-
-       A newborn bar has close EQUAL to open, so one print used to
-       decide its direction -- and that flip was over in a handful
-       of prints, long before the panel repainted. Chris: "it just
-       exits on its own with no visable disagreement at all". The
-       disagreement was real and it was never on the screen. */
-    + ((f.moved_ticks != null && f.min_turn_ticks)
+    /* HOW FAR THIS CANDLE IS FROM ITS OWN OPEN. Shown, not gated:
+       the four-tick minimum that used to sit here came out by
+       instruction and the five-second hold below is what debounces
+       this gate now. */
+    + ((f.moved_ticks != null)
         ? '<div class="thin">'
           + (f.moved_ticks > 0 ? '+' : '') + f.moved_ticks
-          + ' ticks from this candle\u2019s open &middot; needs '
-          + f.min_turn_ticks + ' to turn'
-          + (f.held_for_want_of_move
-              ? ' &mdash; <b style="color:var(--dim)">the candle reads '
-                + esc(f.raw || '').toUpperCase() + ', holding '
-                + esc(f.side || '').toUpperCase() + '</b>'
-              : '')
-          + '</div>'
-        : (f.held_through_flat
-            ? '<div class="thin">price is exactly on this candle\u2019s '
-              + 'open &mdash; holding ' + esc(f.side || '').toUpperCase()
-              + ' until it moves</div>'
-            : ''))
+          + ' ticks from this candle\u2019s open</div>'
+        : '')
+    + (f.held_through_flat
+        ? '<div class="thin">price is exactly on this candle\u2019s '
+          + 'open &mdash; holding ' + esc(f.side || '').toUpperCase()
+          + ' until it moves</div>'
+        : '')
     /* The vote, as information. It used to BE the direction, behind
        a margin band and a minimum count, and both of those produce
        flat. Kept because when it disagrees with the body that is
@@ -16773,10 +16791,21 @@ function paintStackWin(SW) {
        changing its mind for no reason. Chris: "if volume agrees
        with tick charts direction for a pull back a trade should be
        taken in that pullback direction as well". */
+    /* A HELD DIRECTION AND A FRESH ONE LOOK THE SAME WITHOUT THIS.
+       A flip has to stand for its full hold before it can open a
+       trade, so an entry that has not fired yet is WAITING, not
+       absent -- and the two call for very different reactions. */
     + (f.side
-        ? '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
-          + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
-          + ' <span class="thin">in on this, out when it flips</span>'
+        ? (f.ready === false
+            ? '<b class="short">HOLDING ' + f.side.toUpperCase()
+              + ' &mdash; ' + Number(f.held_s || 0).toFixed(0) + 's of '
+              + Number(f.min_hold_s || 0).toFixed(0) + 's</b>'
+              + ' <span class="thin">a flip has to stand before it '
+              + 'can open a trade</span>'
+            : '<b class="' + (f.side === 'up' ? 'long' : 'short') + '">'
+              + 'TICK BAR ' + f.side.toUpperCase() + '</b>'
+              + ' <span class="thin">in on this, out when it flips '
+              + 'or the 5-minute bar ends</span>')
         : '<b class="short">NO DIRECTION</b> <span class="thin">'
           + esc(f.why || '') + '</span>')
     /* THE TAPE LINE: IS THIS BAR CONTINUING, OR PULLING BACK?
@@ -16878,8 +16907,8 @@ function paintStackWin(SW) {
        failed, and the no-trade band sits on ITS open. */
     + '<div class="thin">GATE 1 &mdash; THE LIVE '
     + esc(st.trading || '').toUpperCase() + ' CANDLE (close vs open, '
-    + 'live) &mdash; the trend; it must agree to open and it is '
-    + 'what closes a trade</div>'
+    + 'live) &mdash; the trend; it must agree to open. It does '
+    + 'not close a trade</div>'
     + '<div style="margin:4px 0">' + row(st.trading, g2side) + '</div>'
     + (st.held_through_flat
         ? '<div class="thin">price is exactly on the '
@@ -16931,8 +16960,8 @@ function paintStackWin(SW) {
           ? (SW.side === 'down' ? 'down' : 'up')
           : (rg.failed ? 'down' : 'line'))
       + ');padding:6px 0 6px 10px">'
-      + '<div class="thin">THE TWO CHARTS TOGETHER &mdash; this '
-      + 'decides whether a trade is viable</div>'
+      + '<div class="thin">THE TWO CHARTS TOGETHER &mdash; shown '
+      + 'only; the pullback reading does not gate anything</div>'
       + '<div style="margin:4px 0">'
       + '<b class="' + (rg.where === 'continuation'
           ? (SW.side === 'down' ? 'short' : 'long') : 'short') + '">'
@@ -17005,9 +17034,9 @@ function paintStackWin(SW) {
       '<div class="thin" style="margin-bottom:4px"><b>THE '
     + esc(st.trading || '').toUpperCase() + ' CANDLE &amp; THE TICK '
     + 'CHART'
-    + '</b> &mdash; they agree, it is a continuation and a trade; '
-    + 'they disagree, it is a pullback and you hold. Out when the '
-    + 'timeframe turns or the pullback fails.</div>'
+    + '</b> &mdash; both must agree to open, and the tick candle\u2019s '
+    + 'direction has to hold 5s first. Out on the tick bar\u2019s flip, '
+    + 'or when the 5-minute bar it opened in ends.</div>'
     + tfBlock
     + ruleBlock
     + regimeBlock

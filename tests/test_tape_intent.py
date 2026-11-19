@@ -309,7 +309,7 @@ class TestItReachesThePanel:
         assert "decides nothing" in WEB[i:i + 1600]
 
 
-class TestVolumeRefusesADeadPush:
+class TestVolumeIsDrawnAndDoesNotVote:
     """It has had three jobs in three revisions and this is the
     right one.
 
@@ -324,12 +324,16 @@ class TestVolumeRefusesADeadPush:
 
     SCREENSHOT = {"state": "pullback", "depth": 0.90, "heavy": True}
 
-    def test_a_dead_push_blocks_the_entry(self):
+    def test_a_dead_push_no_longer_blocks_the_entry(self):
+        """IT DID, FOR ONE REVISION, and Chris took it back out by
+        name: "Nothing else votes ... the pullback reading -- all
+        computed, all drawn, none of them gate anything."
+        """
         from liqmap import stackwin as sw
         r = {"5m": {"present": True, "qualified": "up"}}
         st = sw.state({}, "up", r, 300.0, tf_ticks=20.0,
                       intent=self.SCREENSHOT)
-        assert st["side"] == ""
+        assert st["side"] == "up"
 
     def test_a_live_push_does_not(self):
         from liqmap import stackwin as sw
@@ -351,7 +355,7 @@ class TestVolumeRefusesADeadPush:
 
     def test_it_never_closes_a_trade(self):
         from liqmap import stackwin as sw
-        assert sw.holds("up", "up", "up") == (True, "")
+        assert sw.holds("up", "up") == (True, "")
 
     def test_the_reading_is_still_computed(self):
         r = ti.read("up", 7000.0, 7100.0, 6999.0, 7040.0,

@@ -222,12 +222,14 @@ class TestTheMemoryIsTheCallersCom:
         assert 'rt_._gate_held = {**(fus.get("held")' in blk, \
             "the gates' memory is no longer stored"
 
-    def test_there_is_no_dwell_left_to_feed(self):
-        """Chris: "remove the 10 second hold completely". Pinned in
-        the negative -- it has been re-wired here before."""
+    def test_the_dwell_is_fed_the_held_direction(self):
+        """Chris restored it at five seconds. Feeding it the RAW
+        reading would restart the hold at every tie -- the same
+        reset, one layer down, which is why the ten-second version
+        never elapsed."""
         i = WEB.index("def _journal_step_un(")
         blk = WEB[i:i + 30000]
-        assert "_dw." not in blk and "Dwell" not in blk
+        assert "_dw.on_tick(_sw.hold_dir(_bd," in blk
 
 
 class TestGateTwoIsTheRealLiveCandle:
@@ -274,8 +276,8 @@ class TestGateTwoIsTheRealLiveCandle:
     def test_the_panel_says_the_timeframe_is_the_trend(self):
         assert "GATE 1 &mdash; THE LIVE " in WEB
         assert "close vs open, " in WEB
-        assert "it must agree to open and it is " in WEB
-        assert "what closes a trade" in WEB
+        assert "it must agree to open. It does " in WEB
+        assert "not close a trade" in WEB
 
     def test_the_panel_arrow_shows_what_the_gate_uses(self):
         """An arrow reading "flat" beside a verdict reading AGREES
@@ -286,15 +288,22 @@ class TestGateTwoIsTheRealLiveCandle:
 
 
 class TestWhatDidNotChange:
-    def test_the_dwell_no_longer_gates_entries(self):
+    def test_the_hold_gates_entries_again_at_five_seconds(self):
         """It did, for two revisions. Chris removed it."""
-        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, intent=PUSH)
-        assert st["side"] == U
-        assert not hasattr(sw, "DWELL_S")
+        assert sw.DWELL_S == 5.0
+        st = sw.state({}, U, rungs(**{"5m": U}), 300.0, intent=PUSH,
+                      tf_ticks=20.0, held_s=1.0)
+        assert st["side"] == "" and "has to hold 5s" in st["why"]
+        ok = sw.state({}, U, rungs(**{"5m": U}), 300.0, intent=PUSH,
+                      tf_ticks=20.0, held_s=9.0)
+        assert ok["side"] == U
 
-    def test_the_time_stop_is_gone(self):
-        assert "TRADE_BAR_S = " not in WEB
-        assert not hasattr(sw, "exit_reason")
+    def test_the_time_stop_is_back(self):
+        """Removed once, restored by name: "the trade has outlived
+        the 5-minute bar it opened in"."""
+        assert sw.TRADE_BAR_S == 300.0
+        assert hasattr(sw, "exit_reason")
+        assert "_sw.TRADE_BAR_S" in WEB
 
     def test_it_does_not_trade(self):
         import ast
