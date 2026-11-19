@@ -237,8 +237,14 @@ class TestTheRouteActuallyUsesIt:
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
-        i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        # THE WHOLE FUNCTION, NOT 30,000 CHARACTERS OF IT. A
+        # fixed window is an assertion about how long a function
+        # is, and this one failed the moment a strategy was added
+        # -- about code that was sitting right there, 400
+        # characters past the cut.
+        from tests.test_journal import py_func
+        assert src  # the read above still proves the file is there
+        blk = py_func("_journal_step_un")
         assert "jn_quote.mark_px(" in blk, \
             "the open position is still marked at the last print"
         assert "jn_quote.fill_px(" in blk, \

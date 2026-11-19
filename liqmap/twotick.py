@@ -68,10 +68,22 @@ CAP_BAR_S = 300.0
 MAX_TRADES_PER_BAR = 2
 
 
+def _too_fresh(held_s: float | None, min_hold_s: float) -> bool:
+    """Has this chart's turn not stood long enough yet?
+
+    `None` MEANS NOBODY IS TRACKING IT, which must not read as
+    "zero seconds" -- an untracked chart would otherwise block
+    every entry forever.
+    """
+    return bool(held_s is not None and min_hold_s > 0
+                and held_s < min_hold_s)
+
+
 def entry_side(lead: str, confirm: str,
                held_s: float | None = None,
                min_hold_s: float = DWELL_S,
-               episode_taken: bool = False) -> tuple[str, str]:
+               episode_taken: bool = False,
+               lead_held_s: float | None = None) -> tuple[str, str]:
     """The side both tick charts are offering, and why not.
 
     THE ORDER IS THE RULE. Each refusal names the thing that
@@ -79,11 +91,18 @@ def entry_side(lead: str, confirm: str,
     saying which gate said no is the complaint this whole engine
     keeps getting rebuilt after.
 
-    THE HOLD IS ON THE CONFIRMATION. Chris: "the same 5 second
-    hold on gate 3 before a trade is taken". It is measured on gate
-    3's HELD direction, not its raw one -- a reading that blanks at
-    a tie would restart the hold on an absence, which is how the
-    ten-second version never elapsed.
+    BOTH CHARTS HAVE TO HOLD. Chris: "the same 5 second hold on
+    gate 3 before a trade is taken", and then "lets add a 5 second
+    hold on the lead the same way it is on the confirmation". Each
+    is measured on that chart's HELD direction, not its raw one --
+    a reading that blanks at a tie would restart the clock on an
+    absence, which is how the ten-second version never elapsed.
+
+    THE HOLDS GATE ENTRIES ONLY. "The same way it is on the
+    confirmation" -- and the confirmation's hold has never touched
+    the exit. A flip against the position still closes the trade on
+    the poll it happens, with nothing waiting five seconds to let
+    it run further.
     """
     if lead not in SIDES:
         return "", "the lead tick chart has no direction yet"
@@ -92,7 +111,14 @@ def entry_side(lead: str, confirm: str,
     if confirm != lead:
         return "", (f"the lead chart is {lead} but the confirming "
                     f"chart is {confirm}")
-    if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
+    # THE LEAD IS ASKED FIRST, the same order as everything else
+    # here: it names the direction, so when both are still fresh
+    # the panel blames the chart the trade would be built on.
+    if _too_fresh(lead_held_s, min_hold_s):
+        return "", (f"the lead chart turned {lead} "
+                    f"{lead_held_s:.0f}s ago -- it has to hold "
+                    f"{min_hold_s:.0f}s")
+    if _too_fresh(held_s, min_hold_s):
         return "", (f"the confirming chart turned {confirm} "
                     f"{held_s:.0f}s ago -- it has to hold "
                     f"{min_hold_s:.0f}s")
@@ -146,6 +172,7 @@ def state(lead_raw: str = "", confirm_raw: str = "",
           lead_bar: int = 0, confirm_bar: int = 0,
           held_s: float | None = None,
           min_hold_s: float = DWELL_S,
+          lead_held_s: float | None = None,
           lead_roll: dict | None = None,
           confirm_roll: dict | None = None,
           episode_taken: bool = False,
@@ -175,14 +202,15 @@ def state(lead_raw: str = "", confirm_raw: str = "",
 
     side, why = entry_side(lead, confirm, held_s=held_s,
                            min_hold_s=min_hold_s,
-                           episode_taken=spent)
+                           episode_taken=spent,
+                           lead_held_s=lead_held_s)
     # WHAT ACTUALLY CLOSES THIS TRADE, answered here so the panel
     # cannot describe an exit the rule does not have. There is no
     # switch to read: both charts close a trade in this strategy.
     exits = ["lead", "confirm"]
 
-    ready = not (held_s is not None and min_hold_s > 0
-                 and held_s < min_hold_s)
+    ready = not _too_fresh(held_s, min_hold_s)
+    lead_ready = not _too_fresh(lead_held_s, min_hold_s)
     return {
         "mode": "ticks",
         "side": side,
@@ -194,6 +222,15 @@ def state(lead_raw: str = "", confirm_raw: str = "",
         "lead": {
             "side": lead,
             "exits": True,
+            # THE LEAD HOLDS TOO NOW. Carried the same way the
+            # confirmation's is, so the panel can draw one
+            # countdown per chart rather than implying the pair
+            # share one clock -- they do not, they turn at
+            # different moments and each has to stand on its own.
+            "held_s": (None if lead_held_s is None
+                       else float(lead_held_s)),
+            "min_hold_s": float(min_hold_s or 0.0),
+            "ready": lead_ready,
             "raw": str(lead_raw or ""),
             "per_bar": int(lead_bar or 0),
             "true": lead in SIDES,

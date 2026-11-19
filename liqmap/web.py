@@ -7969,6 +7969,22 @@ def create_app() -> FastAPI:
                     rt_._ticks_dwell = _tdw
                 except Exception:                       # noqa: BLE001
                     pass
+            # A SECOND TRACKER, FOR THE LEAD. Chris: "lets add a 5
+            # second hold on the lead the same way it is on the
+            # confirmation".
+            #
+            # TWO CLOCKS, NOT ONE SHARED. The charts turn at
+            # different moments -- that is the whole point of
+            # reading two sizes -- so one tracker fed both
+            # directions would restart on whichever moved last and
+            # neither hold would mean anything.
+            _ldw = getattr(rt_, "_ticks_lead_dwell", None)
+            if _ldw is None:
+                _ldw = _tt.Dwell()
+                try:
+                    rt_._ticks_lead_dwell = _ldw
+                except Exception:                       # noqa: BLE001
+                    pass
             _tprev = getattr(rt_, "_ticks_held", None) or {}
             _now_t = time.time()
             # THE HOLD IS ON THE CONFIRMATION, fed the HELD
@@ -7979,11 +7995,15 @@ def create_app() -> FastAPI:
             _conf_held = _tt.hold_dir(str(_conf.get("body_dir") or ""),
                                       str(_tprev.get("confirm") or ""))
             _tdw.on_tick(_conf_held, _now_t)
+            _lead_held = _tt.hold_dir(str(_lead.get("body_dir") or ""),
+                                      str(_tprev.get("lead") or ""))
+            _ldw.on_tick(_lead_held, _now_t)
             fus = _tt.state(
                 lead_raw=(_lead.get("body_dir") or ""),
                 confirm_raw=(_conf.get("body_dir") or ""),
                 lead_bar=_lead_n, confirm_bar=_conf_n,
                 held_s=_tdw.held_s(_now_t),
+                lead_held_s=_ldw.held_s(_now_t),
                 lead_roll=(_lead.get("roll") or {}),
                 confirm_roll=(_conf.get("roll") or {}),
                 prev=_tprev)
@@ -16956,7 +16976,9 @@ function paintTwoTick(TT) {
       '<div style="' + edge(L.side) + '">'
     + '<div class="thin">LEAD &mdash; THE ' + size(L)
     + ' CANDLE (close vs open, as the chart draws it) &mdash; it '
-    + 'names the direction, and its flip closes a trade'
+    + 'names the direction, must hold '
+    + Number(L.min_hold_s || 0).toFixed(0) + 's before anything '
+    + 'opens, and its flip closes a trade'
     + '</div>'
     + '<div style="margin:4px 0">' + leg('lead', L.side) + '</div>'
     + (L.held_through_flat
@@ -16974,6 +16996,16 @@ function paintTwoTick(TT) {
                 + ', shown only'
               : '')
           + '</div>'
+        : '')
+    /* A HELD DIRECTION AND A FRESH ONE LOOK IDENTICAL WITHOUT
+       THIS. An entry that has not fired YET is waiting, not
+       blocked, and the two call for very different reactions. */
+    + ((L.ready === false && L.side)
+        ? '<div class="thin"><b class="short">HOLDING '
+          + esc(L.side).toUpperCase() + ' &mdash; '
+          + Number(L.held_s || 0).toFixed(0) + 's of '
+          + Number(L.min_hold_s || 0).toFixed(0) + 's</b> '
+          + 'a turn has to stand before it can open a trade</div>'
         : '')
     + (L.side
         ? '<b class="' + (L.side === 'up' ? 'long' : 'short') + '">'
@@ -17054,7 +17086,7 @@ function paintTwoTick(TT) {
   box.innerHTML =
       '<div class="thin" style="margin-bottom:4px"><b>TWO TICK '
     + 'CHARTS</b> &mdash; the lead names the direction, the '
-    + 'confirmation has to agree and hold '
+    + 'confirmation has to agree, and both have to hold '
     + Number(C.min_hold_s || 0).toFixed(0) + 's. Out when either '
     + 'chart flips. No clock ends a trade.</div>'
     + leadBlock

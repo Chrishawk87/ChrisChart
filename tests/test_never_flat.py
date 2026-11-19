@@ -81,10 +81,23 @@ def rungs(**kw) -> dict:
     return out
 
 
+def _step() -> str:
+    """`_journal_step_un` in full, found by indentation.
+
+    These three tests sliced a fixed 30,000 characters, which is
+    an assertion about how long the function is rather than about
+    what it does -- and it grew past that the first time a
+    strategy was added. Too wide is no better: a window that runs
+    on into the next function lets a test pass on a phrase that
+    lives somewhere else, which has happened in this suite.
+    """
+    from tests.test_journal import py_func
+    return py_func("_journal_step_un")
+
+
 class TestGateOneIsTheCandle:
     def test_the_route_reads_the_body_not_the_vote(self):
-        i = WEB.index("def _journal_step_un(")
-        blk = WEB[i:i + 30000]
+        blk = _step()
         assert '_bd = _tk.get("body_dir")' in blk, \
             "gate 1 is not reading the candle's own direction"
         assert "_sw.state(win, _bd," in blk
@@ -214,8 +227,7 @@ class TestTheMemoryIsTheCallersCom:
         assert nxt["side"] == U
 
     def test_the_route_stores_it_and_hands_it_back(self):
-        i = WEB.index("def _journal_step_un(")
-        blk = WEB[i:i + 30000]
+        blk = _step()
         assert 'getattr(rt_, "_gate_held", None)' in blk, \
             "the route keeps no memory, so nothing can be held"
         assert "prev=_prev" in blk
@@ -227,8 +239,7 @@ class TestTheMemoryIsTheCallersCom:
         tick chart". Feeding it the RAW reading would restart the
         hold at every tie -- the same reset, one layer down, which
         is why the ten-second version never elapsed."""
-        i = WEB.index("def _journal_step_un(")
-        blk = WEB[i:i + 30000]
+        blk = _step()
         assert "_dw.on_tick(_cand, _now_s)" in blk
         assert "_sw.stack_side(_rungs," in blk, \
             "the hold is still measuring the tick chart"

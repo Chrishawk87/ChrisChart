@@ -74,6 +74,50 @@ class TestTheEntry:
         assert "no direction" in why
         assert "but" not in why
 
+    def test_the_hold_is_on_the_lead_too(self):
+        """Chris: "lets add a 5 second hold on the lead the same
+        way it is on the confirmation"."""
+        got, why = tt.entry_side(U, U, held_s=9.0, lead_held_s=1.0,
+                                 min_hold_s=5.0)
+        assert got == ""
+        assert "lead chart turned up 1s ago" in why
+        assert tt.entry_side(U, U, held_s=9.0, lead_held_s=5.0,
+                             min_hold_s=5.0) == (U, "")
+
+    def test_both_have_to_hold_not_just_one(self):
+        """TWO CLOCKS, NOT ONE. The charts turn at different
+        moments -- that is the point of reading two sizes -- so
+        either one being fresh has to block on its own."""
+        assert tt.entry_side(U, U, held_s=1.0, lead_held_s=9.0)[0] == ""
+        assert tt.entry_side(U, U, held_s=9.0, lead_held_s=1.0)[0] == ""
+        assert tt.entry_side(U, U, held_s=1.0, lead_held_s=1.0)[0] == ""
+        assert tt.entry_side(U, U, held_s=9.0, lead_held_s=9.0)[0] == U
+
+    def test_the_lead_is_blamed_first_when_both_are_fresh(self):
+        """It names the direction, so it is the chart the trade
+        would be built on."""
+        _, why = tt.entry_side(U, U, held_s=1.0, lead_held_s=1.0)
+        assert "lead chart" in why
+        assert "confirming" not in why
+
+    def test_an_untracked_lead_hold_does_not_block(self):
+        """`None` means nobody is tracking it, which must not read
+        as zero seconds -- that would block every entry forever."""
+        assert tt.entry_side(U, U, held_s=9.0,
+                             lead_held_s=None) == (U, "")
+
+    def test_neither_hold_touches_the_exit(self):
+        """"The same way it is on the confirmation" -- and the
+        confirmation's hold has never touched the exit. A flip
+        closes the trade on the poll it happens."""
+        import inspect
+        sig = inspect.signature(tt.exit_reason)
+        for bad in ("held_s", "lead_held_s", "min_hold_s"):
+            assert bad not in sig.parameters, \
+                f"exit_reason takes {bad} -- a hold reached the exit"
+        assert tt.exit_reason(U, D) == "the lead chart flipped down " \
+            "against your up trade"
+
     def test_the_hold_is_on_the_confirmation(self):
         got, why = tt.entry_side(U, U, held_s=1.0, min_hold_s=5.0)
         assert got == ""
@@ -203,11 +247,31 @@ class TestTheState:
 
     def test_the_hold_countdown_reaches_the_panel(self):
         out = tt.state(lead_raw=U, confirm_raw=U, lead_bar=5000,
-                       confirm_bar=1000, held_s=2.0, min_hold_s=5.0)
+                       confirm_bar=1000, held_s=2.0, min_hold_s=5.0,
+                       lead_held_s=9.0)
         assert out["side"] == ""
         assert out["confirm"]["ready"] is False
         assert out["confirm"]["held_s"] == 2.0
         assert out["confirm"]["min_hold_s"] == 5.0
+
+    def test_the_leads_countdown_reaches_the_panel_too(self):
+        """ONE COUNTDOWN PER CHART. Drawing a single clock would
+        imply they share one, and they do not."""
+        out = tt.state(lead_raw=U, confirm_raw=U, lead_bar=5000,
+                       confirm_bar=1000, held_s=9.0, min_hold_s=5.0,
+                       lead_held_s=2.0)
+        assert out["side"] == ""
+        assert out["lead"]["ready"] is False
+        assert out["lead"]["held_s"] == 2.0
+        assert out["lead"]["min_hold_s"] == 5.0
+        assert out["confirm"]["ready"] is True
+
+    def test_each_chart_is_ready_on_its_own(self):
+        out = tt.state(lead_raw=U, confirm_raw=U, held_s=9.0,
+                       lead_held_s=9.0, min_hold_s=5.0)
+        assert out["lead"]["ready"] is True
+        assert out["confirm"]["ready"] is True
+        assert out["side"] == U
 
     def test_the_sizes_reach_the_panel(self):
         out = tt.state(lead_raw=U, confirm_raw=U, lead_bar=5000,
@@ -333,12 +397,52 @@ class TestItIsWiredThrough:
         assert "_lead.get" not in seg, \
             "the hold is being fed the lead chart"
 
+    def test_the_lead_has_its_own_clock_fed_its_own_direction(self):
+        """TWO TRACKERS, NOT ONE SHARED. One tracker fed both
+        directions would restart on whichever chart moved last, and
+        then neither hold would mean anything."""
+        blk = self._step()
+        assert "_ticks_lead_dwell" in blk, "the lead has no clock"
+        # THE WINDOW IS THE ASSIGNMENT ITSELF, not a span of
+        # characters before it -- the confirmation's own line sits
+        # directly above and would otherwise land inside it.
+        def span(assign, tick):
+            a = blk.index(assign)
+            t = blk.index(tick, a)
+            return blk[a:blk.index("\n", t)]
+
+        seg = span("_lead_held = ", "_ldw.on_tick(")
+        assert "_lead.get" in seg
+        assert "_lead_held, _now_t" in seg
+        assert "_conf" not in seg, \
+            "the lead's clock is being fed the confirming chart"
+        seg2 = span("_conf_held = ", "_tdw.on_tick(")
+        assert "_conf.get" in seg2
+        assert "_conf_held, _now_t" in seg2
+        assert "_lead" not in seg2, \
+            "the confirmation's clock is being fed the lead chart"
+        assert "lead_held_s=_ldw.held_s(" in blk, \
+            "the lead's hold never reaches the rule"
+        assert "held_s=_tdw.held_s(" in blk, \
+            "the confirmation's hold stopped reaching the rule"
+
+    def test_the_panel_counts_down_both_charts(self):
+        src = self._web()
+        i = src.index("function paintTwoTick(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "L.ready === false" in fn, \
+            "the lead's countdown is never drawn"
+        assert "C.ready === false" in fn, \
+            "the confirmation's countdown is never drawn"
+        assert "L.held_s" in fn and "C.held_s" in fn
+
     def test_it_keeps_its_own_dwell_and_memory(self):
         """SHARING THE STACK RULE'S WOULD CARRY A HOLD ACROSS A
         STRATEGY SWITCH -- from a chart this rule never read."""
         blk = self._step()
         assert "_ticks_dwell" in blk
         assert "_ticks_held" in blk
+        assert "_ticks_lead_dwell" in blk
         assert "_tick_dwell" not in blk.split('strat == "ticks"')[1][:3000]
 
     def test_the_exit_is_handed_what_state_resolved(self):
@@ -510,6 +614,61 @@ class TestItActuallySteps:
         assert jr.get("twotick"), "the two-tick panel is missing"
         assert jr.get("stackwin") is None, \
             "the stack panel is drawn under the two-tick rule"
+
+    def test_the_two_clocks_are_really_two_objects(
+            self, client, monkeypatch):
+        """SOURCE TEXT CANNOT SEE THIS. A mutation that left both
+        `Dwell()` calls in place and simply assigned one tracker to
+        the other passed every text check -- the words were all
+        still there. Only running it and comparing the objects
+        catches it, and a shared clock means neither hold means
+        anything: it restarts on whichever chart moved last."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "ticks"
+        rt.journal.save_settings(s)
+        for attr in ("_ticks_dwell", "_ticks_lead_dwell"):
+            try:
+                delattr(rt, attr)
+            except AttributeError:
+                pass
+
+        client.get("/api/read",
+                   params={"coin": "ES", "interval": "15m",
+                           "timeframes": "15m,5m,1m"},
+                   headers=AUTH)
+        a = getattr(rt, "_ticks_dwell", None)
+        b = getattr(rt, "_ticks_lead_dwell", None)
+        assert a is not None, "the confirmation has no clock"
+        assert b is not None, "the lead has no clock"
+        assert a is not b, "both charts are sharing one tracker"
+
+    def test_the_two_clocks_run_independently(
+            self, client, monkeypatch):
+        """PROVED BY DIVERGENCE, not by identity alone. Two
+        separate objects fed the same direction would still be one
+        clock in effect."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "ticks"
+        rt.journal.save_settings(s)
+        client.get("/api/read",
+                   params={"coin": "ES", "interval": "15m",
+                           "timeframes": "15m,5m,1m"},
+                   headers=AUTH)
+        a = getattr(rt, "_ticks_dwell")
+        b = getattr(rt, "_ticks_lead_dwell")
+        now = 1_700_000_000.0
+        a.on_tick("up", now)
+        b.on_tick("up", now)
+        # The lead turns; the confirmation does not.
+        b.on_tick("down", now + 10.0)
+        assert a.held_s(now + 10.0) == pytest.approx(10.0)
+        assert b.held_s(now + 10.0) == pytest.approx(0.0)
 
     def test_the_memory_rides_home_between_polls(
             self, client, monkeypatch):
