@@ -5676,6 +5676,16 @@ def create_app() -> FastAPI:
                     "that is wrong in a way nobody spots."}
         return {"ok": True, "open": t.to_dict(price)}
 
+    def _snap_per_bar(n: int) -> int:
+        """The offered tick size nearest this one."""
+        from .tickbar import PER_BAR_CHOICES as _P
+
+        try:
+            v = int(n or 0)
+        except (TypeError, ValueError):
+            return 5000
+        return v if v in _P else min(_P, key=lambda c: abs(c - v))
+
     @app.post("/api/journal/settings",
               dependencies=[Depends(require_token)])
     def api_journal_settings(coin: str = "ES", auto: bool | None = None,
@@ -5684,6 +5694,7 @@ def create_app() -> FastAPI:
                              tp_ticks: float | None = None,
                              sl_ticks: float | None = None,
                              window_s: float | None = None,
+                             tick_bar: int | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5701,6 +5712,12 @@ def create_app() -> FastAPI:
                           else max(0.0, float(sl_ticks))),
                 window_s=(cur.window_s if window_s is None
                           else float(window_s)),
+                # GATE 2'S CHART. Snapped to a size that exists, so
+                # a hand-typed query cannot ask for a builder that
+                # was never created and silently get the nearest.
+                tick_bar=(int(getattr(cur, "tick_bar", 5000) or 5000)
+                          if tick_bar is None
+                          else _snap_per_bar(int(tick_bar))),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7801,19 +7818,29 @@ def create_app() -> FastAPI:
             # NAMED BEFORE IT IS USED, and that is not a formality:
             # this was assigned thirty lines further down and gate 1
             # read it here, so every step raised UnboundLocalError
-            # the moment the branch ran. The same shape as the
-            # `FUSION_RESET_S` and `MAX_PER_BAR` faults -- a name
-            # defined after its first reader, which no amount of
-            # reading the source catches and one execution does.
+            # the moment the branch ran -- on every window, not just
+            # the new ones. The same shape as the `FUSION_RESET_S`
+            # and `MAX_PER_BAR` faults, and no amount of reading the
+            # source catches it. One execution does, and there is a
+            # test that executes it now.
             _tf_name = jn.window_label(float(s.window_s or 900.0))
             _traded_n = _pi3(_tf_name)
-            if _traded_n is None:
-                _g1 = 0                       # the default, 5,000
-            else:
-                _want = max(1, int(_traded_n) // 5)
-                _g1 = min((n for n in _PBC2 if n < _traded_n),
-                          key=lambda n: abs(n - _want),
-                          default=max(1, int(_traded_n) // 5))
+            # GATE 2'S CHART IS NOW PICKED, NOT DERIVED. Chris: "i
+            # want to add a few tick profiles for gate number 2".
+            # It used to be a fifth of gate 1, which is meaningless
+            # once gate 1 is a time candle and has no fifth.
+            _g1 = int(getattr(s, "tick_bar", 0) or 0) or 5000
+            if _g1 not in _PBC2:
+                _g1 = min(_PBC2, key=lambda n: abs(n - _g1))
+            # THE DEGENERATE CASE. If gate 1 is itself a tick chart
+            # of this size, the two sides are the identical number
+            # agreeing with itself and gate 2 is decoration. Drop to
+            # the next size down and say so on the panel.
+            _g2_clash = bool(_traded_n is not None
+                             and int(_traded_n) == int(_g1))
+            if _g2_clash:
+                _g1 = max((n for n in _PBC2 if n < int(_traded_n)),
+                          default=max(1, int(_traded_n) // 2))
             _tk = _tick_now(rt_, _g1, "raw", 0.0, 0, FUSION_RESET_S)
             # NO DWELL. Chris: "remove the 10 second hold
             # completely its not a factor in the opening anymore".
@@ -8058,6 +8085,19 @@ def create_app() -> FastAPI:
                 arg, "open", _bid, _ask, _last or px, _age)
             if open_px <= 0:
                 open_px, open_src = px, "last: no price"
+            # THE AGREEMENT IS SPENT ONLY WHEN A TRADE REALLY
+            # OPENS. The rule offering a side is not the same as the
+            # journal accepting it -- the cap, or AUTO being off,
+            # can refuse one -- and an agreement that produced no
+            # trade must not be marked as having produced one.
+            if strat == "stack":
+                try:
+                    _h = getattr(rt_, "_gate_held", None) or {}
+                    _h["episode"] = {**(_h.get("episode") or {}),
+                                     "taken": True}
+                    rt_._gate_held = _h
+                except Exception:                       # noqa: BLE001
+                    pass
             t = j.open_trade(
                 coin_, arg, open_px, mode="auto", bar_ts=bar_ts,
                 strategy=strat,
@@ -10406,9 +10446,15 @@ DASHBOARD = """<!doctype html>
           <option value="250t">250 ticks</option>
           <option value="500t">500 ticks</option>
           <option value="1000t">1,000 ticks</option>
+          <option value="1500t">1,500 ticks</option>
           <option value="2000t">2,000 ticks</option>
+          <option value="3000t">3,000 ticks</option>
           <option value="4000t">4,000 ticks</option>
           <option value="5000t">5,000 ticks</option>
+          <option value="6000t">6,000 ticks</option>
+          <option value="7000t">7,000 ticks</option>
+          <option value="8000t">8,000 ticks</option>
+          <option value="9000t">9,000 ticks</option>
           <option value="10000t">10,000 ticks</option></optgroup>
           <optgroup label="fused: prints AND imbalance (ES only)">
           <option value="1000x500">1,000 ticks &times; 500 OFI</option>
@@ -10740,6 +10786,7 @@ has to be running before the gate stops refusing.">spike
           <label>window
             <select id="jnlWin" onchange="jnlSet()"
               style="margin:0 4px">
+              <option value="60">1 minute</option>
               <option value="300">5 minutes</option>
               <option value="900">15 minutes</option>
               <!-- A TICK CHART IS A TIMEFRAME TOO. Carried negative
@@ -10749,6 +10796,26 @@ has to be running before the gate stops refusing.">spike
                    two sides are never the same number. -->
               <option value="-5000">5000 ticks</option>
               <option value="-10000">10000 ticks</option>
+            </select></label>
+          <!-- GATE 2'S CHART, picked rather than derived. It used
+               to be a fifth of gate 1, which means nothing once
+               gate 1 is a time candle. -->
+          <label>tick chart
+            <select id="jnlTick" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="250">250t</option>
+              <option value="500">500t</option>
+              <option value="1000">1000t</option>
+              <option value="1500">1500t</option>
+              <option value="2000">2000t</option>
+              <option value="3000">3000t</option>
+              <option value="4000">4000t</option>
+              <option value="5000" selected>5000t</option>
+              <option value="6000">6000t</option>
+              <option value="7000">7000t</option>
+              <option value="8000">8000t</option>
+              <option value="9000">9000t</option>
+              <option value="10000">10000t</option>
             </select></label>
           <label><input type="checkbox" id="jnlTpOn"
             onchange="jnlSet()"> take profit
@@ -15739,6 +15806,7 @@ async function jnlSet() {
     jnlTp: $('jnlTp').value || 0,
     jnlSl: $('jnlSl').value || 0,
     jnlWin: $('jnlWin') ? String(Math.round($('jnlWin').value || 900)) : undefined,
+    jnlTick: $('jnlTick') ? String(Math.round($('jnlTick').value || 5000)) : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -15749,6 +15817,7 @@ async function jnlSet() {
     tp_ticks: $('jnlTp').value || 0,
     sl_ticks: $('jnlSl').value || 0,
     window_s: $('jnlWin') ? $('jnlWin').value : 900,
+    tick_bar: $('jnlTick') ? $('jnlTick').value : 5000,
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -16642,8 +16711,17 @@ function paintStackWin(SW) {
       '<div style="border-left:3px solid var(--'
     + (f.side ? (f.side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 1 &mdash; THE 5000T CANDLE '
-    + '(close vs open, as the chart draws it)</div>'
+    /* GATE 2 IS THE TICK CHART NOW. Chris: "i want to add a few
+       tick profiles for gate number 2 ... replace gate ones old
+       tick bar with live timeframes". The jobs did NOT move -- the
+       timeframe is still the trend and still what closes a trade --
+       only which slot each chart sits in. The size is read off the
+       payload rather than written in, because it is picked now. */
+    + '<div class="thin">GATE 2 &mdash; THE '
+    + ((f.roll && f.roll.window)
+        ? Number(f.roll.window).toLocaleString() + 'T'
+        : 'TICK')
+    + ' CANDLE (close vs open, as the chart draws it)</div>'
     + '<div style="margin:4px 0">' + leg('tick bar', f.side) + '</div>'
     /* HELD THROUGH THE TIE, AND SAID SO. The candle sits exactly
        on its open for an instant and has no body to read. The rule
@@ -16795,9 +16873,13 @@ function paintStackWin(SW) {
       '<div style="margin-top:8px;border-left:3px solid var(--'
     + (g2side ? (g2side === 'up' ? 'up' : 'down') : 'line')
     + ');padding:6px 0 6px 10px">'
-    + '<div class="thin">GATE 2 &mdash; THE REAL '
+    /* GATE 1 IS THE LIVE TIMEFRAME. It is the trend: its turn
+       closes the trade, its retrace decides whether a pullback has
+       failed, and the no-trade band sits on ITS open. */
+    + '<div class="thin">GATE 1 &mdash; THE LIVE '
     + esc(st.trading || '').toUpperCase() + ' CANDLE (close vs open, '
-    + 'live) &mdash; it must agree to open</div>'
+    + 'live) &mdash; the trend; it must agree to open and it is '
+    + 'what closes a trade</div>'
     + '<div style="margin:4px 0">' + row(st.trading, g2side) + '</div>'
     + (st.held_through_flat
         ? '<div class="thin">price is exactly on the '
@@ -16905,6 +16987,12 @@ function paintStackWin(SW) {
     ? '<b class="' + (SW.side === 'up' ? 'long' : 'short') + '">'
       + SW.side.toUpperCase() + '</b> <span class="thin">'
       + esc(SW.say || '') + '</span>'
+      + ((SW.episode && SW.episode.taken && SW.episode.agreeing)
+          ? '<div class="thin" style="margin-top:2px">'
+            + '<b style="color:var(--dim)">AGREEMENT SPENT</b> '
+            + '&mdash; one trade per agreement; they have to '
+            + 'disagree before another is taken</div>'
+          : '')
       + (SW.blocked_by
           ? '<div class="thin" style="margin-top:2px">'
             + '<b style="color:var(--down)">NO TRADE</b> &mdash; '
@@ -16914,13 +17002,14 @@ function paintStackWin(SW) {
       + esc(SW.why || '') + '</span>';
 
   box.innerHTML =
-      '<div class="thin" style="margin-bottom:4px"><b>THE TICK BAR '
-    + '&amp; THE ' + esc(st.trading || '').toUpperCase() + ' CANDLE'
+      '<div class="thin" style="margin-bottom:4px"><b>THE '
+    + esc(st.trading || '').toUpperCase() + ' CANDLE &amp; THE TICK '
+    + 'CHART'
     + '</b> &mdash; they agree, it is a continuation and a trade; '
     + 'they disagree, it is a pullback and you hold. Out when the '
     + 'timeframe turns or the pullback fails.</div>'
-    + ruleBlock
     + tfBlock
+    + ruleBlock
     + regimeBlock
     + '<div style="margin-top:8px">' + verdict + '</div>'
     + context;
@@ -16977,6 +17066,7 @@ function paintJournal(d) {
   chk('jnlAuto', S.auto); chk('jnlTpOn', S.tp_on); chk('jnlSlOn', S.sl_on);
   set('jnlTp', S.tp_ticks); set('jnlSl', S.sl_ticks);
   set('jnlWin', String(Math.round(S.window_s || 900)));
+  set('jnlTick', String(Math.round(S.tick_bar || 5000)));
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =

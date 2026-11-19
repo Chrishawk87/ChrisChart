@@ -94,6 +94,11 @@ class Settings:
     tp_ticks: float = 16.0
     sl_ticks: float = 8.0
     window_s: float = 900.0
+    # GATE 2'S CHART, BY PRINT COUNT. Chris: "i want to add a few
+    # tick profiles for gate number 2". It was derived -- a fifth of
+    # gate 1 -- which is no use when gate 1 is a time candle and has
+    # no fifth.
+    tick_bar: int = 5000
     strategy: str = "ofi"
 
     def to_dict(self) -> dict:
@@ -101,10 +106,8 @@ class Settings:
                 "tp_on": self.tp_on, "sl_on": self.sl_on,
                 "tp_ticks": self.tp_ticks, "sl_ticks": self.sl_ticks,
                 "window_s": self.window_s,
-                "window_label": (window_label(self.window_s)
-                                 if self.window_s < 0 else
-                                 "5m" if self.window_s <= 300
-                                 else "15m"),
+                "window_label": window_label(self.window_s),
+                "tick_bar": int(self.tick_bar or 5000),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
                                                  self.strategy),
@@ -409,6 +412,7 @@ _ADDED = (
 _ADDED_SETTINGS = (
     ("window_s", "REAL NOT NULL DEFAULT 900"),
     ("strategy", "TEXT NOT NULL DEFAULT 'ofi'"),
+    ("tick_bar", "INTEGER NOT NULL DEFAULT 5000"),
 )
 
 
@@ -467,6 +471,7 @@ class Journal(ThreadedDB):
                         tp_ticks=float(r["tp_ticks"]),
                         sl_ticks=float(r["sl_ticks"]),
                         window_s=float(r["window_s"] or 900.0),
+                        tick_bar=int(r["tick_bar"] or 5000),
                         strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
@@ -474,12 +479,14 @@ class Journal(ThreadedDB):
             conn.execute(
                 "INSERT INTO journal_settings"
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
-                "  window_s, strategy) VALUES (?,?,?,?,?,?,?,?)"
+                "  window_s, tick_bar, strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
                 " sl_ticks=excluded.sl_ticks,"
                 " window_s=excluded.window_s,"
+                " tick_bar=excluded.tick_bar,"
                 " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
@@ -489,9 +496,13 @@ class Journal(ThreadedDB):
                  # would have erased a tick size on the first save.
                  # Negative is unambiguous: a window of seconds is
                  # never below zero.
-                 (float(s.window_s)
-                  if float(s.window_s or 900) < 0 else
-                  300.0 if float(s.window_s or 900) <= 300 else 900.0),
+                 # ONE OF THE OFFERED WINDOWS, AND NOTHING ELSE.
+                 # The clamp exists so a junk value cannot reach the
+                 # rule; it has to know every window that is offered
+                 # or it silently rewrites the one that was picked.
+                 # It erased tick windows once already.
+                 _clamp_window(s.window_s),
+                 max(1, int(s.tick_bar or 5000)),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 
@@ -915,6 +926,25 @@ STRATEGIES = {
 }
 
 
+def _clamp_window(window_s: float) -> float:
+    """The nearest window this engine actually offers.
+
+    A junk value must not reach the rule, but the clamp has to know
+    every window on the selector or it rewrites a valid choice into
+    something the user did not pick -- which is how a tick window
+    came back as 900 on its first save.
+    """
+    try:
+        w = float(window_s or 900.0)
+    except (TypeError, ValueError):
+        return 900.0
+    if w < 0:                       # a tick chart, carried negative
+        return w
+    if w <= 60.0:
+        return 60.0
+    return 300.0 if w <= 300.0 else 900.0
+
+
 def window_label(window_s: float) -> str:
     """What the traded chart is called: "5m", "15m" or "5000t".
 
@@ -938,6 +968,10 @@ def window_label(window_s: float) -> str:
         return "15m"
     if w < 0:
         return f"{int(round(-w))}t"
+    if w <= 0.0:
+        return "15m"               # no window given: the default
+    if w <= 60.0:
+        return "1m"
     return "5m" if w <= 300.0 else "15m"
 
 

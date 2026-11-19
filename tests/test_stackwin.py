@@ -765,8 +765,8 @@ class TestTheWiring:
             "the volume reading never reaches the rule"
         assert '_tk = _tick_now(rt_, _g1, "raw", 0.0, 0, FUSION_RESET_S)' \
             in blk, "gate 1 is not reading the continuous tick series"
-        assert "_g1 = 0" in blk, \
-            "a time window no longer defaults gate 1 to 5,000"
+        assert 'getattr(s, "tick_bar", 0)' in blk, \
+            "gate 2's chart is derived again instead of picked"
 
     def test_the_panel_labels_what_does_not_decide(self):
         import pathlib
@@ -1250,15 +1250,18 @@ class TestATickChartCanBeTheTradedTimeframe:
                      key=lambda n: abs(n - want), default=want)
             assert g1 < traded, (traded, g1)
 
-    def test_the_route_sizes_gate_one_below_it(self):
+    def test_the_route_breaks_a_size_clash(self):
+        """If gate 1 is itself a tick chart of the size gate 2 was
+        set to, the two sides are the identical number agreeing with
+        itself and gate 2 is decoration."""
         import pathlib
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("_traded_n = _pi3(_tf_name)")
-        blk = src[i:i + 500]
-        assert "n < _traded_n" in blk, \
-            "gate 1 can be the same size as the traded chart"
-        assert "_traded_n) // 5" in blk
+        blk = src[i:i + 1200]
+        assert "_g2_clash" in blk, "a size clash is not detected"
+        assert "n < int(_traded_n)" in blk, \
+            "the clash is detected and not broken"
 
     def test_the_candle_reader_serves_both_kinds(self):
         import pathlib
@@ -1303,6 +1306,185 @@ class TestATickChartCanBeTheTradedTimeframe:
         assert 'value="-5000"' in blk and 'value="-10000"' in blk
         assert 'value="300"' in blk and 'value="900"' in blk, \
             "the time windows were dropped"
+
+
+
+class TestOneTradePerAgreement:
+    """Chris: "take a trade when timeframe and Tick chart match 1
+    trade per agreement ... this should kill most of the
+    disagreements and multi entries".
+
+    An agreement is an UNBROKEN RUN of the two charts pointing the
+    same way. Once it has produced a trade it produces no more --
+    they have to stop agreeing before a fresh one can be taken."""
+
+    UP = {"state": "continuation", "heavy": False}
+
+    def _step(self, prev, tick=U, candle=U, took=False):
+        st = sw.state({}, tick, rungs(**{"5m": candle}), 300.0,
+                      tf_ticks=20.0, intent=self.UP, prev=prev)
+        nxt = dict(st["held"])
+        if took:
+            nxt["episode"] = {**nxt["episode"], "taken": True}
+        return st, nxt
+
+    def test_the_first_agreement_trades(self):
+        st, _ = self._step({})
+        assert st["side"] == U
+
+    def test_the_same_agreement_does_not_trade_twice(self):
+        _, prev = self._step({}, took=True)
+        st, _ = self._step(prev)
+        assert st["side"] == ""
+        assert "already been traded" in st["why"]
+
+    def test_a_break_starts_a_fresh_agreement(self):
+        _, prev = self._step({}, took=True)
+        _, prev = self._step(prev, tick=D)          # pullback
+        st, _ = self._step(prev)
+        assert st["side"] == U, "a fresh agreement was refused"
+
+    def test_a_flip_to_the_other_side_is_a_fresh_agreement(self):
+        _, prev = self._step({}, took=True)
+        st, _ = self._step(prev, tick=D, candle=D)
+        assert st["side"] == D
+
+    def test_an_agreement_that_never_traded_is_not_spent(self):
+        """THE CASE THAT MAKES THE CALLER OWN THE FLAG. The rule
+        offering a side is not the journal accepting it -- the cap,
+        or AUTO being off, refuses entries the rule offered -- and
+        an agreement that produced no trade must stay live."""
+        _, prev = self._step({}, took=False)
+        st, _ = self._step(prev)
+        assert st["side"] == U
+
+    def test_the_run_is_reported(self):
+        st, _ = self._step({})
+        assert st["episode"]["agreeing"] is True
+        assert st["episode"]["side"] == U
+        assert st["episode"]["decides"] is True
+
+    def test_a_pullback_is_not_a_run(self):
+        st, _ = self._step({}, tick=D)
+        assert st["episode"]["agreeing"] is False
+        assert st["episode"]["side"] == ""
+
+    def test_the_route_marks_it_only_when_a_trade_opens(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        # INSIDE THE JOURNAL STEP. There is another
+        # `if act == "open":` in a hand-trading route above, and a
+        # whole-file index lands on that one -- the same way an
+        # earlier route test passed while the thing it named was
+        # untouched.
+        i = src.index("def _journal_step_un(")
+        blk = src[i:i + 30000]
+        j = blk.index('if act == "open":')
+        seg = blk[j:j + 1400]
+        assert '"taken": True' in seg, \
+            "an agreement is never marked spent, so it trades forever"
+        assert "j.open_trade(" in seg
+
+
+class TestGateTwosChartIsPicked:
+    """Chris: "i want to add a few tick profiles for gate number 2
+    250, 500, 1000, 1500, 2000, 3000, 4000, 5000, 6000, 7k, 8k, 9,
+    and 10k"."""
+
+    WANTED = (250, 500, 1000, 1500, 2000, 3000, 4000, 5000,
+              6000, 7000, 8000, 9000, 10000)
+
+    def test_every_size_he_asked_for_exists(self):
+        from liqmap.tickbar import PER_BAR_CHOICES as P
+        assert tuple(sorted(P)) == self.WANTED
+
+    def test_the_settings_carry_it(self):
+        from liqmap.journal import Settings
+        assert Settings().tick_bar == 5000
+        assert "tick_bar" in Settings().to_dict()
+
+    def test_it_survives_being_saved(self, tmp_path):
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", tick_bar=1500))
+        assert j.settings("ES").tick_bar == 1500
+
+    def test_the_selector_offers_all_of_them(self):
+        import pathlib
+        import re
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index('id="jnlTick"')
+        box = src[i:src.index("</select>", i)]
+        shown = tuple(sorted(int(m) for m in
+                             re.findall(r'value="(\d+)"', box)))
+        assert shown == self.WANTED
+
+    def test_the_route_reads_the_setting(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index("_traded_n = _pi3(_tf_name)")
+        blk = src[i:i + 1200]
+        assert 'getattr(s, "tick_bar", 0)' in blk
+        assert "_g1 not in _PBC2" in blk, \
+            "a size with no builder behind it is not snapped"
+
+
+class TestGateOneIsALiveTimeframe:
+    """Chris: "replace gate ones old tick bar with live timeframes
+    that i can select between 1m, 5m and 15minute this has to be
+    live timeframe"."""
+
+    def test_one_minute_is_a_window(self):
+        from liqmap import journal as jn
+        assert jn.window_label(60.0) == "1m"
+        assert sw.traded_tf(60.0) == "1m"
+
+    def test_the_clamp_keeps_it(self):
+        """It forced every value to 300 or 900, so a 1m window would
+        have come back as 5m on its first save -- the same way a
+        tick window came back as 15m."""
+        from liqmap.journal import _clamp_window
+        assert _clamp_window(60.0) == 60.0
+        assert _clamp_window(300.0) == 300.0
+        assert _clamp_window(900.0) == 900.0
+
+    def test_junk_is_not_a_one_minute_window(self):
+        """Adding the 1m choice turned every zero into a 1m row --
+        the shortest, busiest chart there is, reached by accident."""
+        for bad in (0, None, "", "x"):
+            assert sw.traded_tf(bad) == ""
+
+    def test_a_one_minute_window_survives_a_save(self, tmp_path):
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", window_s=60.0))
+        assert j.settings("ES").window_s == 60.0
+        assert sw.traded_tf(j.settings("ES").window_s) == "1m"
+
+    def test_the_selector_offers_it(self):
+        import pathlib
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        i = src.index('id="jnlWin"')
+        box = src[i:src.index("</select>", i)]
+        for v in ('value="60"', 'value="300"', 'value="900"'):
+            assert v in box, v
+
+    def test_the_rule_runs_on_a_one_minute_row(self):
+        r = {"1m": {"present": True, "qualified": U, "bps": 3.0}}
+        st = sw.state({}, U, r, 60.0, tf_ticks=20.0,
+                      intent={"state": "continuation", "heavy": False})
+        assert st["stack"]["trading"] == "1m"
+        assert st["side"] == U
+
+    def test_the_timeframe_is_still_the_trend(self):
+        """The slots swapped; the jobs did not. The timeframe closes
+        the trade and the tick chart never does."""
+        assert sw.holds(U, D, U) == (True, "")        # tick turned
+        assert sw.holds(U, U, D)[0] is False          # timeframe did
 
 
 # ---------------------------------------------------------------------

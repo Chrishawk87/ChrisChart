@@ -77,8 +77,18 @@ from dataclasses import dataclass, field
 # THE SIZES CHRIS NAMED: "250tick, 500tick, 1000, 2000, 4000, 5000,
 # or even 10,000". 233 was a Fibonacci habit from retail charting
 # software and he does not use it; 4000 was missing.
-PER_BAR_CHOICES: tuple[int, ...] = (250, 500, 1000, 2000, 4000,
-                                    5000, 10000)
+# THE SIZES HE ASKED FOR, IN FULL. Chris: "i want to add a few tick
+# profiles for gate number 2 250, 500, 1000, 1500, 2000, 3000, 4000,
+# 5000, 6000, 7k, 8k, 9, and 10k".
+#
+# Every size is a builder, and there is one family continuous and one
+# cut at each of two clock periods -- so thirteen sizes is thirty-nine
+# builders, each taking a handful of adds per print. That is the cost
+# and it is paid on every trade; it buys a selector that switches
+# instantly instead of starting from an empty chart.
+PER_BAR_CHOICES: tuple[int, ...] = (250, 500, 1000, 1500, 2000, 3000,
+                                    4000, 5000, 6000, 7000, 8000,
+                                    9000, 10000)
 DEFAULT_PER_BAR = 1000
 
 # The series the fusion rule reads unless told otherwise. Chris named

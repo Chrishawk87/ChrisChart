@@ -91,6 +91,14 @@ def traded_tf(period_s: float) -> str:
         return ""
     if p < 0:
         return f"{int(round(-p))}t"
+    if p <= 0.0:
+        # NOT A ONE-MINUTE WINDOW. Zero is "no window given", and
+        # adding the 1m choice turned every junk value into a 1m
+        # row -- the shortest, busiest chart there is, reached by
+        # accident.
+        return ""
+    if p <= 60.0:
+        return "1m"
     return TRADED_OF.get(p, "15m" if p >= 600.0 else "5m")
 
 
@@ -363,7 +371,8 @@ def entry_side(tick: str, candle: str = "",
                tf_ticks: float | None = None,
                min_open_ticks: float = MIN_OPEN_TICKS,
                intent: dict | None = None,
-               tick_failed: bool = False) -> tuple[str, str]:
+               tick_failed: bool = False,
+               episode_taken: bool = False) -> tuple[str, str]:
     """The side to take, or the reason there is none.
 
     A CONTINUATION, AND NOTHING ELSE. Chris: both gates pointing the
@@ -378,6 +387,14 @@ def entry_side(tick: str, candle: str = "",
     caller cannot measure it and the check is skipped -- a caller
     that cannot see the distance must not be silently blocked from
     ever trading.
+
+    `episode_taken` IS ONE TRADE PER AGREEMENT. Chris: "take a
+    trade when timeframe and Tick chart match 1 trade per agreement
+    ... this should kill most of the disagreements and multi
+    entries". An agreement is an unbroken run of the two charts
+    pointing the same way; once it has produced a trade it produces
+    no more. The two have to stop agreeing -- a pullback, a flip,
+    either chart going quiet -- before a fresh one can be taken.
 
     `tick_failed` IS THE TICK CHART'S OWN PUSH HAVING GONE, and it
     blocks the entry even when the two directions agree. A bar that
@@ -400,6 +417,9 @@ def entry_side(tick: str, candle: str = "",
                         "rolling over, not continuing")
         return "", (f"pulling back -- the tick candle is {tick} "
                     f"against a {candle} timeframe")
+    if episode_taken:
+        return "", ("this agreement has already been traded -- they "
+                    "have to disagree before another is taken")
     if tf_ticks is not None and abs(float(tf_ticks)) < float(
             min_open_ticks or 0.0):
         return "", (f"the timeframe candle is {abs(tf_ticks):.0f} "
@@ -515,6 +535,7 @@ def state(win: dict | None, tick: str, rungs: dict | None,
           intent: dict | None = None,
           tf_intent: dict | None = None,
           tf_ticks: float | None = None,
+          episode_taken: bool = False,
           prev: dict | None = None) -> dict:
     """Everything the rule and the panel need, from one place.
 
@@ -598,9 +619,18 @@ def state(win: dict | None, tick: str, rungs: dict | None,
     failed = bool(where == "pullback"
                   and pullback_failed(tf_depth, tf_heavy))
 
+    # ONE TRADE PER AGREEMENT. The run of agreement is identified
+    # by the side the two charts are agreeing on; it ends the moment
+    # that is no longer a continuation, whatever broke it.
+    prev_ep = prev.get("episode") or {}
+    agreeing = (where == "continuation" and tick in SIDES)
+    same_run = bool(agreeing and prev_ep.get("side") == tick)
+    spent = bool(episode_taken or (same_run and prev_ep.get("taken")))
+
     side, why = entry_side(tick, s_side, tf_ticks,
                            intent=intent or {},
-                           tick_failed=tick_failed)
+                           tick_failed=tick_failed,
+                           episode_taken=spent)
 
     rows = {}
     for name in (tf, below):
@@ -734,6 +764,19 @@ def state(win: dict | None, tick: str, rungs: dict | None,
             "side": w_side, "why": w_why,
             "decides": False,
         },
+        # THE RUN OF AGREEMENT, and whether it has been spent.
+        # `taken` is set by the CALLER when a trade actually opens,
+        # because only the caller knows whether the journal accepted
+        # the entry -- the cap or AUTO being off can refuse one the
+        # rule offered, and an agreement that never produced a trade
+        # must not be marked as having produced one.
+        "episode": {
+            "side": tick if agreeing else "",
+            "agreeing": agreeing,
+            "same_run": same_run,
+            "taken": spent,
+            "decides": True,
+        },
         # THE MEMORY THE CALLER STORES AND HANDS BACK AS `prev`.
         # Returned rather than kept, so one module cannot serve two
         # callers one history.
@@ -741,6 +784,8 @@ def state(win: dict | None, tick: str, rungs: dict | None,
         # so its memory rides home with the gates' rather than in a
         # second place the caller has to remember to carry.
         "held": {"tick": tick, "candle": s_side,
+                 "episode": {"side": tick if agreeing else "",
+                             "taken": spent},
                  # `worst` and `bar_dir` ride home too: the first is
                  # how deep this pullback has been, which one instant
                  # cannot know, and the second is what tells the next

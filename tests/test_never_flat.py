@@ -120,8 +120,12 @@ class TestGateOneIsTheCandle:
         # is exactly what was being reported as the direction.
         assert b.current.path_dir == "flat"
 
-    def test_the_panel_names_what_gate_one_reads(self):
-        assert "GATE 1 &mdash; THE 5000T CANDLE" in WEB
+    def test_the_panel_names_the_tick_chart_gate(self):
+        """The slots swapped: gate 2 is the tick chart now, and its
+        size is read off the payload because it is picked rather
+        than written into the heading."""
+        assert "GATE 2 &mdash; THE '" in WEB
+        assert "f.roll.window" in WEB
         assert "close vs open, as the chart draws it" in WEB
 
     def test_the_vote_is_still_drawn_beside_it(self):
@@ -267,10 +271,11 @@ class TestGateTwoIsTheRealLiveCandle:
         screen rather than guessed at."""
         assert "open_px" in WEB and "last_px" in WEB
 
-    def test_the_panel_says_it_is_the_real_live_candle_gate(self):
-        assert "GATE 2 &mdash; THE REAL " in WEB
+    def test_the_panel_says_the_timeframe_is_the_trend(self):
+        assert "GATE 1 &mdash; THE LIVE " in WEB
         assert "close vs open, " in WEB
-        assert "it must agree to open" in WEB
+        assert "it must agree to open and it is " in WEB
+        assert "what closes a trade" in WEB
 
     def test_the_panel_arrow_shows_what_the_gate_uses(self):
         """An arrow reading "flat" beside a verdict reading AGREES
