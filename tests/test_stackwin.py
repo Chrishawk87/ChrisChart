@@ -50,6 +50,27 @@ D = "down"
 U = "up"
 
 
+def _step_block(src: str) -> str:
+    """`_journal_step_un` exactly, from its `def` to the next one.
+
+    A FIXED CHARACTER WINDOW IS A TEST THAT EXPIRES. These slices
+    read `_step_block(src)`, and the function grew past that the
+    first time a strategy was added -- two tests failed with "it
+    never reaches the payload" about code that was sitting right
+    there. Widening the number would only move the date.
+
+    TOO WIDE IS WORSE THAN TOO NARROW, which is why this does not
+    just take the rest of the file: a window that runs on into the
+    next function lets a test pass on a phrase that lives
+    somewhere else entirely. That has happened here once already.
+    """
+    import re
+    i = src.index("def _journal_step_un(")
+    col = len(src[:i].split("\n")[-1])
+    m = re.compile(r"\n {0,%d}(?! )\S" % col).search(src, i + 10)
+    return src[i:m.start()] if m else src[i:]
+
+
 def rungs(**kw) -> dict:
     """Cascade rows, as the route hands them over."""
     out = {}
@@ -208,7 +229,7 @@ class TestWhatIsBackAndWhatStaysOut:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         assert "_sw.Dwell()" in blk, "nothing measures the hold"
         assert "_dw.on_tick(_cand, _now_s)" in blk, \
             "the hold is not on the timeframe"
@@ -583,7 +604,7 @@ class TestTwoTradesAFiveMinuteBar:
         # that lands on the wrong block is how the earlier route
         # test passed while the thing it named was untouched.
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         j = blk.index('if act == "close":')
         assert "max_per_bar=cap" in blk[j:j + 1200]
 
@@ -714,7 +735,7 @@ class TestTheWiring:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         assert 'strat == "stack"' in blk, "the route never builds it"
         assert "_sw.state(" in blk
         assert '"stackwin"' in blk, "it never reaches the payload"
@@ -883,7 +904,7 @@ class TestTheRuleDoesNotWaitForTheSlowRoute:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         assert "_csc.rows_from_candles(" in blk, \
             "the rule still waits for the route to hand it rows"
         assert "_candle_now(rt_, tf)" in blk
@@ -896,7 +917,7 @@ class TestTheRuleDoesNotWaitForTheSlowRoute:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         assert "jn.window_label(float(s.window_s or 900.0))" in blk, \
             "the traded chart is named in more than one place"
 
@@ -1060,7 +1081,7 @@ class TestARefusedEntryIsNeverSilent:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         assert blk.count('idle_why = arg if act == "" else ""') >= 2, \
             "a path through decide leaves the reason unset"
 
@@ -1302,9 +1323,12 @@ class TestOneTradePerAgreement:
         # earlier route test passed while the thing it named was
         # untouched.
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         j = blk.index('if act == "open":')
-        seg = blk[j:j + 1400]
+        # THE SAME TRAP ONE LEVEL DOWN. A fixed window inside the
+        # block expires the same way; this runs to the end of the
+        # `if act == "open":` body instead.
+        seg = blk[j:blk.index("\n        st = j.stats(", j)]
         assert '"taken": True' in seg, \
             "an agreement is never marked spent, so it trades forever"
         assert "j.open_trade(" in seg
@@ -1699,7 +1723,7 @@ class TestGateThreeIsWiredThrough:
     def test_the_route_reads_gate_three_and_snaps_it(self):
         src = self._src()
         i = src.index("def _journal_step_un(")
-        blk = src[i:i + 30000]
+        blk = _step_block(src)
         assert 'getattr(s, "tick_bar_3", 0)' in blk
         assert "_g3 not in _PBC2" in blk, \
             "a size with no builder behind it is not snapped"

@@ -7934,6 +7934,64 @@ def create_app() -> FastAPI:
                                       "bar_ts": _tfi.get("bar_ts") or 0.0}}
             except Exception:                           # noqa: BLE001
                 pass
+        elif strat == "ticks":
+            # TWO TICK CHARTS, ONE LEADING. Chris: "just between
+            # gate 2 and gate 3 using gate 2 as the lead and gate 3
+            # as the confirmation with the same 5 second hold on
+            # gate 3 before a trade is taken".
+            #
+            # NO TIMEFRAME IS READ HERE AT ALL -- not the window,
+            # not the stack rows, not the live candle. The branch
+            # is short because the rule is: two cuts of the same
+            # tape and the hold between them.
+            from . import twotick as _tt
+            from .tickbar import PER_BAR_CHOICES as _PBCT
+
+            _lead_n = int(getattr(s, "tick_bar", 0) or 0) or 5000
+            if _lead_n not in _PBCT:
+                _lead_n = min(_PBCT, key=lambda n: abs(n - _lead_n))
+            _conf_n = int(getattr(s, "tick_bar_3", 0) or 0) or 1000
+            if _conf_n not in _PBCT:
+                _conf_n = min(_PBCT, key=lambda n: abs(n - _conf_n))
+            _lead = _tick_now(rt_, _lead_n, "raw", 0.0, 0,
+                              FUSION_RESET_S)
+            _conf = _tick_now(rt_, _conf_n, "raw", 0.0, 0,
+                              FUSION_RESET_S)
+            # ITS OWN DWELL AND ITS OWN MEMORY, on the runtime.
+            # The stack rule's tracker follows the TIMEFRAME and
+            # this one follows gate 3; sharing either would let a
+            # strategy switch carry a hold or a held direction from
+            # a chart this rule never read.
+            _tdw = getattr(rt_, "_ticks_dwell", None)
+            if _tdw is None:
+                _tdw = _tt.Dwell()
+                try:
+                    rt_._ticks_dwell = _tdw
+                except Exception:                       # noqa: BLE001
+                    pass
+            _tprev = getattr(rt_, "_ticks_held", None) or {}
+            _now_t = time.time()
+            # THE HOLD IS ON THE CONFIRMATION, fed the HELD
+            # direction rather than the raw one -- restarting the
+            # clock on a tie is how the ten-second version never
+            # elapsed. The same two calls `state` makes, on the
+            # same inputs, so they cannot disagree.
+            _conf_held = _tt.hold_dir(str(_conf.get("body_dir") or ""),
+                                      str(_tprev.get("confirm") or ""))
+            _tdw.on_tick(_conf_held, _now_t)
+            fus = _tt.state(
+                lead_raw=(_lead.get("body_dir") or ""),
+                confirm_raw=(_conf.get("body_dir") or ""),
+                lead_bar=_lead_n, confirm_bar=_conf_n,
+                held_s=_tdw.held_s(_now_t),
+                confirm_exits=bool(getattr(s, "tick3_exit", False)),
+                lead_roll=(_lead.get("roll") or {}),
+                confirm_roll=(_conf.get("roll") or {}),
+                prev=_tprev)
+            try:
+                rt_._ticks_held = dict(fus.get("held") or {})
+            except Exception:                           # noqa: BLE001
+                pass
         else:
             fus = (_timed_now(rt_) if strat == "timed"
                    else _fusion_now(rt_))
@@ -7964,6 +8022,18 @@ def create_app() -> FastAPI:
                         ((_st.get("rows") or {})
                          .get(_st.get("below") or "") or {}).get("dir")
                         or None}
+        elif strat == "ticks":
+            # NAMED BY SIZE, because "lead" and "confirm" on their
+            # own do not say which chart is which once both are
+            # selectable -- and the row beside the signal has to be
+            # what the signal actually read.
+            _ld = fus.get("lead") or {}
+            _cf = fus.get("confirm") or {}
+            says = {
+                f"{int(_ld.get('per_bar') or 0)}t lead":
+                    _ld.get("side") or None,
+                f"{int(_cf.get('per_bar') or 0)}t confirm":
+                    _cf.get("side") or None}
         vetoed = blocked_why
         # The window is the candle the cap counts against.
         bar_ts = float(win.get("start_ts") or 0.0)
@@ -8013,6 +8083,15 @@ def create_app() -> FastAPI:
             bar_ts = _swb.bar_of(time.time(), _swb.CAP_BAR_S)
             cap = _swb.MAX_TRADES_PER_BAR
             taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
+        if strat == "ticks":
+            # THE SAME CEILING THE STACK RULE RUNS UNDER, and it
+            # matters more here: with no clock on the trade and no
+            # band off an open, the cap is the only thing bounding
+            # how often this rule can churn.
+            from . import twotick as _ttb
+            bar_ts = _ttb.bar_of(time.time(), _ttb.CAP_BAR_S)
+            cap = _ttb.MAX_TRADES_PER_BAR
+            taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
         if strat in ("fused", "timed"):
             # ONE TRADE PER 5-MINUTE CANDLE, for both rules, counted
             # against that candle rather than the 15-minute window.
@@ -8056,6 +8135,24 @@ def create_app() -> FastAPI:
                 t.side, (fus.get("m1") or {}).get("dir") or "")
             if rev:
                 disagreed = why_rev
+        elif strat == "ticks" and t is not None and t.open:
+            # THE LEAD CHART TURNING, AND NOTHING ELSE BY DEFAULT.
+            # Asked what should close a trade in this strategy,
+            # Chris picked "Gate 2's flip only, no clock" -- so no
+            # time stop is consulted here at all. The confirming
+            # chart closes it too only when the `g3 exit` switch is
+            # on.
+            #
+            # THE HELD DIRECTIONS `state` RESOLVED, not a second
+            # copy. Recomputing them here is how the exit once
+            # ended up reading the vote while the entry read the
+            # body, opening a long and closing it on one poll.
+            from . import twotick as _tte
+            disagreed = _tte.exit_reason(
+                t.side,
+                (fus.get("lead") or {}).get("side") or "",
+                (fus.get("confirm") or {}).get("side") or "",
+                bool(getattr(s, "tick3_exit", False))) or disagreed
         elif strat == "stack" and t is not None and t.open:
             # THE TIMEFRAME TURNING, OR A PULLBACK THAT FAILED.
             #
@@ -8170,6 +8267,14 @@ def create_app() -> FastAPI:
                     rt_._gate_held = _h
                 except Exception:                       # noqa: BLE001
                     pass
+            if strat == "ticks":
+                try:
+                    _ht = getattr(rt_, "_ticks_held", None) or {}
+                    _ht["episode"] = {**(_ht.get("episode") or {}),
+                                      "taken": True}
+                    rt_._ticks_held = _ht
+                except Exception:                       # noqa: BLE001
+                    pass
             t = j.open_trade(
                 coin_, arg, open_px, mode="auto", bar_ts=bar_ts,
                 strategy=strat,
@@ -8201,6 +8306,17 @@ def create_app() -> FastAPI:
             # telling half the story.
             "stackwin": ({**fus, "blocked_by": idle_why}
                          if strat == "stack" else None),
+            # THE TWO TICK CHARTS, IN THEIR OWN PANEL. A separate
+            # key rather than a flag on the one above: the stack
+            # panel describes a timeframe this rule does not have,
+            # and a painter that tries to draw both ends up drawing
+            # neither honestly.
+            #
+            # THE JOURNAL'S REFUSAL TRAVELS WITH THEM, for the same
+            # reason it travels with the stack gates -- the cap
+            # saying no is otherwise invisible in this box.
+            "twotick": ({**fus, "blocked_by": idle_why}
+                        if strat == "ticks" else None),
             "quote": jn_quote.read(
                 (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
                 (getattr(rt_, "ofi", None)), _last or px, _age),
@@ -10838,6 +10954,11 @@ has to be running before the gate stops refusing.">spike
              in is the order they are read on screen. -->
         <div id="jnlStackWin" style="display:none;margin-bottom:10px">
         </div>
+        <!-- THE TWO TICK CHARTS, ALONE. Its own box for the same
+             reason the gates have one: the order the rule applies
+             them in is the order they are read on screen. -->
+        <div id="jnlTwoTick" style="display:none;margin-bottom:10px">
+        </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;
           align-items:center;margin-bottom:10px">
           <button id="jnlAutoBtn" onclick="jnlToggleAuto()"
@@ -10854,6 +10975,12 @@ has to be running before the gate stops refusing.">spike
               <option value="fused">Fused (intrabar)</option>
               <option value="timed">Timed (1m guides the 5m)</option>
               <option value="stack">Stack + window (all four, then the stack)</option>
+              <!-- TWO TICK CHARTS AND NO TIMEFRAME. Chris: "just
+                   between gate 2 and gate 3 using gate 2 as the
+                   lead and gate 3 as the confirmation". The window
+                   selector beside this one does nothing for it --
+                   it reads the two tick sizes and nothing else. -->
+              <option value="ticks">Two tick charts (gate 2 leads, gate 3 confirms)</option>
             </select></label>
           <label>window
             <select id="jnlWin" onchange="jnlSet()"
@@ -16787,6 +16914,144 @@ function paintClockWindows(d) {
    NO HOLD, NO CLOCK, NO CAP. Each was removed by name and each is
    held out by a test in the negative -- all three have been
    silently re-wired in this file before. */
+/* THE TWO-TICK PANEL.
+
+   Chris: "just between gate 2 and gate 3 using gate 2 as the lead
+   and gate 3 as the confirmation with the same 5 second hold on
+   gate 3 before a trade is taken".
+
+   IT DRAWS WHAT THE RULE DECIDED, not the inputs to decide it
+   again. A screen that recomputes a direction eventually disagrees
+   with the rule beside it, which has happened here with the
+   5-minute cell and with the OFI bar already. */
+function paintTwoTick(TT) {
+  const box = $('jnlTwoTick');
+  if (!box) return;
+  if (!TT) { box.style.display = 'none'; return; }
+  box.style.display = '';
+
+  const L = TT.lead || {};
+  const C = TT.confirm || {};
+  const arrow = (d) => d === 'up'
+    ? '<b class="long">UP</b>'
+    : d === 'down' ? '<b class="short">DOWN</b>'
+    : '<span class="thin">&mdash;</span>';
+  const leg = (name, d) =>
+    '<span style="display:inline-block;min-width:118px">'
+    + '<span class="thin">' + name + '</span> ' + arrow(d) + '</span>';
+  const size = (b) => Number(b.per_bar || 0).toLocaleString() + 'T';
+  const edge = (d) => 'border-left:3px solid var(--'
+    + (d ? (d === 'up' ? 'up' : 'down') : 'line')
+    + ');padding:6px 0 6px 10px';
+
+  /* THE LEAD. Its flip is the exit, so the heading says so --
+     a gate whose job is not stated on the panel is how a trade
+     ends for no visible reason. */
+  const leadBlock =
+      '<div style="' + edge(L.side) + '">'
+    + '<div class="thin">LEAD &mdash; THE ' + size(L)
+    + ' CANDLE (close vs open, as the chart draws it) &mdash; it '
+    + 'names the direction, and its flip is what closes a trade'
+    + '</div>'
+    + '<div style="margin:4px 0">' + leg('lead', L.side) + '</div>'
+    + (L.held_through_flat
+        ? '<div class="thin">price is exactly on this candle\u2019s '
+          + 'open &mdash; holding ' + esc(L.side || '').toUpperCase()
+          + ' until it moves</div>'
+        : '')
+    + ((L.roll && L.roll.window)
+        ? '<div class="thin">prints: '
+          + Number(L.roll.up_prints || 0).toLocaleString() + ' up '
+          + '&middot; '
+          + Number(L.roll.down_prints || 0).toLocaleString() + ' down'
+          + (L.roll.dir && L.side && L.roll.dir !== L.side
+              ? ' &mdash; the vote says ' + esc(L.roll.dir).toUpperCase()
+                + ', shown only'
+              : '')
+          + '</div>'
+        : '')
+    + (L.side
+        ? '<b class="' + (L.side === 'up' ? 'long' : 'short') + '">'
+          + 'LEAD ' + L.side.toUpperCase() + '</b>'
+        : '<b class="short">NO DIRECTION</b> <span class="thin">'
+          + 'nothing opens until the lead has one</span>')
+    + '</div>';
+
+  /* THE CONFIRMATION, AND THE HOLD THAT SITS ON IT. A held
+     direction and a fresh one look identical without the countdown
+     -- and an entry that has not fired YET calls for a very
+     different reaction from one that is blocked. */
+  const confBlock =
+      '<div style="margin-top:8px;' + edge(C.side) + '">'
+    + '<div class="thin">CONFIRMATION &mdash; THE ' + size(C)
+    + ' CANDLE &mdash; it must agree, and hold '
+    + Number(C.min_hold_s || 0).toFixed(0) + 's before anything opens'
+    + (C.exits ? '. It closes a trade too' : '')
+    + '</div>'
+    + '<div style="margin:4px 0">' + leg('confirm', C.side) + '</div>'
+    + (C.held_through_flat
+        ? '<div class="thin">price is exactly on this candle\u2019s '
+          + 'open &mdash; holding ' + esc(C.side || '').toUpperCase()
+          + ' until it moves</div>'
+        : '')
+    + (C.same_as_lead
+        ? '<div class="thin"><b style="color:var(--dim)">SAME SIZE AS '
+          + 'THE LEAD</b> &mdash; it is the same reading twice, so it '
+          + 'agrees by construction and confirms nothing</div>'
+        : '')
+    + ((C.ready === false && C.side)
+        ? '<div class="thin"><b class="short">HOLDING '
+          + esc(C.side).toUpperCase() + ' &mdash; '
+          + Number(C.held_s || 0).toFixed(0) + 's of '
+          + Number(C.min_hold_s || 0).toFixed(0) + 's</b> '
+          + 'a turn has to stand before it can open a trade</div>'
+        : '')
+    + (C.side
+        ? (C.agrees
+            ? '<b class="' + (C.side === 'up' ? 'long' : 'short') + '">'
+              + 'AGREES &mdash; both ' + esc(C.side).toUpperCase()
+              + '</b>'
+            : '<b class="short">DISAGREES</b> <span class="thin">the '
+              + 'confirming chart is ' + esc(C.side).toUpperCase()
+              + '</span>')
+        : '<b class="short">NO DIRECTION</b> <span class="thin">'
+          + 'nothing opens until the confirmation has one</span>')
+    + '</div>';
+
+  /* THE VERDICT, AND THE JOURNAL'S ANSWER TO IT. Two different
+     questions. Chris: "on some trades tick bar and 5 or 15 min can
+     actually be up and no trade it taken like its invisible". */
+  const verdict = TT.side
+    ? '<b class="' + (TT.side === 'up' ? 'long' : 'short') + '">'
+      + TT.side.toUpperCase() + '</b> <span class="thin">'
+      + esc(TT.say || '') + '</span>'
+      + ((TT.episode && TT.episode.taken && TT.episode.agreeing)
+          ? '<div class="thin" style="margin-top:2px">'
+            + '<b style="color:var(--dim)">AGREEMENT SPENT</b> '
+            + '&mdash; one trade per agreement; they have to '
+            + 'disagree before another is taken</div>'
+          : '')
+      + (TT.blocked_by
+          ? '<div class="thin" style="margin-top:2px">'
+            + '<b style="color:var(--down)">NO TRADE</b> &mdash; '
+            + esc(TT.blocked_by) + '</div>'
+          : '')
+    : '<b class="short">NO SIDE</b> <span class="thin">'
+      + esc(TT.why || '') + '</span>';
+
+  box.innerHTML =
+      '<div class="thin" style="margin-bottom:4px"><b>TWO TICK '
+    + 'CHARTS</b> &mdash; the lead names the direction, the '
+    + 'confirmation has to agree and hold '
+    + Number(C.min_hold_s || 0).toFixed(0) + 's. Out when the lead '
+    + 'flips'
+    + (C.exits ? ', or when the confirmation flips' : '')
+    + '. No clock ends a trade.</div>'
+    + leadBlock
+    + confBlock
+    + '<div style="margin-top:8px">' + verdict + '</div>';
+}
+
 function paintStackWin(SW) {
   const box = $('jnlStackWin');
   if (!box) return;
@@ -17270,6 +17535,7 @@ function paintJournal(d) {
       + ' ticks from the open of this OFI bar</span>'
     : '<span class="thin">— no OFI bar forming</span>';
   paintStackWin(J.stackwin);
+  paintTwoTick(J.twotick);
 
   const ag = $('jnlAgree');
   const W = J.window || {};

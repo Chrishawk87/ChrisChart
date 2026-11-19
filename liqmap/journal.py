@@ -946,6 +946,11 @@ STRATEGIES = {
     "timed": "Timed -- the 5m candle, guided in and out by the 1m",
     "stack": ("Stack + window -- all four of the window agree, then "
               "the traded row and the one below it"),
+    # TWO TICK CHARTS AND NO CLOCK. Chris: "just between gate 2 and
+    # gate 3 using gate 2 as the lead and gate 3 as the confirmation
+    # with the same 5 second hold on gate 3".
+    "ticks": ("Two tick charts -- gate 2 leads, gate 3 confirms and "
+              "has to hold 5s"),
 }
 
 
@@ -1076,6 +1081,21 @@ def window_signal(win: dict, strategy: str = "ofi",
             return side, ""
         return "", (str(fused.get("why") or "")
                     or "the window and the stack do not agree")
+
+    # THE TWO-TICK RULE READS NO WINDOW EITHER.
+    #
+    # Checked up here with the other intrabar rules, before the
+    # window guards below, because it has no timeframe at all --
+    # being refused for "no window yet" would block a rule that was
+    # never going to look at one.
+    if strategy == "ticks":
+        if not fused:
+            return "", "no reading from either tick chart yet"
+        side = str(fused.get("side") or "")
+        if side in ("up", "down"):
+            return side, ""
+        return "", (str(fused.get("why") or "")
+                    or "the two tick charts do not agree")
 
     if strategy == "fused":
         if not fused:
