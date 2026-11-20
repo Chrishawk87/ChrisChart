@@ -111,6 +111,14 @@ class Settings:
     # his exit rule is the one thing he asked to leave alone when
     # gate 3 went in -- turning it on is a deliberate act.
     tick3_exit: bool = False
+    # THE FUSED BAR THE GATE PANEL WATCHES, as (prints, contracts).
+    # Chris: "the fused bar should be a visible gate all on its own
+    # that i can look at". One of the four pairs a builder exists
+    # for -- a builder is a running count and a running
+    # accumulator, so one created on demand starts empty and says
+    # nothing until it fills.
+    fused_ticks: int = 10000
+    fused_ofi: int = 4000
     strategy: str = "ofi"
 
     def to_dict(self) -> dict:
@@ -122,6 +130,8 @@ class Settings:
                 "tick_bar": int(self.tick_bar or 5000),
                 "tick_bar_3": int(self.tick_bar_3 or 1000),
                 "tick3_exit": bool(self.tick3_exit),
+                "fused_ticks": int(self.fused_ticks or 10000),
+                "fused_ofi": int(self.fused_ofi or 4000),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
                                                  self.strategy),
@@ -429,6 +439,8 @@ _ADDED_SETTINGS = (
     ("tick_bar", "INTEGER NOT NULL DEFAULT 5000"),
     ("tick_bar_3", "INTEGER NOT NULL DEFAULT 1000"),
     ("tick3_exit", "INTEGER NOT NULL DEFAULT 0"),
+    ("fused_ticks", "INTEGER NOT NULL DEFAULT 10000"),
+    ("fused_ofi", "INTEGER NOT NULL DEFAULT 4000"),
 )
 
 
@@ -490,6 +502,8 @@ class Journal(ThreadedDB):
                         tick_bar=int(r["tick_bar"] or 5000),
                         tick_bar_3=int(r["tick_bar_3"] or 1000),
                         tick3_exit=bool(r["tick3_exit"]),
+                        fused_ticks=int(r["fused_ticks"] or 10000),
+                        fused_ofi=int(r["fused_ofi"] or 4000),
                         strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
@@ -498,8 +512,8 @@ class Journal(ThreadedDB):
                 "INSERT INTO journal_settings"
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
-                "  strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                "  fused_ticks, fused_ofi, strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -508,6 +522,8 @@ class Journal(ThreadedDB):
                 " tick_bar=excluded.tick_bar,"
                 " tick_bar_3=excluded.tick_bar_3,"
                 " tick3_exit=excluded.tick3_exit,"
+                " fused_ticks=excluded.fused_ticks,"
+                " fused_ofi=excluded.fused_ofi,"
                 " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
@@ -526,6 +542,10 @@ class Journal(ThreadedDB):
                  max(1, int(s.tick_bar or 5000)),
                  max(1, int(s.tick_bar_3 or 1000)),
                  int(bool(s.tick3_exit)),
+                 # ONE OF THE FOUR OFFERED PAIRS AND NOTHING ELSE.
+                 # A pair with no builder behind it is not a
+                 # slower reading, it is no reading at all.
+                 *_snap_fused(s.fused_ticks, s.fused_ofi),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 
@@ -952,6 +972,25 @@ STRATEGIES = {
     "ticks": ("Two tick charts -- gate 2 leads, gate 3 confirms and "
               "has to hold 5s"),
 }
+
+
+def _snap_fused(ticks: int | float, ofi: int | float) -> tuple[int, int]:
+    """The offered fused pair nearest the one asked for.
+
+    THE SAME GUARD THE TICK SIZES HAVE, for a stronger reason: a
+    tick size with no builder would at worst be a chart nobody
+    drew, but a fused pair with no builder is a gate that reads
+    nothing and says nothing, forever, with the selector showing
+    the value that was picked.
+    """
+    from .fusedbar import PAIRS
+    try:
+        t, o = int(ticks or 0), int(ofi or 0)
+    except (TypeError, ValueError):
+        return PAIRS[-1]
+    if (t, o) in PAIRS:
+        return t, o
+    return min(PAIRS, key=lambda k: abs(k[0] - t) + abs(k[1] - o))
 
 
 def _clamp_window(window_s: float) -> float:

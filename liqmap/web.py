@@ -5697,6 +5697,8 @@ def create_app() -> FastAPI:
                              tick_bar: int | None = None,
                              tick_bar_3: int | None = None,
                              tick3_exit: bool | None = None,
+                             fused_ticks: int | None = None,
+                             fused_ofi: int | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5725,6 +5727,11 @@ def create_app() -> FastAPI:
                             else _snap_per_bar(int(tick_bar_3))),
                 tick3_exit=(bool(getattr(cur, "tick3_exit", False))
                             if tick3_exit is None else bool(tick3_exit)),
+                fused_ticks=(int(getattr(cur, "fused_ticks", 10000)
+                                 or 10000)
+                             if fused_ticks is None else int(fused_ticks)),
+                fused_ofi=(int(getattr(cur, "fused_ofi", 4000) or 4000)
+                           if fused_ofi is None else int(fused_ofi)),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7459,6 +7466,75 @@ def create_app() -> FastAPI:
                 "ofi_target": bld.ofi_target,
                 "say": prog.get("say") or ""}
 
+    def _fused_gate(rt_, pair: tuple[int, int] | None = None) -> dict:
+        """What the tick chart is doing inside the forming fused bar.
+
+        Chris: "what i want to see is what the tick chart is doing
+        inside the OFI, like moving down together, moving up
+        together ofi remaining down but tick is bouncing from
+        bottom or top".
+
+        FROM THE SAME BUILDER THE CHART DRAWS, for the same reason
+        `_fused_now` is: a second implementation of two legs would
+        put a different bar on the panel from the one on screen.
+
+        IT READS THE BAR BEING BUILT, not the last closed one. The
+        question is what is happening inside the candle right now;
+        a closed bar answers it one bar late.
+
+        THIS DECIDES NOTHING. There is no strategy behind it:
+        "we can create the strategy after i can see what it does
+        ill make entry and exit rules then".
+        """
+        from . import fusedread as _fr
+        from .fusedbar import DEFAULT_PAIR, PAIRS, label
+
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        books = getattr(tape, "fusedbars", None) if tape else None
+        key = tuple(pair or DEFAULT_PAIR)
+        if key not in PAIRS:
+            key = min(PAIRS, key=lambda k: (abs(int(k[0]) - int(key[0]))
+                                            + abs(int(k[1]) - int(key[1]))))
+        if not books:
+            return {"pair": list(key), "label": label(*key),
+                    "building": False,
+                    "why": ("fused bars are built from the ES tape "
+                            "and that engine is not running"),
+                    "decides": False}
+        bld = books.get(key)
+        if bld is None:
+            return {"pair": list(key), "label": label(*key),
+                    "building": False,
+                    "why": "no builder for that pair",
+                    "decides": False}
+        cur = bld.current
+        if cur is None:
+            # BETWEEN BARS. Real and momentary -- the last event
+            # closed one and the next has not opened one. Not an
+            # error, and not a reading either.
+            return {"pair": list(key), "label": label(*key),
+                    "building": False,
+                    "why": "between bars -- the last event closed one",
+                    "decides": False}
+        out = _fr.read(
+            ofi_dir=cur.ofi_dir, tick_dir=cur.tick_dir,
+            open_px=cur.open, high=cur.high, low=cur.low,
+            close=cur.close,
+            net_ofi=cur.net_ofi, ofi_target=bld.ofi_target,
+            prints=cur.prints, tick_target=bld.tick_target)
+        return {**out, "pair": list(key), "label": label(*key),
+                "building": True, "why": "",
+                "open": float(cur.open or 0.0),
+                "high": float(cur.high or 0.0),
+                "low": float(cur.low or 0.0),
+                "close": float(cur.close or 0.0),
+                "net_ofi": int(cur.net_ofi),
+                "ofi_target": int(bld.ofi_target),
+                "prints": int(cur.prints),
+                "tick_target": int(bld.tick_target),
+                "seconds": round(float(cur.seconds), 1)}
+
     def _footprint_imbalance(rt_) -> dict:
         """Which way the forming footprint bar is imbalanced.
 
@@ -8342,6 +8418,15 @@ def create_app() -> FastAPI:
             # saying no is otherwise invisible in this box.
             "twotick": ({**fus, "blocked_by": idle_why}
                         if strat == "ticks" else None),
+            # THE FUSED GATE, ON EVERY STRATEGY. Not tied to one,
+            # because there is no strategy behind it yet and the
+            # whole point is watching it while trading something
+            # else: "the fused bar should be a visible gate all on
+            # its own that i can look at the same way i can see the
+            # tick bar strategy".
+            "fusedgate": _fused_gate(
+                rt_, (int(getattr(s, "fused_ticks", 0) or 10000),
+                      int(getattr(s, "fused_ofi", 0) or 4000))),
             "quote": jn_quote.read(
                 (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
                 (getattr(rt_, "ofi", None)), _last or px, _age),
@@ -10984,6 +11069,11 @@ has to be running before the gate stops refusing.">spike
              them in is the order they are read on screen. -->
         <div id="jnlTwoTick" style="display:none;margin-bottom:10px">
         </div>
+        <!-- THE FUSED GATE, ON ITS OWN AND ON EVERY STRATEGY. It
+             describes the tape rather than a rule, and there is no
+             rule behind it yet -- it is here to be watched. -->
+        <div id="jnlFusedGate" style="display:none;margin-bottom:10px">
+        </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;
           align-items:center;margin-bottom:10px">
           <button id="jnlAutoBtn" onclick="jnlToggleAuto()"
@@ -11058,6 +11148,18 @@ has to be running before the gate stops refusing.">spike
               <option value="8000">8000t</option>
               <option value="9000">9000t</option>
               <option value="10000">10000t</option>
+            </select></label>
+          <!-- THE FUSED PAIR. Only the four a builder exists for:
+               a builder is a running count and a running
+               accumulator, so one created on demand starts empty
+               and says nothing until it fills. -->
+          <label>fused
+            <select id="jnlFused" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="1000x500">1000t &times; 500</option>
+              <option value="2500x1000">2500t &times; 1000</option>
+              <option value="5000x2000">5000t &times; 2000</option>
+              <option value="10000x4000" selected>10000t &times; 4000</option>
             </select></label>
           <label title="gate 3 also closes a trade when it flips"
             ><input type="checkbox" id="jnlT3Ex" onchange="jnlSet()"
@@ -16054,6 +16156,7 @@ async function jnlSet() {
     jnlTick: $('jnlTick') ? String(Math.round($('jnlTick').value || 5000)) : undefined,
     jnlTick3: $('jnlTick3') ? String(Math.round($('jnlTick3').value || 1000)) : undefined,
     jnlT3Ex: $('jnlT3Ex') ? ($('jnlT3Ex').checked ? '1' : '0') : undefined,
+    jnlFused: $('jnlFused') ? String($('jnlFused').value || '10000x4000') : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -16067,6 +16170,10 @@ async function jnlSet() {
     tick_bar: $('jnlTick') ? $('jnlTick').value : 5000,
     tick_bar_3: $('jnlTick3') ? $('jnlTick3').value : 1000,
     tick3_exit: ($('jnlT3Ex') && $('jnlT3Ex').checked) ? 'true' : 'false',
+    fused_ticks: $('jnlFused')
+      ? String($('jnlFused').value || '10000x4000').split('x')[0] : 10000,
+    fused_ofi: $('jnlFused')
+      ? String($('jnlFused').value || '10000x4000').split('x')[1] : 4000,
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -16949,6 +17056,108 @@ function paintClockWindows(d) {
    again. A screen that recomputes a direction eventually disagrees
    with the rule beside it, which has happened here with the
    5-minute cell and with the OFI bar already. */
+/* THE FUSED GATE: WHAT THE TICK CHART IS DOING INSIDE THE OFI.
+
+   Chris: "its a tick chart inside a OFI candle what i want to see
+   is what the tick chart is doing inside the OFI, like moving down
+   together, moving up together ofi remaining down but tick is
+   bouncing from bottom or top or read it like normal candle and
+   OFI trying to go up or down".
+
+   IT DECIDES NOTHING AND SAYS SO. There is no strategy behind this
+   yet -- "we can create the strategy after i can see what it does
+   ill make entry and exit rules then". On this engine a reading
+   drawn like a gate eventually gets treated as one, so the label
+   is part of the panel rather than a note somewhere else. */
+function paintFusedGate(FG) {
+  const box = $('jnlFusedGate');
+  if (!box) return;
+  if (!FG) { box.style.display = 'none'; return; }
+  box.style.display = '';
+
+  const head = '<div class="thin" style="margin-bottom:4px">'
+    + '<b>THE FUSED BAR &mdash; ' + esc(FG.label || '')
+    + '</b> &mdash; the tick chart inside the OFI candle. '
+    + '<b style="color:var(--dim)">SHOWN ONLY</b>, nothing here '
+    + 'opens or closes a trade</div>';
+
+  if (!FG.building) {
+    box.innerHTML = head
+      + '<div style="border-left:3px solid var(--line);'
+      + 'padding:6px 0 6px 10px"><span class="thin">'
+      + esc(FG.why || 'nothing building') + '</span></div>';
+    return;
+  }
+
+  const arrow = (d) => d === 'up'
+    ? '<b class="long">UP</b>'
+    : d === 'down' ? '<b class="short">DOWN</b>'
+    : '<span class="thin">&mdash;</span>';
+  const leg = (name, d) =>
+    '<span style="display:inline-block;min-width:118px">'
+    + '<span class="thin">' + name + '</span> ' + arrow(d) + '</span>';
+  const pct = (v) => Number(v || 0).toFixed(0) + '%';
+  const lg = FG.legs || {};
+
+  /* THE HEADLINE, in the words he used for each state. The colour
+     follows the BOOK, which is how the fused candles on the chart
+     already read -- a bounce keeps the book's colour because the
+     book has not changed its mind, price has. */
+  const edge = 'border-left:3px solid var(--'
+    + (FG.where === 'together'
+        ? (FG.ofi_dir === 'down' ? 'down' : 'up')
+        : FG.where === 'apart' ? 'line'
+        : FG.where === 'bounce'
+            ? (FG.ofi_dir === 'down' ? 'down' : 'up') : 'line')
+    + ');padding:6px 0 6px 10px';
+
+  const word = FG.where === 'together'
+      ? '<b class="' + (FG.ofi_dir === 'down' ? 'short' : 'long') + '">'
+        + 'MOVING ' + esc(FG.ofi_dir || '').toUpperCase()
+        + ' TOGETHER</b>'
+    : FG.where === 'bounce'
+      ? '<b style="color:var(--dim)">BOUNCING OFF THE '
+        + (FG.ofi_dir === 'down' ? 'BOTTOM' : 'TOP') + '</b>'
+    : FG.where === 'apart'
+      ? '<b class="short">BOOK AND PRICE APART</b>'
+      : '<b class="short">NOTHING SETTLED</b>';
+
+  const body =
+      '<div style="' + edge + '">'
+    + '<div style="margin:4px 0">'
+    + leg('the book', FG.ofi_dir) + leg('price', FG.tick_dir)
+    + '</div>'
+    + word + ' <span class="thin">' + esc(FG.say || '') + '</span>'
+    /* READ IT LIKE A NORMAL CANDLE: where the close sits between
+       this bar's own high and low, which is the "top or bottom"
+       half of what he asked for. Drawn separately from the retrace
+       because they answer different questions -- one is where
+       price is, the other is whether the move is still on. */
+    + ((FG.pos != null)
+        ? '<div class="thin">the close is ' + pct(100 * FG.pos)
+          + ' of the way up this bar&rsquo;s range'
+          + (FG.at ? ' &mdash; at the ' + esc(FG.at) : '')
+          + ' &middot; ' + pct(100 * FG.back) + ' of the move given '
+          + 'back (a bounce from ' + pct(100 * FG.bounce_at) + ')'
+          + '</div>'
+        : '<div class="thin">every print in this bar has landed on '
+          + 'one price &mdash; it has no range to read yet</div>')
+    /* BOTH LEGS, NEVER ONE. A bar can sit at 98% on one and 4% on
+       the other, and that is the entire reason this bar type
+       exists. */
+    + '<div class="thin">the book is ' + pct(lg.ofi_pct) + ' of '
+    + Number(FG.ofi_target || 0).toLocaleString() + ' &middot; prints '
+    + pct(lg.tick_pct) + ' of '
+    + Number(FG.tick_target || 0).toLocaleString()
+    + (lg.waiting_on
+        ? ' &mdash; waiting on ' + esc(lg.waiting_on)
+        : ' &mdash; both legs met, the next print closes it')
+    + '</div>'
+    + '</div>';
+
+  box.innerHTML = head + body;
+}
+
 function paintTwoTick(TT) {
   const box = $('jnlTwoTick');
   if (!box) return;
@@ -17528,6 +17737,8 @@ function paintJournal(d) {
   set('jnlTick', String(Math.round(S.tick_bar || 5000)));
   set('jnlTick3', String(Math.round(S.tick_bar_3 || 1000)));
   if ($('jnlT3Ex')) $('jnlT3Ex').checked = !!S.tick3_exit;
+  set('jnlFused', String(Math.round(S.fused_ticks || 10000))
+      + 'x' + String(Math.round(S.fused_ofi || 4000)));
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =
@@ -17578,6 +17789,7 @@ function paintJournal(d) {
     : '<span class="thin">— no OFI bar forming</span>';
   paintStackWin(J.stackwin);
   paintTwoTick(J.twotick);
+  paintFusedGate(J.fusedgate);
 
   const ag = $('jnlAgree');
   const W = J.window || {};
