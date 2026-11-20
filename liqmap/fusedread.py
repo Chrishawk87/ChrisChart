@@ -57,6 +57,11 @@ word the panel prints and nothing else; the raw percentage is
 drawn beside it either way, so nothing is hidden behind the
 threshold and no trade turns on it.
 
+THE RULE, IN ONE PLACE. In when the outer candle and the inner
+body point the same way and have done for five seconds, on a bar
+that has settled. Out on the take profit, or on the two coming
+apart. Nothing else opens a trade and nothing else closes one.
+
 IT DECIDES NOW, AND IT DID NOT BEFORE. It shipped as a panel --
 "Agreeing, bounce shown only" -- he watched it, and then wrote the
 rules off what he saw: "the auto trader will then trade the
@@ -140,6 +145,67 @@ def position(high: float, low: float, close: float) -> float | None:
     if span <= EPS:
         return None
     return max(0.0, min(1.0, (c - lo) / span))
+
+
+class AgreeHold:
+    """How long the two legs have been moving together THIS run.
+
+    NOT `stackwin.Dwell`, and the difference is the whole reason
+    this exists. There a flat is an ABSENCE -- the candle sitting
+    exactly on its open for an instant -- and ignoring it is what
+    finally made a hold elapse at all.
+
+    Here a break is an EVENT. The bar bounced, or the two came
+    apart, or a new one started settling; the agreement stopped,
+    and Chris's rule is that it has to stand again from scratch:
+    "if it bounces but then starts moving together again after the
+    moving together holds for 5 seconds then reenter the trade".
+
+    Fed `Dwell` instead, a bounce lasting two minutes left the
+    clock untouched and the next `together` reading opened a trade
+    on the same instant it appeared.
+
+    A clock that jumps backwards makes `held_s` zero rather than
+    negative.
+    """
+
+    __slots__ = ("_side", "_since", "runs")
+
+    def __init__(self) -> None:
+        self._side = ""
+        self._since = 0.0
+        self.runs = 0
+
+    def on_tick(self, side: str, now: float) -> None:
+        d = side if side in SIDES else ""
+        try:
+            t = float(now or 0.0)
+        except (TypeError, ValueError):
+            return
+        if not d:
+            # THE BREAK RESTARTS IT. This is the one line that
+            # differs from `Dwell`, and it is the line Chris's
+            # rule lives in.
+            self._side = ""
+            self._since = 0.0
+            return
+        if d != self._side:
+            self._side = d
+            self._since = t
+            self.runs += 1
+
+    @property
+    def side(self) -> str:
+        return self._side
+
+    def held_s(self, now: float) -> float:
+        try:
+            t = float(now or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        if not self._side or self._since <= 0 or t < self._since:
+            return 0.0
+        return t - self._since
 
 
 def _num(v) -> float:
@@ -442,43 +508,37 @@ def entry_side(where: str, side: str,
     return side, ""
 
 
-def exit_reason(trade_side: str, where: str, side: str = "",
-                bar_ts: float = 0.0, open_bar_ts: float = 0.0) -> str:
+def exit_reason(trade_side: str, where: str) -> str:
     """Why this trade should end now, or "" to hold it.
 
-    THREE THINGS CLOSE IT, and Chris named all three: "Bounce,
-    apart, or the bar closing".
+    ONE THING CLOSES IT HERE, and the take profit closes the other
+    kind. Chris: "the only exit is TP or when book and price
+    disagree ... thats the only exit strategy".
 
-    THE BAR CLOSING IS CHECKED FIRST, so the log says the candle
-    ended rather than blaming a reading taken on the next one. A
-    new bar is unsettled by construction -- holding a position into
-    a stretch where this rule has no reading at all is the thing
-    the settling was added to avoid, and it would be worse inside a
-    trade than outside one.
+    WHAT WAS REMOVED, AND DELIBERATELY. A bounce closed trades for
+    one revision and no longer does: the pullback is a reading he
+    wants to SEE, and taking him out on it was cutting winners
+    that the take profit was already sized to collect. The bar
+    closing closed trades too, and does not: a position now rides
+    across bar boundaries, through the settling stretch on the far
+    side, because a bar ending is bookkeeping and not a change in
+    the market.
 
-    A BOUNCE IS NOT A REVERSAL and it still closes the trade. That
-    is his rule, not an inference: the book is still pointing his
-    way when it fires. The take profit is what takes a good trade
-    off; this takes him out of one that has stopped going.
+    THAT LEAVES NO CLOCK AND NO BAR ON THIS TRADE AT ALL. The only
+    things that end it are the take profit, the two legs coming
+    apart, a stop if one is set, and the journal's own rule that
+    closes a position when the strategy actively offers the
+    opposite side.
+
+    SETTLING IS NOT AN EXIT EITHER. A new bar has no direction for
+    a while by construction; reading that absence as a reason to
+    be out would close every trade at every bar boundary, which is
+    the bar-close exit wearing a different name.
     """
     if trade_side not in SIDES:
         return ""
-    if open_bar_ts and bar_ts and float(bar_ts) != float(open_bar_ts):
-        return "the fused bar this trade opened in has closed"
-    if where == "bounce":
-        return "price is bouncing off this bar's extreme"
     if where == "apart":
         return "the book and price have come apart"
-    if where == "settling":
-        return "the bar is no longer settled"
-    # THE DIRECTION TURNING UNDER AN OPEN TRADE. Not one of the
-    # three he listed, because with those three in place it can
-    # barely happen -- the book flipping shows up as "apart" first.
-    # It is here so that the one path that reaches it is not a
-    # silent hold: a `together` reading pointing the other way is
-    # not a reason to stay in.
-    if where == "together" and side in SIDES and side != trade_side:
-        return f"they are now moving {side} together, against you"
     return ""
 
 

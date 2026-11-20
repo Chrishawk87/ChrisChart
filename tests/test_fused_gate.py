@@ -708,38 +708,43 @@ class TestTheRule:
     def test_an_untracked_hold_does_not_block(self):
         assert fr.entry_side("together", "up", held_s=None) == ("up", "")
 
-    @pytest.mark.parametrize("where,word", [
-        ("bounce", "bouncing"), ("apart", "come apart"),
-        ("settling", "no longer settled"),
-    ])
-    def test_his_three_exits(self, where, word):
-        why = fr.exit_reason("up", where, "up", 100.0, 100.0)
-        assert why, f"{where} did not close the trade"
-        assert word in why
+    def test_coming_apart_is_the_only_exit_in_this_module(self):
+        """Chris: "the only exit is TP or when book and price
+        disagree ... thats the only exit strategy". The take
+        profit is the journal's; this is the other half."""
+        why = fr.exit_reason("up", "apart")
+        assert "come apart" in why
 
-    def test_the_bar_closing_closes_the_trade(self):
-        why = fr.exit_reason("up", "together", "up", 200.0, 100.0)
-        assert "bar this trade opened in has closed" in why
+    @pytest.mark.parametrize("where", ["bounce", "settling",
+                                       "together", ""])
+    def test_nothing_else_closes_a_trade(self, where):
+        """WHAT WAS REMOVED, AND DELIBERATELY.
 
-    def test_the_bar_closing_is_blamed_before_anything_else(self):
-        """ORDER CARRIES MEANING. A new bar is unsettled by
-        construction, so without this the log would blame the
-        settling instead of the candle ending."""
-        why = fr.exit_reason("up", "settling", "", 200.0, 100.0)
-        assert "bar this trade opened in has closed" in why
+        A bounce closed trades for one revision: it was cutting
+        winners the take profit was sized to collect, and the
+        pullback is a reading he wants to SEE rather than act on.
+        The bar closing closed them too -- a bar ending is
+        bookkeeping, not a change in the market -- and with it
+        gone, settling must not close them either, or the
+        bar-close exit comes straight back wearing another name.
+        """
+        assert fr.exit_reason("up", where) == "", \
+            f"{where} still closes a trade"
+        assert fr.exit_reason("down", where) == ""
 
-    def test_moving_together_your_way_holds_the_trade(self):
-        assert fr.exit_reason("up", "together", "up", 100.0, 100.0) == ""
+    def test_the_exit_reads_no_bar_and_no_clock(self):
+        """A POSITION RIDES ACROSS BAR BOUNDARIES NOW. Nothing
+        about which candle it opened in reaches this."""
+        import inspect
+        sig = inspect.signature(fr.exit_reason)
+        assert list(sig.parameters) == ["trade_side", "where"]
+        for bad in ("bar_ts", "open_bar_ts", "held_s", "now_ts"):
+            assert bad not in sig.parameters, \
+                f"exit_reason takes {bad}"
 
-    def test_moving_together_the_other_way_is_not_a_hold(self):
-        why = fr.exit_reason("up", "together", "down", 100.0, 100.0)
-        assert "against you" in why
-
-    def test_an_unknown_bar_stamp_is_not_a_close(self):
-        """A trade with no fused stamp on it -- a hand-taken row,
-        or one opened before this strategy existed -- must not be
-        closed for being in the wrong bar."""
-        assert fr.exit_reason("up", "together", "up", 200.0, 0.0) == ""
+    def test_an_unknown_side_is_never_closed(self):
+        assert fr.exit_reason("", "apart") == ""
+        assert fr.exit_reason("flat", "apart") == ""
 
     def test_state_puts_the_reading_and_the_verdict_in_one_place(self):
         out = fr.state(ofi_dir="down", tick_dir="down", open_px=20.0,
@@ -844,8 +849,11 @@ class TestTheStrategyIsWiredThrough:
         i = blk.index("_fre.exit_reason(")
         seg = blk[i:i + 420]
         assert 'fus.get("where")' in seg
-        assert 'fus.get("bar_ts")' in seg
-        assert 'getattr(t, "bar_ts"' in seg
+        # NO BAR STAMP REACHES THE EXIT. A position rides across
+        # bar boundaries now, so handing it one would be the
+        # bar-close exit coming back by the side door.
+        assert "bar_ts" not in seg, \
+            "the exit still reads which candle the trade opened in"
 
     def test_the_cap_does_not_quietly_become_two(self):
         """`decide` reads `max_per_bar or MAX_PER_BAR`, so a cap of
@@ -1214,3 +1222,192 @@ class TestThePanelActuallyRenders:
                       {**self.BAR, "building": False,
                        "why": "between bars -- the last event closed one"})
         assert "between bars" in html
+
+
+class TestAfterTheTakeProfit:
+    """Chris: "if we hit take profit another trade is taken as long
+    as book and price agree but never trade on settling price and
+    book must agree for 5 seconds before a trade is taken"."""
+
+    # AUTO ON, because `decide` only ever OPENS on auto -- a
+    # hand-taken row is his to open. Closing on a target happens
+    # either way, which is why the close tests below do not need
+    # it.
+    SET = dict(coin="ES", strategy="together", auto=True, tp_on=True,
+               tp_ticks=10.0, sl_on=False)
+
+    def _trade(self):
+        from liqmap.journal import Trade
+        return Trade(id=1, coin="ES", side="up", mode="auto",
+                     opened_ts=0.0, open_px=7160.00,
+                     strategy="together")
+
+    def test_the_take_profit_closes_it(self):
+        from liqmap.journal import Settings, should_close
+        t, s = self._trade(), Settings(**self.SET)
+        assert should_close(t, s, 7162.50, "up", window_rule=True,
+                            disagreed="") == "tp"
+
+    def test_a_bounce_does_not_take_it_off_first(self):
+        """IT WAS CUTTING WINNERS THE TAKE PROFIT WAS SIZED TO
+        COLLECT. Nine ticks into a ten-tick target, a pullback
+        used to close the trade."""
+        from liqmap.journal import Settings, should_close
+        t, s = self._trade(), Settings(**self.SET)
+        assert should_close(t, s, 7162.25, "", window_rule=True,
+                            disagreed=fr.exit_reason("up", "bounce")) == ""
+
+    def test_another_trade_follows_while_they_still_agree(self):
+        """The agreement does not have to re-form: it has been
+        standing the whole time, so `held_s` is already past five
+        seconds and the next look opens again."""
+        from liqmap.journal import Settings, decide
+        s = Settings(**self.SET)
+        act, arg = decide(None, s, 7162.50, "up", (),
+                          window_rule=True, max_per_bar=1_000_000)
+        assert (act, arg) == ("open", "up")
+
+    def test_but_not_while_the_bar_is_settling(self):
+        """"never trade on settling" -- and the rule offers no side
+        at all there, so there is nothing for the journal to
+        open."""
+        from liqmap.journal import Settings, decide
+        s = Settings(**self.SET)
+        side, _ = fr.entry_side("settling", "", held_s=99.0)
+        assert side == ""
+        act, arg = decide(None, s, 7162.50, side, (),
+                          window_rule=True, max_per_bar=1_000_000)
+        assert act != "open", arg
+
+    def test_and_not_before_the_agreement_has_held_five_seconds(self):
+        from liqmap.journal import Settings, decide
+        s = Settings(**self.SET)
+        side, why = fr.entry_side("together", "up", held_s=2.0)
+        assert side == ""
+        assert "5s" in why
+        act, _ = decide(None, s, 7162.50, side, (), window_rule=True,
+                        max_per_bar=1_000_000)
+        assert act != "open"
+
+    def test_the_route_looks_again_after_closing(self):
+        """A CLOSE AND A RE-ENTRY IN ONE POLL. Without the second
+        look the next trade waits for the following poll, and on a
+        target that is the move already gone."""
+        from tests.test_journal import py_func
+        blk = py_func("_journal_step_un")
+        i = blk.index('if act == "close":')
+        seg = blk[i:i + 1600]
+        assert "j.close_trade(" in seg
+        # THE ASSIGNMENT, NOT THE WORDS. A mutation that moved the
+        # call into a lambda and set `act, arg = ("", "")` left
+        # every word in place and re-entered nothing; what matters
+        # is that the second look lands in the variables the code
+        # below acts on.
+        assert "act, arg = jn.decide(None," in seg, \
+            "nothing re-enters until the next poll"
+        k = seg.index("act, arg = jn.decide(None,")
+        assert 'if act == "open":' in seg[k:], \
+            "the second look is taken and then not acted on"
+
+    def test_the_cap_does_not_stop_the_re_entry(self):
+        """The journal counts trades per candle, and a ceiling of
+        two would block the third target of a busy bar."""
+        from tests.test_journal import py_func
+        blk = py_func("_journal_step_un")
+        i = blk.index('\n        if strat == "together":')
+        assert "cap = 1_000_000" in blk[i:i + 1400]
+
+
+class TestNothingOpensOnABounceOrASettlingBar:
+    """Chris: "never take a buy when pulling back from the top or
+    bottom appears or settling -- only when it says both agree and
+    its been held for 5 seconds"."""
+
+    @pytest.mark.parametrize("where", ["bounce", "settling", "apart", ""])
+    def test_only_together_ever_opens(self, where):
+        for side in ("up", "down", ""):
+            got, _ = fr.entry_side(where, side, held_s=999.0)
+            assert got == "", f"{where}/{side} opened a trade"
+
+    def test_together_and_held_is_the_only_way_in(self):
+        assert fr.entry_side("together", "up", held_s=5.0) == ("up", "")
+        assert fr.entry_side("together", "up", held_s=4.9)[0] == ""
+
+    def test_the_reading_offers_no_side_on_a_pullback(self):
+        """BLOCKED TWICE OVER, on purpose: the state has no side to
+        offer, and `entry_side` refuses the state by name."""
+        out = fr.read(ofi_dir="up", tick_dir="up", open_px=7160.50,
+                      high=7184.00, low=7154.00, close=7169.50,
+                      **FULL)
+        assert out["where"] == "bounce"
+        assert out["side"] == ""
+
+
+class TestTheHoldRestartsWhenTheAgreementBreaks:
+    """Chris: "if it bounces but then starts moving together again
+    after the moving together holds for 5 seconds then reenter the
+    trade"."""
+
+    def test_a_bounce_restarts_the_five_seconds(self):
+        c = fr.AgreeHold()
+        c.on_tick("up", 1000.0)
+        assert c.held_s(1010.0) == pytest.approx(10.0)
+        c.on_tick("", 1010.0)            # the bar bounces
+        c.on_tick("", 1130.0)            # still bouncing
+        c.on_tick("up", 1130.0)          # together again
+        assert c.held_s(1130.0) == pytest.approx(0.0), \
+            "the agreement broke and the clock kept running"
+        assert c.held_s(1134.0) == pytest.approx(4.0)
+        assert fr.entry_side("together", "up",
+                             held_s=c.held_s(1134.0))[0] == ""
+        assert fr.entry_side("together", "up",
+                             held_s=c.held_s(1136.0))[0] == "up"
+
+    def test_this_is_where_it_differs_from_dwell(self):
+        """`Dwell` IGNORES A BLANK ON PURPOSE -- there a gap is the
+        candle sitting on its open, and counting it as a turn is
+        what kept the old ten-second hold from ever elapsing. Fed
+        `Dwell`, a two-minute bounce left this clock untouched and
+        the next `together` reading opened a trade on the instant
+        it appeared."""
+        from liqmap.stackwin import Dwell
+        old, new = Dwell(), fr.AgreeHold()
+        for c in (old, new):
+            c.on_tick("up", 1000.0)
+            c.on_tick("", 1010.0)
+            c.on_tick("up", 1130.0)
+        assert old.held_s(1130.0) == pytest.approx(130.0)
+        assert new.held_s(1130.0) == pytest.approx(0.0)
+
+    def test_a_flip_restarts_it_too(self):
+        c = fr.AgreeHold()
+        c.on_tick("up", 1000.0)
+        c.on_tick("down", 1004.0)
+        assert c.held_s(1004.0) == pytest.approx(0.0)
+        assert c.side == "down"
+
+    def test_an_unbroken_run_keeps_counting(self):
+        c = fr.AgreeHold()
+        c.on_tick("up", 1000.0)
+        for t in range(1001, 1010):
+            c.on_tick("up", float(t))
+        assert c.held_s(1010.0) == pytest.approx(10.0)
+        assert c.runs == 1
+
+    def test_junk_never_raises_and_never_backdates(self):
+        c = fr.AgreeHold()
+        c.on_tick("up", 1000.0)
+        for bad in (None, "", "abc"):
+            c.on_tick("up", bad)
+        assert c.held_s(1010.0) == pytest.approx(10.0)
+        assert c.held_s(900.0) == 0.0, "a backwards clock went negative"
+        assert c.held_s("abc") == 0.0
+
+    def test_the_route_uses_it(self):
+        from tests.test_journal import py_func
+        blk = py_func("_journal_step_un")
+        i = blk.index('elif strat == "together":')
+        seg = blk[i:i + 2600]
+        assert "_fr2.AgreeHold()" in seg
+        assert "_fr2.Dwell()" not in seg, \
+            "the agreement is on a clock that ignores it breaking"

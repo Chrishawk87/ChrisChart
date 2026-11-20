@@ -8134,9 +8134,13 @@ def create_app() -> FastAPI:
             # chart's direction, and sharing a tracker would carry
             # a hold across a strategy switch.
             from . import fusedread as _fr2
+            # `AgreeHold`, NOT `Dwell`. A bounce or a settling bar
+            # has to restart the five seconds, and `Dwell` ignores
+            # a blank on purpose -- there a gap is an absence, here
+            # it is the agreement ending.
             _fdw = getattr(rt_, "_fused_dwell", None)
             if _fdw is None:
-                _fdw = _fr2.Dwell()
+                _fdw = _fr2.AgreeHold()
                 try:
                     rt_._fused_dwell = _fdw
                 except Exception:                       # noqa: BLE001
@@ -8331,20 +8335,19 @@ def create_app() -> FastAPI:
             if rev:
                 disagreed = why_rev
         elif strat == "together" and t is not None and t.open:
-            # BOUNCE, APART, OR THE BAR CLOSING. All three named by
-            # Chris; the bar closing is checked first inside
-            # `exit_reason` so the log says the candle ended rather
-            # than blaming a reading taken on the next one.
+            # THE TWO LEGS COMING APART, AND NOTHING ELSE HERE.
+            # Chris: "the only exit is TP or when book and price
+            # disagree ... thats the only exit strategy". The take
+            # profit is the journal's, checked before this; the
+            # bounce and the bar closing both closed trades for one
+            # revision and no longer do.
             #
-            # `bar_ts` ON THE TRADE IS THE FUSED BAR IT OPENED IN,
-            # which is why the stamp below is the fused bar's start
-            # rather than a five-minute boundary.
+            # NO BAR STAMP IS READ. A position rides across bar
+            # boundaries now, which is why nothing here is handed
+            # the fused bar's start.
             from . import fusedread as _fre
             disagreed = _fre.exit_reason(
-                t.side, str(fus.get("where") or ""),
-                str(fus.get("side") or ""),
-                float(fus.get("bar_ts") or 0.0),
-                float(getattr(t, "bar_ts", 0.0) or 0.0)) or disagreed
+                t.side, str(fus.get("where") or "")) or disagreed
         elif strat == "ticks" and t is not None and t.open:
             # EITHER CHART TURNING AGAINST THE POSITION. Still no
             # clock -- "Gate 2's flip only, no clock" -- but the
@@ -17233,7 +17236,7 @@ function paintFusedGate(FG) {
        lie on this panel. */
     + (FG.decides
         ? ' &mdash; in when they move together and it holds, out on '
-          + 'a bounce, on them coming apart, or when the bar closes'
+          + 'your take profit or when they come apart'
         : '. <b style="color:var(--dim)">SHOWN ONLY</b>, nothing '
           + 'here opens or closes a trade')
     + '</div>';
