@@ -119,6 +119,11 @@ class Settings:
     # nothing until it fills.
     fused_ticks: int = 10000
     fused_ofi: int = 4000
+    # HOW MUCH GIVE-BACK IS A BOUNCE, as a percentage, picked on
+    # the panel. Chris, after watching it: "give me a list of
+    # percentages that i can select from starting from 0 to 33%".
+    # It is his exit, so it is a dial rather than a constant.
+    fused_bounce: int = 33
     strategy: str = "ofi"
 
     def to_dict(self) -> dict:
@@ -132,6 +137,7 @@ class Settings:
                 "tick3_exit": bool(self.tick3_exit),
                 "fused_ticks": int(self.fused_ticks or 10000),
                 "fused_ofi": int(self.fused_ofi or 4000),
+                "fused_bounce": int(self.fused_bounce),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
                                                  self.strategy),
@@ -441,6 +447,7 @@ _ADDED_SETTINGS = (
     ("tick3_exit", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_ticks", "INTEGER NOT NULL DEFAULT 10000"),
     ("fused_ofi", "INTEGER NOT NULL DEFAULT 4000"),
+    ("fused_bounce", "INTEGER NOT NULL DEFAULT 33"),
 )
 
 
@@ -504,6 +511,7 @@ class Journal(ThreadedDB):
                         tick3_exit=bool(r["tick3_exit"]),
                         fused_ticks=int(r["fused_ticks"] or 10000),
                         fused_ofi=int(r["fused_ofi"] or 4000),
+                        fused_bounce=int(r["fused_bounce"]),
                         strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
@@ -512,8 +520,8 @@ class Journal(ThreadedDB):
                 "INSERT INTO journal_settings"
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
-                "  fused_ticks, fused_ofi, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "  fused_ticks, fused_ofi, fused_bounce, strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -524,6 +532,7 @@ class Journal(ThreadedDB):
                 " tick3_exit=excluded.tick3_exit,"
                 " fused_ticks=excluded.fused_ticks,"
                 " fused_ofi=excluded.fused_ofi,"
+                " fused_bounce=excluded.fused_bounce,"
                 " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
@@ -546,6 +555,11 @@ class Journal(ThreadedDB):
                  # A pair with no builder behind it is not a
                  # slower reading, it is no reading at all.
                  *_snap_fused(s.fused_ticks, s.fused_ofi),
+                 # ONE OF THE OFFERED PERCENTAGES. Zero is one of
+                 # them and means "any give-back at all", so this
+                 # cannot use `or` anywhere -- zero is a choice,
+                 # not an absence.
+                 _snap_bounce(s.fused_bounce),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 
@@ -971,6 +985,11 @@ STRATEGIES = {
     # with the same 5 second hold on gate 3".
     "ticks": ("Two tick charts -- gate 2 leads, gate 3 confirms and "
               "has to hold 5s"),
+    # THE FUSED BAR, TRADED. Chris, after watching the panel: "the
+    # auto trader will then trade the direction that is set ...
+    # book down or up, price down or up and says moving together".
+    "together": ("Moving together -- the fused bar's book and price "
+                 "agree and have held 5s"),
 }
 
 
@@ -991,6 +1010,24 @@ def _snap_fused(ticks: int | float, ofi: int | float) -> tuple[int, int]:
     if (t, o) in PAIRS:
         return t, o
     return min(PAIRS, key=lambda k: abs(k[0] - t) + abs(k[1] - o))
+
+
+def _snap_bounce(pct: int | float) -> int:
+    """The offered bounce percentage nearest the one asked for.
+
+    ZERO IS A REAL CHOICE HERE and means "any give-back at all", so
+    nothing in this path may treat it as missing. `int(pct or 33)`
+    would silently turn his tightest setting into his loosest.
+    """
+    from .fusedread import BOUNCE_CHOICES
+    opts = [int(round(100.0 * c)) for c in BOUNCE_CHOICES]
+    try:
+        want = int(pct)
+    except (TypeError, ValueError):
+        return opts[-1]
+    if want in opts:
+        return want
+    return min(opts, key=lambda o: abs(o - want))
 
 
 def _clamp_window(window_s: float) -> float:
@@ -1127,6 +1164,20 @@ def window_signal(win: dict, strategy: str = "ofi",
     # window guards below, because it has no timeframe at all --
     # being refused for "no window yet" would block a rule that was
     # never going to look at one.
+    # THE FUSED-BAR RULE READS NO WINDOW EITHER. Checked up here
+    # with the other intrabar rules, before the window guards
+    # below: it reads one fused candle and nothing else, and being
+    # refused for "no window yet" would block a rule that was never
+    # going to look at one.
+    if strategy == "together":
+        if not fused:
+            return "", "no fused bar reading yet"
+        side = str(fused.get("entry") or "")
+        if side in ("up", "down"):
+            return side, ""
+        return "", (str(fused.get("why") or "")
+                    or "the book and price are not moving together")
+
     if strategy == "ticks":
         if not fused:
             return "", "no reading from either tick chart yet"

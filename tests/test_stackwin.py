@@ -658,14 +658,22 @@ class TestItStillTakesAsManyTradesAsTheTapeGives:
         src = (pathlib.Path(__file__).resolve().parents[1]
                / "liqmap" / "web.py").read_text()
         i = src.index("cap = 0")
-        # To the cap itself, not a fixed window -- the stack branch
-        # now sits between them and pushed it out of a 700-char
-        # slice.
-        blk = src[i:src.index("cap = 1", i) + 10]
+        # TO THE END OF THE CAP SECTION, by what follows it.
+        # This read `src.index("cap = 1", i)` -- which a later
+        # strategy's `cap = 1_000_000` matched, truncating the
+        # slice before the branch this test is about. A boundary
+        # that another branch can satisfy by accident is the same
+        # fault as a fixed character window.
+        blk = src[i:src.index("t = j.open_trade_for(", i)]
         assert 'strat in ("fused", "timed")' in blk
         assert 'strat == "stack"' in blk
-        head = blk.split('if strat in ("fused", "timed")')[0]
-        assert "cap = 1" not in head, \
+        # THE STACK BRANCH ITSELF, not everything before the
+        # fused one: other strategies set their own caps in
+        # between now, and this test is about this one.
+        j = blk.index('if strat == "stack":')
+        seg = blk[j:blk.index("if strat ==", j + 10)]
+        assert "cap = _swb.MAX_TRADES_PER_BAR" in seg
+        assert "cap = 1" not in seg, \
             "the stack rule was given a one-per-candle cap"
 
 

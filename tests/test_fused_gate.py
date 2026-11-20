@@ -46,43 +46,71 @@ class TestItOnlySuggests:
             assert bad not in src, f"fusedread.py mentions {bad}"
 
 
-class TestItDecidesNothing:
-    """"Agreeing, bounce shown only" -- and there is no strategy
-    behind it at all yet."""
+class TestWhatItDecides:
+    """IT DECIDES NOW, AND IT DID NOT BEFORE.
 
-    def test_every_reading_says_it_decides_nothing(self):
-        for kw in ({}, {"ofi_dir": "down", "tick_dir": "down",
-                        "open_px": 20.0, "high": 20.0, "low": 0.0,
-                        "close": 1.0},
-                   {"ofi_dir": "up", "tick_dir": "down",
-                    "open_px": 0.0, "high": 10.0, "low": 0.0,
-                    "close": 1.0}):
-            assert fr.read(**kw)["decides"] is False
+    This class replaced one called `TestItDecidesNothing`, which
+    asserted the opposite and was right to. Chris watched the panel
+    and then wrote the rules: "the auto trader will then trade the
+    direction that is set ... book down or up, price down or up and
+    says moving together and exit the trade on bounces never trade
+    when book and price are apart or nothing settled". The old
+    tests guarded a promise the screen no longer makes; they are
+    replaced rather than deleted, so what is guaranteed instead is
+    written down.
+    """
 
-    def test_it_returns_no_side_to_trade(self):
-        """IT HAS NO `side` AND MUST NOT GROW ONE. A reading with a
-        side in it is one line away from being wired to an entry."""
+    def test_it_says_it_decides(self):
         out = fr.read(ofi_dir="down", tick_dir="down", open_px=20.0,
-                      high=20.0, low=0.0, close=1.0)
-        assert "side" not in out, \
-            "the reading offers a side -- it is a gate now"
+                      high=20.0, low=0.0, close=1.0,
+                      net_ofi=-4000, ofi_target=4000,
+                      prints=10000, tick_target=10000)
+        assert out["decides"] is True
 
-    def test_the_route_does_not_let_it_block_or_close(self):
-        src = (SRC / "web.py").read_text()
-        i = src.index("def _fused_gate(")
-        fn = src[i:src.index("\n    def ", i + 10)]
-        for bad in ("entry_side", "exit_reason", "disagreed",
-                    "open_trade", "close_trade", "window_signal"):
-            assert bad not in fn, \
-                f"the fused gate helper touches {bad}"
+    def test_only_moving_together_offers_a_side(self):
+        """NEVER TRADE WHEN THEY ARE APART OR NOTHING IS SETTLED.
+        Every other state returns no side at all, rather than a
+        side with a flag beside it -- a side that exists is a side
+        something eventually trades."""
+        full = dict(net_ofi=-4000, ofi_target=4000, prints=10000,
+                    tick_target=10000)
+        together = fr.read(ofi_dir="down", tick_dir="down",
+                           open_px=20.0, high=20.0, low=0.0,
+                           close=1.0, **full)
+        assert together["where"] == "together"
+        assert together["side"] == "down"
+        for name, kw in [
+            ("bounce", dict(ofi_dir="down", tick_dir="down",
+                            open_px=20.0, high=20.0, low=0.0,
+                            close=12.0)),
+            ("apart", dict(ofi_dir="down", tick_dir="up",
+                           open_px=0.0, high=10.0, low=0.0,
+                           close=9.0)),
+            ("flat book", dict(ofi_dir="flat", tick_dir="up",
+                               open_px=0.0, high=10.0, low=0.0,
+                               close=9.0)),
+        ]:
+            out = fr.read(**kw, **full)
+            assert out["side"] == "", f"{name} offered a side"
 
-    def test_no_rule_module_imports_it(self):
-        """IT IS NOT REACHABLE FROM A RULE. The panel reads it; the
-        rules must not, until he writes the rules."""
-        for mod in ("stackwin.py", "twotick.py", "journal.py"):
+    def test_a_settling_bar_offers_nothing(self):
+        out = fr.read(ofi_dir="down", tick_dir="down", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0,
+                      net_ofi=-10, ofi_target=4000,
+                      prints=40, tick_target=10000)
+        assert out["where"] == "settling"
+        assert out["side"] == ""
+        assert fr.entry_side(out["where"], out["side"],
+                             held_s=99.0)[0] == ""
+
+    def test_the_tick_strategies_do_not_import_it(self):
+        """ONE RULE PER STRATEGY. The tick strategies must not
+        reach this reading -- a gate shared between two rules is
+        how a change made for one silently moves the other."""
+        for mod in ("stackwin.py", "twotick.py"):
             src = (SRC / mod).read_text()
             assert "fusedread" not in src, \
-                f"{mod} imports the shown-only reading"
+                f"{mod} imports the fused reading"
 
 
 class TestHisFourCases:
@@ -340,13 +368,27 @@ class TestItIsWiredThrough:
         """NOT TIED TO ONE. The whole point is watching it while
         trading something else -- "a visible gate all on its own
         that i can look at the same way i can see the tick bar
-        strategy"."""
+        strategy". On its own strategy it is the reading the rule
+        already took; on every other one it is computed fresh. What
+        must never happen is `None`."""
         blk = self._step()
         i = blk.index('"fusedgate"')
-        seg = blk[i:i + 400]
-        assert "strat ==" not in seg, \
+        seg = blk[i:i + 700]
+        assert "else None" not in seg, \
             "the fused gate is hidden behind a strategy"
-        assert "else None" not in seg
+        assert "_fused_gate(" in seg
+
+    def test_its_own_strategy_reuses_the_reading_it_traded_on(self):
+        """A SECOND CALL WOULD READ THE BAR A MOMENT LATER and the
+        panel could show a state the rule never saw. That is how
+        the 5-minute cell and the OFI bar each came to disagree
+        with the rule beside them."""
+        blk = self._step()
+        i = blk.index('"fusedgate"')
+        seg = blk[i:i + 700]
+        assert 'if strat == "together"' in seg
+        assert "**fus" in seg, \
+            "the panel recomputes instead of reusing the reading"
 
     def test_the_panel_is_drawn_and_shown(self):
         src = self._web()
@@ -411,7 +453,12 @@ class TestItActuallySteps:
         fg = jr.get("fusedgate")
         assert fg is not None, (
             f"the fused gate is missing on the {strat} strategy")
-        assert fg.get("decides") is False
+        # ONE SHAPE ON EVERY STRATEGY. It reads the same bar
+        # whichever rule is running, so a panel that changed shape
+        # with the dropdown would be two panels wearing one name.
+        assert fg.get("decides") is True
+        for k in ("where", "entry", "label", "held"):
+            assert k in fg, f"{k} missing on the {strat} strategy"
 
     def test_the_payload_names_the_pair_it_read(self, client,
                                                 monkeypatch):
@@ -443,3 +490,473 @@ class TestItActuallySteps:
         s = d.get("settings") or d
         assert int(s.get("fused_ticks")) == 5000, \
             "a setting the call did not mention was reset"
+
+
+FULL = dict(net_ofi=-4000, ofi_target=4000, prints=10000,
+            tick_target=10000)
+
+
+class TestSettling:
+    """Chris: "everytime a new tick ofi candle prints instead
+    allowing it to bounce up and down or not sure of direction let
+    it settle and then pick true direction"."""
+
+    def test_a_new_bar_names_no_direction(self):
+        out = fr.read(ofi_dir="down", tick_dir="down", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0,
+                      net_ofi=-20, ofi_target=4000,
+                      prints=50, tick_target=10000)
+        assert out["where"] == "settling"
+        assert out["side"] == ""
+        assert out["settled"] is False
+        assert out["settle_why"]
+
+    def test_both_legs_have_to_settle_not_either(self):
+        """A bar can be most of the way along its print count with
+        an accumulator on zero -- busy and uncommitted -- and that
+        is exactly the bar whose direction means nothing."""
+        prints_only = fr.read(ofi_dir="down", tick_dir="down",
+                              open_px=20.0, high=20.0, low=0.0,
+                              close=1.0, net_ofi=-10,
+                              ofi_target=4000, prints=9000,
+                              tick_target=10000)
+        assert prints_only["where"] == "settling"
+        book_only = fr.read(ofi_dir="down", tick_dir="down",
+                            open_px=20.0, high=20.0, low=0.0,
+                            close=1.0, net_ofi=-3900,
+                            ofi_target=4000, prints=20,
+                            tick_target=10000)
+        assert book_only["where"] == "settling"
+
+    def test_ten_percent_of_both_settles_it(self):
+        out = fr.read(ofi_dir="down", tick_dir="down", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0,
+                      net_ofi=-400, ofi_target=4000,
+                      prints=1000, tick_target=10000)
+        assert out["settled"] is True
+        assert out["where"] == "together"
+
+    def test_it_is_the_same_warm_up_the_fused_strategy_uses(self):
+        """TWO WARM-UPS THAT COULD DISAGREE would mean one panel
+        calling a bar settled while the other does not."""
+        from liqmap.fusedbar import MIN_FRACTION
+        assert fr.MIN_SETTLE == MIN_FRACTION
+
+    def test_once_settled_the_direction_is_held_through_a_tie(self):
+        """"then pick true direction" -- and keep it. A bar that
+        ticks back to flat for an instant has not changed its
+        mind."""
+        first = fr.read(ofi_dir="down", tick_dir="down",
+                        open_px=20.0, high=20.0, low=0.0, close=1.0,
+                        bar_ts=100.0, **FULL)
+        assert first["where"] == "together"
+        tie = fr.read(ofi_dir="flat", tick_dir="flat", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0, bar_ts=100.0,
+                      prev=first["held"], **FULL)
+        assert tie["ofi_dir"] == "down"
+        assert tie["where"] == "together"
+
+    def test_the_memory_dies_at_the_bar_boundary(self):
+        """HOLDING A DIRECTION INTO A NEW BAR would defeat the
+        settling it was added for -- the new bar would open already
+        pointing somewhere."""
+        first = fr.read(ofi_dir="down", tick_dir="down",
+                        open_px=20.0, high=20.0, low=0.0, close=1.0,
+                        bar_ts=100.0, **FULL)
+        nxt = fr.read(ofi_dir="flat", tick_dir="flat", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0, bar_ts=200.0,
+                      prev=first["held"], **FULL)
+        # "flat" is what the builder itself reports for a zero
+        # accumulator, and it is passed through honestly. What
+        # must not survive is the DOWN from the previous bar.
+        assert nxt["ofi_dir"] != "down", \
+            "a direction was carried into a new bar"
+        assert nxt["where"] != "together"
+        assert nxt["side"] == ""
+
+    def test_the_memory_names_the_bar_it_belongs_to(self):
+        out = fr.read(ofi_dir="down", tick_dir="down", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0, bar_ts=100.0,
+                      **FULL)
+        assert out["held"]["bar_ts"] == 100.0
+        assert set(out["held"]) >= {"ofi_dir", "tick_dir", "bar_ts"}
+
+    def test_an_unsettled_bar_does_not_hold_anything(self):
+        """The hold starts when the direction is picked, not
+        before -- otherwise the first flicker of a new bar gets
+        held for the rest of it."""
+        out = fr.read(ofi_dir="flat", tick_dir="flat", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0, bar_ts=100.0,
+                      prev={"ofi_dir": "down", "tick_dir": "down",
+                            "bar_ts": 100.0},
+                      net_ofi=-10, ofi_target=4000, prints=20,
+                      tick_target=10000)
+        assert out["where"] == "settling"
+
+
+class TestTheBounceDial:
+    """Chris: "give me a list of percentages that i can select from
+    starting from 0 to 33%"."""
+
+    def test_the_choices_run_from_zero_to_a_third(self):
+        assert fr.BOUNCE_CHOICES[0] == 0.0
+        assert fr.BOUNCE_CHOICES[-1] == pytest.approx(0.33)
+        assert list(fr.BOUNCE_CHOICES) == sorted(fr.BOUNCE_CHOICES)
+        assert len(set(fr.BOUNCE_CHOICES)) == len(fr.BOUNCE_CHOICES)
+
+    @pytest.mark.parametrize("pct,close_px,where", [
+        (0.33, 12.0, "bounce"), (0.33, 6.0, "together"),
+        (0.10, 3.0, "bounce"), (0.10, 1.0, "together"),
+        (0.05, 2.0, "bounce"),
+    ])
+    def test_a_tighter_setting_calls_it_sooner(self, pct, close_px,
+                                               where):
+        out = fr.read(ofi_dir="down", tick_dir="down", open_px=20.0,
+                      high=20.0, low=0.0, close=close_px,
+                      bounce_at=pct, **FULL)
+        assert out["where"] == where
+
+    def test_zero_means_any_give_back_at_all(self):
+        at_low = fr.read(ofi_dir="down", tick_dir="down",
+                         open_px=20.0, high=20.0, low=0.0,
+                         close=0.0, bounce_at=0.0, **FULL)
+        assert at_low["where"] == "together", \
+            "at zero every bar reads as a bounce and nothing ever trades"
+        off_low = fr.read(ofi_dir="down", tick_dir="down",
+                          open_px=20.0, high=20.0, low=0.0,
+                          close=0.25, bounce_at=0.0, **FULL)
+        assert off_low["where"] == "bounce"
+
+    def test_the_setting_reaches_the_reading(self):
+        out = fr.read(ofi_dir="down", tick_dir="down", open_px=20.0,
+                      high=20.0, low=0.0, close=1.0, bounce_at=0.15,
+                      **FULL)
+        assert out["bounce_at"] == pytest.approx(0.15)
+
+
+class TestTheRule:
+    """"book down or up, price down or up and says moving together
+    ... exit the trade on bounces never trade when book and price
+    are apart or nothing settled"."""
+
+    @pytest.mark.parametrize("side", ["up", "down"])
+    def test_moving_together_and_held_opens(self, side):
+        assert fr.entry_side("together", side, held_s=9.0) == (side, "")
+
+    def test_the_agreement_has_to_hold_five_seconds(self):
+        """"after the moving together holds for 5 seconds then
+        reenter the trade"."""
+        assert fr.DWELL_S == 5.0
+        got, why = fr.entry_side("together", "down", held_s=1.0)
+        assert got == ""
+        assert "moving down together for 1s" in why
+        assert fr.entry_side("together", "down", held_s=5.0)[0] == "down"
+
+    @pytest.mark.parametrize("where,word", [
+        ("apart", "apart"),
+        ("settling", "has not settled"),
+        ("bounce", "bouncing"),
+        ("", "nothing settled"),
+    ])
+    def test_nothing_else_opens_a_trade_and_each_says_why(
+            self, where, word):
+        """THE REFUSAL HAS TO NAME THE STATE THAT REFUSED.
+
+        Each of these is blocked twice over -- the specific check,
+        and the catch-all for anything that is not `together`. A
+        mutation deleting the bounce check therefore changed no
+        behaviour and survived a test that only asked whether a
+        trade opened. What it changed was the sentence on the
+        panel: a bounce started reading as "nothing settled",
+        which is a different market and the wrong thing to do
+        about it.
+        """
+        got, why = fr.entry_side(where, "down", held_s=99.0)
+        assert got == "", f"{where} opened a trade"
+        assert word in why, f"{where} refused with: {why}"
+
+    def test_an_untracked_hold_does_not_block(self):
+        assert fr.entry_side("together", "up", held_s=None) == ("up", "")
+
+    @pytest.mark.parametrize("where,word", [
+        ("bounce", "bouncing"), ("apart", "come apart"),
+        ("settling", "no longer settled"),
+    ])
+    def test_his_three_exits(self, where, word):
+        why = fr.exit_reason("up", where, "up", 100.0, 100.0)
+        assert why, f"{where} did not close the trade"
+        assert word in why
+
+    def test_the_bar_closing_closes_the_trade(self):
+        why = fr.exit_reason("up", "together", "up", 200.0, 100.0)
+        assert "bar this trade opened in has closed" in why
+
+    def test_the_bar_closing_is_blamed_before_anything_else(self):
+        """ORDER CARRIES MEANING. A new bar is unsettled by
+        construction, so without this the log would blame the
+        settling instead of the candle ending."""
+        why = fr.exit_reason("up", "settling", "", 200.0, 100.0)
+        assert "bar this trade opened in has closed" in why
+
+    def test_moving_together_your_way_holds_the_trade(self):
+        assert fr.exit_reason("up", "together", "up", 100.0, 100.0) == ""
+
+    def test_moving_together_the_other_way_is_not_a_hold(self):
+        why = fr.exit_reason("up", "together", "down", 100.0, 100.0)
+        assert "against you" in why
+
+    def test_an_unknown_bar_stamp_is_not_a_close(self):
+        """A trade with no fused stamp on it -- a hand-taken row,
+        or one opened before this strategy existed -- must not be
+        closed for being in the wrong bar."""
+        assert fr.exit_reason("up", "together", "up", 200.0, 0.0) == ""
+
+    def test_state_puts_the_reading_and_the_verdict_in_one_place(self):
+        out = fr.state(ofi_dir="down", tick_dir="down", open_px=20.0,
+                       high=20.0, low=0.0, close=1.0, held_s=9.0,
+                       bar_ts=100.0, **FULL)
+        assert out["where"] == "together"
+        assert out["entry"] == "down"
+        assert out["ready"] is True
+        assert out["bar_ts"] == 100.0
+        assert out["min_hold_s"] == 5.0
+
+    def test_state_counts_the_hold_down(self):
+        out = fr.state(ofi_dir="down", tick_dir="down", open_px=20.0,
+                       high=20.0, low=0.0, close=1.0, held_s=2.0,
+                       bar_ts=100.0, **FULL)
+        assert out["entry"] == ""
+        assert out["ready"] is False
+        assert out["held_s"] == 2.0
+
+
+class TestTheStrategyIsWiredThrough:
+    def _web(self):
+        return (SRC / "web.py").read_text()
+
+    def _step(self):
+        from tests.test_journal import py_func
+        return py_func("_journal_step_un")
+
+    def test_it_is_a_registered_strategy(self):
+        from liqmap.journal import STRATEGIES
+        assert "together" in STRATEGIES
+
+    def test_it_survives_being_saved(self, tmp_path):
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", strategy="together"))
+        assert j.settings("ES").strategy == "together", \
+            "an unregistered strategy is silently rewritten to ofi"
+
+    def test_the_dropdown_offers_it(self):
+        assert 'value="together"' in self._web()
+
+    def test_the_signal_does_not_wait_on_a_window(self):
+        from liqmap.journal import window_signal
+        side, why = window_signal({}, "together", "",
+                                  {"entry": "down", "why": ""})
+        assert side == "down", why
+        side, why = window_signal({}, "together", "", {})
+        assert side == ""
+        assert "window" not in why
+
+    def test_the_signal_reads_the_entry_not_the_raw_side(self):
+        """`side` is the direction the BAR is pointing; `entry` is
+        the one the rule will act on. They differ for the whole of
+        the five-second hold, and reading the wrong one would enter
+        the moment they agree."""
+        side, why = window_signal_safe({"side": "down", "entry": "",
+                                        "why": "holding"})
+        assert side == ""
+        assert "holding" in why
+
+    def test_the_step_builds_it(self):
+        blk = self._step()
+        assert 'strat == "together"' in blk
+        assert "_fused_gate(rt_, _fpair" in blk
+
+    def test_zero_percent_is_never_treated_as_missing(self):
+        """`or 33` ANYWHERE ON THIS PATH turns his tightest setting
+        into his loosest, silently, on every save."""
+        blk = self._step()
+        i = blk.index("_fb_pct = ")
+        seg = blk[i:i + 420]
+        assert "or 33" not in seg
+        assert "is None" in seg
+        src = self._web()
+        assert "fused_bounce: $('jnlBounce') ? $('jnlBounce').value : 33," \
+            in src, "the page defaults the bounce with ||"
+
+    def test_the_dwell_is_fed_the_agreement_not_a_leg(self):
+        """"after the moving together holds for 5 seconds" -- it is
+        the together STATE that has to stand, so a bar flickering
+        in and out of agreement never accumulates five seconds."""
+        blk = self._step()
+        i = blk.index("_fdw.on_tick(")
+        seg = blk[i:blk.index("\n", i)]
+        assert "_peek" in seg
+        assert "ofi_dir" not in seg, \
+            "the hold is being fed a leg rather than the agreement"
+
+    def test_it_keeps_its_own_dwell_and_memory(self):
+        blk = self._step()
+        assert "_fused_dwell" in blk
+        assert "_fused_held" in blk
+        seg = blk[blk.index('strat == "together"'):]
+        seg = seg[:seg.index('strat == "ticks"')] if \
+            'strat == "ticks"' in seg else seg
+        assert "_ticks_dwell" not in seg
+        assert "_tick_dwell" not in seg
+
+    def test_the_exit_is_handed_what_state_resolved(self):
+        blk = self._step()
+        i = blk.index("_fre.exit_reason(")
+        seg = blk[i:i + 420]
+        assert 'fus.get("where")' in seg
+        assert 'fus.get("bar_ts")' in seg
+        assert 'getattr(t, "bar_ts"' in seg
+
+    def test_the_cap_does_not_quietly_become_two(self):
+        """`decide` reads `max_per_bar or MAX_PER_BAR`, so a cap of
+        0 applies the default of two. He asked for no ceiling: "as
+        many times as it meets the rule agreement"."""
+        blk = self._step()
+        # `elif strat == "together":` CONTAINS THIS STRING, so a
+        # bare index lands on the step branch instead of the cap.
+        i = blk.index('\n        if strat == "together":')
+        seg = blk[i:i + 1400]
+        assert "cap = 1_000_000" in seg
+        assert "cap = 0" not in seg
+        assert 'bar_ts = float(fus.get("bar_ts")' in seg, \
+            "the cap counts against the wrong candle"
+
+    def test_the_panel_draws_the_new_states(self):
+        src = self._web()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "SETTLING" in fn
+        assert "FG.ready === false" in fn, \
+            "the hold countdown is never drawn"
+        assert "FG.entry" in fn
+        assert "FG.blocked_by" in fn, \
+            "a refusal by the journal is invisible on this panel"
+        assert "FG.decides" in fn, \
+            "the heading cannot stop saying SHOWN ONLY"
+
+    def test_the_bounce_selector_offers_his_list(self):
+        import re
+        src = self._web()
+        i = src.index('id="jnlBounce"')
+        box = src[i:src.index("</select>", i)]
+        shown = sorted(int(m) for m in
+                       re.findall(r'value="(\d+)"', box))
+        want = sorted(int(round(100 * c)) for c in fr.BOUNCE_CHOICES)
+        assert shown == want
+
+    def test_the_bounce_setting_round_trips_including_zero(self,
+                                                           tmp_path):
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        for pct in (0, 5, 10, 15, 20, 25, 33):
+            j.save_settings(Settings(coin="ES", fused_bounce=pct))
+            assert j.settings("ES").fused_bounce == pct, \
+                f"{pct}% did not survive the save"
+
+
+def window_signal_safe(fused: dict):
+    from liqmap.journal import window_signal
+    return window_signal({}, "together", "", fused)
+
+
+class TestTheStrategyActuallySteps:
+    @pytest.mark.parametrize("bounce", [0, 5, 15, 33])
+    def test_the_step_runs_at_every_bounce_setting(
+            self, client, monkeypatch, bounce):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        s.fused_bounce = bounce
+        rt.journal.save_settings(s)
+        assert rt.journal.settings("ES").fused_bounce == bounce
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, (
+            f"the step raised at {bounce}%: {jr.get('error')}")
+
+    def test_the_panel_carries_the_rules_verdict(self, client,
+                                                 monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        fg = ((d.get("journal") or {}).get("fusedgate")) or {}
+        assert fg, "the fused panel is missing on its own strategy"
+        # ONE SHAPE WHETHER OR NOT A BAR IS BUILDING. The fixture
+        # has no tape engine, so this exercises the path that used
+        # to return a short dict with no verdict in it at all.
+        assert "entry" in fg, "the panel shows no verdict"
+        assert fg.get("decides") is True
+        assert "min_hold_s" in fg
+        assert "where" in fg and "held" in fg
+
+    def test_its_memory_rides_home_between_polls(self, client,
+                                                 monkeypatch):
+        """WITHOUT IT NOTHING HOLDS. These functions are pure --
+        drop the one assignment and the direction blanks at every
+        tie and the hold restarts on an absence. Nothing raises; it
+        quietly stops working."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        rt.journal.save_settings(s)
+        for attr in ("_fused_held", "_fused_dwell"):
+            try:
+                delattr(rt, attr)
+            except AttributeError:
+                pass
+        for _ in range(2):
+            client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH)
+        # NOT `assert held` -- with no tape engine in the fixture
+        # the reading is empty, and an empty dict is the honest
+        # answer there. What must never happen is the attribute
+        # going unset, which is what dropping the assignment does.
+        assert getattr(rt, "_fused_held", None) is not None, \
+            "the previous reading is never kept"
+        assert getattr(rt, "_fused_dwell", None) is not None
+
+    def test_its_clock_is_not_the_tick_strategys(self, client,
+                                                 monkeypatch):
+        """Sharing one would carry a hold across a strategy switch,
+        from a reading this rule never took."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        for strat in ("ticks", "together"):
+            s = rt.journal.settings("ES")
+            s.strategy = strat
+            rt.journal.save_settings(s)
+            client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH)
+        a = getattr(rt, "_fused_dwell", None)
+        b = getattr(rt, "_ticks_dwell", None)
+        assert a is not None and b is not None
+        assert a is not b, "both strategies share one clock"

@@ -44,23 +44,68 @@ word the panel prints and nothing else; the raw percentage is
 drawn beside it either way, so nothing is hidden behind the
 threshold and no trade turns on it.
 
-THIS DECIDES NOTHING. Chris: "Agreeing, bounce shown only" -- and
-at this point there is no strategy behind it at all. It is a panel
-to watch. Every block it emits carries `decides: False`, and a
-test asserts that, because on this engine a reading that is drawn
-like a gate eventually gets treated as one.
+IT DECIDES NOW, AND IT DID NOT BEFORE. It shipped as a panel --
+"Agreeing, bounce shown only" -- he watched it, and then wrote the
+rules off what he saw: "the auto trader will then trade the
+direction that is set for example: ( book down or up, price down
+or up and says moving together) and exit the trade on bounces
+never trade when book and price are apart or nothing settled".
+
+So `decides` is True, the panel no longer says SHOWN ONLY, and the
+tests that enforced the old promise have been replaced rather than
+deleted -- what they guarded was a claim on the screen, and the
+screen now makes the opposite claim.
+
+SETTLING, AND WHY IT IS NOT A DETAIL.
+
+    Chris: "everytime a new tick ofi candle prints instead allowing
+    it to bounce up and down or not sure of direction let it settle
+    and then pick true direction."
+
+    A fused bar's first prints have almost no range and an
+    accumulator near zero, so both legs flicker. Reading a
+    direction there is reading noise, and a rule that enters on it
+    enters at random. Below `MIN_SETTLE` of BOTH legs this reports
+    "settling" and offers no direction at all -- the same 10% the
+    fused strategy's `live_signal` already waits for, so the two
+    warm-ups cannot disagree.
+
+    Once settled, the direction is HELD through a tie, exactly as
+    the tick gates hold theirs. A bar that ticks back to flat for
+    an instant has not changed its mind.
+
+    THE MEMORY DIES AT THE BAR BOUNDARY. Holding a direction into a
+    new bar would defeat the settling it was added for, so `prev`
+    carries the bar it belongs to and is dropped when that changes.
 """
 
 from __future__ import annotations
 
+from .stackwin import Dwell, hold_dir  # noqa: F401
 from .tapeintent import EPS, depth
 
 SIDES = ("up", "down")
 
-# How much of the bar's move has to be given back before the panel
-# calls it a bounce rather than a push. A third: enough to be a
-# move against the bar rather than a tick of noise at the extreme.
+# How much of the bar's move has to be given back before this calls
+# it a bounce rather than a push.
+#
+# IT IS PICKED ON THE PANEL NOW. Chris, after watching it: "when it
+# actually bounces it takes a long time for it to say that it
+# bounced almost 20 ticks of move before it does" -- a third of a
+# 10,000-print bar's move is a long way on ES. He asked for "a list
+# of percentages that i can select from starting from 0 to 33%".
 BOUNCE_AT = 0.33
+BOUNCE_CHOICES = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.33)
+
+# How far along BOTH legs a bar has to be before any direction is
+# read off it. The same 10% `fusedbar.live_signal` already waits
+# for, imported rather than restated so the two cannot drift.
+MIN_SETTLE = 0.10
+
+# The turn has to stand this long before it opens a trade. Chris:
+# "after the moving together holds for 5 seconds then reenter the
+# trade" -- the same five seconds his tick strategy runs on.
+DWELL_S = 5.0
 
 # Where in its own high-low range the close has to sit before the
 # panel will say "at the top" or "at the bottom" of the bar.
@@ -120,10 +165,47 @@ def legs(net_ofi: float, ofi_target: float,
             "waiting_on": waiting}
 
 
+def settled(net_ofi: float, ofi_target: float,
+            prints: float, tick_target: float,
+            min_settle: float = MIN_SETTLE) -> tuple[bool, str]:
+    """Has enough of this bar arrived to read a direction off it?
+
+    BOTH LEGS, NOT EITHER. A bar can be 90% of the way along its
+    print count with an accumulator sitting on zero -- busy and
+    uncommitted -- and that is precisely the bar whose direction
+    means nothing.
+
+    Chris: "everytime a new tick ofi candle prints instead allowing
+    it to bounce up and down or not sure of direction let it settle
+    and then pick true direction."
+    """
+    try:
+        no, ot = abs(float(net_ofi or 0.0)), float(ofi_target or 0.0)
+        pr, tt = float(prints or 0.0), float(tick_target or 0.0)
+        frac = float(min_settle or 0.0)
+    except (TypeError, ValueError):
+        return False, "nothing has arrived in this bar yet"
+    if frac <= 0.0:
+        return True, ""
+    pct = int(round(100.0 * frac))
+    need_o, need_t = ot * frac, tt * frac
+    if ot > 0 and no < need_o:
+        return False, (f"the book has moved {int(no):,} of the "
+                       f"{int(need_o):,} ({pct}% of the bar) it takes "
+                       "before a direction counts")
+    if tt > 0 and pr < need_t:
+        return False, (f"{int(pr):,} prints in -- {int(need_t):,} "
+                       f"({pct}% of the bar) before a direction "
+                       "counts")
+    return True, ""
+
+
 def _say(where: str, ofi_dir: str, tick_dir: str, pos: float | None,
          back: float, edge: str) -> str:
     """One sentence, in the words he used to describe each state."""
     pct = int(round(100.0 * back))
+    if where == "settling":
+        return edge or "settling -- not enough of this bar yet"
     if where == "together":
         side = "down" if ofi_dir == "down" else "up"
         end = "low" if side == "down" else "high"
@@ -151,31 +233,53 @@ def read(ofi_dir: str = "", tick_dir: str = "",
          close: float = 0.0,
          net_ofi: float = 0.0, ofi_target: float = 0.0,
          prints: float = 0.0, tick_target: float = 0.0,
-         bounce_at: float = BOUNCE_AT) -> dict:
+         bounce_at: float = BOUNCE_AT,
+         min_settle: float = MIN_SETTLE,
+         bar_ts: float = 0.0,
+         prev: dict | None = None) -> dict:
     """The whole reading of one forming fused bar.
 
     `where` is the headline and it is one of:
 
+        "settling"  too little of the bar has arrived to read a
+                    direction off it at all
         "together"  both legs the same way, price still at the end
                     of the move it made
         "bounce"    both legs the same way, price has come back off
                     that extreme by more than `bounce_at`
         "apart"     the book and the traded price disagree
-        ""          neither has said anything yet
+        ""          settled, but neither leg has said anything
 
-    NOTHING HERE GATES ANYTHING. `decides` is False on every block
-    and stays False until he writes the rules: "we can create the
-    strategy after i can see what it does ill make entry and exit
-    rules then".
+    ONLY "together" IS TRADEABLE, and only after it has held. The
+    rest are reasons not to be in: "never trade when book and price
+    are apart or nothing settled".
     """
     ofi_dir = str(ofi_dir or "")
     tick_dir = str(tick_dir or "")
+    prev = prev or {}
+    # THE MEMORY BELONGS TO ONE BAR. Carrying a held direction into
+    # a new bar would defeat the settling it was added for -- the
+    # new bar would open already pointing somewhere.
+    same_bar = bool(float(prev.get("bar_ts") or 0.0)
+                    == float(bar_ts or 0.0))
+    ok, settle_why = settled(net_ofi, ofi_target, prints,
+                             tick_target, min_settle)
+    if ok and same_bar:
+        # HELD THROUGH A TIE, once the bar has settled. A bar that
+        # ticks back to flat for an instant has not changed its
+        # mind, and an absence must never read as a reversal.
+        ofi_dir = hold_dir(ofi_dir, str(prev.get("ofi_dir") or ""))
+        tick_dir = hold_dir(tick_dir, str(prev.get("tick_dir") or ""))
+
     pos = position(high, low, close)
     edge = at_edge(pos)
     back = depth(ofi_dir, open_px, high, low, close)
     agree = bool(ofi_dir in SIDES and ofi_dir == tick_dir)
+    bounce_at = float(bounce_at if bounce_at is not None else BOUNCE_AT)
 
-    if ofi_dir not in SIDES:
+    if not ok:
+        where = "settling"
+    elif ofi_dir not in SIDES:
         where = ""
     elif tick_dir not in SIDES:
         # THE BOOK HAS COMMITTED AND PRICE HAS NOT. Not a
@@ -184,13 +288,26 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         where = ""
     elif not agree:
         where = "apart"
-    elif back >= float(bounce_at or 0.0):
+    elif back > 0.0 and back >= bounce_at:
+        # `back > 0.0` IS WHAT MAKES 0% USABLE. He asked for a list
+        # "starting from 0", and at zero a bare `>=` would call a
+        # bar sitting exactly on its extreme a bounce -- every bar
+        # would be one and "together" would never appear. At zero
+        # this means "any give-back at all", which is what picking
+        # zero is asking for.
         where = "bounce"
     else:
         where = "together"
 
     return {
         "where": where,
+        "settled": ok,
+        "settle_why": settle_why,
+        # THE SIDE THIS OFFERS, AND ONLY FROM "together". Every
+        # other state returns no side at all rather than a side with
+        # a flag beside it -- a side that exists is a side something
+        # eventually trades.
+        "side": ofi_dir if where == "together" else "",
         "agree": agree,
         "ofi_dir": ofi_dir,
         "tick_dir": tick_dir,
@@ -204,7 +321,123 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         "bounce_at": float(bounce_at or 0.0),
         "legs": legs(net_ofi, ofi_target, prints, tick_target),
         "say": _say(where, ofi_dir, tick_dir, pos, back, edge),
-        # SHOWN ONLY. Chris: "Agreeing, bounce shown only", and
-        # there is no strategy behind this yet at all.
-        "decides": False,
+        # WHAT THE NEXT READING NEEDS BACK. A field dropped from
+        # here does not error -- it silently resets that part of the
+        # reading on every poll, which is how a hold that never
+        # elapsed and a direction that chattered both got shipped.
+        "held": {"ofi_dir": ofi_dir, "tick_dir": tick_dir,
+                 "bar_ts": float(bar_ts or 0.0)},
+        "decides": True,
     }
+
+
+def entry_side(where: str, side: str,
+               held_s: float | None = None,
+               min_hold_s: float = DWELL_S) -> tuple[str, str]:
+    """The side this bar is offering, and why not.
+
+    Chris: "the auto trader will then trade the direction that is
+    set for example: ( book down or up, price down or up and says
+    moving together) ... never trade when book and price are apart
+    or nothing settled".
+
+    SO ONLY "together" OPENS ANYTHING. A bounce does not -- it is
+    what closes a trade, and entering on one would be entering
+    against the retrace that just stopped the last one.
+
+    THE HOLD IS ON THE AGREEMENT ITSELF. "after the moving together
+    holds for 5 seconds then reenter the trade" -- it is the
+    together STATE that has to stand, not either leg on its own, so
+    a bar that flickers in and out of agreement never accumulates
+    five seconds of it.
+    """
+    if where == "settling":
+        return "", "the bar has not settled -- no direction yet"
+    if where == "apart":
+        return "", "the book and price are apart"
+    if where == "bounce":
+        return "", "price is bouncing off this bar's extreme"
+    if where != "together" or side not in SIDES:
+        return "", "nothing settled -- neither leg has committed"
+    if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
+        return "", (f"they have been moving {side} together for "
+                    f"{held_s:.0f}s -- it has to hold "
+                    f"{min_hold_s:.0f}s")
+    return side, ""
+
+
+def exit_reason(trade_side: str, where: str, side: str = "",
+                bar_ts: float = 0.0, open_bar_ts: float = 0.0) -> str:
+    """Why this trade should end now, or "" to hold it.
+
+    THREE THINGS CLOSE IT, and Chris named all three: "Bounce,
+    apart, or the bar closing".
+
+    THE BAR CLOSING IS CHECKED FIRST, so the log says the candle
+    ended rather than blaming a reading taken on the next one. A
+    new bar is unsettled by construction -- holding a position into
+    a stretch where this rule has no reading at all is the thing
+    the settling was added to avoid, and it would be worse inside a
+    trade than outside one.
+
+    A BOUNCE IS NOT A REVERSAL and it still closes the trade. That
+    is his rule, not an inference: the book is still pointing his
+    way when it fires. The take profit is what takes a good trade
+    off; this takes him out of one that has stopped going.
+    """
+    if trade_side not in SIDES:
+        return ""
+    if open_bar_ts and bar_ts and float(bar_ts) != float(open_bar_ts):
+        return "the fused bar this trade opened in has closed"
+    if where == "bounce":
+        return "price is bouncing off this bar's extreme"
+    if where == "apart":
+        return "the book and price have come apart"
+    if where == "settling":
+        return "the bar is no longer settled"
+    # THE DIRECTION TURNING UNDER AN OPEN TRADE. Not one of the
+    # three he listed, because with those three in place it can
+    # barely happen -- the book flipping shows up as "apart" first.
+    # It is here so that the one path that reaches it is not a
+    # silent hold: a `together` reading pointing the other way is
+    # not a reason to stay in.
+    if where == "together" and side in SIDES and side != trade_side:
+        return f"they are now moving {side} together, against you"
+    return ""
+
+
+def state(ofi_dir: str = "", tick_dir: str = "",
+          open_px: float = 0.0, high: float = 0.0, low: float = 0.0,
+          close: float = 0.0,
+          net_ofi: float = 0.0, ofi_target: float = 0.0,
+          prints: float = 0.0, tick_target: float = 0.0,
+          bounce_at: float = BOUNCE_AT,
+          min_settle: float = MIN_SETTLE,
+          bar_ts: float = 0.0,
+          held_s: float | None = None,
+          min_hold_s: float = DWELL_S,
+          prev: dict | None = None) -> dict:
+    """The reading and the rule's verdict on it, from one place.
+
+    ONE READING, NOT TWO. The panel is handed what the rule decided
+    rather than the inputs to decide it again. A screen that
+    recomputes a direction is a screen that eventually disagrees
+    with the rule beside it, and that has happened here with the
+    5-minute cell and with the OFI bar already.
+    """
+    out = read(ofi_dir=ofi_dir, tick_dir=tick_dir, open_px=open_px,
+               high=high, low=low, close=close, net_ofi=net_ofi,
+               ofi_target=ofi_target, prints=prints,
+               tick_target=tick_target, bounce_at=bounce_at,
+               min_settle=min_settle, bar_ts=bar_ts, prev=prev)
+    side, why = entry_side(out["where"], out["side"],
+                           held_s=held_s, min_hold_s=min_hold_s)
+    ready = not (held_s is not None and min_hold_s > 0
+                 and held_s < min_hold_s)
+    return {**out,
+            "entry": side,
+            "why": why,
+            "held_s": (None if held_s is None else float(held_s)),
+            "min_hold_s": float(min_hold_s or 0.0),
+            "ready": ready,
+            "bar_ts": float(bar_ts or 0.0)}

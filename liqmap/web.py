@@ -5699,6 +5699,7 @@ def create_app() -> FastAPI:
                              tick3_exit: bool | None = None,
                              fused_ticks: int | None = None,
                              fused_ofi: int | None = None,
+                             fused_bounce: int | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5732,6 +5733,10 @@ def create_app() -> FastAPI:
                              if fused_ticks is None else int(fused_ticks)),
                 fused_ofi=(int(getattr(cur, "fused_ofi", 4000) or 4000)
                            if fused_ofi is None else int(fused_ofi)),
+                # ZERO IS A CHOICE. No `or` anywhere on this path.
+                fused_bounce=(int(getattr(cur, "fused_bounce", 33))
+                              if fused_bounce is None
+                              else int(fused_bounce)),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7466,7 +7471,10 @@ def create_app() -> FastAPI:
                 "ofi_target": bld.ofi_target,
                 "say": prog.get("say") or ""}
 
-    def _fused_gate(rt_, pair: tuple[int, int] | None = None) -> dict:
+    def _fused_gate(rt_, pair: tuple[int, int] | None = None,
+                    bounce: float | None = None,
+                    held_s: float | None = None,
+                    prev: dict | None = None) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -7482,12 +7490,34 @@ def create_app() -> FastAPI:
         question is what is happening inside the candle right now;
         a closed bar answers it one bar late.
 
-        THIS DECIDES NOTHING. There is no strategy behind it:
-        "we can create the strategy after i can see what it does
-        ill make entry and exit rules then".
+        IT DECIDES NOW. He watched it and wrote the rules off what
+        he saw, so this returns the rule's verdict alongside the
+        reading rather than the reading alone -- one computation,
+        so the panel and the rule cannot disagree.
         """
         from . import fusedread as _fr
         from .fusedbar import DEFAULT_PAIR, PAIRS, label
+
+        def _nothing(key, why):
+            """ONE SHAPE, WHETHER OR NOT A BAR IS BUILDING.
+
+            These paths used to return a short dict with no
+            `entry` and no `decides`, so the panel and anything
+            reading the payload had two shapes to handle -- and a
+            missing `decides` reads as false, which would put
+            SHOWN ONLY back on a panel that now trades.
+            """
+            return {"pair": list(key), "label": label(*key),
+                    "building": False, "why": why,
+                    "where": "", "side": "", "entry": "",
+                    "ofi_dir": "", "tick_dir": "",
+                    "settled": False, "settle_why": why,
+                    "agree": False, "pos": None, "at": "",
+                    "back": 0.0, "legs": {},
+                    "say": why, "held": {},
+                    "held_s": None, "ready": False,
+                    "min_hold_s": float(_fr.DWELL_S),
+                    "bar_ts": 0.0, "decides": True}
 
         svc = getattr(rt_, "ofi", None)
         tape = getattr(svc, "tape", None) if svc else None
@@ -7497,32 +7527,28 @@ def create_app() -> FastAPI:
             key = min(PAIRS, key=lambda k: (abs(int(k[0]) - int(key[0]))
                                             + abs(int(k[1]) - int(key[1]))))
         if not books:
-            return {"pair": list(key), "label": label(*key),
-                    "building": False,
-                    "why": ("fused bars are built from the ES tape "
-                            "and that engine is not running"),
-                    "decides": False}
+            return _nothing(key, "fused bars are built from the ES "
+                                 "tape and that engine is not running")
         bld = books.get(key)
         if bld is None:
-            return {"pair": list(key), "label": label(*key),
-                    "building": False,
-                    "why": "no builder for that pair",
-                    "decides": False}
+            return _nothing(key, "no builder for that pair")
         cur = bld.current
         if cur is None:
             # BETWEEN BARS. Real and momentary -- the last event
             # closed one and the next has not opened one. Not an
             # error, and not a reading either.
-            return {"pair": list(key), "label": label(*key),
-                    "building": False,
-                    "why": "between bars -- the last event closed one",
-                    "decides": False}
-        out = _fr.read(
+            return _nothing(
+                key, "between bars -- the last event closed one")
+        out = _fr.state(
             ofi_dir=cur.ofi_dir, tick_dir=cur.tick_dir,
             open_px=cur.open, high=cur.high, low=cur.low,
             close=cur.close,
             net_ofi=cur.net_ofi, ofi_target=bld.ofi_target,
-            prints=cur.prints, tick_target=bld.tick_target)
+            prints=cur.prints, tick_target=bld.tick_target,
+            bounce_at=(_fr.BOUNCE_AT if bounce is None
+                       else float(bounce)),
+            bar_ts=float(cur.start_ts or 0.0),
+            held_s=held_s, prev=prev)
         return {**out, "pair": list(key), "label": label(*key),
                 "building": True, "why": "",
                 "open": float(cur.open or 0.0),
@@ -8087,6 +8113,51 @@ def create_app() -> FastAPI:
                 rt_._ticks_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
                 pass
+        elif strat == "together":
+            # THE FUSED BAR, TRADED. Chris: "the auto trader will
+            # then trade the direction that is set ... book down or
+            # up, price down or up and says moving together and
+            # exit the trade on bounces never trade when book and
+            # price are apart or nothing settled".
+            #
+            # ITS OWN DWELL AND ITS OWN MEMORY on the runtime, for
+            # the same reason the tick strategy has its own: this
+            # one follows the AGREEMENT between two legs of one
+            # bar, which is a different thing from either tick
+            # chart's direction, and sharing a tracker would carry
+            # a hold across a strategy switch.
+            from . import fusedread as _fr2
+            _fdw = getattr(rt_, "_fused_dwell", None)
+            if _fdw is None:
+                _fdw = _fr2.Dwell()
+                try:
+                    rt_._fused_dwell = _fdw
+                except Exception:                       # noqa: BLE001
+                    pass
+            _fprev = getattr(rt_, "_fused_held", None) or {}
+            _now_f = time.time()
+            _fpair = (int(getattr(s, "fused_ticks", 0) or 10000),
+                      int(getattr(s, "fused_ofi", 0) or 4000))
+            # ZERO IS A CHOICE, NOT AN ABSENCE -- `or 33` here
+            # would turn his tightest setting into his loosest.
+            _fb_pct = getattr(s, "fused_bounce", None)
+            _fbounce = (_fr2.BOUNCE_AT if _fb_pct is None
+                        else float(int(_fb_pct)) / 100.0)
+            # THE DWELL IS FED THE AGREEMENT, not a leg. "after the
+            # moving together holds for 5 seconds" -- it is the
+            # together STATE that has to stand, so a bar flickering
+            # in and out of agreement never accumulates five
+            # seconds of it. Resolved with a first pass that asks
+            # for no hold, because the hold is what this is about
+            # to measure.
+            _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev)
+            _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
+            fus = _fused_gate(rt_, _fpair, _fbounce,
+                              _fdw.held_s(_now_f), _fprev)
+            try:
+                rt_._fused_held = dict(fus.get("held") or {})
+            except Exception:                           # noqa: BLE001
+                pass
         else:
             fus = (_timed_now(rt_) if strat == "timed"
                    else _fusion_now(rt_))
@@ -8129,6 +8200,9 @@ def create_app() -> FastAPI:
                     _ld.get("side") or None,
                 f"{int(_cf.get('per_bar') or 0)}t confirm":
                     _cf.get("side") or None}
+        elif strat == "together":
+            says = {"the book": fus.get("ofi_dir") or None,
+                    "price": fus.get("tick_dir") or None}
         vetoed = blocked_why
         # The window is the candle the cap counts against.
         bar_ts = float(win.get("start_ts") or 0.0)
@@ -8177,6 +8251,25 @@ def create_app() -> FastAPI:
             from . import stackwin as _swb
             bar_ts = _swb.bar_of(time.time(), _swb.CAP_BAR_S)
             cap = _swb.MAX_TRADES_PER_BAR
+            taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
+        if strat == "together":
+            # THE CANDLE THIS COUNTS AGAINST IS THE FUSED BAR, not
+            # a five-minute boundary -- the bar closing is an exit,
+            # so the stamp has to be the same bar the exit reads.
+            #
+            # NO PER-BAR CEILING, AND THAT IS DELIBERATE. Chris:
+            # "as many times as it meets the rule agreement if it
+            # bounces but then starts moving together again after
+            # the moving together holds for 5 seconds then reenter
+            # the trade". What limits re-entry is the five-second
+            # hold on the agreement, not a counter.
+            #
+            # A BIG NUMBER RATHER THAN ZERO. `decide` reads
+            # `max_per_bar or MAX_PER_BAR`, so passing 0 would
+            # quietly apply the default of two -- the "NO CAP"
+            # comment that was false here once already.
+            bar_ts = float(fus.get("bar_ts") or 0.0)
+            cap = 1_000_000
             taken = j.sides_in_bar(coin_, bar_ts, strat, strict=True)
         if strat == "ticks":
             # THE SAME CEILING THE STACK RULE RUNS UNDER, and it
@@ -8230,6 +8323,21 @@ def create_app() -> FastAPI:
                 t.side, (fus.get("m1") or {}).get("dir") or "")
             if rev:
                 disagreed = why_rev
+        elif strat == "together" and t is not None and t.open:
+            # BOUNCE, APART, OR THE BAR CLOSING. All three named by
+            # Chris; the bar closing is checked first inside
+            # `exit_reason` so the log says the candle ended rather
+            # than blaming a reading taken on the next one.
+            #
+            # `bar_ts` ON THE TRADE IS THE FUSED BAR IT OPENED IN,
+            # which is why the stamp below is the fused bar's start
+            # rather than a five-minute boundary.
+            from . import fusedread as _fre
+            disagreed = _fre.exit_reason(
+                t.side, str(fus.get("where") or ""),
+                str(fus.get("side") or ""),
+                float(fus.get("bar_ts") or 0.0),
+                float(getattr(t, "bar_ts", 0.0) or 0.0)) or disagreed
         elif strat == "ticks" and t is not None and t.open:
             # EITHER CHART TURNING AGAINST THE POSITION. Still no
             # clock -- "Gate 2's flip only, no clock" -- but the
@@ -8424,9 +8532,19 @@ def create_app() -> FastAPI:
             # else: "the fused bar should be a visible gate all on
             # its own that i can look at the same way i can see the
             # tick bar strategy".
-            "fusedgate": _fused_gate(
-                rt_, (int(getattr(s, "fused_ticks", 0) or 10000),
-                      int(getattr(s, "fused_ofi", 0) or 4000))),
+            # ON ITS OWN STRATEGY THE READING IS ALREADY TAKEN
+            # above, so it is reused rather than recomputed: a
+            # second call would read the bar a moment later and the
+            # panel could show a state the rule never saw. That is
+            # exactly how the 5-minute cell and the OFI bar each
+            # came to disagree with the rule beside them.
+            "fusedgate": (
+                {**fus, "blocked_by": idle_why} if strat == "together"
+                else _fused_gate(
+                    rt_, (int(getattr(s, "fused_ticks", 0) or 10000),
+                          int(getattr(s, "fused_ofi", 0) or 4000)),
+                    (None if getattr(s, "fused_bounce", None) is None
+                     else float(int(s.fused_bounce)) / 100.0))),
             "quote": jn_quote.read(
                 (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
                 (getattr(rt_, "ofi", None)), _last or px, _age),
@@ -11096,6 +11214,10 @@ has to be running before the gate stops refusing.">spike
                    selector beside this one does nothing for it --
                    it reads the two tick sizes and nothing else. -->
               <option value="ticks">Two tick charts (gate 2 leads, gate 3 confirms)</option>
+              <!-- THE FUSED BAR, TRADED. Book and price moving
+                   together, held 5s. Out on a bounce, on them
+                   coming apart, or on the bar closing. -->
+              <option value="together">Moving together (the fused bar)</option>
             </select></label>
           <label>window
             <select id="jnlWin" onchange="jnlSet()"
@@ -11160,6 +11282,22 @@ has to be running before the gate stops refusing.">spike
               <option value="2500x1000">2500t &times; 1000</option>
               <option value="5000x2000">5000t &times; 2000</option>
               <option value="10000x4000" selected>10000t &times; 4000</option>
+            </select></label>
+          <!-- HOW MUCH GIVE-BACK IS A BOUNCE. Chris: "give me a
+               list of percentages that i can select from starting
+               from 0 to 33%". Zero means any give-back at all. -->
+          <label title="how much of the bar's move has to be given
+                        back before it reads as a bounce"
+            >bounce
+            <select id="jnlBounce" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0">0% (any)</option>
+              <option value="5">5%</option>
+              <option value="10">10%</option>
+              <option value="15">15%</option>
+              <option value="20">20%</option>
+              <option value="25">25%</option>
+              <option value="33" selected>33%</option>
             </select></label>
           <label title="gate 3 also closes a trade when it flips"
             ><input type="checkbox" id="jnlT3Ex" onchange="jnlSet()"
@@ -16157,6 +16295,7 @@ async function jnlSet() {
     jnlTick3: $('jnlTick3') ? String(Math.round($('jnlTick3').value || 1000)) : undefined,
     jnlT3Ex: $('jnlT3Ex') ? ($('jnlT3Ex').checked ? '1' : '0') : undefined,
     jnlFused: $('jnlFused') ? String($('jnlFused').value || '10000x4000') : undefined,
+    jnlBounce: $('jnlBounce') ? String($('jnlBounce').value) : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -16174,6 +16313,9 @@ async function jnlSet() {
       ? String($('jnlFused').value || '10000x4000').split('x')[0] : 10000,
     fused_ofi: $('jnlFused')
       ? String($('jnlFused').value || '10000x4000').split('x')[1] : 4000,
+    /* ZERO IS A CHOICE, so this cannot use || anywhere -- it would
+       turn his tightest setting into his loosest on every save. */
+    fused_bounce: $('jnlBounce') ? $('jnlBounce').value : 33,
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -17077,9 +17219,16 @@ function paintFusedGate(FG) {
 
   const head = '<div class="thin" style="margin-bottom:4px">'
     + '<b>THE FUSED BAR &mdash; ' + esc(FG.label || '')
-    + '</b> &mdash; the tick chart inside the OFI candle. '
-    + '<b style="color:var(--dim)">SHOWN ONLY</b>, nothing here '
-    + 'opens or closes a trade</div>';
+    + '</b> &mdash; the tick chart inside the OFI candle'
+    /* IT DECIDES NOW. It shipped saying SHOWN ONLY, he watched it
+       and wrote the rules; a heading left behind would be the one
+       lie on this panel. */
+    + (FG.decides
+        ? ' &mdash; in when they move together and it holds, out on '
+          + 'a bounce, on them coming apart, or when the bar closes'
+        : '. <b style="color:var(--dim)">SHOWN ONLY</b>, nothing '
+          + 'here opens or closes a trade')
+    + '</div>';
 
   if (!FG.building) {
     box.innerHTML = head
@@ -17104,14 +17253,17 @@ function paintFusedGate(FG) {
      already read -- a bounce keeps the book's colour because the
      book has not changed its mind, price has. */
   const edge = 'border-left:3px solid var(--'
-    + (FG.where === 'together'
+    + (FG.where === 'settling' ? 'line'
+        : FG.where === 'together'
         ? (FG.ofi_dir === 'down' ? 'down' : 'up')
         : FG.where === 'apart' ? 'line'
         : FG.where === 'bounce'
             ? (FG.ofi_dir === 'down' ? 'down' : 'up') : 'line')
     + ');padding:6px 0 6px 10px';
 
-  const word = FG.where === 'together'
+  const word = FG.where === 'settling'
+      ? '<b style="color:var(--dim)">SETTLING</b>'
+    : FG.where === 'together'
       ? '<b class="' + (FG.ofi_dir === 'down' ? 'short' : 'long') + '">'
         + 'MOVING ' + esc(FG.ofi_dir || '').toUpperCase()
         + ' TOGETHER</b>'
@@ -17127,7 +17279,34 @@ function paintFusedGate(FG) {
     + '<div style="margin:4px 0">'
     + leg('the book', FG.ofi_dir) + leg('price', FG.tick_dir)
     + '</div>'
-    + word + ' <span class="thin">' + esc(FG.say || '') + '</span>'
+    + word + ' <span class="thin">'
+    + esc(FG.where === 'settling' ? (FG.settle_why || FG.say || '')
+                                  : (FG.say || '')) + '</span>'
+    /* A HELD AGREEMENT AND A FRESH ONE LOOK IDENTICAL WITHOUT THE
+       COUNTDOWN, and an entry that has not fired YET is waiting,
+       not blocked. */
+    + ((FG.ready === false && FG.where === 'together')
+        ? '<div class="thin"><b class="short">HOLDING '
+          + esc(FG.ofi_dir || '').toUpperCase() + ' &mdash; '
+          + Number(FG.held_s || 0).toFixed(0) + 's of '
+          + Number(FG.min_hold_s || 0).toFixed(0) + 's</b> '
+          + 'the agreement has to stand before it opens a trade</div>'
+        : '')
+    /* THE RULE'S VERDICT AND THE JOURNAL'S ANSWER TO IT. Two
+       different questions, and this box answered only the first
+       until a cap refusing a trade turned out to be invisible. */
+    + (FG.decides
+        ? (FG.entry
+            ? '<div class="thin" style="margin-top:2px"><b class="'
+              + (FG.entry === 'up' ? 'long' : 'short') + '">TRADE '
+              + esc(FG.entry).toUpperCase() + '</b></div>'
+            : '')
+          + (FG.blocked_by
+              ? '<div class="thin" style="margin-top:2px">'
+                + '<b style="color:var(--down)">NO TRADE</b> &mdash; '
+                + esc(FG.blocked_by) + '</div>'
+              : '')
+        : '')
     /* READ IT LIKE A NORMAL CANDLE: where the close sits between
        this bar's own high and low, which is the "top or bottom"
        half of what he asked for. Drawn separately from the retrace
@@ -17739,6 +17918,8 @@ function paintJournal(d) {
   if ($('jnlT3Ex')) $('jnlT3Ex').checked = !!S.tick3_exit;
   set('jnlFused', String(Math.round(S.fused_ticks || 10000))
       + 'x' + String(Math.round(S.fused_ofi || 4000)));
+  if (S.fused_bounce != null)
+    set('jnlBounce', String(Math.round(S.fused_bounce)));
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =
