@@ -7548,6 +7548,11 @@ def create_app() -> FastAPI:
             bounce_at=(_fr.BOUNCE_AT if bounce is None
                        else float(bounce)),
             bar_ts=float(cur.start_ts or 0.0),
+            # THE CHART'S OWN VERDICT ON THIS BAR, carried rather
+            # than recomputed: `tradeable` is what greys a candle
+            # in the renderer, and the panel beside it must not
+            # reach a different answer about the same bar.
+            tradeable=bool(cur.tradeable),
             held_s=held_s, prev=prev)
         return {**out, "pair": list(key), "label": label(*key),
                 "building": True, "why": "",
@@ -7559,7 +7564,9 @@ def create_app() -> FastAPI:
                 "ofi_target": int(bld.ofi_target),
                 "prints": int(cur.prints),
                 "tick_target": int(bld.tick_target),
-                "seconds": round(float(cur.seconds), 1)}
+                "seconds": round(float(cur.seconds), 1),
+                "tradeable": bool(cur.tradeable),
+                "why_not": str(cur.why_not or "")}
 
     def _footprint_imbalance(rt_) -> dict:
         """Which way the forming footprint bar is imbalanced.
@@ -17219,7 +17226,8 @@ function paintFusedGate(FG) {
 
   const head = '<div class="thin" style="margin-bottom:4px">'
     + '<b>THE FUSED BAR &mdash; ' + esc(FG.label || '')
-    + '</b> &mdash; the tick chart inside the OFI candle'
+    + '</b> &mdash; the outer candle is the book, the body inside '
+    + 'it is the traded price'
     /* IT DECIDES NOW. It shipped saying SHOWN ONLY, he watched it
        and wrote the rules; a heading left behind would be the one
        lie on this panel. */
@@ -17268,8 +17276,8 @@ function paintFusedGate(FG) {
         + 'MOVING ' + esc(FG.ofi_dir || '').toUpperCase()
         + ' TOGETHER</b>'
     : FG.where === 'bounce'
-      ? '<b style="color:var(--dim)">BOUNCING OFF THE '
-        + (FG.ofi_dir === 'down' ? 'BOTTOM' : 'TOP') + '</b>'
+      ? '<b style="color:var(--dim)">PULLING BACK FROM THE '
+        + (FG.tick_dir === 'down' ? 'BOTTOM' : 'TOP') + '</b>'
     : FG.where === 'apart'
       ? '<b class="short">BOOK AND PRICE APART</b>'
       : '<b class="short">NOTHING SETTLED</b>';
@@ -17277,7 +17285,7 @@ function paintFusedGate(FG) {
   const body =
       '<div style="' + edge + '">'
     + '<div style="margin:4px 0">'
-    + leg('the book', FG.ofi_dir) + leg('price', FG.tick_dir)
+    + leg('outer (book)', FG.ofi_dir) + leg('body (price)', FG.tick_dir)
     + '</div>'
     + word + ' <span class="thin">'
     + esc(FG.where === 'settling' ? (FG.settle_why || FG.say || '')
@@ -17314,13 +17322,30 @@ function paintFusedGate(FG) {
        price is, the other is whether the move is still on. */
     + ((FG.pos != null)
         ? '<div class="thin">the close is ' + pct(100 * FG.pos)
-          + ' of the way up this bar&rsquo;s range'
+          + ' of the way up this candle&rsquo;s range'
           + (FG.at ? ' &mdash; at the ' + esc(FG.at) : '')
-          + ' &middot; ' + pct(100 * FG.back) + ' of the move given '
-          + 'back (a bounce from ' + pct(100 * FG.bounce_at) + ')'
+          + ' &middot; ' + pct(100 * FG.back) + ' off its extreme '
+          + '(a bounce from ' + pct(100 * FG.bounce_at) + ')'
           + '</div>'
         : '<div class="thin">every print in this bar has landed on '
           + 'one price &mdash; it has no range to read yet</div>')
+    /* THE CANDLE'S OWN FOUR NUMBERS AND THE SIGNED BOOK.
+       Chris compared this panel against the chart header and could
+       not tell whether they were even the same bar -- they were,
+       minutes apart. Percentages alone made that impossible to
+       see; the raw figures line up with the chart at a glance. */
+    + ((FG.open)
+        ? '<div class="thin">O ' + chPx(FG.open) + ' H ' + chPx(FG.high)
+          + ' L ' + chPx(FG.low) + ' C ' + chPx(FG.close)
+          + ' &middot; book '
+          + (FG.net_ofi > 0 ? '+' : '') + Number(FG.net_ofi || 0).toLocaleString()
+          + ' of ' + Number(FG.ofi_target || 0).toLocaleString()
+          + (FG.grayed
+              ? ' &middot; <b style="color:var(--dim)">the chart greys '
+                + 'this bar</b>'
+              : '')
+          + '</div>'
+        : '')
     /* BOTH LEGS, NEVER ONE. A bar can sit at 98% on one and 4% on
        the other, and that is the entire reason this bar type
        exists. */

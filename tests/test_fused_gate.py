@@ -141,21 +141,26 @@ class TestHisFourCases:
         assert out["agree"] is True, \
             "a bounce is not a disagreement -- both legs still say down"
         assert out["ofi_dir"] == "down"
-        assert "bouncing off the bottom" in out["say"]
+        assert "pulling back from the bottom" in out["say"]
+        # 12 of the candle's 20-point range off the low.
         assert out["back"] == pytest.approx(0.6)
 
     def test_the_book_stays_up_while_price_fades_off_the_top(self):
         out = fr.read(ofi_dir="up", tick_dir="up", open_px=5000.0,
                       high=5020.0, low=5000.0, close=5008.0)
         assert out["where"] == "bounce"
-        assert "bouncing off the top" in out["say"]
+        assert "pulling back from the top" in out["say"]
 
     def test_the_book_and_price_disagreeing_is_its_own_state(self):
         out = fr.read(ofi_dir="down", tick_dir="up", open_px=5000.0,
                       high=5010.0, low=4998.0, close=5009.0)
         assert out["where"] == "apart"
         assert out["agree"] is False
-        assert "not reading the same bar" in out["say"]
+        # SAID THE WAY THE CHART SAYS IT. The renderer washes a bar
+        # whose book and price disagree, so the panel names the
+        # same thing the candle shows rather than inventing a
+        # second vocabulary for it.
+        assert "greys this bar" in out["say"]
 
     def test_read_it_like_a_normal_candle(self):
         """"or read it like normal candle" -- where the close sits
@@ -192,11 +197,24 @@ class TestTheMeasures:
         assert out["pos"] is None
         assert out["at"] == ""
 
-    def test_the_retrace_is_the_one_the_tick_panel_already_uses(self):
-        """NOT A SECOND MEASURE OF THE SAME THING. Two panels that
-        measure one bar differently is how they come to disagree."""
-        from liqmap import tapeintent as ti
-        assert fr.depth is ti.depth
+    def test_the_denominator_is_the_candles_own_range(self):
+        """THIS USED TO BE `tapeintent.depth`, which measures
+        against the move from the OPEN and was framed on the book.
+        On Chris's bar -- the book down 6.5 points while price ran
+        23.5 up -- it divided by the 6.5 and saturated at 100%,
+        telling him the whole move was gone on a candle that was
+        quietly fading off its high.
+
+        The range cannot be small relative to its own wick, so the
+        range is the denominator."""
+        # O 7160.50  H 7184.00  L 7154.00  C 7174.00, book DOWN.
+        out = fr.read(ofi_dir="down", tick_dir="up", open_px=7160.50,
+                      high=7184.00, low=7154.00, close=7174.00,
+                      **FULL)
+        # the payload rounds to three places
+        assert out["back"] == pytest.approx(10.0 / 30.0, abs=1e-3), \
+            "the retrace is not measured on the candle's range"
+        assert out["back"] < 1.0, "it saturated again"
 
     def test_the_retrace_is_measured_against_the_books_direction(self):
         """His case is "OFI remaining down but tick is bouncing" --
@@ -206,27 +224,33 @@ class TestTheMeasures:
                       high=5020.0, low=5000.0, close=5010.0)
         assert out["back"] == pytest.approx(0.5)
 
-    def test_which_direction_frames_the_retrace_is_visible(self):
-        """THE TWO FRAMINGS ONLY DIFFER WHEN THE LEGS DO, which is
-        why the test above cannot see the difference: with both
-        legs down, measuring against either gives the same number.
-        A mutation swapping the book for price survived it.
+    def test_the_body_picks_the_extreme_not_the_book(self):
+        """THE INNER CANDLE IS THE THING THAT BOUNCES. Chris: "ofi
+        remaining down but tick is bouncing from bottom or top" --
+        the book is the context, the body is what comes off its
+        extreme. An up body ran to the high, so the high is what it
+        can pull back from, whatever the book says."""
+        kw = dict(open_px=7160.50, high=7184.00, low=7154.00,
+                  close=7174.00)
+        up_body = fr.pullback("up", kw["high"], kw["low"], kw["close"])
+        dn_body = fr.pullback("down", kw["high"], kw["low"], kw["close"])
+        assert up_body == pytest.approx(10.0 / 30.0)
+        assert dn_body == pytest.approx(20.0 / 30.0)
+        for book in ("up", "down"):
+            out = fr.read(ofi_dir=book, tick_dir="up", **kw, **FULL)
+            assert out["back"] == pytest.approx(up_body, abs=1e-3), \
+                "the book changed where the retrace is measured from"
 
-        Here the book is DOWN and price is UP. Framed on the book,
-        the bar's whole downward move is gone -- 1.0. Framed on
-        price, the bar is a tick off its high -- 0.1. The panel
-        draws this number, so which one it is matters."""
-        out = fr.read(ofi_dir="down", tick_dir="up", open_px=5000.0,
-                      high=5010.0, low=4998.0, close=5009.0)
-        assert out["back"] == pytest.approx(1.0), \
-            "the retrace is framed on price, not on the book"
-        from liqmap.tapeintent import depth
-        assert depth("up", 5000.0, 5010.0, 4998.0, 5009.0) \
-            == pytest.approx(0.1), "the two framings are not distinct"
+    def test_a_flat_body_has_no_extreme_to_come_off(self):
+        """A candle that closed where it opened has not run
+        anywhere, so 0.0 would be a claim rather than an answer --
+        but it is also not a pullback."""
+        assert fr.pullback("", 10.0, 0.0, 5.0) == 0.0
+        assert fr.pullback("flat", 10.0, 0.0, 5.0) == 0.0
 
     def test_at_the_extreme_nothing_is_given_back(self):
         out = fr.read(ofi_dir="down", tick_dir="down", open_px=5020.0,
-                      high=5020.0, low=5000.0, close=5000.0)
+                      high=5020.0, low=5000.0, close=5000.0, **FULL)
         assert out["back"] == pytest.approx(0.0)
         assert out["where"] == "together"
 
@@ -400,12 +424,18 @@ class TestItIsWiredThrough:
         fn = src[i:src.index("\nfunction ", i + 10)]
         assert "SHOWN ONLY" in fn, \
             "the panel does not say it decides nothing"
-        assert "MOVING" in fn and "BOUNCING OFF THE" in fn
+        assert "MOVING" in fn and "PULLING BACK FROM THE" in fn
+        assert "outer (book)" in fn and "body (price)" in fn, \
+            "the panel does not name the two candles the chart draws"
         assert "FG.pos" in fn, "the candle read is never drawn"
         assert "FG.legs" in fn or "FG.legs || {}" in fn
 
 
 from tests.test_cme_panels import _cme, client  # noqa: E402,F401
+# THE SERVED PAGE, not web.py's source: reading the script out of
+# the Python file would carry that file's backslash escapes and
+# test a string nobody is ever sent.
+from tests.test_stack_strip import page_js  # noqa: E402,F401
 
 AUTH = {"Authorization": "Bearer t0ken"}
 
@@ -960,3 +990,227 @@ class TestTheStrategyActuallySteps:
         b = getattr(rt, "_ticks_dwell", None)
         assert a is not None and b is not None
         assert a is not b, "both strategies share one clock"
+
+
+class TestItReadsTheCandleTheChartDraws:
+    """Chris, after comparing the panel against the chart: "its
+    goal is to read the chart the way it is if you look at the
+    chart there is a outside OFI candle and a inside tick candle it
+    should read what that is doing".
+
+    HIS BAR, from the screenshots: O 7160.50 H 7184.00 L 7154.00,
+    a 30-point outer candle. He read it as "the OFI is clearly up
+    and the tick was up and now pulling back from the top", and the
+    panel answered "100% of the move given back".
+    """
+
+    BAR = dict(open_px=7160.50, high=7184.00, low=7154.00)
+
+    def test_his_bar_reads_as_pulling_back_from_the_top(self):
+        out = fr.read(ofi_dir="up", tick_dir="up", close=7169.50,
+                      **self.BAR, **FULL)
+        assert out["where"] == "bounce"
+        assert out["back"] == pytest.approx(14.5 / 30.0, abs=1e-3)
+        assert "pulling back from the top" in out["say"]
+
+    def test_the_old_framing_saturated_on_exactly_this_bar(self):
+        """THE FAULT, WRITTEN DOWN. Framed on the book's move from
+        the open, a bar with the book down 6.50 points and price up
+        23.50 divides by the 6.50 and pins at 1.0 -- it reported
+        the entire move gone on a candle sitting two thirds of the
+        way up its own range."""
+        from liqmap.tapeintent import depth
+        assert depth("down", 7160.50, 7184.00, 7154.00,
+                     7174.00) == pytest.approx(1.0)
+        now = fr.read(ofi_dir="down", tick_dir="up", close=7174.00,
+                      **self.BAR, **FULL)
+        assert now["back"] == pytest.approx(10.0 / 30.0, abs=1e-3)
+        assert now["pos"] == pytest.approx(20.0 / 30.0, abs=1e-3)
+
+    def test_the_panel_and_the_chart_header_can_be_lined_up(self):
+        """He could not tell whether the two were even the same bar
+        -- they were, minutes apart -- because the panel showed
+        only percentages. The candle's four numbers and the signed
+        book now ride in the payload."""
+        out = fr.read(ofi_dir="down", tick_dir="up", close=7174.00,
+                      net_ofi=-1320, ofi_target=4000, prints=39236,
+                      tick_target=10000, **self.BAR)
+        assert out["open"] == 7160.50
+        assert out["high"] == 7184.00
+        assert out["low"] == 7154.00
+        assert out["close"] == 7174.00
+        assert out["net_ofi"] == -1320, \
+            "the book's sign is not carried, only its size"
+
+    def test_it_carries_the_wash_the_chart_puts_on_the_bar(self):
+        """`tradeable` is what greys a candle in the renderer. The
+        panel beside it must not reach a different answer about the
+        same bar."""
+        grey = fr.read(ofi_dir="down", tick_dir="up", close=7174.00,
+                       tradeable=False, **self.BAR, **FULL)
+        assert grey["grayed"] is True
+        ok = fr.read(ofi_dir="up", tick_dir="up", close=7174.00,
+                     tradeable=True, **self.BAR, **FULL)
+        assert ok["grayed"] is False
+        unknown = fr.read(ofi_dir="up", tick_dir="up", close=7174.00,
+                          **self.BAR, **FULL)
+        assert unknown["grayed"] is None, \
+            "an unknown wash is reported as 'not greyed'"
+
+    def test_the_panel_prints_the_candles_own_numbers(self):
+        """WITHOUT THESE HE CANNOT TELL whether the panel and the
+        chart are even looking at the same bar -- which is the
+        whole complaint. Percentages alone made that impossible;
+        a mutation hiding this block changed no reading and broke
+        no other test."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        for want in ("chPx(FG.open)", "chPx(FG.high)", "chPx(FG.low)",
+                     "chPx(FG.close)", "FG.net_ofi"):
+            assert want in fn, f"the panel never draws {want}"
+        assert "FG.net_ofi > 0 ? '+' : ''" in fn, \
+            "the book is drawn without its sign"
+        assert "FG.grayed" in fn, \
+            "the panel cannot say the chart greys this bar"
+        # `box.innerHTML` appears twice -- the not-building early
+        # return writes one too -- so this is the LAST one.
+        j = fn.rindex("box.innerHTML")
+        assert "chPx(FG.open)" in fn[:j], \
+            "the block is built after the page is written"
+
+    def test_the_route_hands_it_the_charts_own_verdict(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "tradeable=bool(cur.tradeable)" in fn, \
+            "the panel does not know what the chart greys"
+        assert "cur.start_ts" in fn
+
+    def test_the_route_reads_the_live_bar_the_chart_draws(self):
+        """`rows(include_live=True)` appends `self._cur`; this reads
+        `bld.current`, which is the same object. One bar, one
+        builder -- the mismatch he reported was the same bar read
+        minutes apart, not two sources."""
+        from liqmap.fusedbar import FusedBars
+        b = FusedBars(tick_target=1000, ofi_target=500)
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "bld.current" in fn
+        assert hasattr(b, "current")
+        assert "rows(" not in fn, \
+            "the panel builds its own view of the series"
+
+    @pytest.mark.parametrize("bad", [None, "", "abc", object()])
+    def test_junk_never_reaches_int_in_the_payload(self, bad):
+        """THE PAYLOAD CARRIES RAW FIGURES NOW, and the first
+        version wrote `int(net_ofi or 0)` straight into it. That
+        raises on a string, in a route whose exceptions get
+        swallowed into `journal.error`."""
+        out = fr.read(ofi_dir="up", tick_dir="up", open_px=bad,
+                      high=bad, low=bad, close=bad, net_ofi=bad,
+                      ofi_target=bad, prints=bad, tick_target=bad)
+        assert out["net_ofi"] == 0
+        assert out["open"] == 0.0
+
+
+class TestThePanelActuallyRenders:
+    """A SOURCE SCAN CANNOT SEE A DEAD BRANCH.
+
+    A mutation that changed `((FG.open) ? ... : '')` to
+    `((false) ? ... : '')` left every word of the block in the
+    file, so every text assertion still passed -- and the candle's
+    own numbers never reached the screen. Chris needs those
+    numbers to line the panel up against the chart; that is the
+    whole reason they are there. So this runs the painter in node
+    and reads what it wrote.
+    """
+
+    BAR = {
+        "label": "10000x4000", "pair": [10000, 4000], "building": True,
+        "why": "", "where": "apart", "side": "", "entry": "",
+        "ofi_dir": "down", "tick_dir": "up", "agree": False,
+        "settled": True, "settle_why": "",
+        "pos": 0.667, "at": "", "back": 0.333, "bounce_at": 0.33,
+        "grayed": True,
+        "open": 7160.50, "high": 7184.00, "low": 7154.00,
+        "close": 7174.00, "net_ofi": -1320,
+        "ofi_target": 4000, "prints": 39236, "tick_target": 10000,
+        "legs": {"ofi_pct": 33.0, "tick_pct": 100.0,
+                 "waiting_on": "the book"},
+        "say": "the outer candle is down and the body is up -- the "
+               "chart greys this bar, pulling back from the top by 33%",
+        "held": {}, "held_s": 9.0, "min_hold_s": 5.0, "ready": True,
+        "bar_ts": 100.0, "decides": True, "blocked_by": "",
+    }
+
+    def test_the_candles_four_numbers_reach_the_screen(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate", self.BAR)
+        # `chPx` groups thousands, the way the chart header does.
+        for want in ("7,160.50", "7,184.00", "7,154.00", "7,174.00"):
+            assert want in html, f"{want} is not on the panel"
+
+    def test_the_book_is_drawn_with_its_sign(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate", self.BAR)
+        assert "-1,320" in html, html[-900:]
+        assert "4,000" in html
+
+    def test_it_says_the_chart_greys_this_bar(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate", self.BAR)
+        assert "greys" in html
+
+        # THE SENTENCE CARRIES THE WORD TOO on an apart bar, so a
+        # not-greyed payload has to drop both or this proves
+        # nothing about the flag.
+        ok = {**self.BAR, "grayed": False, "where": "together",
+              "ofi_dir": "up", "agree": True,
+              "say": "moving up together -- the outer candle is up "
+                     "and the body is holding the high"}
+        html2 = run_js(page_js, "fusedGate", ok)
+        assert "greys" not in html2
+
+    def test_it_names_the_two_candles_the_chart_draws(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate", self.BAR)
+        assert "outer (book)" in html
+        assert "body (price)" in html
+
+    def test_a_pullback_reads_from_the_top(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**self.BAR, "where": "bounce", "ofi_dir": "up",
+                       "agree": True})
+        assert "PULLING BACK FROM THE TOP" in html
+
+        down = run_js(page_js, "fusedGate",
+                      {**self.BAR, "where": "bounce", "ofi_dir": "down",
+                       "tick_dir": "down", "agree": True})
+        assert "PULLING BACK FROM THE BOTTOM" in down
+
+    def test_a_settling_bar_says_so(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**self.BAR, "where": "settling", "settled": False,
+                       "settle_why": "412 prints in -- 1,000 (10% of "
+                                     "the bar) before a direction counts"})
+        assert "SETTLING" in html
+        assert "412 prints in" in html
+
+    def test_it_no_longer_claims_to_be_shown_only(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate", self.BAR)
+        assert "SHOWN ONLY" not in html, \
+            "the panel trades now and still says it does not"
+
+    def test_a_bar_that_is_not_building_still_renders(self, page_js):
+        """The not-building path writes its own innerHTML, and it
+        has to survive the same payload shape."""
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**self.BAR, "building": False,
+                       "why": "between bars -- the last event closed one"})
+        assert "between bars" in html

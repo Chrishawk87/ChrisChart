@@ -112,6 +112,10 @@ globalThis.__probe = {
     paintClockWindows(payload);
     return document.getElementById('clockWin').innerHTML;
   },
+  fusedGate(fg) {
+    paintFusedGate(fg);
+    return document.getElementById('jnlFusedGate').innerHTML;
+  },
   cascade(d, last, thisBar, stripCoin, selected) {
     document.getElementById('coin').value = selected;
     _ofiLast = last; _ofiThisBar = thisBar; _ofiStripCoin = stripCoin;

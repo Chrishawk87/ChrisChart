@@ -25,19 +25,32 @@ between "moving down together" and "OFI remaining down but tick is
 bouncing from bottom", which are the two states he named and which
 look identical if you only read directions.
 
-THE RETRACE IS `tapeintent.depth`, NOT A SECOND MEASURE OF THE
-SAME THING. It answers "how much of this bar's move is gone",
-measured against the move the bar MADE rather than its full range,
-and it is already the number the tick panel shows. A second
-implementation would drift from it and then two panels would
-disagree about one bar.
+IT READS THE CANDLE THE CHART DRAWS. Chris, on the first version:
+"its goal is to read the chart the way it is if you look at the
+chart there is a outside OFI candle and a inside tick candle it
+should read what that is doing".
 
-MEASURED AGAINST THE BOOK'S DIRECTION, not price's. His case is
-"OFI remaining down but tick is bouncing" -- the book's commitment
-is the frame and price's position inside it is the question. On an
-OFI-down bar that means the span from the open to the low, so 0.0
-is price pinned at the low with the book short, and 1.0 is price
-all the way back to where the bar opened.
+    THE OUTSIDE IS THE OFI CANDLE -- the high-low range, coloured
+    by the sign of the book's accumulator, washed gray when the
+    book and price disagree. That is literally what the renderer
+    does: `b.dir` picks the colour and `b.tradeable` picks the
+    wash.
+
+    THE INSIDE IS THE TICK CANDLE -- the body, open to close, of
+    the prints that arrived in the same window.
+
+So the pullback here is read the way anyone reads a candle: an up
+candle with a long upper wick has come back off the top. It is the
+distance from the close to the extreme the body ran to, over the
+WHOLE range of the outer candle.
+
+WHY NOT `tapeintent.depth`, WHICH THIS USED TO USE. That measures
+against the move from the OPEN, and framed on the book's
+direction. On a bar where the book was down 6.5 points while price
+ran 23.5 up, it divided by the 6.5 and saturated: the panel told
+Chris "100% of the move given back" about a bar quietly fading off
+its high. The denominator has to be the candle's own range, which
+cannot be small relative to its own wick.
 
 BOUNCE_AT IS A LABEL BOUNDARY, NOT A FINDING. It decides which
 word the panel prints and nothing else; the raw percentage is
@@ -82,7 +95,7 @@ SETTLING, AND WHY IT IS NOT A DETAIL.
 from __future__ import annotations
 
 from .stackwin import Dwell, hold_dir  # noqa: F401
-from .tapeintent import EPS, depth
+from .tapeintent import EPS
 
 SIDES = ("up", "down")
 
@@ -126,6 +139,51 @@ def position(high: float, low: float, close: float) -> float | None:
     span = h - lo
     if span <= EPS:
         return None
+    return max(0.0, min(1.0, (c - lo) / span))
+
+
+def _num(v) -> float:
+    """A number, or 0.0 -- never an exception.
+
+    THE PAYLOAD CARRIES THE RAW FIGURES NOW so they can be lined up
+    against the chart header, and the first version wrote
+    `int(net_ofi or 0)` straight into it. That raises on a string,
+    and the one caller is a route whose exceptions get swallowed
+    into `journal.error` where nothing is looking. A test that
+    feeds junk to every entry point is what caught it.
+    """
+    try:
+        return float(v or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def pullback(body_dir: str, high: float, low: float,
+             close: float) -> float:
+    """How far off its extreme the candle has come, 0 to 1.
+
+    THE UPPER WICK, AS A FRACTION OF THE WHOLE CANDLE. On an up
+    body: 0.0 is the close sitting on the high and 1.0 is the close
+    back at the low. Down body, the other way round.
+
+    THE INNER BODY PICKS THE EXTREME, the outer candle supplies the
+    range. A body that closed up ran to the high, so the high is
+    what it can come back from -- which is what "pulling back from
+    the top" means when you look at the chart.
+
+    FLAT BODY, NO READING. A candle that closed where it opened has
+    not run anywhere, so there is no extreme to have come off and
+    0.0 would be a claim rather than an answer.
+    """
+    try:
+        h, lo, c = float(high or 0.0), float(low or 0.0), float(close or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    span = h - lo
+    if span <= EPS or body_dir not in SIDES:
+        return 0.0
+    if body_dir == "up":
+        return max(0.0, min(1.0, (h - c) / span))
     return max(0.0, min(1.0, (c - lo) / span))
 
 
@@ -202,29 +260,32 @@ def settled(net_ofi: float, ofi_target: float,
 
 def _say(where: str, ofi_dir: str, tick_dir: str, pos: float | None,
          back: float, edge: str) -> str:
-    """One sentence, in the words he used to describe each state."""
+    """One sentence, describing the candle the chart draws."""
     pct = int(round(100.0 * back))
+    frm = "top" if tick_dir == "up" else "bottom"
     if where == "settling":
-        return edge or "settling -- not enough of this bar yet"
+        return "settling -- not enough of this bar yet"
     if where == "together":
         side = "down" if ofi_dir == "down" else "up"
         end = "low" if side == "down" else "high"
-        return (f"moving {side} together -- the book is {side} and "
-                f"price is holding the {end}")
+        return (f"moving {side} together -- the outer candle is "
+                f"{side} and the body is holding the {end}")
     if where == "bounce":
-        frm = "bottom" if ofi_dir == "down" else "top"
-        return (f"the book is still {ofi_dir} but price is bouncing "
-                f"off the {frm} -- {pct}% of the move given back")
+        return (f"the outer candle is still {ofi_dir} but the body "
+                f"is pulling back from the {frm} -- {pct}% of the "
+                "candle off its extreme")
     if where == "apart":
-        return (f"the book is {ofi_dir} and price is {tick_dir} -- "
-                "they are not reading the same bar")
+        extra = (f", pulling back from the {frm} by {pct}%"
+                 if back > 0.0 else "")
+        return (f"the outer candle is {ofi_dir} and the body is "
+                f"{tick_dir} -- the chart greys this bar{extra}")
     if not ofi_dir or ofi_dir == "flat":
         return "the book has not committed either way yet"
     if not tick_dir or tick_dir == "flat":
-        return (f"the book is {ofi_dir}; price has closed back where "
-                "the bar opened")
+        return (f"the outer candle is {ofi_dir}; the body closed "
+                "where the bar opened")
     if edge:
-        return f"price is at the {edge} of the bar"
+        return f"the close is at the {edge} of the candle"
     return "nothing settled yet"
 
 
@@ -236,6 +297,7 @@ def read(ofi_dir: str = "", tick_dir: str = "",
          bounce_at: float = BOUNCE_AT,
          min_settle: float = MIN_SETTLE,
          bar_ts: float = 0.0,
+         tradeable: bool | None = None,
          prev: dict | None = None) -> dict:
     """The whole reading of one forming fused bar.
 
@@ -273,7 +335,11 @@ def read(ofi_dir: str = "", tick_dir: str = "",
 
     pos = position(high, low, close)
     edge = at_edge(pos)
-    back = depth(ofi_dir, open_px, high, low, close)
+    # THE INNER BODY PICKS THE EXTREME, the outer candle supplies
+    # the range. Framed on the body rather than the book because
+    # the body is the thing that bounces: "ofi remaining down but
+    # tick is bouncing from bottom or top".
+    back = pullback(tick_dir, high, low, close)
     agree = bool(ofi_dir in SIDES and ofi_dir == tick_dir)
     bounce_at = float(bounce_at if bounce_at is not None else BOUNCE_AT)
 
@@ -317,6 +383,16 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # candle", the second is "is this still pushing".
         "pos": pos,
         "at": edge,
+        # WHAT THE CHART ITSELF SHOWS about this bar. `grayed` is
+        # the wash the renderer puts over a bar whose book and
+        # price disagree, carried here so the panel and the candle
+        # cannot say different things about the same bar.
+        "grayed": (None if tradeable is None else not bool(tradeable)),
+        "open": _num(open_px),
+        "high": _num(high),
+        "low": _num(low),
+        "close": _num(close),
+        "net_ofi": int(_num(net_ofi)),
         "back": round(back, 3),
         "bounce_at": float(bounce_at or 0.0),
         "legs": legs(net_ofi, ofi_target, prints, tick_target),
@@ -414,6 +490,7 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           bounce_at: float = BOUNCE_AT,
           min_settle: float = MIN_SETTLE,
           bar_ts: float = 0.0,
+          tradeable: bool | None = None,
           held_s: float | None = None,
           min_hold_s: float = DWELL_S,
           prev: dict | None = None) -> dict:
@@ -429,7 +506,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                high=high, low=low, close=close, net_ofi=net_ofi,
                ofi_target=ofi_target, prints=prints,
                tick_target=tick_target, bounce_at=bounce_at,
-               min_settle=min_settle, bar_ts=bar_ts, prev=prev)
+               min_settle=min_settle, bar_ts=bar_ts,
+               tradeable=tradeable, prev=prev)
     side, why = entry_side(out["where"], out["side"],
                            held_s=held_s, min_hold_s=min_hold_s)
     ready = not (held_s is not None and min_hold_s > 0
