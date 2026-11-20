@@ -5700,6 +5700,7 @@ def create_app() -> FastAPI:
                              fused_ticks: int | None = None,
                              fused_ofi: int | None = None,
                              fused_bounce: int | None = None,
+                             fused_tf: int | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5737,6 +5738,9 @@ def create_app() -> FastAPI:
                 fused_bounce=(int(getattr(cur, "fused_bounce", 33))
                               if fused_bounce is None
                               else int(fused_bounce)),
+                # OFF IS ZERO AND ZERO IS A CHOICE.
+                fused_tf=(int(getattr(cur, "fused_tf", 0))
+                          if fused_tf is None else int(fused_tf)),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7474,7 +7478,8 @@ def create_app() -> FastAPI:
     def _fused_gate(rt_, pair: tuple[int, int] | None = None,
                     bounce: float | None = None,
                     held_s: float | None = None,
-                    prev: dict | None = None) -> dict:
+                    prev: dict | None = None,
+                    tf_s: int = 0) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -7497,6 +7502,30 @@ def create_app() -> FastAPI:
         """
         from . import fusedread as _fr
         from .fusedbar import DEFAULT_PAIR, PAIRS, label
+        # IMPORTED HERE, not reached for through the enclosing
+        # scope: `jn` is bound further down this file and is not
+        # visible from this helper, which is a NameError the
+        # execution tests found and a source scan would not.
+        from .journal import window_label as _wl
+
+        # NAMED FIRST, BEFORE ANYTHING THAT READS IT EXISTS.
+        #
+        # This sat below the `books` check, and `_nothing` -- a
+        # closure defined above it -- referenced it. The engine-not-
+        # running path therefore raised NameError on a free
+        # variable, in a route whose exceptions are swallowed into
+        # `journal.error` where nothing is looking. That is the
+        # FOURTH time this exact shape has shipped here
+        # (`FUSION_RESET_S`, `MAX_PER_BAR`, `_tf_name` in the stack
+        # branch), and no amount of reading the source catches it.
+        # One execution does, and the tests execute it.
+        #
+        # NAMED ONCE, too: a second spelling of "5m" is a second
+        # chance to gate on one timeframe while the panel draws
+        # another.
+        _tf_name = (_wl(float(tf_s)) if tf_s else "")
+        _tf_dir = ((_candle_now(rt_, _tf_name) or {}).get("dir") or ""
+                   if _tf_name else "")
 
         def _nothing(key, why):
             """ONE SHAPE, WHETHER OR NOT A BAR IS BUILDING.
@@ -7515,6 +7544,9 @@ def create_app() -> FastAPI:
                     "agree": False, "pos": None, "at": "",
                     "back": 0.0, "legs": {},
                     "say": why, "held": {},
+                    "tf": {"dir": "", "on": bool(tf_s),
+                           "name": _tf_name, "agrees": False,
+                           "decides": bool(tf_s)},
                     "held_s": None, "ready": False,
                     "min_hold_s": float(_fr.DWELL_S),
                     "bar_ts": 0.0, "decides": True}
@@ -7553,6 +7585,12 @@ def create_app() -> FastAPI:
             # in the renderer, and the panel beside it must not
             # reach a different answer about the same bar.
             tradeable=bool(cur.tradeable),
+            # THE LIVE TIMEFRAME BESIDE PRICE. Chris: "use it as a
+            # trade filter to only make a trade if the 5 minute
+            # agrees with the book and price". The same reader the
+            # other strategies use, so the row on this panel and
+            # the candle on the chart are one number.
+            tf_dir=_tf_dir, tf_on=bool(tf_s), tf_name=_tf_name or "5m",
             held_s=held_s, prev=prev)
         return {**out, "pair": list(key), "label": label(*key),
                 "building": True, "why": "",
@@ -8161,10 +8199,12 @@ def create_app() -> FastAPI:
             # seconds of it. Resolved with a first pass that asks
             # for no hold, because the hold is what this is about
             # to measure.
-            _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev)
+            _ftf = int(getattr(s, "fused_tf", 0) or 0)
+            _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev,
+                                _ftf)
             _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
             fus = _fused_gate(rt_, _fpair, _fbounce,
-                              _fdw.held_s(_now_f), _fprev)
+                              _fdw.held_s(_now_f), _fprev, _ftf)
             try:
                 rt_._fused_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -8346,8 +8386,12 @@ def create_app() -> FastAPI:
             # boundaries now, which is why nothing here is handed
             # the fused bar's start.
             from . import fusedread as _fre
+            _tf = fus.get("tf") or {}
             disagreed = _fre.exit_reason(
-                t.side, str(fus.get("where") or "")) or disagreed
+                t.side, str(fus.get("where") or ""),
+                str(fus.get("tick_dir") or ""),
+                str(_tf.get("dir") or ""), bool(_tf.get("on")),
+                str(_tf.get("name") or "5m")) or disagreed
         elif strat == "ticks" and t is not None and t.open:
             # EITHER CHART TURNING AGAINST THE POSITION. Still no
             # clock -- "Gate 2's flip only, no clock" -- but the
@@ -8548,13 +8592,33 @@ def create_app() -> FastAPI:
             # panel could show a state the rule never saw. That is
             # exactly how the 5-minute cell and the OFI bar each
             # came to disagree with the rule beside them.
+            # IT ONLY DECIDES ON ITS OWN STRATEGY, and saying so
+            # is the whole point of this branch.
+            #
+            # The panel used to report `decides: True` whatever was
+            # selected, so with "Fused (intrabar)" running it told
+            # Chris "in when they move together and it holds" while
+            # `live_signal` was actually trading -- a rule with no
+            # pullback test at all, which enters on exactly the
+            # bounces this panel says it refuses. He saw a trade
+            # open on a bounce and was right to.
+            #
+            # A panel that claims a rule nobody is running is worse
+            # than one that claims nothing, because it is read as
+            # evidence about the trade that just happened.
             "fusedgate": (
-                {**fus, "blocked_by": idle_why} if strat == "together"
-                else _fused_gate(
+                {**fus, "blocked_by": idle_why, "decides": True,
+                 "strategy": strat,
+                 "strategy_label": jn.STRATEGIES.get(strat, strat)}
+                if strat == "together"
+                else {**_fused_gate(
                     rt_, (int(getattr(s, "fused_ticks", 0) or 10000),
                           int(getattr(s, "fused_ofi", 0) or 4000)),
                     (None if getattr(s, "fused_bounce", None) is None
-                     else float(int(s.fused_bounce)) / 100.0))),
+                     else float(int(s.fused_bounce)) / 100.0),
+                    None, None, int(getattr(s, "fused_tf", 0) or 0)),
+                    "decides": False, "entry": "", "strategy": strat,
+                    "strategy_label": jn.STRATEGIES.get(strat, strat)}),
             "quote": jn_quote.read(
                 (lambda _s: getattr(getattr(_s, "tape", None), "book", None))
                 (getattr(rt_, "ofi", None)), _last or px, _age),
@@ -11308,6 +11372,19 @@ has to be running before the gate stops refusing.">spike
               <option value="20">20%</option>
               <option value="25">25%</option>
               <option value="33" selected>33%</option>
+            </select></label>
+          <!-- THE LIVE TIMEFRAME BESIDE PRICE, as a filter on the
+               fused rule. Off is a real setting, not an absence. -->
+          <label title="only trade when this live candle agrees with
+                        the book and price; exit when price turns
+                        against it"
+            >tf filter
+            <select id="jnlFusedTf" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0" selected>off</option>
+              <option value="60">1 minute</option>
+              <option value="300">5 minute</option>
+              <option value="900">15 minute</option>
             </select></label>
           <label title="gate 3 also closes a trade when it flips"
             ><input type="checkbox" id="jnlT3Ex" onchange="jnlSet()"
@@ -16306,6 +16383,7 @@ async function jnlSet() {
     jnlT3Ex: $('jnlT3Ex') ? ($('jnlT3Ex').checked ? '1' : '0') : undefined,
     jnlFused: $('jnlFused') ? String($('jnlFused').value || '10000x4000') : undefined,
     jnlBounce: $('jnlBounce') ? String($('jnlBounce').value) : undefined,
+    jnlFusedTf: $('jnlFusedTf') ? String($('jnlFusedTf').value) : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -16326,6 +16404,8 @@ async function jnlSet() {
     /* ZERO IS A CHOICE, so this cannot use || anywhere -- it would
        turn his tightest setting into his loosest on every save. */
     fused_bounce: $('jnlBounce') ? $('jnlBounce').value : 33,
+    /* OFF IS ZERO AND ZERO IS A CHOICE -- no || on this one. */
+    fused_tf: $('jnlFusedTf') ? $('jnlFusedTf').value : 0,
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -17237,8 +17317,14 @@ function paintFusedGate(FG) {
     + (FG.decides
         ? ' &mdash; in when they move together and it holds, out on '
           + 'your take profit or when they come apart'
-        : '. <b style="color:var(--dim)">SHOWN ONLY</b>, nothing '
-          + 'here opens or closes a trade')
+        /* NAME THE RULE THAT IS ACTUALLY RUNNING. "Shown only" on
+           its own invites the reading that nothing is trading;
+           what is true is that something else is, and it does not
+           read this panel. */
+        : '. <b style="color:var(--dim)">SHOWN ONLY</b> &mdash; the '
+          + 'strategy running is <b>'
+          + esc(FG.strategy_label || FG.strategy || 'another rule')
+          + '</b>, which does not read this panel')
     + '</div>';
 
   if (!FG.building) {
@@ -17289,7 +17375,25 @@ function paintFusedGate(FG) {
       '<div style="' + edge + '">'
     + '<div style="margin:4px 0">'
     + leg('outer (book)', FG.ofi_dir) + leg('body (price)', FG.tick_dir)
+    + ((FG.tf && FG.tf.on)
+        ? leg(esc(FG.tf.name || 'tf') + ' candle', FG.tf.dir)
+        : '')
     + '</div>'
+    /* THE FILTER, DRAWN WHETHER OR NOT IT IS ON. A filter that is
+       invisible when switched off reads as one that is not there,
+       and then a trade it would have blocked looks like the rule
+       failing. */
+    + ((FG.tf && FG.tf.on)
+        ? '<div class="thin">the ' + esc(FG.tf.name || '')
+          + ' candle must agree to open, and price turning against '
+          + 'it closes the trade'
+          + ((FG.tf.dir && FG.side && !FG.tf.agrees)
+              ? ' &mdash; <b class="short">it is '
+                + esc(FG.tf.dir).toUpperCase() + '</b>'
+              : '')
+          + '</div>'
+        : '<div class="thin">no timeframe filter &mdash; the two '
+          + 'candles decide this on their own</div>')
     + word + ' <span class="thin">'
     + esc(FG.where === 'settling' ? (FG.settle_why || FG.say || '')
                                   : (FG.say || '')) + '</span>'
@@ -17948,6 +18052,8 @@ function paintJournal(d) {
       + 'x' + String(Math.round(S.fused_ofi || 4000)));
   if (S.fused_bounce != null)
     set('jnlBounce', String(Math.round(S.fused_bounce)));
+  if (S.fused_tf != null)
+    set('jnlFusedTf', String(Math.round(S.fused_tf)));
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =

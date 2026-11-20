@@ -124,6 +124,10 @@ class Settings:
     # percentages that i can select from starting from 0 to 33%".
     # It is his exit, so it is a dial rather than a constant.
     fused_bounce: int = 33
+    # THE LIVE TIMEFRAME THE FUSED RULE FILTERS ON, in seconds, or
+    # 0 for off. Chris: "lets include a 5 minute or a 15 minute
+    # live time on side of price and use it as a trade filter".
+    fused_tf: int = 0
     strategy: str = "ofi"
 
     def to_dict(self) -> dict:
@@ -138,6 +142,9 @@ class Settings:
                 "fused_ticks": int(self.fused_ticks or 10000),
                 "fused_ofi": int(self.fused_ofi or 4000),
                 "fused_bounce": int(self.fused_bounce),
+                "fused_tf": int(self.fused_tf),
+                "fused_tf_label": (window_label(float(self.fused_tf))
+                                   if self.fused_tf else "off"),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
                                                  self.strategy),
@@ -448,6 +455,7 @@ _ADDED_SETTINGS = (
     ("fused_ticks", "INTEGER NOT NULL DEFAULT 10000"),
     ("fused_ofi", "INTEGER NOT NULL DEFAULT 4000"),
     ("fused_bounce", "INTEGER NOT NULL DEFAULT 33"),
+    ("fused_tf", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -512,6 +520,7 @@ class Journal(ThreadedDB):
                         fused_ticks=int(r["fused_ticks"] or 10000),
                         fused_ofi=int(r["fused_ofi"] or 4000),
                         fused_bounce=int(r["fused_bounce"]),
+                        fused_tf=int(r["fused_tf"]),
                         strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
@@ -520,8 +529,9 @@ class Journal(ThreadedDB):
                 "INSERT INTO journal_settings"
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
-                "  fused_ticks, fused_ofi, fused_bounce, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "  fused_ticks, fused_ofi, fused_bounce,"
+                "  fused_tf, strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -533,6 +543,7 @@ class Journal(ThreadedDB):
                 " fused_ticks=excluded.fused_ticks,"
                 " fused_ofi=excluded.fused_ofi,"
                 " fused_bounce=excluded.fused_bounce,"
+                " fused_tf=excluded.fused_tf,"
                 " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
@@ -560,6 +571,10 @@ class Journal(ThreadedDB):
                  # cannot use `or` anywhere -- zero is a choice,
                  # not an absence.
                  _snap_bounce(s.fused_bounce),
+                 # OFF, 1m, 5m OR 15m AND NOTHING ELSE. Zero is
+                 # off and is a choice, so no `or` on this path.
+                 (int(s.fused_tf)
+                  if int(s.fused_tf) in (0, 60, 300, 900) else 0),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 

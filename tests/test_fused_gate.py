@@ -486,9 +486,23 @@ class TestItActuallySteps:
         # ONE SHAPE ON EVERY STRATEGY. It reads the same bar
         # whichever rule is running, so a panel that changed shape
         # with the dropdown would be two panels wearing one name.
-        assert fg.get("decides") is True
         for k in ("where", "entry", "label", "held"):
             assert k in fg, f"{k} missing on the {strat} strategy"
+        # BUT IT ONLY DECIDES ON ITS OWN. This said True whatever
+        # was selected, so with "Fused (intrabar)" running the
+        # panel described the moving-together rule while
+        # `live_signal` -- which has no pullback test at all --
+        # was the thing actually taking trades. Chris saw an entry
+        # on a bounce and the panel had told him that could not
+        # happen.
+        assert fg.get("decides") is (strat == "together"), (
+            f"the panel claims to decide on the {strat} strategy")
+        assert fg.get("strategy") == strat
+        if strat != "together":
+            assert fg.get("entry") == "", \
+                "it offers a side under a rule that is not reading it"
+            assert fg.get("strategy_label"), \
+                "the panel cannot name the rule that IS running"
 
     def test_the_payload_names_the_pair_it_read(self, client,
                                                 monkeypatch):
@@ -737,8 +751,11 @@ class TestTheRule:
         about which candle it opened in reaches this."""
         import inspect
         sig = inspect.signature(fr.exit_reason)
-        assert list(sig.parameters) == ["trade_side", "where"]
-        for bad in ("bar_ts", "open_bar_ts", "held_s", "now_ts"):
+        assert list(sig.parameters) == [
+            "trade_side", "where", "tick_dir", "tf_dir", "tf_on",
+            "tf_name"]
+        for bad in ("bar_ts", "open_bar_ts", "held_s", "now_ts",
+                    "period_s"):
             assert bad not in sig.parameters, \
                 f"exit_reason takes {bad}"
 
@@ -1411,3 +1428,337 @@ class TestTheHoldRestartsWhenTheAgreementBreaks:
         assert "_fr2.AgreeHold()" in seg
         assert "_fr2.Dwell()" not in seg, \
             "the agreement is on a clock that ignores it breaking"
+
+
+class TestThePanelNeverClaimsAnotherRulesTrades:
+    """Chris: "there is a trade that took place by passed my rule"
+    -- an entry on a bounce.
+
+    It had. With "Fused (intrabar)" selected, `live_signal` was
+    the rule running: 10% of both legs and the two agreeing, with
+    no pullback test anywhere in it. It enters on exactly the
+    bounces this panel says it refuses -- and the panel reported
+    `decides: True` whatever the dropdown said, describing the
+    moving-together rule over the top of a different one.
+
+    A panel that claims a rule nobody is running is worse than one
+    that claims nothing: it gets read as evidence about the trade
+    that just happened.
+    """
+
+    def test_the_other_fused_rule_really_does_enter_on_a_pullback(self):
+        """NOT AN ASSUMPTION ABOUT THE OTHER RULE -- its own
+        function, on a bar this panel calls a bounce."""
+        from liqmap.fusedbar import FusedBar, live_signal
+        bar = FusedBar(start_ts=0.0, tick_target=10000,
+                       ofi_target=4000)
+        bar.open, bar.high, bar.low = 7160.50, 7184.00, 7154.00
+        bar.close = 7169.50
+        bar.prints, bar.net_ofi = 39236, 2097
+        bar.ts_last = 60.0
+
+        side, why = live_signal(bar)
+        assert side == "up", why
+
+        ours = fr.read(ofi_dir=bar.ofi_dir, tick_dir=bar.tick_dir,
+                       open_px=bar.open, high=bar.high, low=bar.low,
+                       close=bar.close, net_ofi=bar.net_ofi,
+                       ofi_target=4000, prints=bar.prints,
+                       tick_target=10000)
+        assert ours["where"] == "bounce"
+        assert fr.entry_side(ours["where"], ours["side"],
+                             held_s=999.0)[0] == "", \
+            "the two rules agree, so this explains nothing"
+
+    def test_the_panel_says_which_rule_is_running(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "decides": False, "entry": "",
+                       "strategy": "fused",
+                       "strategy_label": "Fused -- the tick bar and "
+                                         "the OFI, read separately"})
+        assert "SHOWN ONLY" in html
+        assert "Fused" in html, html[:400]
+        assert "does not read this panel" in html
+        assert "in when they move together" not in html, \
+            "it still describes a rule that is not running"
+
+    def test_and_says_the_opposite_on_its_own_strategy(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "decides": True, "strategy": "together",
+                       "strategy_label": "Moving together"})
+        assert "in when they move together" in html
+        assert "SHOWN ONLY" not in html
+
+    def test_it_offers_no_side_under_another_rule(self):
+        """`entry` is blanked rather than left standing: a side in
+        the payload is a side something eventually reads."""
+        from tests.test_journal import py_func
+        blk = py_func("_journal_step_un")
+        i = blk.index('"fusedgate": (')
+        seg = blk[i:i + 1400]
+        assert '"decides": False' in seg
+        assert '"entry": ""' in seg
+        assert '"decides": True' in seg
+        assert 'if strat == "together"' in seg
+
+
+class TestTheTimeframeFilter:
+    """Chris: "lets include a 5 minute or a 15 minute live time on
+    side of price and use it as a trade filter to only make a trade
+    if the 5 minute agrees with the book and price and exit a trade
+    when price disagrees with the 5 minute"."""
+
+    @pytest.mark.parametrize("side", ["up", "down"])
+    def test_all_three_agreeing_opens(self, side):
+        assert fr.entry_side("together", side, held_s=9.0,
+                             tf_dir=side, tf_on=True) == (side, "")
+
+    def test_the_timeframe_against_blocks(self):
+        got, why = fr.entry_side("together", "up", held_s=9.0,
+                                 tf_dir="down", tf_on=True)
+        assert got == ""
+        assert "5m candle is down" in why
+
+    @pytest.mark.parametrize("tf", ["", "flat"])
+    def test_a_filter_switched_on_with_nothing_to_say_blocks(self, tf):
+        """ON MEANS ON. Letting a blank through means switching the
+        filter on does nothing until the candle happens to have a
+        body -- which is the gate-3 fault over again."""
+        got, why = fr.entry_side("together", "up", held_s=9.0,
+                                 tf_dir=tf, tf_on=True)
+        assert got == ""
+        assert "no direction yet" in why
+
+    def test_switched_off_it_changes_nothing(self):
+        assert fr.entry_side("together", "up", held_s=9.0,
+                             tf_dir="down", tf_on=False) == ("up", "")
+        assert fr.entry_side("together", "up", held_s=9.0) == ("up", "")
+
+    def test_it_cannot_rescue_a_blocked_entry(self):
+        """A FILTER, NOT A VOTE. Agreeing does not overrule the
+        bounce, the settling or the five-second hold."""
+        for where in ("bounce", "settling", "apart"):
+            assert fr.entry_side(where, "up", held_s=9.0,
+                                 tf_dir="up", tf_on=True)[0] == ""
+        assert fr.entry_side("together", "up", held_s=1.0,
+                             tf_dir="up", tf_on=True)[0] == ""
+
+    def test_it_is_checked_after_the_hold_not_folded_into_it(self):
+        """The five seconds is on the book-and-price agreement,
+        which is what he asked for by name. Folding the timeframe
+        in would mean a candle that turned green five seconds ago
+        restarts a clock that has been running a minute."""
+        _, why = fr.entry_side("together", "up", held_s=1.0,
+                               tf_dir="down", tf_on=True)
+        assert "has to hold" in why, why
+        assert "5m candle" not in why
+
+    def test_the_name_follows_the_selection(self):
+        _, why = fr.entry_side("together", "up", held_s=9.0,
+                               tf_dir="down", tf_on=True,
+                               tf_name="15m")
+        assert "15m candle is down" in why
+
+    @pytest.mark.parametrize("trade,tick,tf", [
+        ("up", "up", "down"), ("up", "down", "up"),
+        ("down", "down", "up"), ("down", "up", "down"),
+    ])
+    def test_price_against_the_timeframe_closes_it(self, trade, tick,
+                                                   tf):
+        why = fr.exit_reason(trade, "together", tick, tf, True)
+        assert why
+        assert "against the 5m candle" in why
+
+    def test_price_with_the_timeframe_holds_it(self):
+        assert fr.exit_reason("up", "together", "up", "up", True) == ""
+
+    @pytest.mark.parametrize("tf", ["", "flat"])
+    def test_a_flat_timeframe_is_not_a_disagreement(self, tf):
+        """A timeframe candle sits exactly on its open constantly;
+        reading that as a reversal closes trades on nothing."""
+        assert fr.exit_reason("up", "together", "up", tf, True) == ""
+
+    def test_flat_price_is_not_a_disagreement_either(self):
+        assert fr.exit_reason("up", "together", "", "down", True) == ""
+
+    def test_switched_off_nothing_about_the_exit_changes(self):
+        assert fr.exit_reason("up", "together", "up", "down",
+                              False) == ""
+        assert fr.exit_reason("up", "apart", "up", "up", True) == \
+            "the book and price have come apart"
+
+    def test_coming_apart_keeps_the_blame_when_both_fire(self):
+        """ORDER CARRIES MEANING: the book and price parting is the
+        older rule and the one he named first."""
+        why = fr.exit_reason("up", "apart", "up", "down", True)
+        assert "come apart" in why
+        assert "5m" not in why
+
+    def test_it_watches_price_not_the_book(self):
+        """HIS ASYMMETRY, NOT AN INFERENCE: the entry wants all
+        three pointing one way, the exit watches the body against
+        the timeframe. The book parting from price is the line
+        above."""
+        import inspect
+        sig = inspect.signature(fr.exit_reason)
+        assert "tick_dir" in sig.parameters
+        assert "ofi_dir" not in sig.parameters
+
+    def test_the_state_carries_the_row_whether_on_or_off(self):
+        """A filter invisible when switched off reads as one that
+        is not there, and then a trade it would have blocked looks
+        like the rule failing."""
+        off = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                       high=20.0, low=0.0, close=20.0, held_s=9.0,
+                       **FULL)
+        assert off["tf"]["on"] is False
+        assert off["tf"]["decides"] is False
+        on = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                      high=20.0, low=0.0, close=20.0, held_s=9.0,
+                      tf_dir="up", tf_on=True, tf_name="15m", **FULL)
+        assert on["tf"] == {"dir": "up", "on": True, "name": "15m",
+                            "agrees": True, "decides": True}
+        assert on["entry"] == "up"
+
+
+class TestTheTimeframeFilterIsWiredThrough:
+    def _web(self):
+        return (SRC / "web.py").read_text()
+
+    def _step(self):
+        from tests.test_journal import py_func
+        return py_func("_journal_step_un")
+
+    def test_the_settings_carry_it(self):
+        from liqmap.journal import Settings
+        s = Settings()
+        assert s.fused_tf == 0
+        assert s.to_dict()["fused_tf"] == 0
+        assert s.to_dict()["fused_tf_label"] == "off"
+
+    @pytest.mark.parametrize("tf,kept", [(0, 0), (60, 60),
+                                         (300, 300), (900, 900),
+                                         (30, 0), (123, 0),
+                                         (600, 0)])
+    def test_only_off_five_and_fifteen_survive_a_save(self, tmp_path,
+                                                      tf, kept):
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", fused_tf=tf))
+        assert j.settings("ES").fused_tf == kept
+
+    def test_the_selector_offers_off_one_five_and_fifteen(self):
+        import re
+        src = self._web()
+        i = src.index('id="jnlFusedTf"')
+        box = src[i:src.index("</select>", i)]
+        shown = sorted(int(m) for m in re.findall(r'value="(\d+)"', box))
+        assert shown == [0, 60, 300, 900]
+
+    def test_every_offered_choice_has_a_name_and_a_candle(self):
+        """A SELECTOR VALUE THE READER CANNOT NAME is a filter
+        that silently does nothing: `window_label` picks the
+        interval `_candle_now` is asked for, so a value it maps
+        wrongly gates on a timeframe nobody chose."""
+        from liqmap.journal import window_label
+        assert window_label(60.0) == "1m"
+        assert window_label(300.0) == "5m"
+        assert window_label(900.0) == "15m"
+
+    def test_off_is_never_read_as_missing(self):
+        """`or 300` ANYWHERE turns "off" into a filter he did not
+        switch on."""
+        src = self._web()
+        assert "fused_tf: $('jnlFusedTf') ? $('jnlFusedTf').value : 0," \
+            in src
+        blk = self._step()
+        i = blk.index("_ftf = ")
+        assert "or 0" in blk[i:i + 120]
+
+    def test_the_step_reads_it_and_hands_it_over(self):
+        blk = self._step()
+        assert 'getattr(s, "fused_tf", 0)' in blk
+        assert "_fused_gate(rt_, _fpair, _fbounce, None, _fprev,\n" in blk \
+            or "_fprev,\n                                _ftf)" in blk
+
+    def test_the_helper_reads_the_live_candle(self):
+        src = self._web()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "_candle_now(rt_, _tf_name)" in fn, \
+            "the filter is not reading a live timeframe candle"
+        assert "_wl(float(tf_s))" in fn, \
+            "the timeframe name is not built from the setting"
+        assert "from .journal import window_label as _wl" in fn, \
+            "it reaches for `jn` through a scope it cannot see"
+
+    def test_the_timeframe_is_named_before_anything_reads_it(self):
+        """THE FOURTH NameError OF THIS SHAPE. `_nothing` is a
+        closure defined above the assignment and referenced it, so
+        the engine-not-running path raised a free-variable error
+        into `journal.error`, where nothing was looking."""
+        src = self._web()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert fn.index("_tf_name = ") < fn.index("def _nothing("), \
+            "the closure is defined before the name it reads"
+
+    def test_the_exit_is_handed_the_filter(self):
+        blk = self._step()
+        i = blk.index("_fre.exit_reason(")
+        seg = blk[i:i + 420]
+        assert 'fus.get("tick_dir")' in seg
+        assert '_tf.get("dir")' in seg
+        assert '_tf.get("on")' in seg
+
+    def test_the_panel_draws_the_row(self):
+        src = self._web()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "FG.tf" in fn
+        assert "no timeframe filter" in fn, \
+            "the panel goes silent when the filter is off"
+
+    @pytest.mark.parametrize("tf", [0, 60, 300, 900])
+    def test_the_step_runs_at_every_setting(self, client, monkeypatch,
+                                            tf):
+        """EXECUTION, NOT SOURCE TEXT. Adding this filter shipped a
+        NameError on the engine-not-running path that no source
+        scan could see -- it raised into `journal.error` and every
+        text assertion still passed."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        s.fused_tf = tf
+        rt.journal.save_settings(s)
+        assert rt.journal.settings("ES").fused_tf == tf
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, (
+            f"the step raised with tf={tf}: {jr.get('error')}")
+        fg = jr.get("fusedgate") or {}
+        assert (fg.get("tf") or {}).get("on") is bool(tf)
+
+    def test_the_route_takes_it(self, client):
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_tf": "900"},
+                        headers=AUTH).json()
+        s = d.get("settings") or d
+        assert int(s.get("fused_tf")) == 900
+        assert s.get("fused_tf_label") == "15m"
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_tf": "0"},
+                        headers=AUTH).json()
+        s = d.get("settings") or d
+        assert int(s.get("fused_tf")) == 0, \
+            "switching the filter off was read as leaving it alone"
+        assert s.get("fused_tf_label") == "off"

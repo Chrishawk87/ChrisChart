@@ -475,7 +475,9 @@ def read(ofi_dir: str = "", tick_dir: str = "",
 
 def entry_side(where: str, side: str,
                held_s: float | None = None,
-               min_hold_s: float = DWELL_S) -> tuple[str, str]:
+               min_hold_s: float = DWELL_S,
+               tf_dir: str = "", tf_on: bool = False,
+               tf_name: str = "5m") -> tuple[str, str]:
     """The side this bar is offering, and why not.
 
     Chris: "the auto trader will then trade the direction that is
@@ -505,10 +507,32 @@ def entry_side(where: str, side: str,
         return "", (f"they have been moving {side} together for "
                     f"{held_s:.0f}s -- it has to hold "
                     f"{min_hold_s:.0f}s")
+    # THE TIMEFRAME, AS A FILTER AND ONLY A FILTER. Chris: "use it
+    # as a trade filter to only make a trade if the 5 minute agrees
+    # with the book and price".
+    #
+    # CHECKED AFTER THE HOLD, not folded into it. The five seconds
+    # is on the book-and-price agreement, which is what he asked
+    # for by name; the timeframe is consulted at the moment of
+    # entry. Folding it in would mean a timeframe that turned
+    # green five seconds ago restarts a clock that has been
+    # running for a minute.
+    #
+    # ON MEANS ON. A filter switched on with nothing to say must
+    # block, or switching it on does nothing until the candle
+    # happens to have a body -- which is the gate-3 fault again.
+    if tf_on:
+        if tf_dir not in SIDES:
+            return "", (f"the {tf_name} candle has no direction yet")
+        if tf_dir != side:
+            return "", (f"the {tf_name} candle is {tf_dir} against a "
+                        f"{side} entry")
     return side, ""
 
 
-def exit_reason(trade_side: str, where: str) -> str:
+def exit_reason(trade_side: str, where: str,
+                tick_dir: str = "", tf_dir: str = "",
+                tf_on: bool = False, tf_name: str = "5m") -> str:
     """Why this trade should end now, or "" to hold it.
 
     ONE THING CLOSES IT HERE, and the take profit closes the other
@@ -539,6 +563,22 @@ def exit_reason(trade_side: str, where: str) -> str:
         return ""
     if where == "apart":
         return "the book and price have come apart"
+    # PRICE AGAINST THE TIMEFRAME. Chris: "exit a trade when price
+    # disagrees with the 5 minute".
+    #
+    # PRICE, NOT THE BOOK, and that asymmetry is his: the entry
+    # wants all three pointing one way, the exit watches the body
+    # against the timeframe. The book coming apart from price is
+    # already the line above.
+    #
+    # FLAT IS NOT A DISAGREEMENT. A timeframe candle sits exactly
+    # on its open constantly, and reading that as a reversal would
+    # close trades on nothing -- the mistake this engine has made
+    # three times.
+    if tf_on and tick_dir in SIDES and tf_dir in SIDES \
+            and tick_dir != tf_dir:
+        return (f"price is {tick_dir} against the {tf_name} candle, "
+                f"which is {tf_dir}")
     return ""
 
 
@@ -550,6 +590,7 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           bounce_at: float = BOUNCE_AT,
           min_settle: float = MIN_SETTLE,
           bar_ts: float = 0.0,
+          tf_dir: str = "", tf_on: bool = False, tf_name: str = "5m",
           tradeable: bool | None = None,
           held_s: float | None = None,
           min_hold_s: float = DWELL_S,
@@ -569,7 +610,9 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                min_settle=min_settle, bar_ts=bar_ts,
                tradeable=tradeable, prev=prev)
     side, why = entry_side(out["where"], out["side"],
-                           held_s=held_s, min_hold_s=min_hold_s)
+                           held_s=held_s, min_hold_s=min_hold_s,
+                           tf_dir=tf_dir, tf_on=tf_on,
+                           tf_name=tf_name)
     ready = not (held_s is not None and min_hold_s > 0
                  and held_s < min_hold_s)
     return {**out,
@@ -578,4 +621,13 @@ def state(ofi_dir: str = "", tick_dir: str = "",
             "held_s": (None if held_s is None else float(held_s)),
             "min_hold_s": float(min_hold_s or 0.0),
             "ready": ready,
+            # THE TIMEFRAME ROW, for the panel. Carried whether or
+            # not it is on, so the screen can say "off" rather than
+            # going silent -- a filter that is invisible when
+            # switched off reads as one that is not there.
+            "tf": {"dir": str(tf_dir or ""), "on": bool(tf_on),
+                   "name": str(tf_name or ""),
+                   "agrees": bool(tf_dir in SIDES
+                                  and tf_dir == out["side"]),
+                   "decides": bool(tf_on)},
             "bar_ts": float(bar_ts or 0.0)}
