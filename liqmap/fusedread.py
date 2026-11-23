@@ -500,13 +500,30 @@ def read(ofi_dir: str = "", tick_dir: str = "",
                     == float(bar_ts or 0.0))
     ok, settle_why = settled(net_ofi, ofi_target, prints,
                              tick_target, min_settle)
+    if same_bar:
+        # THE BODY IS HELD WHETHER OR NOT THE BAR HAS SETTLED.
+        #
+        # Chris: "the body (shape) keeps blinking in and out its
+        # supposed to be as accurate as it is right now just a
+        # constant reading never fading".
+        #
+        # It is drawn and it decides nothing, so the settling gate
+        # -- which exists to stop a RULE reading noise -- has no
+        # business over it. Behind that gate it fell back to the
+        # raw close-against-open on every poll of an unsettled
+        # bar, and a candle sits exactly on its open often enough
+        # that the row flickered.
+        body_dir = hold_dir(body_dir, str(prev.get("body_dir") or ""))
     if ok and same_bar:
         # HELD THROUGH A TIE, once the bar has settled. A bar that
         # ticks back to flat for an instant has not changed its
         # mind, and an absence must never read as a reversal.
+        #
+        # THESE TWO DECIDE, so they stay behind the gate: a
+        # direction held from before the bar settled is a
+        # direction read off noise.
         ofi_dir = hold_dir(ofi_dir, str(prev.get("ofi_dir") or ""))
         tick_dir = hold_dir(tick_dir, str(prev.get("tick_dir") or ""))
-        body_dir = hold_dir(body_dir, str(prev.get("body_dir") or ""))
 
     pos = position(high, low, close)
     edge = at_edge(pos)

@@ -17464,9 +17464,13 @@ function paintFusedGate(FG) {
        the body the whole way up -- and that disagreement is the
        case for the change, so it has to be visible. */
     + leg('price (moving)', FG.tick_dir)
-    + ((FG.body_dir && FG.tick_dir && FG.body_dir !== FG.tick_dir)
-        ? leg('body (shape)', FG.body_dir)
-        : '')
+    /* ALWAYS DRAWN. It was conditional on disagreeing with price,
+       so the row vanished every time the two lined up and came
+       back when they parted -- Chris: "keeps blinking in and out
+       ... just a constant reading never fading". A row that
+       appears only when something is wrong is also a row you
+       cannot check when nothing is. */
+    + leg('body (shape)', FG.body_dir)
     + ((FG.tf && FG.tf.on)
         ? leg(esc(FG.tf.name || 'tf') + ' candle', FG.tf.dir)
         : '')

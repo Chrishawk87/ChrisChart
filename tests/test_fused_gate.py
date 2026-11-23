@@ -2444,3 +2444,131 @@ class TestPriceIsTowardOrAwayFromTheOpen:
         assert "price (moving)" in html
         assert "body (shape)" in html, \
             "the stale body is invisible exactly when it matters"
+
+
+class TestTheBodyRowIsConstant:
+    """Chris: "the body (shape) keeps blinking in and out its
+    supposed to be as accurate as it is right now just a constant
+    reading never fading".
+
+    Two causes, and both were mine. The row was drawn only when
+    the body disagreed with price, so it vanished whenever they
+    lined up. And the body was held through a tie only once the
+    bar had SETTLED -- behind that gate it fell back to the raw
+    close-against-open on every poll, and a candle sits exactly on
+    its open often enough that it flickered.
+    """
+
+    # the candle alone -- the book and the body are passed per test
+    CANDLE = dict(open_px=100.0, high=120.0, low=100.0, close=120.0)
+
+    def test_the_row_is_drawn_when_they_agree(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "body_dir": "up",
+                       "ofi_dir": "up", "where": "together",
+                       "agree": True, "side": "up"})
+        assert "body (shape)" in html, \
+            "the row vanishes whenever the body and price line up"
+
+    def test_and_when_they_disagree(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "body_dir": "down",
+                       "ofi_dir": "up", "where": "together",
+                       "agree": True, "side": "up"})
+        assert "body (shape)" in html
+
+    def test_and_when_the_body_has_nothing_to_say(self, page_js):
+        """A row that disappears and a row reading "--" are
+        different things on a screen, and only one of them can be
+        checked."""
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "body_dir": "",
+                       "ofi_dir": "up", "where": "together",
+                       "agree": True, "side": "up"})
+        assert "body (shape)" in html
+
+    def test_the_painter_never_makes_it_conditional(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        j = fn.index("leg('body (shape)'")
+        # back up to the start of that expression
+        line = fn[fn.rindex("\n", 0, j):j]
+        assert "?" not in line, \
+            "the body row is drawn behind a condition again"
+
+    def test_the_body_holds_through_a_tie_before_the_bar_settles(self):
+        """THE SETTLING GATE HAS NO BUSINESS OVER IT. That gate
+        stops a RULE reading noise; the body decides nothing and
+        is only drawn."""
+        unsettled = dict(net_ofi=10, ofi_target=4000, prints=20,
+                         tick_target=10000)
+        first = fr.read(ofi_dir="up", tick_dir="up", open_px=100.0,
+                        high=120.0, low=100.0, close=120.0,
+                        bar_ts=100.0, **unsettled)
+        assert first["settled"] is False
+        assert first["body_dir"] == "up"
+        tie = fr.read(ofi_dir="up", tick_dir="", open_px=100.0,
+                      high=120.0, low=100.0, close=100.0,
+                      bar_ts=100.0, prev=first["held"], **unsettled)
+        assert tie["body_dir"] == "up", \
+            "the body blanked on a tie before the bar settled"
+
+    def test_it_holds_through_a_tie_after_it_settles_too(self):
+        first = fr.read(ofi_dir="up", tick_dir="down", bar_ts=100.0,
+                        **self.CANDLE, **FULL)
+        assert first["settled"] is True
+        assert first["body_dir"] == "down"
+        tie = fr.read(ofi_dir="up", tick_dir="", bar_ts=100.0,
+                      prev=first["held"], **self.CANDLE, **FULL)
+        assert tie["body_dir"] == "down"
+
+    def test_it_does_not_survive_into_the_next_candle(self):
+        """A new bar's body is genuinely new -- holding the last
+        one's shape would be the stale-body problem all over
+        again, in the one place it is still drawn."""
+        first = fr.read(ofi_dir="up", tick_dir="up", bar_ts=100.0,
+                        **self.CANDLE, **FULL)
+        nxt = fr.read(ofi_dir="up", tick_dir="", bar_ts=200.0,
+                      prev=first["held"], **self.CANDLE, **FULL)
+        assert nxt["body_dir"] == ""
+
+    def test_the_body_never_stands_in_for_the_price_leg(self):
+        """A FALLBACK IS THE STALE BODY COMING BACK BY THE SIDE
+        DOOR. It has to be a candle with no run off its open but a
+        body that still has an opinion, which is a bar before its
+        first print: `open` is 0.0 and every other field has a
+        value.
+
+        A mutation that wrote `hold_dir(tick_dir, body_dir)`
+        survived every other test here, because everywhere else
+        the two are blank together.
+        """
+        prev = {"ofi_dir": "up", "tick_dir": "", "body_dir": "up",
+                "bar_ts": 100.0}
+        out = fr.read(ofi_dir="up", tick_dir="up", open_px=0.0,
+                      high=20.0, low=0.0, close=12.0, bar_ts=100.0,
+                      prev=prev, **FULL)
+        assert out["settled"] is True
+        assert out["body_dir"] == "up", "the fixture proves nothing"
+        assert out["run_dir"] == ""
+        assert out["tick_dir"] == "", \
+            "the body stood in for price when the candle had no run"
+        assert out["where"] == ""
+        assert out["side"] == ""
+
+    def test_holding_the_body_moves_no_reading(self):
+        """It is drawn and it decides nothing, so a held body must
+        not change where/side/price."""
+        a = fr.read(ofi_dir="up", tick_dir="up", bar_ts=1.0,
+                    **self.CANDLE, **FULL)
+        b = fr.read(ofi_dir="up", tick_dir="down", bar_ts=1.0,
+                    **self.CANDLE, **FULL)
+        for k in ("where", "side", "tick_dir", "back", "run_dir"):
+            assert a[k] == b[k], f"the body moved {k}"
