@@ -753,7 +753,7 @@ class TestTheRule:
         sig = inspect.signature(fr.exit_reason)
         assert list(sig.parameters) == [
             "trade_side", "where", "tick_dir", "tf_dir", "tf_on",
-            "tf_name"]
+            "tf_name", "tf2_dir", "tf2_on", "tf2_name"]
         for bad in ("bar_ts", "open_bar_ts", "held_s", "now_ts",
                     "period_s"):
             assert bad not in sig.parameters, \
@@ -1621,7 +1621,8 @@ class TestTheTimeframeFilter:
                       high=20.0, low=0.0, close=20.0, held_s=9.0,
                       tf_dir="up", tf_on=True, tf_name="15m", **FULL)
         assert on["tf"] == {"dir": "up", "on": True, "name": "15m",
-                            "agrees": True, "decides": True}
+                            "agrees": True, "left_s": None,
+                            "decides": True}
         assert on["entry"] == "up"
 
 
@@ -1689,10 +1690,15 @@ class TestTheTimeframeFilterIsWiredThrough:
         src = self._web()
         i = src.index("def _fused_gate(")
         fn = src[i:src.index("\n    def ", i + 10)]
-        assert "_candle_now(rt_, _tf_name)" in fn, \
+        assert "_candle_now(rt_, nm)" in fn, \
             "the filter is not reading a live timeframe candle"
-        assert "_wl(float(tf_s))" in fn, \
+        assert "_wl(float(secs))" in fn, \
             "the timeframe name is not built from the setting"
+        # ONE READER FOR BOTH. A second spelling of this is a
+        # second chance to gate on one candle while the panel
+        # draws another.
+        assert fn.count("_candle_now(rt_, nm)") == 1
+        assert "_tf_read(tf_s)" in fn and "_tf_read(tf2_s)" in fn
         assert "from .journal import window_label as _wl" in fn, \
             "it reaches for `jn` through a scope it cannot see"
 
@@ -1704,7 +1710,8 @@ class TestTheTimeframeFilterIsWiredThrough:
         src = self._web()
         i = src.index("def _fused_gate(")
         fn = src[i:src.index("\n    def ", i + 10)]
-        assert fn.index("_tf_name = ") < fn.index("def _nothing("), \
+        assert fn.index("_tf_dir, _tf_name, _tf_left = ") \
+            < fn.index("def _nothing("), \
             "the closure is defined before the name it reads"
 
     def test_the_exit_is_handed_the_filter(self):
@@ -1762,3 +1769,257 @@ class TestTheTimeframeFilterIsWiredThrough:
         assert int(s.get("fused_tf")) == 0, \
             "switching the filter off was read as leaving it alone"
         assert s.get("fused_tf_label") == "off"
+
+
+class TestTheSecondTimeframe:
+    """Chris: "lets add another timeframe on the side of that one"
+    -- same rule: both must agree to open, price turning against
+    either one closes the trade."""
+
+    BOTH = dict(tf_on=True, tf_name="5m", tf2_on=True, tf2_name="15m")
+
+    @pytest.mark.parametrize("side", ["up", "down"])
+    def test_both_agreeing_opens(self, side):
+        assert fr.entry_side("together", side, held_s=9.0,
+                             tf_dir=side, tf2_dir=side,
+                             **self.BOTH) == (side, "")
+
+    @pytest.mark.parametrize("a,b,named,other", [
+        ("down", "up", "5m", "15m"),
+        ("up", "down", "15m", "5m"),
+        ("down", "down", "5m", "15m"),
+    ])
+    def test_either_one_against_blocks_and_is_named(self, a, b, named,
+                                                    other):
+        """THE PANEL HAS TO BLAME THE ONE THAT REFUSED. "a
+        timeframe disagrees" is not something you can act on.
+
+        `"5m candle" in why` IS NOT ENOUGH, and a mutation that
+        swapped the order proved it: "the 15m candle" contains
+        "5m candle" as a substring, so the wrong name passed. The
+        article pins it.
+        """
+        got, why = fr.entry_side("together", "up", held_s=9.0,
+                                 tf_dir=a, tf2_dir=b, **self.BOTH)
+        assert got == ""
+        assert f"the {named} candle" in why, why
+        assert f"the {other} candle" not in why, why
+
+    @pytest.mark.parametrize("blank", ["", "flat"])
+    def test_a_second_filter_on_with_nothing_to_say_blocks(self, blank):
+        got, why = fr.entry_side("together", "up", held_s=9.0,
+                                 tf_dir="up", tf2_dir=blank,
+                                 **self.BOTH)
+        assert got == ""
+        assert "15m candle has no direction yet" in why
+
+    def test_one_on_and_one_off_is_the_old_behaviour(self):
+        assert fr.entry_side("together", "up", held_s=9.0,
+                             tf_dir="up", tf_on=True,
+                             tf2_dir="down", tf2_on=False) == ("up", "")
+
+    def test_both_off_changes_nothing(self):
+        assert fr.entry_side("together", "up", held_s=9.0,
+                             tf_dir="down", tf2_dir="down") == ("up", "")
+
+    @pytest.mark.parametrize("a,b,named,other", [
+        ("down", "up", "5m", "15m"),
+        ("up", "down", "15m", "5m"),
+    ])
+    def test_price_against_either_one_closes_it(self, a, b, named,
+                                                other):
+        why = fr.exit_reason("up", "together", "up", a, True, "5m",
+                             b, True, "15m")
+        assert why
+        assert f"the {named} candle" in why, why
+        assert f"the {other} candle" not in why, why
+
+    def test_a_flat_second_timeframe_is_not_a_disagreement(self):
+        assert fr.exit_reason("up", "together", "up", "up", True,
+                              "5m", "flat", True, "15m") == ""
+
+    def test_the_second_is_silent_when_it_is_off(self):
+        assert fr.exit_reason("up", "together", "up", "up", True,
+                              "5m", "down", False, "15m") == ""
+
+    def test_the_first_keeps_the_blame_when_both_disagree(self):
+        why = fr.exit_reason("up", "together", "up", "down", True,
+                             "5m", "down", True, "15m")
+        assert "5m" in why and "15m" not in why
+
+    def test_the_state_carries_both_rows(self):
+        out = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                       high=20.0, low=0.0, close=20.0, held_s=9.0,
+                       tf_dir="up", tf2_dir="up", **self.BOTH, **FULL)
+        assert out["tf"]["name"] == "5m"
+        assert out["tf2"]["name"] == "15m"
+        assert out["tf2"]["on"] is True
+        assert out["tf2"]["decides"] is True
+        assert out["entry"] == "up"
+
+
+class TestTheCandleCountdown:
+    """Chris: "a candle countdown that way we aren't making trades
+    in the middle of nowhere", and asked what it should do: "Just
+    show it"."""
+
+    def test_it_rides_on_the_first_timeframe(self):
+        out = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                       high=20.0, low=0.0, close=20.0, held_s=9.0,
+                       tf_dir="up", tf_on=True, tf_name="5m",
+                       tf_left_s=137.4, tf2_dir="up", tf2_on=True,
+                       tf2_name="15m", **FULL)
+        assert out["tf"]["left_s"] == pytest.approx(137.4)
+        assert out["tf2"]["left_s"] is None, \
+            "a second clock nobody asked for"
+
+    def test_it_never_goes_negative(self):
+        out = fr.state(tf_on=True, tf_left_s=-4.0, **FULL)
+        assert out["tf"]["left_s"] == 0.0
+
+    def test_an_unknown_countdown_is_none_not_zero(self):
+        """`None` means the candle could not be read. Zero means it
+        is about to close, which is a different thing to look at."""
+        out = fr.state(tf_on=True, **FULL)
+        assert out["tf"]["left_s"] is None
+
+    def test_it_gates_nothing(self):
+        """"Just show it". A clock that blocks entries is a rule,
+        and this is not one -- the entry function cannot even see
+        it."""
+        import inspect
+        sig = inspect.signature(fr.entry_side)
+        for bad in ("left_s", "tf_left_s", "countdown"):
+            assert bad not in sig.parameters
+        assert "tf_left_s" not in inspect.signature(fr.exit_reason).parameters
+        early = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                         high=20.0, low=0.0, close=20.0, held_s=9.0,
+                         tf_dir="up", tf_on=True, tf_left_s=299.0,
+                         **FULL)
+        late = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                        high=20.0, low=0.0, close=20.0, held_s=9.0,
+                        tf_dir="up", tf_on=True, tf_left_s=1.0,
+                        **FULL)
+        assert early["entry"] == late["entry"] == "up", \
+            "the clock is blocking entries"
+
+    def test_the_route_computes_it_from_the_period(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "float(secs) - float(age)" in fn, \
+            "the countdown is not the candle's own remaining time"
+        assert "max(0.0," in fn
+
+    def test_the_panel_draws_it_as_minutes_and_seconds(self):
+        src = (SRC / "web.py").read_text()
+        assert "function mmss(" in src
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "mmss(FG.tf.left_s)" in fn
+        assert "shown only, nothing" in fn, \
+            "the panel does not say the clock blocks nothing"
+
+    @pytest.mark.parametrize("tf,tf2", [
+        (0, 0), (300, 0), (0, 900), (60, 900), (300, 300),
+    ])
+    def test_the_step_runs_with_both_set(self, client, monkeypatch,
+                                         tf, tf2):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        s.fused_tf, s.fused_tf2 = tf, tf2
+        rt.journal.save_settings(s)
+        got = rt.journal.settings("ES")
+        assert (got.fused_tf, got.fused_tf2) == (tf, tf2)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, (
+            f"the step raised at {tf}/{tf2}: {jr.get('error')}")
+        fg = jr.get("fusedgate") or {}
+        assert (fg.get("tf") or {}).get("on") is bool(tf)
+        assert (fg.get("tf2") or {}).get("on") is bool(tf2)
+        assert (fg.get("tf2") or {}).get("left_s") is None
+
+    @pytest.mark.parametrize("tf2,kept", [(0, 0), (60, 60),
+                                          (300, 300), (900, 900),
+                                          (30, 0), (600, 0),
+                                          (1800, 0)])
+    def test_only_the_offered_intervals_survive_a_save(self, tmp_path,
+                                                       tf2, kept):
+        """THE SECOND ONE NEEDS ITS OWN GUARD. The first had one
+        and the second was waved through -- a value with no live
+        candle behind it gates on a timeframe nobody chose."""
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", fused_tf2=tf2))
+        assert j.settings("ES").fused_tf2 == kept
+
+    def test_the_two_are_validated_independently(self, tmp_path):
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", fused_tf=900,
+                                 fused_tf2=42))
+        g = j.settings("ES")
+        assert (g.fused_tf, g.fused_tf2) == (900, 0), \
+            "one bad value took the other down with it"
+
+    def test_the_second_selector_offers_the_same_four(self):
+        import re
+        src = (SRC / "web.py").read_text()
+        i = src.index('id="jnlFusedTf2"')
+        box = src[i:src.index("</select>", i)]
+        shown = sorted(int(m) for m in re.findall(r'value="(\d+)"', box))
+        assert shown == [0, 60, 300, 900]
+
+    def test_the_route_takes_the_second(self, client):
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_tf": "300",
+                                "fused_tf2": "900"},
+                        headers=AUTH).json()
+        s = d.get("settings") or d
+        assert int(s.get("fused_tf")) == 300
+        assert int(s.get("fused_tf2")) == 900
+        assert s.get("fused_tf2_label") == "15m"
+        d = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_tf2": "0"},
+                        headers=AUTH).json()
+        s = d.get("settings") or d
+        assert int(s.get("fused_tf2")) == 0
+        assert int(s.get("fused_tf")) == 300, \
+            "a setting the call did not mention was reset"
+
+    def test_both_panel_rows_render(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "where": "together", "ofi_dir": "up",
+                       "tick_dir": "up", "agree": True, "side": "up",
+                       "tf": {"dir": "up", "on": True, "name": "5m",
+                              "agrees": True, "left_s": 137.0,
+                              "decides": True},
+                       "tf2": {"dir": "down", "on": True,
+                               "name": "15m", "agrees": False,
+                               "left_s": None, "decides": True}})
+        assert "5m candle" in html and "15m candle" in html
+        assert "2:17" in html, "the countdown is not drawn as m:ss"
+        assert "closes in" in html
+        assert "must agree to open" in html
+
+    def test_the_panel_says_so_when_both_are_off(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tf": {"dir": "", "on": False, "name": "",
+                              "agrees": False, "left_s": None,
+                              "decides": False},
+                       "tf2": {"dir": "", "on": False, "name": "",
+                               "agrees": False, "left_s": None,
+                               "decides": False}})
+        assert "no timeframe filter" in html
+        assert "closes in" not in html

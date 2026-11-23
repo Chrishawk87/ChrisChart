@@ -5701,6 +5701,7 @@ def create_app() -> FastAPI:
                              fused_ofi: int | None = None,
                              fused_bounce: int | None = None,
                              fused_tf: int | None = None,
+                             fused_tf2: int | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5741,6 +5742,8 @@ def create_app() -> FastAPI:
                 # OFF IS ZERO AND ZERO IS A CHOICE.
                 fused_tf=(int(getattr(cur, "fused_tf", 0))
                           if fused_tf is None else int(fused_tf)),
+                fused_tf2=(int(getattr(cur, "fused_tf2", 0))
+                           if fused_tf2 is None else int(fused_tf2)),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7479,7 +7482,7 @@ def create_app() -> FastAPI:
                     bounce: float | None = None,
                     held_s: float | None = None,
                     prev: dict | None = None,
-                    tf_s: int = 0) -> dict:
+                    tf_s: int = 0, tf2_s: int = 0) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -7523,9 +7526,33 @@ def create_app() -> FastAPI:
         # NAMED ONCE, too: a second spelling of "5m" is a second
         # chance to gate on one timeframe while the panel draws
         # another.
-        _tf_name = (_wl(float(tf_s)) if tf_s else "")
-        _tf_dir = ((_candle_now(rt_, _tf_name) or {}).get("dir") or ""
-                   if _tf_name else "")
+        def _tf_read(secs):
+            """One live timeframe candle: its direction, and how
+            long it has left.
+
+            THE COUNTDOWN IS SHOWN, NOT GATED. Chris asked for "a
+            candle countdown that way we aren't making trades in
+            the middle of nowhere" and then, asked what it should
+            do, "Just show it". A number the panel draws and the
+            rule never reads.
+            """
+            if not secs:
+                return "", "", None
+            nm = _wl(float(secs))
+            c = _candle_now(rt_, nm) or {}
+            d = str(c.get("dir") or "")
+            age = c.get("seconds")
+            left = (None if age is None
+                    else max(0.0, float(secs) - float(age)))
+            return d, nm, left
+
+        _tf_dir, _tf_name, _tf_left = _tf_read(tf_s)
+        # ONE COUNTDOWN, ON THE FIRST TIMEFRAME ONLY -- his
+        # choice. The second one's clock is read and discarded
+        # rather than not read at all, because `_tf_read` is one
+        # function and a second spelling of it is a second chance
+        # to be wrong about which candle is which.
+        _tf2_dir, _tf2_name, _ = _tf_read(tf2_s)
 
         def _nothing(key, why):
             """ONE SHAPE, WHETHER OR NOT A BAR IS BUILDING.
@@ -7546,7 +7573,10 @@ def create_app() -> FastAPI:
                     "say": why, "held": {},
                     "tf": {"dir": "", "on": bool(tf_s),
                            "name": _tf_name, "agrees": False,
-                           "decides": bool(tf_s)},
+                           "left_s": _tf_left, "decides": bool(tf_s)},
+                    "tf2": {"dir": "", "on": bool(tf2_s),
+                            "name": _tf2_name, "agrees": False,
+                            "left_s": None, "decides": bool(tf2_s)},
                     "held_s": None, "ready": False,
                     "min_hold_s": float(_fr.DWELL_S),
                     "bar_ts": 0.0, "decides": True}
@@ -7591,6 +7621,9 @@ def create_app() -> FastAPI:
             # other strategies use, so the row on this panel and
             # the candle on the chart are one number.
             tf_dir=_tf_dir, tf_on=bool(tf_s), tf_name=_tf_name or "5m",
+            tf_left_s=_tf_left,
+            tf2_dir=_tf2_dir, tf2_on=bool(tf2_s),
+            tf2_name=_tf2_name or "15m",
             held_s=held_s, prev=prev)
         return {**out, "pair": list(key), "label": label(*key),
                 "building": True, "why": "",
@@ -8200,11 +8233,13 @@ def create_app() -> FastAPI:
             # for no hold, because the hold is what this is about
             # to measure.
             _ftf = int(getattr(s, "fused_tf", 0) or 0)
+            _ftf2 = int(getattr(s, "fused_tf2", 0) or 0)
             _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev,
-                                _ftf)
+                                _ftf, _ftf2)
             _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
             fus = _fused_gate(rt_, _fpair, _fbounce,
-                              _fdw.held_s(_now_f), _fprev, _ftf)
+                              _fdw.held_s(_now_f), _fprev, _ftf,
+                              _ftf2)
             try:
                 rt_._fused_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -8387,11 +8422,14 @@ def create_app() -> FastAPI:
             # the fused bar's start.
             from . import fusedread as _fre
             _tf = fus.get("tf") or {}
+            _tf2 = fus.get("tf2") or {}
             disagreed = _fre.exit_reason(
                 t.side, str(fus.get("where") or ""),
                 str(fus.get("tick_dir") or ""),
                 str(_tf.get("dir") or ""), bool(_tf.get("on")),
-                str(_tf.get("name") or "5m")) or disagreed
+                str(_tf.get("name") or "5m"),
+                str(_tf2.get("dir") or ""), bool(_tf2.get("on")),
+                str(_tf2.get("name") or "15m")) or disagreed
         elif strat == "ticks" and t is not None and t.open:
             # EITHER CHART TURNING AGAINST THE POSITION. Still no
             # clock -- "Gate 2's flip only, no clock" -- but the
@@ -8616,7 +8654,8 @@ def create_app() -> FastAPI:
                           int(getattr(s, "fused_ofi", 0) or 4000)),
                     (None if getattr(s, "fused_bounce", None) is None
                      else float(int(s.fused_bounce)) / 100.0),
-                    None, None, int(getattr(s, "fused_tf", 0) or 0)),
+                    None, None, int(getattr(s, "fused_tf", 0) or 0),
+                    int(getattr(s, "fused_tf2", 0) or 0)),
                     "decides": False, "entry": "", "strategy": strat,
                     "strategy_label": jn.STRATEGIES.get(strat, strat)}),
             "quote": jn_quote.read(
@@ -11380,6 +11419,17 @@ has to be running before the gate stops refusing.">spike
                         against it"
             >tf filter
             <select id="jnlFusedTf" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0" selected>off</option>
+              <option value="60">1 minute</option>
+              <option value="300">5 minute</option>
+              <option value="900">15 minute</option>
+            </select></label>
+          <!-- A SECOND ONE BESIDE IT, same rule: both must agree
+               to open, price against either one closes. -->
+          <label title="a second live candle, same rule as the first"
+            >+ tf
+            <select id="jnlFusedTf2" onchange="jnlSet()"
               style="margin:0 4px">
               <option value="0" selected>off</option>
               <option value="60">1 minute</option>
@@ -16384,6 +16434,7 @@ async function jnlSet() {
     jnlFused: $('jnlFused') ? String($('jnlFused').value || '10000x4000') : undefined,
     jnlBounce: $('jnlBounce') ? String($('jnlBounce').value) : undefined,
     jnlFusedTf: $('jnlFusedTf') ? String($('jnlFusedTf').value) : undefined,
+    jnlFusedTf2: $('jnlFusedTf2') ? String($('jnlFusedTf2').value) : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -16406,6 +16457,7 @@ async function jnlSet() {
     fused_bounce: $('jnlBounce') ? $('jnlBounce').value : 33,
     /* OFF IS ZERO AND ZERO IS A CHOICE -- no || on this one. */
     fused_tf: $('jnlFusedTf') ? $('jnlFusedTf').value : 0,
+    fused_tf2: $('jnlFusedTf2') ? $('jnlFusedTf2').value : 0,
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -17301,6 +17353,14 @@ function paintClockWindows(d) {
    ill make entry and exit rules then". On this engine a reading
    drawn like a gate eventually gets treated as one, so the label
    is part of the panel rather than a note somewhere else. */
+/* Seconds as m:ss. A bare "248s" is a number you have to convert
+   before it means anything on a 5-minute candle. */
+function mmss(v) {
+  const t = Math.max(0, Math.round(Number(v) || 0));
+  const m = Math.floor(t / 60), sec = t % 60;
+  return m + ':' + (sec < 10 ? '0' : '') + sec;
+}
+
 function paintFusedGate(FG) {
   const box = $('jnlFusedGate');
   if (!box) return;
@@ -17378,22 +17438,37 @@ function paintFusedGate(FG) {
     + ((FG.tf && FG.tf.on)
         ? leg(esc(FG.tf.name || 'tf') + ' candle', FG.tf.dir)
         : '')
+    + ((FG.tf2 && FG.tf2.on)
+        ? leg(esc(FG.tf2.name || 'tf') + ' candle', FG.tf2.dir)
+        : '')
     + '</div>'
     /* THE FILTER, DRAWN WHETHER OR NOT IT IS ON. A filter that is
        invisible when switched off reads as one that is not there,
        and then a trade it would have blocked looks like the rule
        failing. */
-    + ((FG.tf && FG.tf.on)
-        ? '<div class="thin">the ' + esc(FG.tf.name || '')
-          + ' candle must agree to open, and price turning against '
-          + 'it closes the trade'
-          + ((FG.tf.dir && FG.side && !FG.tf.agrees)
-              ? ' &mdash; <b class="short">it is '
-                + esc(FG.tf.dir).toUpperCase() + '</b>'
-              : '')
-          + '</div>'
+    + ((FG.tf && FG.tf.on) || (FG.tf2 && FG.tf2.on)
+        ? '<div class="thin">'
+          + [FG.tf, FG.tf2].filter(f => f && f.on)
+              .map(f => esc(f.name || '')
+                   + (f.dir && FG.side && !f.agrees
+                       ? ' <b class="short">' + esc(f.dir).toUpperCase()
+                         + '</b>' : ''))
+              .join(' and ')
+          + ' must agree to open, and price turning against either '
+          + 'closes the trade</div>'
         : '<div class="thin">no timeframe filter &mdash; the two '
           + 'candles decide this on their own</div>')
+    /* THE COUNTDOWN ON THE FIRST TIMEFRAME. Chris: "a candle
+       countdown that way we aren't making trades in the middle of
+       nowhere" -- and, asked what it should do, "Just show it".
+       Drawn, never read by the rule, and said to be so. */
+    + ((FG.tf && FG.tf.on && FG.tf.left_s != null)
+        ? '<div class="thin">'
+          + esc(FG.tf.name || '') + ' candle closes in <b>'
+          + mmss(FG.tf.left_s) + '</b> '
+          + '<span style="opacity:.6">&mdash; shown only, nothing '
+          + 'is blocked by the clock</span></div>'
+        : '')
     + word + ' <span class="thin">'
     + esc(FG.where === 'settling' ? (FG.settle_why || FG.say || '')
                                   : (FG.say || '')) + '</span>'
@@ -18054,6 +18129,8 @@ function paintJournal(d) {
     set('jnlBounce', String(Math.round(S.fused_bounce)));
   if (S.fused_tf != null)
     set('jnlFusedTf', String(Math.round(S.fused_tf)));
+  if (S.fused_tf2 != null)
+    set('jnlFusedTf2', String(Math.round(S.fused_tf2)));
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =

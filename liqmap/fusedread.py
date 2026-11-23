@@ -477,7 +477,9 @@ def entry_side(where: str, side: str,
                held_s: float | None = None,
                min_hold_s: float = DWELL_S,
                tf_dir: str = "", tf_on: bool = False,
-               tf_name: str = "5m") -> tuple[str, str]:
+               tf_name: str = "5m",
+               tf2_dir: str = "", tf2_on: bool = False,
+               tf2_name: str = "15m") -> tuple[str, str]:
     """The side this bar is offering, and why not.
 
     Chris: "the auto trader will then trade the direction that is
@@ -521,18 +523,27 @@ def entry_side(where: str, side: str,
     # ON MEANS ON. A filter switched on with nothing to say must
     # block, or switching it on does nothing until the candle
     # happens to have a body -- which is the gate-3 fault again.
-    if tf_on:
-        if tf_dir not in SIDES:
-            return "", (f"the {tf_name} candle has no direction yet")
-        if tf_dir != side:
-            return "", (f"the {tf_name} candle is {tf_dir} against a "
+    # TWO OF THEM, EACH ITS OWN GATE. Chris: "lets add another
+    # timeframe on the side of that one", same rule. They are
+    # checked in order so the panel blames the one that actually
+    # refused rather than "a timeframe".
+    for d, on, nm in ((tf_dir, tf_on, tf_name),
+                      (tf2_dir, tf2_on, tf2_name)):
+        if not on:
+            continue
+        if d not in SIDES:
+            return "", f"the {nm} candle has no direction yet"
+        if d != side:
+            return "", (f"the {nm} candle is {d} against a "
                         f"{side} entry")
     return side, ""
 
 
 def exit_reason(trade_side: str, where: str,
                 tick_dir: str = "", tf_dir: str = "",
-                tf_on: bool = False, tf_name: str = "5m") -> str:
+                tf_on: bool = False, tf_name: str = "5m",
+                tf2_dir: str = "", tf2_on: bool = False,
+                tf2_name: str = "15m") -> str:
     """Why this trade should end now, or "" to hold it.
 
     ONE THING CLOSES IT HERE, and the take profit closes the other
@@ -575,10 +586,12 @@ def exit_reason(trade_side: str, where: str,
     # on its open constantly, and reading that as a reversal would
     # close trades on nothing -- the mistake this engine has made
     # three times.
-    if tf_on and tick_dir in SIDES and tf_dir in SIDES \
-            and tick_dir != tf_dir:
-        return (f"price is {tick_dir} against the {tf_name} candle, "
-                f"which is {tf_dir}")
+    if tick_dir in SIDES:
+        for d, on, nm in ((tf_dir, tf_on, tf_name),
+                          (tf2_dir, tf2_on, tf2_name)):
+            if on and d in SIDES and d != tick_dir:
+                return (f"price is {tick_dir} against the {nm} "
+                        f"candle, which is {d}")
     return ""
 
 
@@ -591,6 +604,9 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           min_settle: float = MIN_SETTLE,
           bar_ts: float = 0.0,
           tf_dir: str = "", tf_on: bool = False, tf_name: str = "5m",
+          tf_left_s: float | None = None,
+          tf2_dir: str = "", tf2_on: bool = False,
+          tf2_name: str = "15m",
           tradeable: bool | None = None,
           held_s: float | None = None,
           min_hold_s: float = DWELL_S,
@@ -612,7 +628,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
     side, why = entry_side(out["where"], out["side"],
                            held_s=held_s, min_hold_s=min_hold_s,
                            tf_dir=tf_dir, tf_on=tf_on,
-                           tf_name=tf_name)
+                           tf_name=tf_name, tf2_dir=tf2_dir,
+                           tf2_on=tf2_on, tf2_name=tf2_name)
     ready = not (held_s is not None and min_hold_s > 0
                  and held_s < min_hold_s)
     return {**out,
@@ -629,5 +646,23 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                    "name": str(tf_name or ""),
                    "agrees": bool(tf_dir in SIDES
                                   and tf_dir == out["side"]),
+                   # HOW LONG THIS CANDLE HAS LEFT. Chris: "a
+                   # candle countdown that way we aren't making
+                   # trades in the middle of nowhere" -- asked
+                   # what it should DO, he said "Just show it".
+                   # So it is drawn and nothing is gated on it:
+                   # `decides` on this field would be a lie the
+                   # next revision gets built on.
+                   "left_s": (None if tf_left_s is None
+                              else max(0.0, float(tf_left_s))),
                    "decides": bool(tf_on)},
+            "tf2": {"dir": str(tf2_dir or ""), "on": bool(tf2_on),
+                    "name": str(tf2_name or ""),
+                    "agrees": bool(tf2_dir in SIDES
+                                   and tf2_dir == out["side"]),
+                    # ONE COUNTDOWN, ON THE FIRST TIMEFRAME. His
+                    # choice: two clocks on one panel is two
+                    # numbers to read and neither gates anything.
+                    "left_s": None,
+                    "decides": bool(tf2_on)},
             "bar_ts": float(bar_ts or 0.0)}
