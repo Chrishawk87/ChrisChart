@@ -1136,10 +1136,17 @@ class Runtime:
                 if getattr(svc.tape, "ratio_track", None) is None:
                     from .ratiotrack import RatioTrack as _RT
                     svc.tape.ratio_track = _RT(period_s=300.0)
-                from .fusedbar import PAIRS as _FPAIRS, FusedBars
+                from .fusedbar import PAIRS as _FPAIRS
+                from .fusedbar import FusedBars, max_s_for
+                # EACH PAIR UNDER ITS OWN CAP. The swing pair needs
+                # a quarter of an hour of busy tape just to fill
+                # its print leg; the 900-second default would close
+                # every one of them short and mark them all
+                # untradeable.
                 svc.tape.fusedbars = {
-                    (int(a), int(b)): FusedBars(tick_target=int(a),
-                                                ofi_target=int(b))
+                    (int(a), int(b)): FusedBars(
+                        tick_target=int(a), ofi_target=int(b),
+                        max_s=max_s_for(int(a), int(b)))
                     for a, b in _FPAIRS}
             if svc.tape.flowread is None:
                 from .flowread import FlowRead
@@ -7571,6 +7578,7 @@ def create_app() -> FastAPI:
                     "agree": False, "pos": None, "at": "",
                     "back": 0.0, "legs": {},
                     "say": why, "held": {},
+                    "reach": {}, "summary": {},
                     "tf": {"dir": "", "on": bool(tf_s),
                            "name": _tf_name, "agrees": False,
                            "left_s": _tf_left, "decides": bool(tf_s)},
@@ -7637,7 +7645,16 @@ def create_app() -> FastAPI:
                 "tick_target": int(bld.tick_target),
                 "seconds": round(float(cur.seconds), 1),
                 "tradeable": bool(cur.tradeable),
-                "why_not": str(cur.why_not or "")}
+                "why_not": str(cur.why_not or ""),
+                # WHAT THE CLOSED BARS ACTUALLY DID. Chris asked
+                # for a much slower pair and the honest answer was
+                # that nobody knows how far the signed book walks
+                # over a longer stretch -- it resets each bar and
+                # wanders, so it cannot be reasoned out from the
+                # targets. This is the measurement that replaces
+                # the extrapolation.
+                "reach": bld.reach(),
+                "summary": bld.summary()}
 
     def _footprint_imbalance(rt_) -> dict:
         """Which way the forming footprint bar is imbalanced.
@@ -10990,6 +11007,10 @@ DASHBOARD = """<!doctype html>
           <option value="2500x1000">2,500 ticks &times; 1,000 OFI</option>
           <option value="5000x2000">5,000 ticks &times; 2,000 OFI</option>
           <option value="10000x4000">10,000 ticks &times; 4,000 OFI</option>
+          <!-- THE SWING PAIR. Ten times the prints and ten times
+               the book; about a quarter of an hour of busy tape on
+               the print leg alone. -->
+          <option value="100000x40000">100,000 ticks &times; 40,000 OFI</option>
           </optgroup>
         </select></label>
         <label><b>take profit</b> <input id="apTp" value="10" size="3"></label>
@@ -11395,6 +11416,7 @@ has to be running before the gate stops refusing.">spike
               <option value="2500x1000">2500t &times; 1000</option>
               <option value="5000x2000">5000t &times; 2000</option>
               <option value="10000x4000" selected>10000t &times; 4000</option>
+              <option value="100000x40000">100000t &times; 40000</option>
             </select></label>
           <!-- HOW MUCH GIVE-BACK IS A BOUNCE. Chris: "give me a
                list of percentages that i can select from starting
@@ -17539,6 +17561,15 @@ function paintFusedGate(FG) {
         ? ' &mdash; waiting on ' + esc(lg.waiting_on)
         : ' &mdash; both legs met, the next print closes it')
     + '</div>'
+    /* WHAT THE CLOSED BARS ACTUALLY DID, under the forming one.
+       Picking targets for a slower pair needs to come off bars
+       that happened, not off a model of how far a signed
+       accumulator wanders. */
+    + ((FG.reach && FG.reach.bars)
+        ? '<div class="thin" style="margin-top:4px;opacity:.75">'
+          + '<b style="color:var(--dim)">MEASURED</b> &mdash; '
+          + esc(FG.reach.say || '') + '</div>'
+        : '')
     + '</div>';
 
   box.innerHTML = head + body;

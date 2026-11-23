@@ -87,9 +87,11 @@ OFI_TARGET = 2_000
 # The fallback. Same value the OFI bars cap a chop bar at.
 MAX_S = 900.0
 
-# Bounds for anything arriving from a query string.
+# Bounds for anything arriving from a query string. The ceiling has
+# to be at least the largest offered pair or a typed interval snaps
+# to a size nobody offers.
 MIN_TICKS, MAX_TICKS = 50, 200_000
-MIN_OFI, MAX_OFI = 50, 200_000
+MIN_OFI, MAX_OFI = 50, 100_000
 
 KEEP = 1_000
 
@@ -99,7 +101,36 @@ PAIRS: tuple[tuple[int, int], ...] = (
     (2_500, 1_000),
     (5_000, 2_000),
     (10_000, 4_000),
+    # THE SWING PAIR. Chris: "if it is 10000 x 4000 OFI then it
+    # should be 100000 x 40000" -- ten times the prints and ten
+    # times the book.
+    #
+    # ONE LEG SCALES, THE OTHER MAY NOT. The print leg is a count,
+    # so ten times the prints really is about ten times the time.
+    # The book leg is a SIGNED accumulator that resets at every
+    # close and wanders, so it does not cover ten times the ground
+    # in ten times the time -- nearer three. Whether 40,000 is
+    # reachable on this tape is a measurement, not an argument,
+    # and `reach()` is what answers it: if the bars keep closing
+    # on the cap with the book far short, this number comes down.
+    (100_000, 40_000),
 )
+
+# THE TIME CAP, PER PAIR. A 100,000-print bar needs about a quarter
+# of an hour of busy tape and much longer in thin hours, so the
+# 900-second default would close every one of them before the print
+# leg filled -- and a bar that misses its print count is marked
+# untradeable and drawn gray. The cap is a backstop against one
+# enormous candle, not a clock on the bar, so it is set well past
+# what the leg should take rather than close to it.
+MAX_S_FOR: dict[tuple[int, int], float] = {
+    (100_000, 40_000): 3_600.0,
+}
+
+
+def max_s_for(ticks: int, ofi: int) -> float:
+    """The cap this pair runs under."""
+    return float(MAX_S_FOR.get((int(ticks), int(ofi)), MAX_S))
 
 # The pair the fused STRATEGY reads when nothing says otherwise. The
 # one Chris named.
@@ -138,6 +169,11 @@ class FusedBar:
     net_ofi: int = 0
     close_reason: str = ""          # 'both' | 'capped' | ''
     closed: bool = False
+    # THE CAP THIS BAR RAN UNDER. `why_not` printed the module
+    # default, which stopped being the truth the moment a pair got
+    # its own -- a bar capped at 3,600s would have told him it
+    # closed on a 900s cap.
+    max_s: float = MAX_S
 
     # -- the two legs ----------------------------------------------------
 
@@ -219,7 +255,7 @@ class FusedBar:
         if not self.prints:
             return "no prints in the bar at all"
         if not self.ticks_met:
-            return (f"closed on the {int(MAX_S)}s cap with "
+            return (f"closed on the {int(self.max_s)}s cap with "
                     f"{self.prints:,} prints, short of "
                     f"{self.tick_target:,}")
         if self.ofi_dir == "flat":
@@ -308,7 +344,8 @@ class FusedBars:
     def _start(self, ts: float) -> FusedBar:
         return FusedBar(start_ts=ts, ts_last=ts,
                         tick_target=self.tick_target,
-                        ofi_target=self.ofi_target)
+                        ofi_target=self.ofi_target,
+                        max_s=self.max_s)
 
     def _maybe_close(self, bar: FusedBar) -> FusedBar | None:
         """Close on both legs, or on the cap. Returns the closed bar."""
@@ -469,6 +506,60 @@ class FusedBars:
             "say": _summary_words(built, cap_pct, tr_pct),
         }
 
+    def reach(self) -> dict:
+        """How far each leg ACTUALLY gets, from the closed bars.
+
+        THE NUMBER THAT REPLACES AN EXTRAPOLATION. Picking targets
+        for a slower pair means knowing how far the signed book
+        walks in a given stretch of time, and that cannot be
+        reasoned out from the targets -- the accumulator resets
+        every bar and wanders, so it does not scale the way a
+        print count does.
+
+        `ofi_at_cap` is the one to read. It is how far the book
+        got, in contracts, on bars that ran the full `max_s` and
+        were closed by the clock. A pair whose `ofi_target` sits
+        far above it is a pair whose book leg never fires: the cap
+        does the closing, every bar is marked capped, and the
+        chart greys all of them.
+
+        MEDIANS, NOT MEANS, and taken from the bars still held --
+        `keep` of them -- so a quiet hour ages out rather than
+        weighting the answer forever.
+        """
+        done = list(self.done)
+        capped = [b for b in done if b.close_reason == "capped"]
+        met = [b for b in done if b.close_reason == "both"]
+        out = {
+            "bars": len(done),
+            "capped": len(capped),
+            "met": len(met),
+            "tick_target": self.tick_target,
+            "ofi_target": self.ofi_target,
+            "max_s": self.max_s,
+            "seconds": round(_median([b.seconds for b in done]), 1),
+            "prints": int(_median([float(b.prints) for b in done])),
+            "ofi": int(_median([abs(float(b.net_ofi)) for b in done])),
+            "ofi_at_cap": int(_median([abs(float(b.net_ofi))
+                                       for b in capped])),
+            "prints_at_cap": int(_median([float(b.prints)
+                                          for b in capped])),
+            "seconds_when_met": round(
+                _median([b.seconds for b in met]), 1),
+        }
+        out["say"] = _reach_words(out)
+        return out
+
+
+def _median(xs: list[float]) -> float:
+    """The middle one. Not the mean: one capped bar on a dead
+    afternoon drags an average somewhere no bar ever was."""
+    if not xs:
+        return 0.0
+    ys = sorted(xs)
+    n = len(ys)
+    return ys[n // 2] if n % 2 else 0.5 * (ys[n // 2 - 1] + ys[n // 2])
+
 
 def _progress_words(b: FusedBar, tick_target: int, ofi_target: int,
                     max_s: float, waiting: str) -> str:
@@ -484,6 +575,24 @@ def _progress_words(b: FusedBar, tick_target: int, ofi_target: int,
         return (f"the prints are there ({b.prints:,}), waiting on the "
                 f"book: {abs(b.net_ofi):,} of {ofi_target:,}")
     return "both legs met -- the next event closes it"
+
+
+def _reach_words(r: dict) -> str:
+    """What the measured bars say, in one line."""
+    if not r["bars"]:
+        return "no bar has closed yet -- nothing measured"
+    bits = [f"{r['bars']:,} closed bars: median "
+            f"{r['prints']:,} prints and {r['ofi']:,} contracts "
+            f"in {r['seconds']:.0f}s"]
+    if r["capped"]:
+        bits.append(
+            f"the {r['capped']:,} that ran the full "
+            f"{int(r['max_s'])}s reached a median of "
+            f"{r['ofi_at_cap']:,} of {r['ofi_target']:,} on the book")
+    if r["met"]:
+        bits.append(f"the {r['met']:,} that met both legs took "
+                    f"{r['seconds_when_met']:.0f}s")
+    return " \u00b7 ".join(bits)
 
 
 def _summary_words(built: int, cap_pct: float, tr_pct: float) -> str:

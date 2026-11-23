@@ -505,8 +505,24 @@ class TestTheTapeFeedsBothLegs:
 
     def test_a_builder_per_offered_pair_is_created(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
-        assert "from .fusedbar import PAIRS as _FPAIRS, FusedBars" in src
-        assert "FusedBars(tick_target=int(a)" in src
+        assert "from .fusedbar import PAIRS as _FPAIRS" in src
+        assert "FusedBars(\n                        tick_target=int(a)" \
+            in src or "FusedBars(tick_target=int(a)" in src
+
+    def test_each_builder_gets_its_own_cap(self):
+        """A PAIR WHOSE PRINT LEG TAKES LONGER THAN THE DEFAULT CAP
+        closes short every time, and a bar that misses its print
+        count is marked untradeable and drawn gray. The swing pair
+        needs about a quarter of an hour of busy tape on the print
+        leg alone."""
+        from liqmap.fusedbar import MAX_S, PAIRS, max_s_for
+        src = (ROOT / "liqmap" / "web.py").read_text()
+        assert "max_s=max_s_for(int(a), int(b))" in src, \
+            "every pair is built under the default cap"
+        assert max_s_for(10_000, 4_000) == MAX_S
+        assert max_s_for(100_000, 40_000) > MAX_S
+        for a, b in PAIRS:
+            assert max_s_for(a, b) >= MAX_S
 
 
 class TestTheChartRoute:

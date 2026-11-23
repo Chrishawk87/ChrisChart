@@ -2023,3 +2023,260 @@ class TestTheCandleCountdown:
                                "decides": False}})
         assert "no timeframe filter" in html
         assert "closes in" not in html
+
+
+class TestTheMeasuredReach:
+    """Chris asked for a 1,000,000 x 333,333 pair. The honest
+    answer was that nobody knows how far the signed book walks
+    over a longer stretch: the accumulator resets at every close
+    and wanders, so it does not scale the way a print count does,
+    and the only number I had was one extrapolation off one bar.
+    He chose to measure first. This is the measurement.
+    """
+
+    @staticmethod
+    def _bars(rows):
+        from liqmap.fusedbar import FusedBar, FusedBars
+        b = FusedBars(tick_target=10_000, ofi_target=4_000)
+        for secs, pr, ofi, why in rows:
+            bar = FusedBar(start_ts=0.0, tick_target=10_000,
+                           ofi_target=4_000)
+            bar.ts_last, bar.prints, bar.net_ofi = secs, pr, ofi
+            bar.close_reason, bar.closed = why, True
+            b.done.append(bar)
+        return b
+
+    ROWS = [(900, 96_000, 2_100, "capped"),
+            (900, 88_000, -2_600, "capped"),
+            (900, 101_000, 1_400, "capped"),
+            (430, 46_000, 4_050, "both"),
+            (610, 65_000, -4_200, "both")]
+
+    def test_nothing_closed_yet_says_so(self):
+        r = self._bars([]).reach()
+        assert r["bars"] == 0
+        assert "nothing measured" in r["say"]
+        assert r["ofi_at_cap"] == 0
+
+    def test_it_reports_how_far_the_book_got_at_the_cap(self):
+        """THE NUMBER THAT SETTLES THE TARGET. A pair whose
+        `ofi_target` sits far above this is a pair whose book leg
+        never fires."""
+        r = self._bars(self.ROWS).reach()
+        assert r["ofi_at_cap"] == 2_100, r
+        assert r["capped"] == 3
+        assert "2,100 of 4,000" in r["say"]
+
+    def test_the_book_is_measured_by_size_not_sign(self):
+        """It is a signed accumulator and it goes both ways. A bar
+        that walked 2,600 SHORT got just as far as one that walked
+        2,600 long."""
+        r = self._bars(self.ROWS).reach()
+        assert r["ofi"] == 2_600, "the sign cancelled real distance"
+
+    def test_it_reports_what_the_bars_that_met_both_legs_took(self):
+        r = self._bars(self.ROWS).reach()
+        assert r["met"] == 2
+        assert r["seconds_when_met"] == pytest.approx(520.0)
+
+    def test_medians_not_means(self):
+        """One capped bar on a dead afternoon drags an average
+        somewhere no bar ever was."""
+        from liqmap.fusedbar import _median
+        assert _median([1.0, 2.0, 3.0]) == 2.0
+        assert _median([1.0, 2.0, 3.0, 4.0]) == 2.5
+        assert _median([]) == 0.0
+        rows = self.ROWS + [(900, 5_000_000, 50, "capped")]
+        r = self._bars(rows).reach()
+        assert r["prints"] < 200_000, \
+            "one freak bar moved the figure"
+
+    def test_it_counts_only_the_bars_still_held(self):
+        """`keep` bars, so a quiet hour ages out rather than
+        weighting the answer forever."""
+        from liqmap.fusedbar import FusedBars
+        b = FusedBars(tick_target=10_000, ofi_target=4_000, keep=3)
+        big = self._bars(self.ROWS)
+        for bar in big.done:
+            b.done.append(bar)
+        assert b.reach()["bars"] == 3
+
+    def test_the_route_carries_it(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "bld.reach()" in fn
+        assert '"reach": {}' in fn, \
+            "the not-building path has a different shape"
+
+    def test_the_panel_draws_it(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "FG.reach" in fn
+        assert "MEASURED" in fn, \
+            "nothing says these are closed bars rather than the live one"
+
+    def test_it_renders_with_closed_bars(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "reach": {"bars": 12, "capped": 9, "met": 3,
+                                 "say": "12 closed bars: median 91,000 "
+                                        "prints and 2,400 contracts in "
+                                        "900s"}})
+        assert "MEASURED" in html
+        assert "91,000" in html
+
+    def test_it_stays_quiet_before_any_bar_closes(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "reach": {"bars": 0, "say": "no bar has closed "
+                                                   "yet"}})
+        assert "MEASURED" not in html, \
+            "it claims a measurement off no bars"
+
+    def test_the_step_carries_it(self, client, monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        assert "reach" in (jr.get("fusedgate") or {})
+
+
+class TestTheSwingPair:
+    """Chris: "i want you to build it in the chart like all the rest
+    first then as selectable to be traded with so if is 10000 x 4000
+    OFI then it should be 100000 x 40000".
+
+    ONE LEG SCALES, THE OTHER MAY NOT, and that is written down
+    rather than argued about: the print leg is a count, so ten
+    times the prints is about ten times the time. The book leg is a
+    signed accumulator that resets at every close and wanders, so
+    it does not cover ten times the ground in ten times the time.
+    Whether 40,000 is reachable on this tape is what `reach()`
+    answers, and if it is not, that number comes down.
+    """
+
+    PAIR = (100_000, 40_000)
+
+    def test_it_is_offered(self):
+        from liqmap.fusedbar import PAIRS
+        assert self.PAIR in PAIRS
+
+    def test_the_interval_is_not_clamped_away(self):
+        """`MAX_OFI` was 200,000 and `MAX_TICKS` 200,000 -- a
+        ceiling below an offered pair means the typed interval
+        snaps to a size nobody offers."""
+        from liqmap.fusedbar import MAX_OFI, MAX_TICKS, parse_interval
+        assert parse_interval("100000x40000") == self.PAIR
+        assert MAX_TICKS >= self.PAIR[0]
+        assert MAX_OFI >= self.PAIR[1]
+
+    def test_every_offered_pair_survives_its_own_parser(self):
+        from liqmap.fusedbar import PAIRS, label, parse_interval
+        for a, b in PAIRS:
+            assert parse_interval(label(a, b)) == (a, b), \
+                f"{a}x{b} is offered and then clamped"
+
+    def test_it_runs_under_a_longer_cap(self):
+        """At roughly 107 prints a second its print leg needs about
+        a quarter of an hour, and much longer in thin hours. Under
+        the 900-second default every bar would close short of its
+        count and be drawn gray."""
+        from liqmap.fusedbar import MAX_S, max_s_for
+        assert max_s_for(*self.PAIR) >= 1_800.0
+        assert max_s_for(10_000, 4_000) == MAX_S, \
+            "the existing pairs were given a different cap"
+
+    def test_a_capped_bar_names_its_own_cap_not_the_default(self):
+        """`why_not` printed the module constant, so a bar capped
+        at 3,600s would have told him it closed on a 900s cap."""
+        from liqmap.fusedbar import FusedBar
+        b = FusedBar(start_ts=0.0, tick_target=100_000,
+                     ofi_target=40_000, max_s=3_600.0)
+        b.ts_last, b.prints, b.net_ofi = 3_600.0, 51_000, 9_000
+        b.open, b.close = 100.0, 101.0
+        assert not b.tradeable
+        assert "3600s cap" in b.why_not, b.why_not
+        assert "900s" not in b.why_not
+
+    def test_the_builder_hands_each_bar_its_cap(self):
+        from liqmap.fusedbar import FusedBars
+        b = FusedBars(tick_target=100_000, ofi_target=40_000,
+                      max_s=3_600.0)
+        bar = b._start(0.0)
+        assert bar.max_s == 3_600.0
+
+    def test_a_bar_that_fills_its_print_leg_is_still_tradeable(self):
+        """THE CAP IS A BACKSTOP, NOT A VERDICT. With a cap set
+        past what the print leg takes, a bar closed by the clock
+        has still met its count -- so it is only gray if the book
+        and price actually disagree."""
+        from liqmap.fusedbar import FusedBar
+        b = FusedBar(start_ts=0.0, tick_target=100_000,
+                     ofi_target=40_000, max_s=3_600.0)
+        b.ts_last, b.prints, b.net_ofi = 3_600.0, 140_000, 9_000
+        b.open, b.close = 100.0, 101.0
+        assert b.ticks_met
+        assert b.tradeable, b.why_not
+
+    def test_the_chart_offers_it(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index('value="10000x4000">10,000 ticks')
+        assert 'value="100000x40000"' in src[i:i + 500], \
+            "it is not on the chart's interval list"
+
+    def test_the_journal_selector_offers_it(self):
+        import re
+        src = (SRC / "web.py").read_text()
+        i = src.index('id="jnlFused"')
+        box = src[i:src.index("</select>", i)]
+        shown = sorted(tuple(int(x) for x in m.split("x"))
+                       for m in re.findall(r'value="(\d+x\d+)"', box))
+        from liqmap.fusedbar import PAIRS
+        assert shown == sorted(tuple(p) for p in PAIRS)
+
+    def test_it_can_be_saved_as_the_traded_pair(self, tmp_path):
+        from liqmap.journal import Journal, Settings
+        j = Journal(tmp_path / "j.db")
+        j.save_settings(Settings(coin="ES", fused_ticks=100_000,
+                                 fused_ofi=40_000))
+        g = j.settings("ES")
+        assert (g.fused_ticks, g.fused_ofi) == self.PAIR
+
+    def test_the_step_runs_on_it(self, client, monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        s.fused_ticks, s.fused_ofi = self.PAIR
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        fg = jr.get("fusedgate") or {}
+        assert fg.get("pair") == list(self.PAIR)
+
+    def test_the_chart_route_serves_it(self, client, monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        d = client.get("/api/chart",
+                       params={"coin": "ES",
+                               "interval": "100000x40000", "n": "50"},
+                       headers=AUTH).json()
+        assert d.get("source") == "fused", d.get("error") or d
+        assert d.get("interval") == "100000x40000"
