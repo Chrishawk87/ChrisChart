@@ -243,6 +243,82 @@ def _num(v) -> float:
         return 0.0
 
 
+def run_from_open(open_px: float, high: float, low: float
+                  ) -> tuple[str, float]:
+    """Which way this candle ran off its open, and how far.
+
+    THE OPEN IS THE ANCHOR, not the extremes. Chris: "the extremes
+    dont matter what is is doing is it moving to tick charts
+    opening or away". The furthest point from the open is used
+    only to answer how far away it got -- which way is up or down
+    off ONE price, the one the candle started at.
+    """
+    try:
+        o, h, lo = float(open_px or 0.0), float(high or 0.0), \
+            float(low or 0.0)
+    except (TypeError, ValueError):
+        return "", 0.0
+    if o <= 0.0:
+        return "", 0.0
+    up_run, dn_run = max(0.0, h - o), max(0.0, o - lo)
+    if up_run <= EPS and dn_run <= EPS:
+        return "", 0.0
+    return ("up", up_run) if up_run >= dn_run else ("down", dn_run)
+
+
+def back_to_open(open_px: float, high: float, low: float,
+                 close: float) -> float:
+    """How much of the run back toward the open, 0 to 1.
+
+    0.0 is price at its furthest from the open -- still going. 1.0
+    is all the way back to the open, the whole run given up.
+
+    AGAINST THE RUN, NOT THE RANGE. The question is "is it moving
+    to the open or away", so the denominator is how far it got
+    from the open, and nothing else enters it.
+    """
+    d, run = run_from_open(open_px, high, low)
+    if not d or run <= EPS:
+        return 0.0
+    try:
+        h, lo, c = float(high or 0.0), float(low or 0.0), \
+            float(close or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    gone = (h - c) if d == "up" else (c - lo)
+    return max(0.0, min(1.0, gone / run))
+
+
+def price_dir(open_px: float, high: float, low: float, close: float,
+              band: float = BOUNCE_AT) -> tuple[str, float, str]:
+    """Which way price is going inside this candle, right now.
+
+    Returns (direction, how far back toward the open, "away" or
+    "toward").
+
+    AWAY FROM THE OPEN IS THE RUN'S OWN DIRECTION; coming back
+    toward it is the other way. A candle that ran up and is
+    holding up there is going UP. The same candle half way back to
+    its open is going DOWN, whatever its body still says.
+
+    THE BAND IS WHY ONE TICK OFF THE HIGH IS NOT A TURN. Price has
+    to give up more than `band` of the run before it counts as
+    heading back, which is the same dial that used to decide a
+    bounce and now has a clearer job.
+    """
+    d, run = run_from_open(open_px, high, low)
+    if not d:
+        return "", 0.0, ""
+    back = back_to_open(open_px, high, low, close)
+    try:
+        b = float(band if band is not None else BOUNCE_AT)
+    except (TypeError, ValueError):
+        b = BOUNCE_AT
+    if back > 0.0 and back >= b:
+        return _other(d), back, "back toward"
+    return d, back, "further away from"
+
+
 def pullback(body_dir: str, high: float, low: float,
              close: float) -> float:
     """How far off its extreme the candle has come, 0 to 1.
@@ -343,39 +419,41 @@ def settled(net_ofi: float, ofi_target: float,
     return True, ""
 
 
+def _other(side: str) -> str:
+    return "down" if side == "up" else "up" if side == "down" else ""
+
+
 def _say(where: str, ofi_dir: str, tick_dir: str, pos: float | None,
-         back: float, edge: str) -> str:
-    """One sentence, describing the candle the chart draws."""
+         back: float, edge: str, moving: str = "",
+         run_dir: str = "", run_pts: float = 0.0) -> str:
+    """One sentence, in the terms Chris asked the candle to be read
+    in: did it run up or down off its open, and is price still
+    going that way or heading back."""
     pct = int(round(100.0 * back))
-    frm = "top" if tick_dir == "up" else "bottom"
+    ran = (f"it ran {run_dir} {run_pts:.2f} off the open and is "
+           f"{pct}% of that back" if run_dir else "")
     if where == "settling":
         return "settling -- not enough of this bar yet"
     if where == "together":
-        side = "down" if ofi_dir == "down" else "up"
-        end = "low" if side == "down" else "high"
-        return (f"moving {side} together -- the outer candle is "
-                f"{side} and the body is holding the {end}")
-    if where == "bounce":
-        return (f"the outer candle is still {ofi_dir} but the body "
-                f"is pulling back from the {frm} -- {pct}% of the "
-                "candle off its extreme")
+        return (f"the book is {ofi_dir} and price is {tick_dir} "
+                f"(moving {moving or ''} the open) -- {ran}"
+                if ran else
+                f"the book is {ofi_dir} and price is {tick_dir}")
     if where == "apart":
-        extra = (f", pulling back from the {frm} by {pct}%"
-                 if back > 0.0 else "")
-        return (f"the outer candle is {ofi_dir} and the body is "
-                f"{tick_dir} -- the chart greys this bar{extra}")
+        return (f"the book is {ofi_dir} and price is {tick_dir} "
+                f"-- the chart greys this bar"
+                + (f"; {ran}" if ran else ""))
     if not ofi_dir or ofi_dir == "flat":
         return "the book has not committed either way yet"
-    if not tick_dir or tick_dir == "flat":
-        return (f"the outer candle is {ofi_dir}; the body closed "
-                "where the bar opened")
+    if not tick_dir:
+        return (f"the book is {ofi_dir}; price has not run off this "
+                "candle's open yet")
     if edge:
         return f"the close is at the {edge} of the candle"
     return "nothing settled yet"
 
 
 def read(ofi_dir: str = "", tick_dir: str = "",
-         roll_dir: str = "",
          open_px: float = 0.0, high: float = 0.0, low: float = 0.0,
          close: float = 0.0,
          net_ofi: float = 0.0, ofi_target: float = 0.0,
@@ -383,7 +461,6 @@ def read(ofi_dir: str = "", tick_dir: str = "",
          bounce_at: float = BOUNCE_AT,
          min_settle: float = MIN_SETTLE,
          bar_ts: float = 0.0,
-         roll_window: int = 0,
          tradeable: bool | None = None,
          prev: dict | None = None) -> dict:
     """The whole reading of one forming fused bar.
@@ -404,11 +481,17 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     are apart or nothing settled".
     """
     ofi_dir = str(ofi_dir or "")
-    # THE BODY, KEPT UNDER ITS OWN NAME. It is the candle's shape
-    # and the pullback is measured off it; it is not the price leg
-    # any more.
+    # THE BODY IS THE CANDLE'S SHAPE AND NOTHING ELSE NOW. It
+    # is drawn and it is held; it decides nothing. `close vs open`
+    # is a POSITION, and the question is which way price is MOVING.
     body_dir = str(tick_dir or "")
-    tick_dir = str(roll_dir or "")
+    bounce_at = float(bounce_at if bounce_at is not None else BOUNCE_AT)
+    # WHICH WAY PRICE IS GOING INSIDE THIS CANDLE. Chris: "the
+    # extremes dont matter what is is doing is it moving to tick
+    # charts opening or away".
+    tick_dir, back, moving = price_dir(open_px, high, low, close,
+                                       bounce_at)
+    run_dir, run_pts = run_from_open(open_px, high, low)
     prev = prev or {}
     # THE MEMORY BELONGS TO ONE BAR. Carrying a held direction into
     # a new bar would defeat the settling it was added for -- the
@@ -431,43 +514,19 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     # the range. Framed on the body rather than the book because
     # the body is the thing that bounces: "ofi remaining down but
     # tick is bouncing from bottom or top".
-    # THE LIVE DIRECTION PICKS THE EXTREME, and it is right by
-    # construction rather than by argument: `back` is only ever
-    # consulted in the branch where the book and price already
-    # AGREE, so the live direction there is the direction of the
-    # move, and the end it picks is the end the move ran to.
-    #
-    # THE BODY CANNOT DO THIS ANY MORE. It goes stale -- that is
-    # the whole reason it stopped being the price leg -- and a
-    # stale body picks the wrong end. On a bar that opened 7180,
-    # sold to 7154 and rallied back to 7174 with the book UP, the
-    # body still reads DOWN, measures off the low, and calls a
-    # 20-point rally "67% pulling back from the bottom". It then
-    # refuses the entry, which is the exact trade Chris is trying
-    # to see.
-    back = pullback(tick_dir, high, low, close)
     agree = bool(ofi_dir in SIDES and ofi_dir == tick_dir)
-    bounce_at = float(bounce_at if bounce_at is not None else BOUNCE_AT)
 
     if not ok:
         where = "settling"
     elif ofi_dir not in SIDES:
         where = ""
     elif tick_dir not in SIDES:
-        # THE BOOK HAS COMMITTED AND PRICE HAS NOT. Not a
-        # disagreement -- price closed exactly where it opened,
-        # which is an absence of a reading rather than one against.
+        # NO RUN OFF THE OPEN YET -- every print on one price, or
+        # the candle sitting exactly where it started. An absence,
+        # not a disagreement.
         where = ""
     elif not agree:
         where = "apart"
-    elif back > 0.0 and back >= bounce_at:
-        # `back > 0.0` IS WHAT MAKES 0% USABLE. He asked for a list
-        # "starting from 0", and at zero a bare `>=` would call a
-        # bar sitting exactly on its extreme a bounce -- every bar
-        # would be one and "together" would never appear. At zero
-        # this means "any give-back at all", which is what picking
-        # zero is asking for.
-        where = "bounce"
     else:
         where = "together"
 
@@ -487,7 +546,11 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # direction, so the two can be seen disagreeing -- which is
         # the whole case for the change.
         "body_dir": body_dir,
-        "roll_window": int(roll_window or 0),
+        # WHICH WAY IT RAN OFF THE OPEN, how far it got, and
+        # whether price is still going that way or heading back.
+        "run_dir": run_dir,
+        "run_pts": round(float(run_pts or 0.0), 2),
+        "moving": moving,
         # WHERE PRICE SITS IN ITS OWN RANGE, and how much of the
         # bar's move it has given back. Two different questions and
         # the panel draws both: the first is "top or bottom of the
@@ -507,7 +570,8 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         "back": round(back, 3),
         "bounce_at": float(bounce_at or 0.0),
         "legs": legs(net_ofi, ofi_target, prints, tick_target),
-        "say": _say(where, ofi_dir, tick_dir, pos, back, edge),
+        "say": _say(where, ofi_dir, tick_dir, pos, back, edge,
+                    moving, run_dir, run_pts),
         # WHAT THE NEXT READING NEEDS BACK. A field dropped from
         # here does not error -- it silently resets that part of the
         # reading on every poll, which is how a hold that never
@@ -547,8 +611,6 @@ def entry_side(where: str, side: str,
         return "", "the bar has not settled -- no direction yet"
     if where == "apart":
         return "", "the book and price are apart"
-    if where == "bounce":
-        return "", "price is bouncing off this bar's extreme"
     if where != "together" or side not in SIDES:
         return "", "nothing settled -- neither leg has committed"
     if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
@@ -649,7 +711,6 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           bounce_at: float = BOUNCE_AT,
           min_settle: float = MIN_SETTLE,
           bar_ts: float = 0.0,
-          roll_dir: str = "", roll_window: int = 0,
           tf_dir: str = "", tf_on: bool = False, tf_name: str = "5m",
           tf_left_s: float | None = None,
           tf2_dir: str = "", tf2_on: bool = False,
@@ -671,7 +732,6 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                ofi_target=ofi_target, prints=prints,
                tick_target=tick_target, bounce_at=bounce_at,
                min_settle=min_settle, bar_ts=bar_ts,
-               roll_dir=roll_dir, roll_window=roll_window,
                tradeable=tradeable, prev=prev)
     side, why = entry_side(out["where"], out["side"],
                            held_s=held_s, min_hold_s=min_hold_s,
