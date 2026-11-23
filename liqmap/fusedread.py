@@ -294,48 +294,118 @@ def back_to_open(open_px: float, high: float, low: float,
     return max(0.0, min(1.0, gone / run))
 
 
-# THE TURNING ROW'S BAND, IN TICKS. Chris: "i dont know why it
-# waits 30 ticks before it says down" -- the inner candle reads
-# `close vs open`, so on a bar sitting 94 ticks above its open it
-# waits 94 ticks. That is the candle being honest, and it is also
-# not what a hand on the mouse needs.
+# THE TURNING ROW'S BAND, IN TICKS, AND WHAT YOU CAN PICK.
+#
+# THE FIRST VERSION OF THIS ROW WAS WRONG AND THE WAY IT WAS WRONG
+# IS WORTH KEEPING WRITTEN DOWN. It measured the close against the
+# CANDLE'S HIGH -- a number that only moves when a new high prints.
+# So on a bar that ran up and pulled back, it said "down" and went
+# on saying "down" while price rallied fourteen points, because
+# every one of those closes was still below a high set minutes
+# earlier. Chris: "thoss one has a turning but its stuck in place
+# doing nothing". It was not frozen. It was anchored.
+#
+# THE EXTREME HAS TO TRAVEL. While this reads up, the high it
+# measures from moves up with every new high; it flips to down only
+# when price comes `band` ticks back off THAT high, and then the
+# low becomes the reference and travels down. Chris: "it should
+# read what the chart is doing in real time", and a reference that
+# stopped moving an hour ago is not real time.
 #
 # TICKS, NOT A PERCENTAGE. A third of a 94-tick run is 31 ticks,
-# which is no faster than the thing it was added to fix. Off the
-# extreme by a fixed few ticks is the same answer on every bar
+# which is no faster than the thing this was added to fix. A fixed
+# few ticks off the live extreme is the same answer on every bar
 # however far it ran.
 TURN_TICKS = 4.0
 TICK = 0.25
 
+# WHAT THE DIAL OFFERS. Chris picked a selector over a fixed
+# number -- the right call, because the band that reads as a turn
+# and the band that reads as noise is a property of his tape and
+# not of this module. In ticks, because that is what the chart is
+# ruled in.
+TURN_CHOICES = (2, 4, 6, 8, 12, 16, 24)
 
-def turning(open_px: float, high: float, low: float, close: float,
-            band_ticks: float = TURN_TICKS,
-            tick: float = TICK) -> tuple[str, float]:
-    """Which way price has turned off this candle's extreme.
 
-    Returns (direction, how many ticks off that extreme).
+def turn_state(close: float, band_ticks: float = TURN_TICKS,
+               prev: dict | None = None,
+               open_px: float = 0.0, bar_ts: float = 0.0,
+               tick: float = TICK) -> dict:
+    """Which way price is going right now, off a travelling extreme.
+
+    Returns {"dir", "ticks_off", "hi", "lo", "bar_ts"}. `ticks_off`
+    is how far price has already come back off the extreme it is
+    measured from -- a countdown to the flip, not a size of move.
+
+    INTRABAR, AND IT STARTS BLANK. Asked what this should do when a
+    new fused candle prints, Chris chose "Start blank each candle":
+    the reference resets to the new candle's open and the row names
+    no direction until price has travelled the band off it. That
+    blank is the honest state -- a direction carried in from the
+    previous bar is a claim about a bar that has not happened yet.
+
+    BOTH EXTREMES ARE TRACKED WHILE IT IS BLANK, so the first
+    direction comes off whichever end price actually left, rather
+    than off the open it happened to start at.
 
     SHOWN, NEVER TRADED. The rule reads the inner candle, which is
-    what the chart greys on; this answers a different question and
-    sits beside it. Three attempts to make a derived reading the
-    price leg each put the panel into contradiction with the
-    candle next to it.
+    what the chart greys on. This answers a different question and
+    sits beside it. Three attempts to make a derived reading into
+    the price leg each put the panel into contradiction with the
+    candle next to it, so it does not get a fourth.
     """
-    d, run = run_from_open(open_px, high, low)
-    if not d or run <= EPS:
-        return "", 0.0
+    prev = prev or {}
     try:
-        h, lo, c = float(high or 0.0), float(low or 0.0), \
-            float(close or 0.0)
+        c = float(close or 0.0)
+        o = float(open_px or 0.0)
         t = float(tick or TICK) or TICK
-        band = max(0.0, float(band_ticks or 0.0))
+        band_t = max(0.0, float(band_ticks or 0.0)) * t
+        ts = float(bar_ts or 0.0)
     except (TypeError, ValueError):
-        return "", 0.0
-    gone = (h - c) if d == "up" else (c - lo)
-    off = max(0.0, gone) / t
-    if off >= band > 0.0:
-        return _other(d), off
-    return d, off
+        return {"dir": "", "ticks_off": 0.0, "hi": 0.0, "lo": 0.0,
+                "bar_ts": 0.0}
+
+    # A NEW BAR WIPES IT. Also the first reading ever, where there
+    # is no previous extreme to carry: `hi`/`lo` missing is not
+    # zero, it is "nothing has been seen yet", and treating it as
+    # zero would put the low at zero and never flip again.
+    fresh = bool(float(prev.get("bar_ts") or 0.0) != ts
+                 or prev.get("hi") is None or prev.get("lo") is None)
+    if fresh:
+        d, hi, lo = "", (o or c), (o or c)
+    else:
+        d = str(prev.get("dir") or "")
+        try:
+            hi = float(prev.get("hi"))
+            lo = float(prev.get("lo"))
+        except (TypeError, ValueError):
+            d, hi, lo = "", c, c
+
+    if d == "up":
+        if c >= hi:
+            hi = c                       # the extreme travels
+        elif band_t > 0.0 and (hi - c) >= band_t:
+            d, lo = "down", c            # and hands over
+    elif d == "down":
+        if c <= lo:
+            lo = c
+        elif band_t > 0.0 and (c - lo) >= band_t:
+            d, hi = "up", c
+    else:
+        hi, lo = max(hi, c), min(lo, c)
+        if band_t > 0.0 and (c - lo) >= band_t:
+            d, hi = "up", c
+        elif band_t > 0.0 and (hi - c) >= band_t:
+            d, lo = "down", c
+
+    if d == "up":
+        off = max(0.0, hi - c) / t
+    elif d == "down":
+        off = max(0.0, c - lo) / t
+    else:
+        off = 0.0
+    return {"dir": d, "ticks_off": round(off, 1),
+            "hi": hi, "lo": lo, "bar_ts": ts}
 
 
 def pullback(body_dir: str, high: float, low: float,
@@ -438,10 +508,6 @@ def settled(net_ofi: float, ofi_target: float,
     return True, ""
 
 
-def _other(side: str) -> str:
-    return "down" if side == "up" else "up" if side == "down" else ""
-
-
 def _say(where: str, ofi_dir: str, tick_dir: str) -> str:
     """One sentence about the two candles, and no numbers in it.
 
@@ -471,7 +537,12 @@ def read(ofi_dir: str = "", tick_dir: str = "",
          min_settle: float = MIN_SETTLE,
          bar_ts: float = 0.0,
          tradeable: bool | None = None,
-         prev: dict | None = None) -> dict:
+         prev: dict | None = None,
+         # ON THE END, NOT IN THE MIDDLE. Inserting a parameter
+         # above `prev` once silently turned every existing
+         # caller's `tradeable` into something else; ten tests
+         # caught it and nothing else would have.
+         turn_ticks: float = TURN_TICKS) -> dict:
     """The whole reading of one forming fused bar.
 
     `where` is the headline and it is one of:
@@ -512,6 +583,18 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     # was meant to land on the live line.
     bounce_at = float(bounce_at if bounce_at is not None else BOUNCE_AT)
     prev = prev or {}
+    # THE TURNING ROW, READ FROM ITS OWN MEMORY. Its state rides
+    # home in `held["turn"]` and comes back in `prev`, the same way
+    # every other held reading here does -- this module stays pure
+    # and the caller keeps the one copy.
+    try:
+        turn_band = max(0.0, float(turn_ticks
+                                   if turn_ticks is not None
+                                   else TURN_TICKS))
+    except (TypeError, ValueError):
+        turn_band = TURN_TICKS
+    turn = turn_state(close, turn_band, (prev or {}).get("turn"),
+                      open_px=open_px, bar_ts=bar_ts)
     # THE MEMORY BELONGS TO ONE BAR. Carrying a held direction into
     # a new bar would defeat the settling it was added for -- the
     # new bar would open already pointing somewhere.
@@ -596,13 +679,14 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # anyone reading the payload. Nothing decides on it and
         # the panel no longer draws it: "i dont care how much just
         # what it actually reads".
-        # WHICH WAY PRICE HAS TURNED OFF THE EXTREME, and how far
-        # off it is. Drawn beside the inner candle, never read by
-        # the rule: `decides` is False and a test asserts it.
+        # WHICH WAY PRICE IS GOING RIGHT NOW, off an extreme that
+        # travels with it, and how far back off that extreme it has
+        # already come. Drawn beside the inner candle, never read
+        # by the rule: `decides` is False and a test asserts it.
         "turning": {
-            "dir": turning(open_px, high, low, close)[0],
-            "ticks_off": round(turning(open_px, high, low, close)[1], 1),
-            "band": float(TURN_TICKS),
+            "dir": turn["dir"],
+            "ticks_off": turn["ticks_off"],
+            "band": float(turn_band),
             "decides": False,
         },
         "run_dir": run_from_open(open_px, high, low)[0],
@@ -633,6 +717,12 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # elapsed and a direction that chattered both got shipped.
         "held": {"ofi_dir": ofi_dir, "tick_dir": tick_dir,
                  "body_dir": body_dir,
+                 # THE TURNING ROW'S TRAVELLING EXTREME. Dropped
+                 # from here it does not error -- it silently
+                 # resets the reference on every poll, which is a
+                 # row that can never flip and looks exactly like
+                 # the bug this replaced.
+                 "turn": turn,
                  "bar_ts": float(bar_ts or 0.0)},
         "decides": True,
     }
@@ -773,7 +863,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           tradeable: bool | None = None,
           held_s: float | None = None,
           min_hold_s: float = DWELL_S,
-          prev: dict | None = None) -> dict:
+          prev: dict | None = None,
+          turn_ticks: float = TURN_TICKS) -> dict:
     """The reading and the rule's verdict on it, from one place.
 
     ONE READING, NOT TWO. The panel is handed what the rule decided
@@ -787,7 +878,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                ofi_target=ofi_target, prints=prints,
                tick_target=tick_target, bounce_at=bounce_at,
                min_settle=min_settle, bar_ts=bar_ts,
-               tradeable=tradeable, prev=prev)
+               tradeable=tradeable, prev=prev,
+               turn_ticks=turn_ticks)
     side, why = entry_side(out["where"], out["side"],
                            held_s=held_s, min_hold_s=min_hold_s,
                            tf_dir=tf_dir, tf_on=tf_on,

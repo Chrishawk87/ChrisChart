@@ -132,6 +132,13 @@ class Settings:
     # timeframe on the side of that one". Both must agree to open
     # and price turning against either one closes the trade.
     fused_tf2: int = 0
+    # HOW FAR PRICE COMES BACK OFF ITS RUNNING EXTREME BEFORE THE
+    # TURNING ROW FLIPS, in ticks. A dial rather than a constant
+    # because the band that reads as a turn and the band that
+    # reads as noise is a property of his tape, not of the rule.
+    # The row is shown only -- this setting moves nothing that
+    # opens or closes a trade.
+    fused_turn: int = 4
     strategy: str = "ofi"
 
     def to_dict(self) -> dict:
@@ -152,6 +159,7 @@ class Settings:
                 "fused_tf2": int(self.fused_tf2),
                 "fused_tf2_label": (window_label(float(self.fused_tf2))
                                     if self.fused_tf2 else "off"),
+                "fused_turn": int(self.fused_turn),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
                                                  self.strategy),
@@ -464,6 +472,7 @@ _ADDED_SETTINGS = (
     ("fused_bounce", "INTEGER NOT NULL DEFAULT 33"),
     ("fused_tf", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_tf2", "INTEGER NOT NULL DEFAULT 0"),
+    ("fused_turn", "INTEGER NOT NULL DEFAULT 4"),
 )
 
 
@@ -530,6 +539,7 @@ class Journal(ThreadedDB):
                         fused_bounce=int(r["fused_bounce"]),
                         fused_tf=int(r["fused_tf"]),
                         fused_tf2=int(r["fused_tf2"]),
+                        fused_turn=int(r["fused_turn"] or 4),
                         strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
@@ -539,8 +549,8 @@ class Journal(ThreadedDB):
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
                 "  fused_ticks, fused_ofi, fused_bounce,"
-                "  fused_tf, fused_tf2, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "  fused_tf, fused_tf2, fused_turn, strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -554,6 +564,7 @@ class Journal(ThreadedDB):
                 " fused_bounce=excluded.fused_bounce,"
                 " fused_tf=excluded.fused_tf,"
                 " fused_tf2=excluded.fused_tf2,"
+                " fused_turn=excluded.fused_turn,"
                 " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
@@ -587,6 +598,11 @@ class Journal(ThreadedDB):
                   if int(s.fused_tf) in (0, 60, 300, 900) else 0),
                  (int(s.fused_tf2)
                   if int(s.fused_tf2) in (0, 60, 300, 900) else 0),
+                 # ONE OF THE OFFERED TICK BANDS. Unlike the
+                 # bounce, zero is NOT offered here: a band of
+                 # zero is a row that flips on every tick and
+                 # says nothing at all.
+                 _snap_turn(s.fused_turn),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 
@@ -1054,6 +1070,26 @@ def _snap_bounce(pct: int | float) -> int:
         return opts[-1]
     if want in opts:
         return want
+    return min(opts, key=lambda o: abs(o - want))
+
+
+def _snap_turn(ticks: int | float) -> int:
+    """The offered turning band nearest the one asked for.
+
+    ZERO IS NOT ON THE LIST, so unlike `_snap_bounce` this one may
+    fall back on a default -- a band of zero ticks would flip the
+    row on every print and it is not a setting anyone picked.
+    """
+    from .fusedread import TURN_CHOICES, TURN_TICKS
+    opts = [int(c) for c in TURN_CHOICES]
+    try:
+        want = int(ticks)
+    except (TypeError, ValueError):
+        return int(TURN_TICKS)
+    if want in opts:
+        return want
+    if want <= 0:
+        return int(TURN_TICKS)
     return min(opts, key=lambda o: abs(o - want))
 
 

@@ -5709,6 +5709,7 @@ def create_app() -> FastAPI:
                              fused_bounce: int | None = None,
                              fused_tf: int | None = None,
                              fused_tf2: int | None = None,
+                             fused_turn: int | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5751,6 +5752,13 @@ def create_app() -> FastAPI:
                           if fused_tf is None else int(fused_tf)),
                 fused_tf2=(int(getattr(cur, "fused_tf2", 0))
                            if fused_tf2 is None else int(fused_tf2)),
+                # THE TURNING ROW'S BAND, IN TICKS. Validated in
+                # the journal against the offered list, the same
+                # way every other selector here is -- a hand-typed
+                # query must not be able to put a band on the row
+                # that the dropdown cannot show.
+                fused_turn=(int(getattr(cur, "fused_turn", 4) or 4)
+                            if fused_turn is None else int(fused_turn)),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7489,7 +7497,10 @@ def create_app() -> FastAPI:
                     bounce: float | None = None,
                     held_s: float | None = None,
                     prev: dict | None = None,
-                    tf_s: int = 0, tf2_s: int = 0) -> dict:
+                    tf_s: int = 0, tf2_s: int = 0,
+                    # ON THE END. Every caller below passes the
+                    # first six positionally.
+                    turn_ticks: float | None = None) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -7576,7 +7587,9 @@ def create_app() -> FastAPI:
                     "ofi_dir": "", "tick_dir": "", "body_dir": "",
                     "run_dir": "", "run_pts": 0.0, "moving": "",
                     "turning": {"dir": "", "ticks_off": 0.0,
-                                "band": float(_fr.TURN_TICKS),
+                                "band": float(_fr.TURN_TICKS
+                                              if turn_ticks is None
+                                              else turn_ticks),
                                 "decides": False},
                     "settled": False, "settle_why": why,
                     "agree": False, "pos": None, "at": "",
@@ -7636,7 +7649,14 @@ def create_app() -> FastAPI:
             tf_left_s=_tf_left,
             tf2_dir=_tf2_dir, tf2_on=bool(tf2_s),
             tf2_name=_tf2_name or "15m",
-            held_s=held_s, prev=prev)
+            held_s=held_s, prev=prev,
+            # THE TURNING ROW'S BAND. Resolved here rather than
+            # defaulted inside the rule so that the number on the
+            # panel and the number the row flips on are the same
+            # one -- the old row read a constant while the page
+            # was about to offer a dial.
+            turn_ticks=(_fr.TURN_TICKS if turn_ticks is None
+                        else float(turn_ticks)))
         return {**out, "pair": list(key), "label": label(*key),
                 "building": True, "why": "",
                 "open": float(cur.open or 0.0),
@@ -8255,12 +8275,18 @@ def create_app() -> FastAPI:
             # to measure.
             _ftf = int(getattr(s, "fused_tf", 0) or 0)
             _ftf2 = int(getattr(s, "fused_tf2", 0) or 0)
+            # SHOWN ONLY, AND PASSED TO BOTH CALLS ANYWAY. The peek
+            # exists to feed the dwell and its reading is thrown
+            # away, but a peek that carried a different band would
+            # advance the turning row's travelling extreme twice a
+            # poll against two different references.
+            _fturn = int(getattr(s, "fused_turn", 4) or 4)
             _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev,
-                                _ftf, _ftf2)
+                                _ftf, _ftf2, _fturn)
             _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
             fus = _fused_gate(rt_, _fpair, _fbounce,
                               _fdw.held_s(_now_f), _fprev, _ftf,
-                              _ftf2)
+                              _ftf2, _fturn)
             try:
                 rt_._fused_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -8604,6 +8630,36 @@ def create_app() -> FastAPI:
                 sl=(s.sl_ticks if s.sl_on else 0.0))
             taken = j.sides_in_bar(coin_, bar_ts, strat)
 
+        # THE FUSED PANEL WHEN SOMETHING ELSE IS TRADING, computed
+        # here rather than inline below so its reading can be kept.
+        #
+        # IT NEEDS A MEMORY OF ITS OWN. The turning row is pure
+        # state -- a travelling high and low -- so a call handed
+        # `prev=None` starts blank on every single poll and the row
+        # can never flip. That is precisely the "stuck in place
+        # doing nothing" it was rebuilt to fix, and on this path it
+        # would have been silent instead of wrong, which is worse.
+        #
+        # A SEPARATE ATTRIBUTE FROM THE TRADED ONE. Sharing
+        # `_fused_held` would let a panel poll advance the extreme
+        # the live rule is holding, and the two are read at
+        # different moments.
+        _shown = {}
+        if strat != "together":
+            _sprev = getattr(rt_, "_fused_shown_held", None) or {}
+            _shown = _fused_gate(
+                rt_, (int(getattr(s, "fused_ticks", 0) or 10000),
+                      int(getattr(s, "fused_ofi", 0) or 4000)),
+                (None if getattr(s, "fused_bounce", None) is None
+                 else float(int(s.fused_bounce)) / 100.0),
+                None, _sprev, int(getattr(s, "fused_tf", 0) or 0),
+                int(getattr(s, "fused_tf2", 0) or 0),
+                int(getattr(s, "fused_turn", 4) or 4))
+            try:
+                rt_._fused_shown_held = dict(_shown.get("held") or {})
+            except Exception:                           # noqa: BLE001
+                pass
+
         st = j.stats(coin_, strategy=strat)
         return {
             "settings": s.to_dict(),
@@ -8670,13 +8726,7 @@ def create_app() -> FastAPI:
                  "strategy": strat,
                  "strategy_label": jn.STRATEGIES.get(strat, strat)}
                 if strat == "together"
-                else {**_fused_gate(
-                    rt_, (int(getattr(s, "fused_ticks", 0) or 10000),
-                          int(getattr(s, "fused_ofi", 0) or 4000)),
-                    (None if getattr(s, "fused_bounce", None) is None
-                     else float(int(s.fused_bounce)) / 100.0),
-                    None, None, int(getattr(s, "fused_tf", 0) or 0),
-                    int(getattr(s, "fused_tf2", 0) or 0)),
+                else {**_shown,
                     "decides": False, "entry": "", "strategy": strat,
                     "strategy_label": jn.STRATEGIES.get(strat, strat)}),
             "quote": jn_quote.read(
@@ -11445,6 +11495,25 @@ has to be running before the gate stops refusing.">spike
               <option value="60">1 minute</option>
               <option value="300">5 minute</option>
               <option value="900">15 minute</option>
+            </select></label>
+          <!-- THE TURNING ROW'S BAND. Chris asked for a selector
+               rather than a fixed number: the band that reads as a
+               turn on his tape is not something this code can know.
+               SHOWN ONLY -- this moves nothing that opens or closes
+               a trade, and the title says so. -->
+          <label title="how far price comes back off its running
+                        high or low before the turning row flips --
+                        shown only, it does not trade"
+            >turn
+            <select id="jnlFusedTurn" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="2">2t</option>
+              <option value="4" selected>4t</option>
+              <option value="6">6t</option>
+              <option value="8">8t</option>
+              <option value="12">12t</option>
+              <option value="16">16t</option>
+              <option value="24">24t</option>
             </select></label>
           <label title="gate 3 also closes a trade when it flips"
             ><input type="checkbox" id="jnlT3Ex" onchange="jnlSet()"
@@ -16444,6 +16513,11 @@ async function jnlSet() {
     jnlFused: $('jnlFused') ? String($('jnlFused').value || '10000x4000') : undefined,
     jnlFusedTf: $('jnlFusedTf') ? String($('jnlFusedTf').value) : undefined,
     jnlFusedTf2: $('jnlFusedTf2') ? String($('jnlFusedTf2').value) : undefined,
+    /* PINNED LIKE THE REST. Without this the next poll repaints
+       the dropdown from the server's older copy and the choice
+       appears to snap back while the save is still in flight. */
+    jnlFusedTurn: $('jnlFusedTurn')
+      ? String($('jnlFusedTurn').value) : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -16465,6 +16539,7 @@ async function jnlSet() {
        turn his tightest setting into his loosest on every save. */
     fused_tf: $('jnlFusedTf') ? $('jnlFusedTf').value : 0,
     fused_tf2: $('jnlFusedTf2') ? $('jnlFusedTf2').value : 0,
+    fused_turn: $('jnlFusedTurn') ? $('jnlFusedTurn').value : 4,
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -17525,14 +17600,26 @@ function paintFusedGate(FG) {
        actually reads". The candle's own four prices stay below,
        because those are what let him line this up against the
        chart; nothing here is a derived number any more. */
+    /* THE TURNING ROW'S OWN LINE. It says what it is measured
+       FROM, because the first version of this row measured off a
+       high that had stopped moving and read "down" through a
+       fourteen-point rally -- and nothing on the screen said what
+       it was anchored to, so there was no way to see that from
+       the panel. "running high" and "running low" are the words
+       that make the difference visible. */
     + ((FG.turning && FG.turning.dir)
-        ? '<div class="thin">turning is '
+        ? '<div class="thin">'
           + Number((FG.turning || {}).ticks_off || 0).toFixed(0)
-          + ' ticks off this candle&rsquo;s extreme, flipping at '
+          + ' ticks back off its running '
+          + (FG.turning.dir === 'up' ? 'high' : 'low')
+          + ', flipping at '
           + Number((FG.turning || {}).band || 0).toFixed(0)
           + ' &mdash; <b style="color:var(--dim)">shown only</b>, '
           + 'the rule reads the inner candle</div>'
-        : '')
+        : '<div class="thin">turning has no direction yet &mdash; '
+          + 'price has not travelled '
+          + Number((FG.turning || {}).band || 0).toFixed(0)
+          + ' ticks off this candle&rsquo;s open</div>')
     + ((FG.pos == null)
         ? '<div class="thin">every print in this bar has landed on '
           + 'one price &mdash; it has no range to read yet</div>'
@@ -18164,6 +18251,8 @@ function paintJournal(d) {
     set('jnlFusedTf', String(Math.round(S.fused_tf)));
   if (S.fused_tf2 != null)
     set('jnlFusedTf2', String(Math.round(S.fused_tf2)));
+  if (S.fused_turn != null)
+    set('jnlFusedTurn', String(Math.round(S.fused_turn)));
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =

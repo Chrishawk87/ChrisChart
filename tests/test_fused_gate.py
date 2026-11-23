@@ -376,7 +376,39 @@ class TestItIsWiredThrough:
         seg = blk[i:i + 700]
         assert "else None" not in seg, \
             "the fused gate is hidden behind a strategy"
-        assert "_fused_gate(" in seg
+        # EXECUTED, NOT SCANNED. This read `"_fused_gate(" in seg`
+        # and broke the moment the shown-only call was hoisted out
+        # of the dict literal so it could keep a memory -- a source
+        # shape, not the behaviour. The behaviour is that a
+        # strategy which is not `together` still gets a populated
+        # panel, and only running it can say so.
+        assert "_shown" in seg or "_fused_gate(" in seg
+        assert "_shown = _fused_gate(" in blk, \
+            "the panel is never built for the other strategies"
+
+    def test_it_is_drawn_while_another_strategy_trades(self, client,
+                                                       monkeypatch):
+        """THE SAME ASSERTION, RUN. Chris watches this panel while
+        the column trades something else, so a payload that is
+        empty on every strategy but its own is the feature not
+        working at all."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "stackwin"
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        fg = jr.get("fusedgate")
+        assert fg, "no fused panel while another strategy traded"
+        assert fg.get("decides") is False
+        assert fg.get("turning") is not None, \
+            "the turning row is missing off its own strategy"
 
     def test_its_own_strategy_reuses_the_reading_it_traded_on(self):
         """A SECOND CALL WOULD READ THE BAR A MOMENT LATER and the
@@ -2411,27 +2443,198 @@ class TestWhatItSaysAboutTheTwo:
 
 
 class TestTheTurningRow:
-    """Chris: "i dont know why it waits 30 ticks before it says
-    down that weird".
+    """Chris, on the first version: "thoss one has a turning but
+    its stuck in place doing nothing", and then "it should read
+    what the chart is doing in real time".
 
-    It was not waiting. The inner candle is `close vs open`, so on
-    a bar sitting 94 ticks above its open it reads UP until price
-    crosses back under that open. That is the candle being honest
-    and it is also no use to a hand on the mouse, so a third row
-    answers the other question beside it.
+    IT WAS NOT STUCK, IT WAS ANCHORED. It measured the close
+    against the candle's HIGH -- a number that only moves when a
+    new high prints -- so on a bar that ran up and pulled back it
+    said "down" and went on saying "down" through a fourteen-point
+    rally, because every one of those closes was still below a high
+    set minutes earlier.
+
+    THE EXTREME HAS TO TRAVEL. While it reads up the reference high
+    moves up with every new high, and it flips only when price
+    comes the band back off THAT high.
     """
 
     BAR = dict(open_px=7160.50, high=7184.00, low=7154.00)
 
-    def test_it_turns_a_few_ticks_off_the_extreme(self):
-        """Four ticks off the high, not ninety-four."""
-        off2 = fr.read(ofi_dir="up", tick_dir="up", close=7183.50,
-                       **self.BAR, **FULL)
-        assert off2["turning"]["dir"] == "up"
-        off4 = fr.read(ofi_dir="up", tick_dir="up", close=7183.00,
-                       **self.BAR, **FULL)
-        assert off4["turning"]["dir"] == "down"
-        assert off4["turning"]["ticks_off"] == pytest.approx(4.0)
+    @staticmethod
+    def _walk(path, band=4.0, open_px=7160.50, bar_ts=1.0):
+        """The row's reading at each close along a path."""
+        st, out = {}, []
+        for c in path:
+            st = fr.turn_state(c, band, st, open_px=open_px,
+                               bar_ts=bar_ts)
+            out.append((st["dir"], st["ticks_off"]))
+        return out
+
+    def test_it_reads_the_rally_while_the_rally_is_happening(self):
+        """THE BUG HE REPORTED, AS A TEST. His own bar: open
+        7160.50, high 7184.00, back to 7169.50, then a rally. The
+        old row said "down" for every close in that rally because
+        they were all below 7184. This one does not."""
+        path = [7166, 7172, 7178, 7184, 7180, 7175, 7169.5,
+                7173, 7177, 7181]
+        got = self._walk(path)
+        assert [d for d, _ in got[:4]] == ["up"] * 4
+        assert [d for d, _ in got[4:7]] == ["down"] * 3
+        # THE RALLY. Three closes, each higher than the last, every
+        # one of them below the 7184 the old row was pinned to.
+        assert [d for d, _ in got[7:]] == ["up"] * 3, \
+            "the row is pinned to a high that stopped moving"
+
+    def test_the_extreme_travels_with_price(self):
+        """A NEW HIGH MOVES THE REFERENCE. Without this the band is
+        measured off the first high forever, which is the whole of
+        the original bug."""
+        st = {}
+        for c in (7180.25, 7180.50, 7180.75, 7181.00):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+        assert st["dir"] == "up"
+        assert st["hi"] == pytest.approx(7181.00)
+        # Three ticks back is not a turn; the fourth is.
+        for c, want in ((7180.75, "up"), (7180.50, "up"),
+                        (7180.25, "up"), (7180.00, "down")):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+            assert st["dir"] == want, f"at {c}"
+
+    def test_the_countdown_to_the_flip_is_visible(self):
+        """`ticks_off` is how far back off the extreme price has
+        already come -- what makes the flip predictable rather than
+        sudden."""
+        st = {}
+        for c in (7180.25, 7180.50, 7180.75, 7181.00):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+        seen = []
+        for c in (7180.75, 7180.50, 7180.25):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+            seen.append(st["ticks_off"])
+        assert seen == [1.0, 2.0, 3.0]
+
+    def test_it_starts_blank_at_every_new_candle(self):
+        """Asked what this should do when a new fused candle
+        prints, Chris chose "Start blank each candle": the
+        reference resets to the new open and the row names no
+        direction until price has travelled the band off it."""
+        st = {}
+        for c in (7180.25, 7180.50, 7180.75, 7181.00):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+        assert st["dir"] == "up"
+        fresh = fr.turn_state(7181.00, 4.0, st, open_px=7181.00,
+                              bar_ts=2.0)
+        assert fresh["dir"] == "", \
+            "a direction was carried into a bar that has not happened"
+        assert fresh["ticks_off"] == 0.0
+        # And it finds one again off the NEW open, not the old high.
+        st2 = fresh
+        for c in (7181.25, 7181.50, 7181.75, 7182.00):
+            st2 = fr.turn_state(c, 4.0, st2, open_px=7181.00,
+                                bar_ts=2.0)
+        assert st2["dir"] == "up"
+
+    def test_the_first_direction_comes_off_whichever_end_it_left(self):
+        """BOTH EXTREMES ARE TRACKED WHILE IT IS BLANK, so a drift
+        up and then a drop names the turn off the drift's high
+        rather than off the open it happened to start at."""
+        st = {}
+        for c in (7180.25, 7180.50, 7180.25, 7180.00, 7179.50):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+        assert st["dir"] == "down"
+        # Four ticks off 7180.50, not off the 7180.00 open -- a
+        # reading taken from the open would still be blank here.
+        assert st["hi"] == pytest.approx(7180.50)
+
+    def test_the_band_is_the_setting_not_a_constant(self):
+        """Chris picked a selector over a fixed number, so a wider
+        band has to actually hold the direction longer."""
+        path = [7180.25, 7180.50, 7180.75, 7181.00, 7180.75,
+                7180.50, 7180.25, 7180.00]
+        tight = self._walk(path, band=4.0, open_px=7180.0)
+        wide = self._walk(path, band=16.0, open_px=7180.0)
+        assert tight[-1][0] == "down"
+        assert wide[-1][0] != "down", \
+            "a 16-tick band flipped on a 4-tick pullback"
+
+    def test_read_passes_the_band_through(self):
+        near = fr.read(ofi_dir="up", tick_dir="up", close=7183.00,
+                       turn_ticks=4.0, **self.BAR, **FULL)
+        wide = fr.read(ofi_dir="up", tick_dir="up", close=7183.00,
+                       turn_ticks=24.0, **self.BAR, **FULL)
+        assert near["turning"]["band"] == pytest.approx(4.0)
+        assert wide["turning"]["band"] == pytest.approx(24.0)
+
+    def test_the_band_it_reports_is_the_band_it_flips_on(self):
+        """THE LABEL AND THE BEHAVIOUR, CHECKED TOGETHER. Reading
+        the setting for the printed number while the row still
+        flips on the constant is a panel saying "flipping at 24"
+        and flipping at 4 -- a mutation that passed every test
+        here until this one existed, and exactly the kind of lie
+        this box keeps being rebuilt over.
+
+        So this walks a path through `read`, not `turn_state`."""
+        def walk(band):
+            prev, seen = None, []
+            for c in (7180.25, 7180.50, 7180.75, 7181.00,
+                      7180.75, 7180.50, 7180.25, 7180.00):
+                out = fr.read(ofi_dir="up", tick_dir="up",
+                              open_px=7180.0, high=7181.0,
+                              low=7180.0, close=c, bar_ts=1.0,
+                              prev=prev, turn_ticks=band, **FULL)
+                prev = out["held"]
+                seen.append(out["turning"]["dir"])
+            return seen
+        tight, wide = walk(4.0), walk(24.0)
+        assert tight[-1] == "down"
+        assert wide[-1] != "down", \
+            "the row flipped on 4 ticks while reporting a 24 band"
+        assert tight != wide
+
+    def test_the_state_rides_home_in_held(self):
+        """A FIELD DROPPED FROM `held` DOES NOT ERROR -- it
+        silently resets the reference on every poll, which is a row
+        that can never flip and looks exactly like the bug this
+        replaced."""
+        out = fr.read(ofi_dir="up", tick_dir="up", close=7183.00,
+                      bar_ts=1.0, **self.BAR, **FULL)
+        assert "turn" in (out.get("held") or {}), \
+            "the travelling extreme is not carried back"
+        t = out["held"]["turn"]
+        for k in ("dir", "hi", "lo", "bar_ts"):
+            assert k in t, f"held turn is missing {k}"
+
+    def test_without_the_memory_the_path_stops_mattering(self):
+        """THE FAILURE MODE, STATED. Hand it no previous reading
+        and every poll re-derives from the open, so how price got
+        to a price has no effect at all -- which is a row that
+        cannot track a turn, only a distance.
+
+        This is not hypothetical: the shown-only panel call was
+        handed `prev=None` and would have behaved exactly like
+        this on every strategy but its own."""
+        up = [7180.25, 7180.50, 7180.75, 7181.00]
+        down = [7179.75, 7179.50, 7179.25, 7181.00]
+        last_up = last_down = None
+        for c in up:
+            last_up = fr.turn_state(c, 4.0, None, open_px=7180.0,
+                                    bar_ts=1.0)
+        for c in down:
+            last_down = fr.turn_state(c, 4.0, None, open_px=7180.0,
+                                      bar_ts=1.0)
+        # Same close, opposite journeys, identical reading.
+        assert last_up == last_down
+        # WITH the memory those two paths read differently, which
+        # is the entire value of carrying it.
+        st_u, st_d = {}, {}
+        for c in up:
+            st_u = fr.turn_state(c, 4.0, st_u, open_px=7180.0,
+                                 bar_ts=1.0)
+        for c in down:
+            st_d = fr.turn_state(c, 4.0, st_d, open_px=7180.0,
+                                 bar_ts=1.0)
+        assert st_u["lo"] != st_d["lo"]
 
     def test_the_inner_candle_is_unchanged_by_it(self):
         """THE ROW IS BESIDE IT, NOT INSTEAD OF IT. Three attempts
@@ -2439,7 +2642,6 @@ class TestTheTurningRow:
         into contradiction with the candle next to it."""
         out = fr.read(ofi_dir="up", tick_dir="up", close=7175.00,
                       **self.BAR, **FULL)
-        assert out["turning"]["dir"] == "down"
         assert out["tick_dir"] == "up"
         assert out["where"] == "together"
         assert out["side"] == "up"
@@ -2448,49 +2650,88 @@ class TestTheTurningRow:
         import inspect
         for fn in (fr.entry_side, fr.exit_reason):
             ps = inspect.signature(fn).parameters
-            for bad in ("turning", "ticks_off"):
+            for bad in ("turning", "ticks_off", "turn_ticks"):
                 assert bad not in ps, f"{fn.__name__} takes {bad}"
-        for close in (7184.00, 7175.00, 7169.50):
+        prev, out = None, None
+        for close in (7184.00, 7180.00, 7175.00, 7169.50):
             out = fr.read(ofi_dir="up", tick_dir="up", close=close,
-                          **self.BAR, **FULL)
+                          bar_ts=1.0, prev=prev, **self.BAR, **FULL)
+            prev = out["held"]
             assert out["turning"]["decides"] is False
             assert out["side"] == "up", \
                 "the turning row moved the verdict"
-
-    def test_it_is_measured_in_ticks_not_a_fraction(self):
-        """A third of a 94-tick run is 31 ticks, which is no faster
-        than the thing this was added to fix. Off the extreme by a
-        fixed few ticks is the same answer however far it ran."""
-        far = fr.read(ofi_dir="up", tick_dir="up", close=7183.00,
-                      **self.BAR, **FULL)
-        near = fr.read(ofi_dir="up", tick_dir="up", open_px=7182.00,
-                       high=7184.00, low=7181.00, close=7183.00,
-                       **FULL)
-        assert far["turning"]["ticks_off"] == pytest.approx(
-            near["turning"]["ticks_off"])
-        assert far["turning"]["dir"] == near["turning"]["dir"]
-
-    def test_at_the_extreme_it_follows_the_run(self):
-        out = fr.read(ofi_dir="up", tick_dir="up", close=7184.00,
-                      **self.BAR, **FULL)
-        assert out["turning"]["dir"] == "up"
-        assert out["turning"]["ticks_off"] == pytest.approx(0.0)
-
-    def test_a_candle_that_has_not_run_has_nothing_to_turn_from(self):
-        out = fr.read(ofi_dir="up", tick_dir="", open_px=7170.0,
-                      high=7170.0, low=7170.0, close=7170.0, **FULL)
-        assert out["turning"]["dir"] == ""
-        assert out["turning"]["ticks_off"] == 0.0
+        # It read DOWN on the last of those and the rule still
+        # offered UP -- the separation, stated rather than implied.
+        assert out["turning"]["dir"] == "down"
 
     def test_a_down_candle_turns_up_off_its_low(self):
-        out = fr.read(ofi_dir="down", tick_dir="down", open_px=7184.0,
-                      high=7184.0, low=7154.0, close=7155.0, **FULL)
-        assert out["turning"]["dir"] == "up"
-        assert out["turning"]["ticks_off"] == pytest.approx(4.0)
+        st = {}
+        for c in (7183.75, 7183.50, 7183.25, 7183.00):
+            st = fr.turn_state(c, 4.0, st, open_px=7184.0, bar_ts=1.0)
+        assert st["dir"] == "down"
+        for c in (7183.25, 7183.50, 7183.75, 7184.00):
+            st = fr.turn_state(c, 4.0, st, open_px=7184.0, bar_ts=1.0)
+        assert st["dir"] == "up"
 
     def test_junk_never_raises(self):
-        for bad in (None, "", "abc"):
-            assert fr.turning(bad, bad, bad, bad) == ("", 0.0)
+        for bad in (None, "", "abc", [], {}):
+            st = fr.turn_state(bad, bad, {"dir": bad, "hi": bad,
+                                          "lo": bad, "bar_ts": bad},
+                               open_px=bad, bar_ts=bad)
+            assert st["dir"] in ("", "up", "down")
+            assert isinstance(st["ticks_off"], float)
+        out = fr.read(ofi_dir="up", tick_dir="up", close="abc",
+                      turn_ticks="abc", **self.BAR, **FULL)
+        assert out["turning"]["band"] == pytest.approx(fr.TURN_TICKS)
+
+    def test_a_zero_band_is_not_offered(self):
+        """A band of zero flips the row on every print. The snapper
+        refuses it; `_snap_bounce` deliberately does NOT, because
+        zero is one of the bounce choices -- the two look alike and
+        must not be copied from one another."""
+        from liqmap.journal import _snap_turn
+        assert 0 not in fr.TURN_CHOICES
+        assert _snap_turn(0) == int(fr.TURN_TICKS)
+        assert _snap_turn(-5) == int(fr.TURN_TICKS)
+        assert _snap_turn("junk") == int(fr.TURN_TICKS)
+        for c in fr.TURN_CHOICES:
+            assert _snap_turn(c) == int(c)
+        assert _snap_turn(5) in (4, 6)
+
+    def test_the_band_round_trips_through_the_journal(self, tmp_path):
+        from liqmap.journal import Journal
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        s.fused_turn = 16
+        assert j.save_settings(s).fused_turn == 16
+        assert j.settings("ES").fused_turn == 16
+        assert j.settings("ES").to_dict()["fused_turn"] == 16
+        s.fused_turn = 999
+        assert j.save_settings(s).fused_turn in fr.TURN_CHOICES
+
+    def test_the_selector_exists_and_is_saved(self):
+        src = (SRC / "web.py").read_text()
+        assert 'id="jnlFusedTurn"' in src, "no dial on the page"
+        for c in fr.TURN_CHOICES:
+            assert f'value="{int(c)}"' in src
+        assert "fused_turn: $('jnlFusedTurn')" in src, \
+            "the choice is never sent"
+        assert "set('jnlFusedTurn'" in src, \
+            "the saved choice never comes back to the dropdown"
+        assert "jnlFusedTurn: $('jnlFusedTurn')" in src, \
+            "the choice is not pinned and will snap back"
+
+    def test_the_route_takes_it(self, client, monkeypatch):
+        _cme(monkeypatch)
+        r = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_turn": 8},
+                        headers=AUTH).json()
+        assert r["settings"]["fused_turn"] == 8
+        # AND A HAND-TYPED JUNK VALUE CANNOT REACH THE ROW.
+        r = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_turn": 4000},
+                        headers=AUTH).json()
+        assert r["settings"]["fused_turn"] in fr.TURN_CHOICES
 
     def test_the_panel_draws_it_and_says_it_decides_nothing(self):
         src = (SRC / "web.py").read_text()
@@ -2499,6 +2740,8 @@ class TestTheTurningRow:
         assert "leg('turning'" in fn
         assert "shown only" in fn, \
             "nothing says the rule does not read this row"
+        assert "running " in fn, \
+            "the line does not say what the band is measured from"
         j = fn.index("leg('turning'")
         line = fn[fn.rindex("\n", 0, j):j]
         assert "?" not in line, "the row is drawn behind a condition"
@@ -2510,12 +2753,26 @@ class TestTheTurningRow:
                        "tick_dir": "up", "ofi_dir": "up",
                        "where": "together", "agree": True,
                        "side": "up",
-                       "turning": {"dir": "down", "ticks_off": 36.0,
+                       "turning": {"dir": "up", "ticks_off": 3.0,
                                    "band": 4.0, "decides": False}})
         assert "turning" in html
-        assert "36 ticks off" in html
+        assert "3 ticks back off its running high" in html
         assert "flipping at 4" in html
         assert "shown only" in html
+
+    def test_the_blank_state_says_why_it_is_blank(self, page_js):
+        """A ROW THAT GOES SILENT READS AS BROKEN. It starts blank
+        at every candle now, so the blank has to explain itself."""
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True,
+                       "side": "up",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "band": 4.0, "decides": False}})
+        assert "no direction yet" in html
+        assert "4 ticks off" in html
 
     def test_the_step_carries_it(self, client, monkeypatch):
         from liqmap import web
@@ -2532,3 +2789,57 @@ class TestTheTurningRow:
         assert "error" not in jr, jr.get("error")
         t = (jr.get("fusedgate") or {}).get("turning")
         assert t is not None and t.get("decides") is False
+
+    def test_the_dial_reaches_the_live_panel_on_both_paths(
+            self, client, monkeypatch):
+        """THE SETTING, THROUGH THE ROUTE, TO THE SCREEN. Dropping
+        the band argument at either call site leaves the dropdown
+        working, the database correct and the panel flipping on
+        the default -- a dial wired to nothing, which every source
+        test here passed happily. Only reading the payload back
+        catches it, and it has to be read on BOTH strategies
+        because the two call sites are separate code.
+
+        The band is checked on its own strategy and on another,
+        because the fused panel is drawn either way."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+
+        def band_for(strategy, ticks):
+            s_ = rt.journal.settings("ES")
+            s_.strategy = strategy
+            s_.fused_turn = ticks
+            rt.journal.save_settings(s_)
+            d = client.get("/api/read",
+                           params={"coin": "ES", "interval": "15m",
+                                   "timeframes": "15m,5m,1m"},
+                           headers=AUTH).json()
+            jr = d.get("journal") or {}
+            assert "error" not in jr, jr.get("error")
+            return ((jr.get("fusedgate") or {}).get("turning")
+                    or {}).get("band")
+
+        for strategy in ("together", "stackwin"):
+            assert band_for(strategy, 24) == pytest.approx(24.0), \
+                f"the dial never reaches the panel on {strategy}"
+            assert band_for(strategy, 2) == pytest.approx(2.0), \
+                f"the panel is pinned to one band on {strategy}"
+
+    def test_the_shown_only_path_keeps_its_own_memory(self):
+        """OFF ITS OWN STRATEGY THE PANEL IS COMPUTED FRESH, and
+        that call used to be handed `prev=None` -- which, for a row
+        made entirely of state, means blank on every poll and a
+        direction it can never find. Silent rather than wrong,
+        which is harder to notice."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("_shown = _fused_gate(")
+        seg = src[i:i + 500]
+        assert "_sprev" in seg, "the shown-only call has no memory"
+        assert "_fused_shown_held" in src, \
+            "nothing keeps the shown-only reading between polls"
+        # AND NOT THE TRADED ONE'S. A shared attribute would let a
+        # panel poll advance the extreme the live rule is holding.
+        j = src.index("rt_._fused_shown_held")
+        assert "rt_._fused_held" not in src[i:j], \
+            "the shown-only path writes the traded memory"
