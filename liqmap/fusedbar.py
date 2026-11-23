@@ -132,6 +132,25 @@ def max_s_for(ticks: int, ofi: int) -> float:
     """The cap this pair runs under."""
     return float(MAX_S_FOR.get((int(ticks), int(ofi)), MAX_S))
 
+
+def roll_window_for(ticks: int) -> int:
+    """How far back the live price direction looks, in prints.
+
+    A TENTH OF THE BAR, Chris's choice, snapped to a size that has
+    a builder behind it. It scales with the candle on its own:
+    10,000 prints inside the 100k bar, 1,000 inside the 10k one --
+    short enough to see a move start, long enough not to chatter.
+
+    IT NEEDS A BUILDER, not just a number. The rolling direction
+    is read off the continuous tick series, and a window with no
+    series behind it is no reading at all.
+    """
+    from .tickbar import PER_BAR_CHOICES
+    want = max(1, int(ticks or 0) // 10)
+    if want in PER_BAR_CHOICES:
+        return int(want)
+    return int(min(PER_BAR_CHOICES, key=lambda n: abs(n - want)))
+
 # The pair the fused STRATEGY reads when nothing says otherwise. The
 # one Chris named.
 DEFAULT_PAIR: tuple[int, int] = (TICK_TARGET, OFI_TARGET)

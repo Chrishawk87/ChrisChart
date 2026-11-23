@@ -7516,6 +7516,7 @@ def create_app() -> FastAPI:
         # scope: `jn` is bound further down this file and is not
         # visible from this helper, which is a NameError the
         # execution tests found and a source scan would not.
+        from .fusedbar import roll_window_for
         from .journal import window_label as _wl
 
         # NAMED FIRST, BEFORE ANYTHING THAT READS IT EXISTS.
@@ -7554,6 +7555,37 @@ def create_app() -> FastAPI:
             return d, nm, left
 
         _tf_dir, _tf_name, _tf_left = _tf_read(tf_s)
+
+        # THE LIVE PRICE DIRECTION, a tenth of the bar back.
+        # Chris: "im trying to see that upwards move the whole
+        # time its happening" -- the body only changes when price
+        # crosses back through ONE old number, and on a
+        # 100,000-print bar that number is a quarter of an hour
+        # old and possibly twenty points away.
+        #
+        # READ OFF THE CONTINUOUS SERIES the chart already runs,
+        # not a second accumulator: `RollingDir` slides forward
+        # one print at a time and never restarts at a close, which
+        # is the whole reason it exists.
+        #
+        # NO FALLBACK TO THE BODY. If this comes back empty the
+        # rule has no price leg and says so. Quietly reverting to
+        # the body would make a broken wire look like a quiet
+        # market, which is how three faults in this engine stayed
+        # hidden for weeks.
+        #
+        # DEFINED HERE, CALLED BELOW. It reads `tape`, which is
+        # not bound until after this point -- a closure resolves
+        # its names when it runs, and the call sites are all past
+        # that line. Calling it here would be the fourth
+        # free-variable NameError this route has shipped.
+        def _roll_dir(window: int) -> str:
+            try:
+                bars = getattr(tape, "tickbars", None) or {}
+                bld_ = bars.get(int(window))
+                return str(bld_.roll.path_dir or "") if bld_ else ""
+            except Exception:                           # noqa: BLE001
+                return ""
         # ONE COUNTDOWN, ON THE FIRST TIMEFRAME ONLY -- his
         # choice. The second one's clock is read and discarded
         # rather than not read at all, because `_tf_read` is one
@@ -7573,7 +7605,8 @@ def create_app() -> FastAPI:
             return {"pair": list(key), "label": label(*key),
                     "building": False, "why": why,
                     "where": "", "side": "", "entry": "",
-                    "ofi_dir": "", "tick_dir": "",
+                    "ofi_dir": "", "tick_dir": "", "body_dir": "",
+                    "roll_window": _rw,
                     "settled": False, "settle_why": why,
                     "agree": False, "pos": None, "at": "",
                     "back": 0.0, "legs": {},
@@ -7596,6 +7629,10 @@ def create_app() -> FastAPI:
         if key not in PAIRS:
             key = min(PAIRS, key=lambda k: (abs(int(k[0]) - int(key[0]))
                                             + abs(int(k[1]) - int(key[1]))))
+        # AFTER THE SNAP, so the look-back belongs to the pair that
+        # is actually read rather than the one that was asked for.
+        _rw = roll_window_for(key[0])
+        _rd = _roll_dir(_rw)
         if not books:
             return _nothing(key, "fused bars are built from the ES "
                                  "tape and that engine is not running")
@@ -7628,6 +7665,7 @@ def create_app() -> FastAPI:
             # agrees with the book and price". The same reader the
             # other strategies use, so the row on this panel and
             # the candle on the chart are one number.
+            roll_dir=_rd, roll_window=_rw,
             tf_dir=_tf_dir, tf_on=bool(tf_s), tf_name=_tf_name or "5m",
             tf_left_s=_tf_left,
             tf2_dir=_tf2_dir, tf2_on=bool(tf2_s),
@@ -17391,8 +17429,9 @@ function paintFusedGate(FG) {
 
   const head = '<div class="thin" style="margin-bottom:4px">'
     + '<b>THE FUSED BAR &mdash; ' + esc(FG.label || '')
-    + '</b> &mdash; the outer candle is the book, the body inside '
-    + 'it is the traded price'
+    + '</b> &mdash; the outer candle is the book, price is the '
+    + 'direction of the last '
+    + Number(FG.roll_window || 0).toLocaleString() + ' prints'
     /* IT DECIDES NOW. It shipped saying SHOWN ONLY, he watched it
        and wrote the rules; a heading left behind would be the one
        lie on this panel. */
@@ -17456,7 +17495,17 @@ function paintFusedGate(FG) {
   const body =
       '<div style="' + edge + '">'
     + '<div style="margin:4px 0">'
-    + leg('outer (book)', FG.ofi_dir) + leg('body (price)', FG.tick_dir)
+    + leg('outer (book)', FG.ofi_dir)
+    /* PRICE IS THE LIVE DIRECTION NOW, the body beside it. They
+       disagree exactly when the body has gone stale -- a bar that
+       opened high, sold off and is ripping back up reads DOWN on
+       the body the whole way up -- and that disagreement is the
+       case for the change, so it has to be visible. */
+    + leg('price (last ' + Number(FG.roll_window || 0).toLocaleString()
+          + ')', FG.tick_dir)
+    + ((FG.body_dir && FG.tick_dir && FG.body_dir !== FG.tick_dir)
+        ? leg('body (shape)', FG.body_dir)
+        : '')
     + ((FG.tf && FG.tf.on)
         ? leg(esc(FG.tf.name || 'tf') + ' candle', FG.tf.dir)
         : '')

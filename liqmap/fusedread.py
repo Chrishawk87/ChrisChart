@@ -39,6 +39,25 @@ should read what that is doing".
     THE INSIDE IS THE TICK CANDLE -- the body, open to close, of
     the prints that arrived in the same window.
 
+PRICE IS THE ROLLING DIRECTION, NOT THE BODY. Chris, on the swing
+pair: "the tick candle (price) that sits inside of the OFI candle
+(book) isnt really saying whats going on at all until tick candle
+completely flips the other direction im trying to see that
+upwards move the whole time its happening".
+
+    He is right, and it gets worse the longer the bar. `close vs
+    open` only changes when price crosses back through ONE old
+    number. On a 10,000-print bar that number is ninety seconds
+    old; on a 100,000-print bar it is a quarter of an hour old and
+    possibly twenty points away. A bar that opened high, sold off
+    and is now ripping back up reads DOWN the whole way up.
+
+    So the price leg is `RollingDir` -- which way the last N
+    prints went, recomputed on every print, never reset at a
+    close. The body is still carried and still drawn, because it
+    is the candle's shape and the pullback is measured off it, but
+    it no longer decides anything.
+
 So the pullback here is read the way anyone reads a candle: an up
 candle with a long upper wick has come back off the top. It is the
 distance from the close to the extreme the body ran to, over the
@@ -356,6 +375,7 @@ def _say(where: str, ofi_dir: str, tick_dir: str, pos: float | None,
 
 
 def read(ofi_dir: str = "", tick_dir: str = "",
+         roll_dir: str = "",
          open_px: float = 0.0, high: float = 0.0, low: float = 0.0,
          close: float = 0.0,
          net_ofi: float = 0.0, ofi_target: float = 0.0,
@@ -363,6 +383,7 @@ def read(ofi_dir: str = "", tick_dir: str = "",
          bounce_at: float = BOUNCE_AT,
          min_settle: float = MIN_SETTLE,
          bar_ts: float = 0.0,
+         roll_window: int = 0,
          tradeable: bool | None = None,
          prev: dict | None = None) -> dict:
     """The whole reading of one forming fused bar.
@@ -383,7 +404,11 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     are apart or nothing settled".
     """
     ofi_dir = str(ofi_dir or "")
-    tick_dir = str(tick_dir or "")
+    # THE BODY, KEPT UNDER ITS OWN NAME. It is the candle's shape
+    # and the pullback is measured off it; it is not the price leg
+    # any more.
+    body_dir = str(tick_dir or "")
+    tick_dir = str(roll_dir or "")
     prev = prev or {}
     # THE MEMORY BELONGS TO ONE BAR. Carrying a held direction into
     # a new bar would defeat the settling it was added for -- the
@@ -398,6 +423,7 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # mind, and an absence must never read as a reversal.
         ofi_dir = hold_dir(ofi_dir, str(prev.get("ofi_dir") or ""))
         tick_dir = hold_dir(tick_dir, str(prev.get("tick_dir") or ""))
+        body_dir = hold_dir(body_dir, str(prev.get("body_dir") or ""))
 
     pos = position(high, low, close)
     edge = at_edge(pos)
@@ -405,6 +431,20 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     # the range. Framed on the body rather than the book because
     # the body is the thing that bounces: "ofi remaining down but
     # tick is bouncing from bottom or top".
+    # THE LIVE DIRECTION PICKS THE EXTREME, and it is right by
+    # construction rather than by argument: `back` is only ever
+    # consulted in the branch where the book and price already
+    # AGREE, so the live direction there is the direction of the
+    # move, and the end it picks is the end the move ran to.
+    #
+    # THE BODY CANNOT DO THIS ANY MORE. It goes stale -- that is
+    # the whole reason it stopped being the price leg -- and a
+    # stale body picks the wrong end. On a bar that opened 7180,
+    # sold to 7154 and rallied back to 7174 with the book UP, the
+    # body still reads DOWN, measures off the low, and calls a
+    # 20-point rally "67% pulling back from the bottom". It then
+    # refuses the entry, which is the exact trade Chris is trying
+    # to see.
     back = pullback(tick_dir, high, low, close)
     agree = bool(ofi_dir in SIDES and ofi_dir == tick_dir)
     bounce_at = float(bounce_at if bounce_at is not None else BOUNCE_AT)
@@ -443,6 +483,11 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         "agree": agree,
         "ofi_dir": ofi_dir,
         "tick_dir": tick_dir,
+        # DRAWN, NOT TRADED. The candle's shape, beside the live
+        # direction, so the two can be seen disagreeing -- which is
+        # the whole case for the change.
+        "body_dir": body_dir,
+        "roll_window": int(roll_window or 0),
         # WHERE PRICE SITS IN ITS OWN RANGE, and how much of the
         # bar's move it has given back. Two different questions and
         # the panel draws both: the first is "top or bottom of the
@@ -468,6 +513,7 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # reading on every poll, which is how a hold that never
         # elapsed and a direction that chattered both got shipped.
         "held": {"ofi_dir": ofi_dir, "tick_dir": tick_dir,
+                 "body_dir": body_dir,
                  "bar_ts": float(bar_ts or 0.0)},
         "decides": True,
     }
@@ -603,6 +649,7 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           bounce_at: float = BOUNCE_AT,
           min_settle: float = MIN_SETTLE,
           bar_ts: float = 0.0,
+          roll_dir: str = "", roll_window: int = 0,
           tf_dir: str = "", tf_on: bool = False, tf_name: str = "5m",
           tf_left_s: float | None = None,
           tf2_dir: str = "", tf2_on: bool = False,
@@ -624,6 +671,7 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                ofi_target=ofi_target, prints=prints,
                tick_target=tick_target, bounce_at=bounce_at,
                min_settle=min_settle, bar_ts=bar_ts,
+               roll_dir=roll_dir, roll_window=roll_window,
                tradeable=tradeable, prev=prev)
     side, why = entry_side(out["where"], out["side"],
                            held_s=held_s, min_hold_s=min_hold_s,
