@@ -294,6 +294,50 @@ def back_to_open(open_px: float, high: float, low: float,
     return max(0.0, min(1.0, gone / run))
 
 
+# THE TURNING ROW'S BAND, IN TICKS. Chris: "i dont know why it
+# waits 30 ticks before it says down" -- the inner candle reads
+# `close vs open`, so on a bar sitting 94 ticks above its open it
+# waits 94 ticks. That is the candle being honest, and it is also
+# not what a hand on the mouse needs.
+#
+# TICKS, NOT A PERCENTAGE. A third of a 94-tick run is 31 ticks,
+# which is no faster than the thing it was added to fix. Off the
+# extreme by a fixed few ticks is the same answer on every bar
+# however far it ran.
+TURN_TICKS = 4.0
+TICK = 0.25
+
+
+def turning(open_px: float, high: float, low: float, close: float,
+            band_ticks: float = TURN_TICKS,
+            tick: float = TICK) -> tuple[str, float]:
+    """Which way price has turned off this candle's extreme.
+
+    Returns (direction, how many ticks off that extreme).
+
+    SHOWN, NEVER TRADED. The rule reads the inner candle, which is
+    what the chart greys on; this answers a different question and
+    sits beside it. Three attempts to make a derived reading the
+    price leg each put the panel into contradiction with the
+    candle next to it.
+    """
+    d, run = run_from_open(open_px, high, low)
+    if not d or run <= EPS:
+        return "", 0.0
+    try:
+        h, lo, c = float(high or 0.0), float(low or 0.0), \
+            float(close or 0.0)
+        t = float(tick or TICK) or TICK
+        band = max(0.0, float(band_ticks or 0.0))
+    except (TypeError, ValueError):
+        return "", 0.0
+    gone = (h - c) if d == "up" else (c - lo)
+    off = max(0.0, gone) / t
+    if off >= band > 0.0:
+        return _other(d), off
+    return d, off
+
+
 def pullback(body_dir: str, high: float, low: float,
              close: float) -> float:
     """How far off its extreme the candle has come, 0 to 1.
@@ -552,6 +596,15 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # anyone reading the payload. Nothing decides on it and
         # the panel no longer draws it: "i dont care how much just
         # what it actually reads".
+        # WHICH WAY PRICE HAS TURNED OFF THE EXTREME, and how far
+        # off it is. Drawn beside the inner candle, never read by
+        # the rule: `decides` is False and a test asserts it.
+        "turning": {
+            "dir": turning(open_px, high, low, close)[0],
+            "ticks_off": round(turning(open_px, high, low, close)[1], 1),
+            "band": float(TURN_TICKS),
+            "decides": False,
+        },
         "run_dir": run_from_open(open_px, high, low)[0],
         "run_pts": round(run_from_open(open_px, high, low)[1], 2),
         # WHERE PRICE SITS IN ITS OWN RANGE, and how much of the

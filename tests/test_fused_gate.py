@@ -2408,3 +2408,127 @@ class TestWhatItSaysAboutTheTwo:
                        "tick_dir": "up", "body_dir": "up",
                        "agree": True, "side": "up"})
         assert "BOTH UP" in html
+
+
+class TestTheTurningRow:
+    """Chris: "i dont know why it waits 30 ticks before it says
+    down that weird".
+
+    It was not waiting. The inner candle is `close vs open`, so on
+    a bar sitting 94 ticks above its open it reads UP until price
+    crosses back under that open. That is the candle being honest
+    and it is also no use to a hand on the mouse, so a third row
+    answers the other question beside it.
+    """
+
+    BAR = dict(open_px=7160.50, high=7184.00, low=7154.00)
+
+    def test_it_turns_a_few_ticks_off_the_extreme(self):
+        """Four ticks off the high, not ninety-four."""
+        off2 = fr.read(ofi_dir="up", tick_dir="up", close=7183.50,
+                       **self.BAR, **FULL)
+        assert off2["turning"]["dir"] == "up"
+        off4 = fr.read(ofi_dir="up", tick_dir="up", close=7183.00,
+                       **self.BAR, **FULL)
+        assert off4["turning"]["dir"] == "down"
+        assert off4["turning"]["ticks_off"] == pytest.approx(4.0)
+
+    def test_the_inner_candle_is_unchanged_by_it(self):
+        """THE ROW IS BESIDE IT, NOT INSTEAD OF IT. Three attempts
+        to make a derived reading the price leg each put the panel
+        into contradiction with the candle next to it."""
+        out = fr.read(ofi_dir="up", tick_dir="up", close=7175.00,
+                      **self.BAR, **FULL)
+        assert out["turning"]["dir"] == "down"
+        assert out["tick_dir"] == "up"
+        assert out["where"] == "together"
+        assert out["side"] == "up"
+
+    def test_it_decides_nothing(self):
+        import inspect
+        for fn in (fr.entry_side, fr.exit_reason):
+            ps = inspect.signature(fn).parameters
+            for bad in ("turning", "ticks_off"):
+                assert bad not in ps, f"{fn.__name__} takes {bad}"
+        for close in (7184.00, 7175.00, 7169.50):
+            out = fr.read(ofi_dir="up", tick_dir="up", close=close,
+                          **self.BAR, **FULL)
+            assert out["turning"]["decides"] is False
+            assert out["side"] == "up", \
+                "the turning row moved the verdict"
+
+    def test_it_is_measured_in_ticks_not_a_fraction(self):
+        """A third of a 94-tick run is 31 ticks, which is no faster
+        than the thing this was added to fix. Off the extreme by a
+        fixed few ticks is the same answer however far it ran."""
+        far = fr.read(ofi_dir="up", tick_dir="up", close=7183.00,
+                      **self.BAR, **FULL)
+        near = fr.read(ofi_dir="up", tick_dir="up", open_px=7182.00,
+                       high=7184.00, low=7181.00, close=7183.00,
+                       **FULL)
+        assert far["turning"]["ticks_off"] == pytest.approx(
+            near["turning"]["ticks_off"])
+        assert far["turning"]["dir"] == near["turning"]["dir"]
+
+    def test_at_the_extreme_it_follows_the_run(self):
+        out = fr.read(ofi_dir="up", tick_dir="up", close=7184.00,
+                      **self.BAR, **FULL)
+        assert out["turning"]["dir"] == "up"
+        assert out["turning"]["ticks_off"] == pytest.approx(0.0)
+
+    def test_a_candle_that_has_not_run_has_nothing_to_turn_from(self):
+        out = fr.read(ofi_dir="up", tick_dir="", open_px=7170.0,
+                      high=7170.0, low=7170.0, close=7170.0, **FULL)
+        assert out["turning"]["dir"] == ""
+        assert out["turning"]["ticks_off"] == 0.0
+
+    def test_a_down_candle_turns_up_off_its_low(self):
+        out = fr.read(ofi_dir="down", tick_dir="down", open_px=7184.0,
+                      high=7184.0, low=7154.0, close=7155.0, **FULL)
+        assert out["turning"]["dir"] == "up"
+        assert out["turning"]["ticks_off"] == pytest.approx(4.0)
+
+    def test_junk_never_raises(self):
+        for bad in (None, "", "abc"):
+            assert fr.turning(bad, bad, bad, bad) == ("", 0.0)
+
+    def test_the_panel_draws_it_and_says_it_decides_nothing(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "leg('turning'" in fn
+        assert "shown only" in fn, \
+            "nothing says the rule does not read this row"
+        j = fn.index("leg('turning'")
+        line = fn[fn.rindex("\n", 0, j):j]
+        assert "?" not in line, "the row is drawn behind a condition"
+
+    def test_it_renders(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True,
+                       "side": "up",
+                       "turning": {"dir": "down", "ticks_off": 36.0,
+                                   "band": 4.0, "decides": False}})
+        assert "turning" in html
+        assert "36 ticks off" in html
+        assert "flipping at 4" in html
+        assert "shown only" in html
+
+    def test_the_step_carries_it(self, client, monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        t = (jr.get("fusedgate") or {}).get("turning")
+        assert t is not None and t.get("decides") is False

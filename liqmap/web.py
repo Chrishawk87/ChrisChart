@@ -7575,6 +7575,9 @@ def create_app() -> FastAPI:
                     "where": "", "side": "", "entry": "",
                     "ofi_dir": "", "tick_dir": "", "body_dir": "",
                     "run_dir": "", "run_pts": 0.0, "moving": "",
+                    "turning": {"dir": "", "ticks_off": 0.0,
+                                "band": float(_fr.TURN_TICKS),
+                                "decides": False},
                     "settled": False, "settle_why": why,
                     "agree": False, "pos": None, "at": "",
                     "back": 0.0, "legs": {},
@@ -17443,6 +17446,13 @@ function paintFusedGate(FG) {
        price was something derived; they are the same reading
        again, and drawing it twice under two names is noise. */
     + leg('inner (tick)', FG.tick_dir)
+    /* THE THIRD ROW, SHOWN ONLY. The inner candle reads `close vs
+       open`, so on a bar far above its open it waits that whole
+       distance before it says down -- Chris: "i dont know why it
+       waits 30 ticks before it says down". This answers the other
+       question, beside it rather than instead of it, and nothing
+       trades on it. */
+    + leg('turning', (FG.turning || {}).dir)
     + ((FG.tf && FG.tf.on)
         ? leg(esc(FG.tf.name || 'tf') + ' candle', FG.tf.dir)
         : '')
@@ -17515,6 +17525,14 @@ function paintFusedGate(FG) {
        actually reads". The candle's own four prices stay below,
        because those are what let him line this up against the
        chart; nothing here is a derived number any more. */
+    + ((FG.turning && FG.turning.dir)
+        ? '<div class="thin">turning is '
+          + Number((FG.turning || {}).ticks_off || 0).toFixed(0)
+          + ' ticks off this candle&rsquo;s extreme, flipping at '
+          + Number((FG.turning || {}).band || 0).toFixed(0)
+          + ' &mdash; <b style="color:var(--dim)">shown only</b>, '
+          + 'the rule reads the inner candle</div>'
+        : '')
     + ((FG.pos == null)
         ? '<div class="thin">every print in this bar has landed on '
           + 'one price &mdash; it has no range to read yet</div>'
