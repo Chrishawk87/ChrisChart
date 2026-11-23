@@ -123,14 +123,19 @@ from .tapeintent import EPS
 
 SIDES = ("up", "down")
 
-# How much of the bar's move has to be given back before this calls
-# it a bounce rather than a push.
+# How much of its run off the open a candle has given back.
 #
-# IT IS PICKED ON THE PANEL NOW. Chris, after watching it: "when it
-# actually bounces it takes a long time for it to say that it
-# bounced almost 20 ticks of move before it does" -- a third of a
-# 10,000-print bar's move is a long way on ES. He asked for "a list
-# of percentages that i can select from starting from 0 to 33%".
+# IT GATES NOTHING NOW, and that is worth stating rather than
+# leaving to be discovered. It was the bounce threshold, then the
+# band that decided when price counted as turned; price is the
+# inner candle itself again -- "simple downs and ups only i dont
+# care how much just what it actually reads" -- so there is
+# nothing left for a percentage to decide.
+#
+# The number is still computed and still rides in the payload,
+# because it is a true fact about the candle and costs nothing.
+# The selector that set it is off the page: a control that
+# changes no reading is worse than no control.
 BOUNCE_AT = 0.33
 BOUNCE_CHOICES = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.33)
 
@@ -289,36 +294,6 @@ def back_to_open(open_px: float, high: float, low: float,
     return max(0.0, min(1.0, gone / run))
 
 
-def price_dir(open_px: float, high: float, low: float, close: float,
-              band: float = BOUNCE_AT) -> tuple[str, float, str]:
-    """Which way price is going inside this candle, right now.
-
-    Returns (direction, how far back toward the open, "away" or
-    "toward").
-
-    AWAY FROM THE OPEN IS THE RUN'S OWN DIRECTION; coming back
-    toward it is the other way. A candle that ran up and is
-    holding up there is going UP. The same candle half way back to
-    its open is going DOWN, whatever its body still says.
-
-    THE BAND IS WHY ONE TICK OFF THE HIGH IS NOT A TURN. Price has
-    to give up more than `band` of the run before it counts as
-    heading back, which is the same dial that used to decide a
-    bounce and now has a clearer job.
-    """
-    d, run = run_from_open(open_px, high, low)
-    if not d:
-        return "", 0.0, ""
-    back = back_to_open(open_px, high, low, close)
-    try:
-        b = float(band if band is not None else BOUNCE_AT)
-    except (TypeError, ValueError):
-        b = BOUNCE_AT
-    if back > 0.0 and back >= b:
-        return _other(d), back, "back toward"
-    return d, back, "further away from"
-
-
 def pullback(body_dir: str, high: float, low: float,
              close: float) -> float:
     """How far off its extreme the candle has come, 0 to 1.
@@ -423,34 +398,24 @@ def _other(side: str) -> str:
     return "down" if side == "up" else "up" if side == "down" else ""
 
 
-def _say(where: str, ofi_dir: str, tick_dir: str, pos: float | None,
-         back: float, edge: str, moving: str = "",
-         run_dir: str = "", run_pts: float = 0.0) -> str:
-    """One sentence, in the terms Chris asked the candle to be read
-    in: did it run up or down off its open, and is price still
-    going that way or heading back."""
-    pct = int(round(100.0 * back))
-    ran = (f"it ran {run_dir} {run_pts:.2f} off the open and is "
-           f"{pct}% of that back" if run_dir else "")
+def _say(where: str, ofi_dir: str, tick_dir: str) -> str:
+    """One sentence about the two candles, and no numbers in it.
+
+    Chris: "it should be simple downs and ups only i dont care how
+    much just what it actually reads".
+    """
     if where == "settling":
         return "settling -- not enough of this bar yet"
     if where == "together":
-        return (f"the book is {ofi_dir} and price is {tick_dir} "
-                f"(moving {moving or ''} the open) -- {ran}"
-                if ran else
-                f"the book is {ofi_dir} and price is {tick_dir}")
+        return (f"the OFI candle is {ofi_dir} and the tick candle "
+                f"is {tick_dir} -- they agree")
     if where == "apart":
-        return (f"the book is {ofi_dir} and price is {tick_dir} "
-                f"-- the chart greys this bar"
-                + (f"; {ran}" if ran else ""))
-    if not ofi_dir or ofi_dir == "flat":
-        return "the book has not committed either way yet"
-    if not tick_dir:
-        return (f"the book is {ofi_dir}; price has not run off this "
-                "candle's open yet")
-    if edge:
-        return f"the close is at the {edge} of the candle"
-    return "nothing settled yet"
+        return (f"the OFI candle is {ofi_dir} and the tick candle "
+                f"is {tick_dir} -- they disagree, and the chart "
+                "greys this bar")
+    if ofi_dir not in SIDES:
+        return "the OFI candle has no direction yet"
+    return "the tick candle has no direction yet"
 
 
 def read(ofi_dir: str = "", tick_dir: str = "",
@@ -472,7 +437,7 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         "together"  both legs the same way, price still at the end
                     of the move it made
         "bounce"    both legs the same way, price has come back off
-                    that extreme by more than `bounce_at`
+                    that extreme by more than the dial
         "apart"     the book and the traded price disagree
         ""          settled, but neither leg has said anything
 
@@ -481,17 +446,27 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     are apart or nothing settled".
     """
     ofi_dir = str(ofi_dir or "")
-    # THE BODY IS THE CANDLE'S SHAPE AND NOTHING ELSE NOW. It
-    # is drawn and it is held; it decides nothing. `close vs open`
-    # is a POSITION, and the question is which way price is MOVING.
+    # PRICE IS THE INNER CANDLE. Chris, pointing at the chart:
+    # "the outer shale is the body the OFI the inner candle is the
+    # tick candle what this is supposed to do it tell me whats
+    # actually happening between the 2" -- and then "it should be
+    # simple downs and ups only i dont care how much just what it
+    # actually reads".
+    #
+    # SO IT IS `close vs open` AND NOTHING DERIVED. Three readings
+    # were tried in its place -- the body's own retrace, a rolling
+    # window over the last N prints, and the run off the open --
+    # and the last of them put the panel into open contradiction
+    # with the candle beside it: on a bar the chart GREYED for the
+    # book and price disagreeing, the panel said "together" and
+    # offered a short. The chart greys on the body. So does this.
     body_dir = str(tick_dir or "")
+    # NOT ASSIGNED TWICE. `tick_dir` is set from the body BELOW,
+    # after the hold, and a copy here would be dead -- overwritten
+    # on every path. It was, and a mutation inverting it changed
+    # nothing and broke no test: dead code absorbs the check that
+    # was meant to land on the live line.
     bounce_at = float(bounce_at if bounce_at is not None else BOUNCE_AT)
-    # WHICH WAY PRICE IS GOING INSIDE THIS CANDLE. Chris: "the
-    # extremes dont matter what is is doing is it moving to tick
-    # charts opening or away".
-    tick_dir, back, moving = price_dir(open_px, high, low, close,
-                                       bounce_at)
-    run_dir, run_pts = run_from_open(open_px, high, low)
     prev = prev or {}
     # THE MEMORY BELONGS TO ONE BAR. Carrying a held direction into
     # a new bar would defeat the settling it was added for -- the
@@ -501,6 +476,12 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     ok, settle_why = settled(net_ofi, ofi_target, prints,
                              tick_target, min_settle)
     if same_bar:
+        # HELD THROUGH A TIE. A candle sitting exactly on its open
+        # for an instant has not turned, and an absence must never
+        # read as a reversal. This is the only guard the reading
+        # needs now: there is nothing else between the print and
+        # the word on the screen.
+        #
         # THE BODY IS HELD WHETHER OR NOT THE BAR HAS SETTLED.
         #
         # Chris: "the body (shape) keeps blinking in and out its
@@ -523,7 +504,11 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # direction held from before the bar settled is a
         # direction read off noise.
         ofi_dir = hold_dir(ofi_dir, str(prev.get("ofi_dir") or ""))
-        tick_dir = hold_dir(tick_dir, str(prev.get("tick_dir") or ""))
+    # PRICE FOLLOWS THE BODY EXACTLY, held the same way and from
+    # the same print. They are one reading under two names: the
+    # body is what the panel draws and price is what the rule
+    # reads, and the day they differ the panel is lying.
+    tick_dir = body_dir
 
     pos = position(high, low, close)
     edge = at_edge(pos)
@@ -563,11 +548,12 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # direction, so the two can be seen disagreeing -- which is
         # the whole case for the change.
         "body_dir": body_dir,
-        # WHICH WAY IT RAN OFF THE OPEN, how far it got, and
-        # whether price is still going that way or heading back.
-        "run_dir": run_dir,
-        "run_pts": round(float(run_pts or 0.0), 2),
-        "moving": moving,
+        # WHICH WAY IT RAN OFF THE OPEN AND HOW FAR, carried for
+        # anyone reading the payload. Nothing decides on it and
+        # the panel no longer draws it: "i dont care how much just
+        # what it actually reads".
+        "run_dir": run_from_open(open_px, high, low)[0],
+        "run_pts": round(run_from_open(open_px, high, low)[1], 2),
         # WHERE PRICE SITS IN ITS OWN RANGE, and how much of the
         # bar's move it has given back. Two different questions and
         # the panel draws both: the first is "top or bottom of the
@@ -584,11 +570,10 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         "low": _num(low),
         "close": _num(close),
         "net_ofi": int(_num(net_ofi)),
-        "back": round(back, 3),
+        "back": round(back_to_open(open_px, high, low, close), 3),
         "bounce_at": float(bounce_at or 0.0),
         "legs": legs(net_ofi, ofi_target, prints, tick_target),
-        "say": _say(where, ofi_dir, tick_dir, pos, back, edge,
-                    moving, run_dir, run_pts),
+        "say": _say(where, ofi_dir, tick_dir),
         # WHAT THE NEXT READING NEEDS BACK. A field dropped from
         # here does not error -- it silently resets that part of the
         # reading on every poll, which is how a hold that never

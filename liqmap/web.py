@@ -11419,22 +11419,6 @@ has to be running before the gate stops refusing.">spike
               <option value="10000x4000" selected>10000t &times; 4000</option>
               <option value="100000x40000">100000t &times; 40000</option>
             </select></label>
-          <!-- HOW MUCH GIVE-BACK IS A BOUNCE. Chris: "give me a
-               list of percentages that i can select from starting
-               from 0 to 33%". Zero means any give-back at all. -->
-          <label title="how much of the bar's move has to be given
-                        back before it reads as a bounce"
-            >bounce
-            <select id="jnlBounce" onchange="jnlSet()"
-              style="margin:0 4px">
-              <option value="0">0% (any)</option>
-              <option value="5">5%</option>
-              <option value="10">10%</option>
-              <option value="15">15%</option>
-              <option value="20">20%</option>
-              <option value="25">25%</option>
-              <option value="33" selected>33%</option>
-            </select></label>
           <!-- THE LIVE TIMEFRAME BESIDE PRICE, as a filter on the
                fused rule. Off is a real setting, not an absence. -->
           <label title="only trade when this live candle agrees with
@@ -16455,7 +16439,6 @@ async function jnlSet() {
     jnlTick3: $('jnlTick3') ? String(Math.round($('jnlTick3').value || 1000)) : undefined,
     jnlT3Ex: $('jnlT3Ex') ? ($('jnlT3Ex').checked ? '1' : '0') : undefined,
     jnlFused: $('jnlFused') ? String($('jnlFused').value || '10000x4000') : undefined,
-    jnlBounce: $('jnlBounce') ? String($('jnlBounce').value) : undefined,
     jnlFusedTf: $('jnlFusedTf') ? String($('jnlFusedTf').value) : undefined,
     jnlFusedTf2: $('jnlFusedTf2') ? String($('jnlFusedTf2').value) : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
@@ -16477,8 +16460,6 @@ async function jnlSet() {
       ? String($('jnlFused').value || '10000x4000').split('x')[1] : 4000,
     /* ZERO IS A CHOICE, so this cannot use || anywhere -- it would
        turn his tightest setting into his loosest on every save. */
-    fused_bounce: $('jnlBounce') ? $('jnlBounce').value : 33,
-    /* OFF IS ZERO AND ZERO IS A CHOICE -- no || on this one. */
     fused_tf: $('jnlFusedTf') ? $('jnlFusedTf').value : 0,
     fused_tf2: $('jnlFusedTf2') ? $('jnlFusedTf2').value : 0,
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
@@ -17392,9 +17373,8 @@ function paintFusedGate(FG) {
 
   const head = '<div class="thin" style="margin-bottom:4px">'
     + '<b>THE FUSED BAR &mdash; ' + esc(FG.label || '')
-    + '</b> &mdash; the outer candle is the book; price is '
-    + 'whether this candle is running away from its open or '
-    + 'coming back to it'
+    + '</b> &mdash; the outer candle is the OFI, the inner one '
+    + 'is the tick'
     /* IT DECIDES NOW. It shipped saying SHOWN ONLY, he watched it
        and wrote the rules; a heading left behind would be the one
        lie on this panel. */
@@ -17437,40 +17417,32 @@ function paintFusedGate(FG) {
     + (FG.where === 'settling' ? 'line'
         : FG.where === 'together'
         ? (FG.ofi_dir === 'down' ? 'down' : 'up')
-        : FG.where === 'apart' ? 'line'
-        : FG.where === 'bounce'
-            ? (FG.ofi_dir === 'down' ? 'down' : 'up') : 'line')
+        : 'line')
     + ');padding:6px 0 6px 10px';
 
   const word = FG.where === 'settling'
       ? '<b style="color:var(--dim)">SETTLING</b>'
     : FG.where === 'together'
       ? '<b class="' + (FG.ofi_dir === 'down' ? 'short' : 'long') + '">'
-        + 'MOVING ' + esc(FG.ofi_dir || '').toUpperCase()
-        + ' TOGETHER</b>'
-    : FG.where === 'bounce'
-      ? '<b style="color:var(--dim)">TURNED BACK TO THE OPEN</b>'
+        + 'BOTH ' + esc(FG.ofi_dir || '').toUpperCase()
+        + '</b>'
     : FG.where === 'apart'
-      ? '<b class="short">BOOK AND PRICE APART</b>'
+      ? '<b class="short">THEY DISAGREE</b>'
       : '<b class="short">NOTHING SETTLED</b>';
 
   const body =
       '<div style="' + edge + '">'
     + '<div style="margin:4px 0">'
-    + leg('outer (book)', FG.ofi_dir)
+    + leg('outer (OFI)', FG.ofi_dir)
     /* PRICE IS THE LIVE DIRECTION NOW, the body beside it. They
        disagree exactly when the body has gone stale -- a bar that
        opened high, sold off and is ripping back up reads DOWN on
        the body the whole way up -- and that disagreement is the
        case for the change, so it has to be visible. */
-    + leg('price (moving)', FG.tick_dir)
-    /* ALWAYS DRAWN. It was conditional on disagreeing with price,
-       so the row vanished every time the two lined up and came
-       back when they parted -- Chris: "keeps blinking in and out
-       ... just a constant reading never fading". A row that
-       appears only when something is wrong is also a row you
-       cannot check when nothing is. */
-    + leg('body (shape)', FG.body_dir)
+    /* ONE ROW, NOT TWO. The body and price were separate while
+       price was something derived; they are the same reading
+       again, and drawing it twice under two names is noise. */
+    + leg('inner (tick)', FG.tick_dir)
     + ((FG.tf && FG.tf.on)
         ? leg(esc(FG.tf.name || 'tf') + ' candle', FG.tf.dir)
         : '')
@@ -17538,23 +17510,15 @@ function paintFusedGate(FG) {
        half of what he asked for. Drawn separately from the retrace
        because they answer different questions -- one is where
        price is, the other is whether the move is still on. */
-    /* THE RUN OFF THE OPEN, which is the whole reading now.
-       Chris: "the extremes dont matter what is is doing is it
-       moving to tick charts opening or away". */
-    + (FG.run_dir
-        ? '<div class="thin">it ran <b>' + esc(FG.run_dir).toUpperCase()
-          + '</b> ' + Number(FG.run_pts || 0).toFixed(2)
-          + ' off the open and is ' + pct(100 * FG.back)
-          + ' of that back &mdash; price counts as turned at '
-          + pct(100 * FG.bounce_at) + '</div>'
+    /* NO PERCENTAGES IN THE READING. Chris: "it should be simple
+       downs and ups only i dont care how much just what it
+       actually reads". The candle's own four prices stay below,
+       because those are what let him line this up against the
+       chart; nothing here is a derived number any more. */
+    + ((FG.pos == null)
+        ? '<div class="thin">every print in this bar has landed on '
+          + 'one price &mdash; it has no range to read yet</div>'
         : '')
-    + ((FG.pos != null)
-        ? '<div class="thin">the close is ' + pct(100 * FG.pos)
-          + ' of the way up this candle&rsquo;s range'
-          + (FG.at ? ' &mdash; at the ' + esc(FG.at) : '')
-          + '</div>'
-        : '<div class="thin">every print in this bar has landed on '
-          + 'one price &mdash; it has no range to read yet</div>')
     /* THE CANDLE'S OWN FOUR NUMBERS AND THE SIGNED BOOK.
        Chris compared this panel against the chart header and could
        not tell whether they were even the same bar -- they were,
@@ -18178,8 +18142,6 @@ function paintJournal(d) {
   if ($('jnlT3Ex')) $('jnlT3Ex').checked = !!S.tick3_exit;
   set('jnlFused', String(Math.round(S.fused_ticks || 10000))
       + 'x' + String(Math.round(S.fused_ofi || 4000)));
-  if (S.fused_bounce != null)
-    set('jnlBounce', String(Math.round(S.fused_bounce)));
   if (S.fused_tf != null)
     set('jnlFusedTf', String(Math.round(S.fused_tf)));
   if (S.fused_tf2 != null)

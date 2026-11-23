@@ -80,15 +80,15 @@ class TestWhatItDecides:
         assert together["where"] == "together"
         assert together["side"] == "down"
         for name, kw in [
-            ("bounce", dict(ofi_dir="down", tick_dir="down",
-                            open_px=20.0, high=20.0, low=0.0,
-                            close=12.0)),
             ("apart", dict(ofi_dir="down", tick_dir="up",
-                           open_px=0.0, high=10.0, low=0.0,
-                           close=9.0)),
+                           open_px=100.0, high=110.0, low=100.0,
+                           close=109.0)),
             ("flat book", dict(ofi_dir="flat", tick_dir="up",
-                               open_px=0.0, high=10.0, low=0.0,
-                               close=9.0)),
+                               open_px=100.0, high=110.0, low=100.0,
+                               close=109.0)),
+            ("no inner", dict(ofi_dir="down", tick_dir="",
+                              open_px=100.0, high=110.0, low=90.0,
+                              close=100.0)),
         ]:
             out = fr.read(**kw, **full)
             assert out["side"] == "", f"{name} offered a side"
@@ -119,51 +119,49 @@ class TestHisFourCases:
     def test_moving_down_together(self):
         """It ran DOWN 20 off its open and is only 5% of that back,
         so price is still going down and the book agrees."""
-        out = fr.read(ofi_dir="down", open_px=5020.0, high=5020.5,
-                      low=5000.0, close=5001.0, **FULL)
-        assert out["run_dir"] == "down"
+        out = fr.read(ofi_dir="down", tick_dir="down",
+                      open_px=5020.0, high=5020.5, low=5000.0,
+                      close=5001.0, **FULL)
         assert out["tick_dir"] == "down"
         assert out["where"] == "together"
         assert out["agree"] is True
 
     def test_moving_up_together(self):
-        out = fr.read(ofi_dir="up", open_px=5000.0, high=5020.0,
-                      low=4999.5, close=5019.0, **FULL)
-        assert out["run_dir"] == "up"
+        out = fr.read(ofi_dir="up", tick_dir="up", open_px=5000.0,
+                      high=5020.0, low=4999.5, close=5019.0, **FULL)
         assert out["tick_dir"] == "up"
         assert out["where"] == "together"
 
-    def test_the_book_stays_down_while_price_comes_back(self):
-        """His third case. The candle ran DOWN 20 off its open and
-        price is 60% of that back toward it -- so price has
-        turned, and the book has not. That is a disagreement now,
-        which is what it always was underneath."""
-        out = fr.read(ofi_dir="down", open_px=5020.0, high=5020.0,
-                      low=5000.0, close=5012.0, **FULL)
-        assert out["run_dir"] == "down"
-        assert out["back"] == pytest.approx(0.6)
+    def test_the_book_down_and_the_inner_candle_up_is_a_disagreement(
+            self):
+        """His third case. The inner candle closed above its open
+        while the book is down -- which is exactly what the chart
+        greys a bar for."""
+        out = fr.read(ofi_dir="down", tick_dir="up", open_px=5000.0,
+                      high=5020.0, low=4990.0, close=5012.0,
+                      tradeable=False, **FULL)
         assert out["tick_dir"] == "up"
         assert out["where"] == "apart"
         assert out["agree"] is False
+        assert out["grayed"] is True
 
-    def test_the_book_stays_up_while_price_comes_back(self):
-        out = fr.read(ofi_dir="up", open_px=5000.0, high=5020.0,
-                      low=5000.0, close=5008.0, **FULL)
-        assert out["run_dir"] == "up"
+    def test_the_book_up_and_the_inner_candle_down_is_too(self):
+        out = fr.read(ofi_dir="up", tick_dir="down", open_px=5020.0,
+                      high=5030.0, low=5000.0, close=5008.0, **FULL)
         assert out["tick_dir"] == "down"
         assert out["where"] == "apart"
 
     def test_the_book_and_price_disagreeing_is_its_own_state(self):
         out = fr.read(ofi_dir="down", tick_dir="up", open_px=5000.0,
-                      high=5010.0, low=4998.0, close=5009.0)
+                      high=5010.0, low=4998.0, close=5009.0, **FULL)
         assert out["where"] == "apart"
         assert out["agree"] is False
         # SAID THE WAY THE CHART SAYS IT. The renderer washes a bar
         # whose book and price disagree, so the panel names the
         # same thing the candle shows rather than inventing a
         # second vocabulary for it.
+        assert "they disagree" in out["say"]
         assert "greys this bar" in out["say"]
-        assert "ran" in out["say"]
 
     def test_read_it_like_a_normal_candle(self):
         """"or read it like normal candle" -- where the close sits
@@ -227,8 +225,8 @@ class TestTheMeasures:
         assert fr.run_from_open(100.0, 110.0, 90.0)[0] == "up"
 
     def test_at_the_open_nothing_is_given_back(self):
-        out = fr.read(ofi_dir="up", open_px=100.0, high=120.0,
-                      low=100.0, close=120.0, **FULL)
+        out = fr.read(ofi_dir="up", tick_dir="up", open_px=100.0,
+                      high=120.0, low=100.0, close=120.0, **FULL)
         assert out["back"] == pytest.approx(0.0)
         assert out["where"] == "together"
 
@@ -243,10 +241,10 @@ class TestTheMeasures:
                                95.0) <= 1.0
 
     def test_a_flat_book_settles_nothing(self):
-        out = fr.read(ofi_dir="flat", open_px=5000.0, high=5010.0,
-                      low=5000.0, close=5009.0, **FULL)
+        out = fr.read(ofi_dir="flat", tick_dir="up", open_px=5000.0,
+                      high=5010.0, low=5000.0, close=5009.0, **FULL)
         assert out["where"] == ""
-        assert "not committed" in out["say"]
+        assert "no direction" in out["say"]
 
     def test_a_candle_that_has_not_run_is_not_a_disagreement(self):
         """Every print on one price. That is an absence of a
@@ -263,7 +261,6 @@ class TestTheMeasures:
             fr.legs(bad, bad, bad, bad)
             fr.run_from_open(bad, bad, bad)
             fr.back_to_open(bad, bad, bad, bad)
-            fr.price_dir(bad, bad, bad, bad)
             fr.read(net_ofi=bad, ofi_target=bad, prints=bad,
                     tick_target=bad, open_px=bad, high=bad, low=bad,
                     close=bad)
@@ -403,15 +400,9 @@ class TestItIsWiredThrough:
         fn = src[i:src.index("\nfunction ", i + 10)]
         assert "SHOWN ONLY" in fn, \
             "the panel does not say it decides nothing"
-        assert "MOVING" in fn and "TURNED BACK TO THE OPEN" in fn
-        assert "outer (book)" in fn, \
-            "the panel does not name the outer candle"
-        assert "price (moving)" in fn, \
-            "price is not named as which way it is going"
-        assert "body (shape)" in fn, \
-            "the candle's shape is nowhere on the panel"
-        assert "off the open" in fn, \
-            "the run off the open is nowhere on the panel"
+        assert "BOTH " in fn and "THEY DISAGREE" in fn
+        assert "outer (OFI)" in fn and "inner (tick)" in fn, \
+            "the panel does not name the two candles the chart draws"
         assert "FG.pos" in fn, "the candle read is never drawn"
         assert "FG.legs" in fn or "FG.legs || {}" in fn
 
@@ -623,56 +614,6 @@ class TestSettling:
         assert out["where"] == "settling"
 
 
-class TestTheTurnDial:
-    """The same dial, a clearer job: it decides how much of the
-    run off the open price has to give up before it counts as
-    having turned. Chris asked for "a list of percentages that i
-    can select from starting from 0 to 33%"."""
-
-    def test_the_choices_run_from_zero_to_a_third(self):
-        assert fr.BOUNCE_CHOICES[0] == 0.0
-        assert fr.BOUNCE_CHOICES[-1] == pytest.approx(0.33)
-        assert list(fr.BOUNCE_CHOICES) == sorted(fr.BOUNCE_CHOICES)
-        assert len(set(fr.BOUNCE_CHOICES)) == len(fr.BOUNCE_CHOICES)
-
-    # a candle that opened at 100 and ran UP 20 points
-    RAN_UP = dict(open_px=100.0, high=120.0, low=100.0)
-
-    @pytest.mark.parametrize("pct,close_px,turned", [
-        (0.33, 112.0, True), (0.33, 119.0, False),
-        (0.10, 117.0, True), (0.10, 119.5, False),
-        (0.05, 118.0, True),
-    ])
-    def test_a_tighter_setting_calls_the_turn_sooner(self, pct,
-                                                     close_px, turned):
-        out = fr.read(ofi_dir="up", close=close_px, bounce_at=pct,
-                      **self.RAN_UP, **FULL)
-        assert (out["tick_dir"] == "down") is turned, out["say"]
-
-    def test_zero_means_any_step_back_is_a_turn(self):
-        at = fr.read(ofi_dir="up", close=120.0, bounce_at=0.0,
-                     **self.RAN_UP, **FULL)
-        assert at["tick_dir"] == "up", \
-            "at its furthest it has not turned, at any setting"
-        off = fr.read(ofi_dir="up", close=119.75, bounce_at=0.0,
-                      **self.RAN_UP, **FULL)
-        assert off["tick_dir"] == "down"
-
-    def test_an_open_of_zero_is_a_bar_before_its_first_print(self):
-        """`FusedBar.open` is 0.0 until a print arrives, and zero
-        is not a price. It must read as "nothing yet" rather than
-        as a 20-point run."""
-        out = fr.read(ofi_dir="up", open_px=0.0, high=20.0, low=0.0,
-                      close=12.0, **FULL)
-        assert out["run_dir"] == ""
-        assert out["tick_dir"] == ""
-
-    def test_the_setting_reaches_the_reading(self):
-        out = fr.read(ofi_dir="up", close=119.0, bounce_at=0.15,
-                      **self.RAN_UP, **FULL)
-        assert out["bounce_at"] == pytest.approx(0.15)
-
-
 class TestTheRule:
     """"book down or up, price down or up and says moving together
     ... exit the trade on bounces never trade when book and price
@@ -823,16 +764,18 @@ class TestTheStrategyIsWiredThrough:
         assert "_fused_gate(rt_, _fpair" in blk
 
     def test_zero_percent_is_never_treated_as_missing(self):
-        """`or 33` ANYWHERE ON THIS PATH turns his tightest setting
-        into his loosest, silently, on every save."""
+        """`or 33` ANYWHERE ON THIS PATH would turn a zero into a
+        33. The selector is off the page now because the value
+        gates nothing, but the stored setting and the route that
+        reads it are still here, and the day it gets a job again
+        this is the fault it will have."""
         blk = self._step()
         i = blk.index("_fb_pct = ")
         seg = blk[i:i + 420]
         assert "or 33" not in seg
         assert "is None" in seg
-        src = self._web()
-        assert "fused_bounce: $('jnlBounce') ? $('jnlBounce').value : 33," \
-            in src, "the page defaults the bounce with ||"
+        from liqmap.journal import Settings
+        assert Settings(fused_bounce=0).to_dict()["fused_bounce"] == 0
 
     def test_the_dwell_is_fed_the_agreement_not_a_leg(self):
         """"after the moving together holds for 5 seconds" -- it is
@@ -892,16 +835,6 @@ class TestTheStrategyIsWiredThrough:
             "a refusal by the journal is invisible on this panel"
         assert "FG.decides" in fn, \
             "the heading cannot stop saying SHOWN ONLY"
-
-    def test_the_bounce_selector_offers_his_list(self):
-        import re
-        src = self._web()
-        i = src.index('id="jnlBounce"')
-        box = src[i:src.index("</select>", i)]
-        shown = sorted(int(m) for m in
-                       re.findall(r'value="(\d+)"', box))
-        want = sorted(int(round(100 * c)) for c in fr.BOUNCE_CHOICES)
-        assert shown == want
 
     def test_the_bounce_setting_round_trips_including_zero(self,
                                                            tmp_path):
@@ -1025,15 +958,14 @@ class TestItReadsTheCandleTheChartDraws:
 
     BAR = dict(open_px=7160.50, high=7184.00, low=7154.00)
 
-    def test_his_bar_reads_as_coming_back_to_the_open(self):
-        """It ran 23.50 up off the open and is 14.50 of that back,
-        so price has turned down while the book is still up."""
-        out = fr.read(ofi_dir="up", close=7169.50, **self.BAR, **FULL)
-        assert out["run_dir"] == "up"
-        assert out["back"] == pytest.approx(14.5 / 23.5, abs=1e-3)
-        assert out["tick_dir"] == "down"
-        assert out["where"] == "apart"
-        assert "back toward" in out["say"] or "ran up" in out["say"]
+    def test_his_bar_agrees_when_the_inner_candle_does(self):
+        """The inner candle closed above its open, so with the book
+        up the two agree -- whatever the wick above them says."""
+        out = fr.read(ofi_dir="up", tick_dir="up", close=7169.50,
+                      **self.BAR, **FULL)
+        assert out["tick_dir"] == "up"
+        assert out["where"] == "together"
+        assert out["side"] == "up"
 
     def test_the_old_framing_saturated_on_exactly_this_bar(self):
         """THE FAULT, WRITTEN DOWN. Framed on the BOOK's move from
@@ -1202,17 +1134,18 @@ class TestThePanelActuallyRenders:
     def test_it_names_the_two_candles_the_chart_draws(self, page_js):
         from tests.test_stack_strip import run_js
         html = run_js(page_js, "fusedGate", self.BAR)
-        assert "outer (book)" in html
-        assert "price (moving)" in html
+        assert "outer (OFI)" in html
+        assert "inner (tick)" in html
 
-    def test_the_run_off_the_open_is_drawn(self, page_js):
+    def test_the_reading_carries_no_percentages(self, page_js):
+        """"i dont care how much just what it actually reads"."""
         from tests.test_stack_strip import run_js
         html = run_js(page_js, "fusedGate",
                       {**self.BAR, "run_dir": "up", "run_pts": 23.5,
-                       "back": 0.426, "moving": "back toward"})
-        assert "it ran <b>UP</b> 23.50 off the open" in html
-        assert "43% of that back" in html
-        assert "counts as turned at" in html
+                       "back": 0.426})
+        assert "off the open and is" not in html
+        assert "of the way up this" not in html
+        assert "counts as turned at" not in html
 
     def test_a_settling_bar_says_so(self, page_js):
         from tests.test_stack_strip import run_js
@@ -1348,11 +1281,10 @@ class TestNothingOpensOnABounceOrASettlingBar:
         assert fr.entry_side("together", "up", held_s=5.0) == ("up", "")
         assert fr.entry_side("together", "up", held_s=4.9)[0] == ""
 
-    def test_the_reading_offers_no_side_once_price_has_turned(self):
-        """It ran 23.5 up off the open and is 62% of that back, so
-        price is DOWN while the book is UP."""
-        out = fr.read(ofi_dir="up", open_px=7160.50, high=7184.00,
-                      low=7154.00, close=7169.50, **FULL)
+    def test_the_reading_offers_no_side_when_they_disagree(self):
+        out = fr.read(ofi_dir="up", tick_dir="down", open_px=7180.00,
+                      high=7184.00, low=7154.00, close=7169.50,
+                      **FULL)
         assert out["tick_dir"] == "down"
         assert out["where"] == "apart"
         assert out["side"] == ""
@@ -1444,9 +1376,16 @@ class TestThePanelNeverClaimsAnotherRulesTrades:
     that just happened.
     """
 
-    def test_the_other_fused_rule_really_does_enter_on_a_pullback(self):
+    def test_the_other_fused_rule_has_its_own_entirely(self):
         """NOT AN ASSUMPTION ABOUT THE OTHER RULE -- its own
-        function, on a bar this panel calls a bounce."""
+        function, on a real bar.
+
+        The two can agree on a given bar; that is not the point.
+        The point is that `live_signal` asks a different question
+        -- 10% of both legs and the two agreeing, with no hold, no
+        settling and no timeframe filter -- so the panel
+        describing THIS rule while THAT one trades is a claim
+        about a trade nobody can check."""
         from liqmap.fusedbar import FusedBar, live_signal
         bar = FusedBar(start_ts=0.0, tick_target=10000,
                        ofi_target=4000)
@@ -1463,10 +1402,17 @@ class TestThePanelNeverClaimsAnotherRulesTrades:
                        close=bar.close, net_ofi=bar.net_ofi,
                        ofi_target=4000, prints=bar.prints,
                        tick_target=10000)
-        assert ours["where"] == "apart"
-        assert fr.entry_side(ours["where"], ours["side"],
-                             held_s=999.0)[0] == "", \
-            "the two rules agree, so this explains nothing"
+        # The readings are built from different questions, and
+        # only one of them is the rule actually running.
+        assert ours["where"] in ("together", "apart", "")
+        import inspect
+        assert "min_fraction" in inspect.signature(
+            live_signal).parameters, \
+            "the other rule no longer has its own warm-up"
+        for gate in ("held_s", "min_hold_s"):
+            assert gate not in inspect.signature(
+                live_signal).parameters, \
+                f"the other rule has a {gate} after all"
 
     def test_the_panel_says_which_rule_is_running(self, page_js):
         from tests.test_stack_strip import run_js
@@ -1667,6 +1613,27 @@ class TestTheTimeframeFilterIsWiredThrough:
         assert window_label(60.0) == "1m"
         assert window_label(300.0) == "5m"
         assert window_label(900.0) == "15m"
+
+    def test_the_dial_no_longer_gates_anything(self):
+        """It was the bounce threshold, then the band that decided
+        when price counted as turned. Price is the inner candle
+        itself now, so there is nothing left for a percentage to
+        decide -- and a control that changes no reading is worse
+        than no control, so it is off the page.
+
+        The value is still stored and still rides in the payload;
+        only the selector is gone, which is one line to restore.
+        """
+        src = self._web()
+        assert 'id="jnlBounce"' not in src, \
+            "an inert selector is still on the page"
+        assert "$('jnlBounce')" not in src
+        for pct in (0.0, 0.33):
+            a = fr.read(ofi_dir="up", tick_dir="up", open_px=100.0,
+                        high=120.0, low=95.0, close=110.0,
+                        bounce_at=pct, **FULL)
+            assert a["where"] == "together", pct
+            assert a["tick_dir"] == "up", pct
 
     def test_off_is_never_read_as_missing(self):
         """`or 300` ANYWHERE turns "off" into a filter he did not
@@ -2280,295 +2247,164 @@ class TestTheSwingPair:
         assert d.get("interval") == "100000x40000"
 
 
-class TestPriceIsTowardOrAwayFromTheOpen:
-    """Chris, after a rolling look-back read nothing like the panel
-    he knew: "this is a intrabar strategy it should read the tick
-    ofi candle whats happening and when", and then "the extremes
-    dont matter what is is doing is it moving to tick charts
-    opening or away".
+class TestTheTwoCandlesAreOneRowEach:
+    """Chris, pointing at the chart: "the outer shale is the body
+    the OFI the inner candle is the tick candle what this is
+    supposed to do it tell me whats actually happening between the
+    2", and then: "it should be simple downs and ups only i dont
+    care how much just what it actually reads".
 
-    So price is not close-vs-open (a POSITION, and a stale one on
-    a long bar), and not a rolling window (which spans bar
-    boundaries and is not intrabar at all). It is: this candle ran
-    some distance off its open, and price is either still going
-    that way or coming back to it.
+    The body row used to blink because it was drawn only when it
+    disagreed with a DERIVED price. There is no derived price any
+    more -- the inner candle is the reading -- so there is one row
+    for the outer and one for the inner, both always drawn.
     """
 
-    A = dict(open_px=7160.50, high=7184.00, low=7154.00, close=7174.00)
-    B = dict(open_px=7180.00, high=7184.00, low=7154.00, close=7174.00)
-
-    def test_bar_a_ran_up_and_is_coming_back(self):
-        out = fr.read(ofi_dir="down", **self.A, **FULL)
-        assert out["run_dir"] == "up"
-        assert out["run_pts"] == pytest.approx(23.5)
-        assert out["back"] == pytest.approx(10.0 / 23.5, abs=1e-3)
-        assert out["moving"] == "back toward"
-        assert out["tick_dir"] == "down"
-        assert out["where"] == "together"
-
-    def test_bar_b_ran_down_and_is_rallying(self):
-        """THE ONE HE WANTED TO SEE. It opened 7180, sold to 7154
-        and is back at 7174 -- the body still reads DOWN, and this
-        reads UP, which is what price is doing."""
-        out = fr.read(ofi_dir="up", **self.B, **FULL)
-        assert out["run_dir"] == "down"
-        assert out["run_pts"] == pytest.approx(26.0)
-        assert out["back"] == pytest.approx(20.0 / 26.0, abs=1e-3)
-        assert out["tick_dir"] == "up"
-        assert out["where"] == "together"
-        assert out["side"] == "up"
-
-    def test_at_its_furthest_it_is_still_going(self):
-        out = fr.read(ofi_dir="up", open_px=7160.50, high=7184.0,
-                      low=7154.0, close=7184.0, **FULL)
-        assert out["back"] == pytest.approx(0.0)
-        assert out["moving"] == "further away from"
-        assert out["tick_dir"] == "up"
-
-    def test_the_body_is_drawn_and_decides_nothing(self):
-        """Bar B's body is DOWN the whole way up. It rides in the
-        payload so the two can be seen disagreeing -- that
-        disagreement is the whole case for the change -- and it
-        changes no reading."""
-        down = fr.read(ofi_dir="up", tick_dir="down", **self.B, **FULL)
-        up = fr.read(ofi_dir="up", tick_dir="up", **self.B, **FULL)
-        assert down["body_dir"] == "down"
-        assert up["body_dir"] == "up"
-        for k in ("where", "side", "tick_dir", "back", "run_dir"):
-            assert down[k] == up[k], f"the body moved {k}"
-
-    def test_the_extremes_are_only_how_far_it_got(self):
-        """"the extremes dont matter" -- the high and low are read
-        to answer how far from the OPEN it ran, and nothing is
-        measured from them."""
-        d, run = fr.run_from_open(7160.50, 7184.0, 7154.0)
-        assert (d, run) == ("up", pytest.approx(23.5))
-        d2, run2 = fr.run_from_open(7180.0, 7184.0, 7154.0)
-        assert (d2, run2) == ("down", pytest.approx(26.0))
-
-    def test_a_candle_sitting_on_its_open_says_nothing(self):
-        out = fr.read(ofi_dir="up", open_px=7170.0, high=7170.0,
-                      low=7170.0, close=7170.0, **FULL)
-        assert out["run_dir"] == ""
-        assert out["tick_dir"] == ""
-        assert out["where"] == ""
-        assert out["side"] == ""
-
-    def test_the_band_is_why_one_tick_is_not_a_turn(self):
-        near = fr.read(ofi_dir="up", open_px=100.0, high=120.0,
-                       low=100.0, close=119.75, bounce_at=0.33,
-                       **FULL)
-        assert near["tick_dir"] == "up"
-        past = fr.read(ofi_dir="up", open_px=100.0, high=120.0,
-                       low=100.0, close=112.0, bounce_at=0.33,
-                       **FULL)
-        assert past["tick_dir"] == "down"
-        assert past["where"] == "apart"
-
-    def test_the_dial_moves_where_the_turn_is(self):
-        kw = dict(ofi_dir="up", open_px=100.0, high=120.0, low=100.0,
-                  close=117.0)
-        assert fr.read(bounce_at=0.33, **kw, **FULL)["tick_dir"] == "up"
-        assert fr.read(bounce_at=0.10, **kw, **FULL)["tick_dir"] == "down"
-
-    def test_zero_means_any_step_back_is_a_turn(self):
-        kw = dict(ofi_dir="up", open_px=100.0, high=120.0, low=100.0)
-        at = fr.read(close=120.0, bounce_at=0.0, **kw, **FULL)
-        off = fr.read(close=119.75, bounce_at=0.0, **kw, **FULL)
-        assert at["tick_dir"] == "up", \
-            "at its furthest it has not turned, at any setting"
-        assert off["tick_dir"] == "down"
-
-    def test_there_is_no_bounce_state_any_more(self):
-        """It meant "they agree but price has come off its
-        extreme", which is now price having TURNED. If the book
-        has not turned with it that is a disagreement; if it has,
-        they agree again the other way."""
-        turned = fr.read(ofi_dir="up", open_px=100.0, high=120.0,
-                         low=100.0, close=108.0, **FULL)
-        assert turned["where"] == "apart"
-        both = fr.read(ofi_dir="down", open_px=100.0, high=120.0,
-                       low=100.0, close=108.0, **FULL)
-        assert both["where"] == "together"
-        assert both["side"] == "down"
-
-    def test_nothing_reads_a_rolling_window_any_more(self):
-        """IT SPANS BAR BOUNDARIES, so it is not intrabar. The
-        whole reading is this candle's own four numbers."""
-        import inspect
-        for fn in (fr.read, fr.state, fr.entry_side, fr.exit_reason):
-            ps = inspect.signature(fn).parameters
-            for bad in ("roll_dir", "roll_window"):
-                assert bad not in ps, f"{fn.__name__} takes {bad}"
-        src = (SRC / "web.py").read_text()
-        i = src.index("def _fused_gate(")
-        body = src[i:src.index("\n    def ", i + 10)]
-        assert "roll" not in body, \
-            "the route still reads a rolling window"
-
-    def test_the_route_passes_only_this_candle(self):
-        src = (SRC / "web.py").read_text()
-        i = src.index("def _fused_gate(")
-        body = src[i:src.index("\n    def ", i + 10)]
-        for want in ("open_px=cur.open", "high=cur.high",
-                     "low=cur.low", "close=cur.close"):
-            assert want in body, f"the reading is not given {want}"
-
-    def test_the_step_carries_the_run(self, client, monkeypatch):
-        from liqmap import web
-        _cme(monkeypatch)
-        rt = web.runtime()
-        s = rt.journal.settings("ES")
-        s.strategy = "together"
-        rt.journal.save_settings(s)
-        d = client.get("/api/read",
-                       params={"coin": "ES", "interval": "15m",
-                               "timeframes": "15m,5m,1m"},
-                       headers=AUTH).json()
-        jr = d.get("journal") or {}
-        assert "error" not in jr, jr.get("error")
-        fg = jr.get("fusedgate") or {}
-        for k in ("run_dir", "run_pts", "moving", "body_dir"):
-            assert k in fg, f"{k} is missing from the payload"
-
-    def test_the_panel_draws_the_run(self, page_js):
+    def test_the_two_rows_are_always_drawn(self, page_js):
         from tests.test_stack_strip import run_js
-        html = run_js(page_js, "fusedGate",
-                      {**TestThePanelActuallyRenders.BAR,
-                       "run_dir": "down", "run_pts": 26.0,
-                       "moving": "back toward", "back": 0.769,
-                       "tick_dir": "up", "body_dir": "down",
-                       "ofi_dir": "up", "where": "together",
-                       "agree": True, "side": "up"})
-        assert "it ran <b>DOWN</b> 26.00 off the open" in html
-        assert "price (moving)" in html
-        assert "body (shape)" in html, \
-            "the stale body is invisible exactly when it matters"
+        for ofi, tick in (("up", "up"), ("up", "down"), ("up", ""),
+                          ("", "")):
+            html = run_js(page_js, "fusedGate",
+                          {**TestThePanelActuallyRenders.BAR,
+                           "ofi_dir": ofi, "tick_dir": tick,
+                           "body_dir": tick})
+            assert "outer (OFI)" in html, (ofi, tick)
+            assert "inner (tick)" in html, (ofi, tick)
 
-
-class TestTheBodyRowIsConstant:
-    """Chris: "the body (shape) keeps blinking in and out its
-    supposed to be as accurate as it is right now just a constant
-    reading never fading".
-
-    Two causes, and both were mine. The row was drawn only when
-    the body disagreed with price, so it vanished whenever they
-    lined up. And the body was held through a tie only once the
-    bar had SETTLED -- behind that gate it fell back to the raw
-    close-against-open on every poll, and a candle sits exactly on
-    its open often enough that it flickered.
-    """
-
-    # the candle alone -- the book and the body are passed per test
-    CANDLE = dict(open_px=100.0, high=120.0, low=100.0, close=120.0)
-
-    def test_the_row_is_drawn_when_they_agree(self, page_js):
-        from tests.test_stack_strip import run_js
-        html = run_js(page_js, "fusedGate",
-                      {**TestThePanelActuallyRenders.BAR,
-                       "tick_dir": "up", "body_dir": "up",
-                       "ofi_dir": "up", "where": "together",
-                       "agree": True, "side": "up"})
-        assert "body (shape)" in html, \
-            "the row vanishes whenever the body and price line up"
-
-    def test_and_when_they_disagree(self, page_js):
-        from tests.test_stack_strip import run_js
-        html = run_js(page_js, "fusedGate",
-                      {**TestThePanelActuallyRenders.BAR,
-                       "tick_dir": "up", "body_dir": "down",
-                       "ofi_dir": "up", "where": "together",
-                       "agree": True, "side": "up"})
-        assert "body (shape)" in html
-
-    def test_and_when_the_body_has_nothing_to_say(self, page_js):
-        """A row that disappears and a row reading "--" are
-        different things on a screen, and only one of them can be
-        checked."""
-        from tests.test_stack_strip import run_js
-        html = run_js(page_js, "fusedGate",
-                      {**TestThePanelActuallyRenders.BAR,
-                       "tick_dir": "up", "body_dir": "",
-                       "ofi_dir": "up", "where": "together",
-                       "agree": True, "side": "up"})
-        assert "body (shape)" in html
-
-    def test_the_painter_never_makes_it_conditional(self):
+    def test_neither_row_is_behind_a_condition(self):
         src = (SRC / "web.py").read_text()
         i = src.index("function paintFusedGate(")
         fn = src[i:src.index("\nfunction ", i + 10)]
-        j = fn.index("leg('body (shape)'")
-        # back up to the start of that expression
-        line = fn[fn.rindex("\n", 0, j):j]
-        assert "?" not in line, \
-            "the body row is drawn behind a condition again"
+        for row in ("leg('outer (OFI)'", "leg('inner (tick)'"):
+            j = fn.index(row)
+            line = fn[fn.rindex("\n", 0, j):j]
+            assert "?" not in line, f"{row} is drawn behind a condition"
 
-    def test_the_body_holds_through_a_tie_before_the_bar_settles(self):
-        """THE SETTLING GATE HAS NO BUSINESS OVER IT. That gate
-        stops a RULE reading noise; the body decides nothing and
-        is only drawn."""
+    def test_the_body_is_not_drawn_twice(self):
+        """They are one reading under two names now. Two identical
+        rows is noise, and a reader checking one against the other
+        learns nothing."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "body (shape)" not in fn
+
+    def test_price_and_the_body_can_never_differ(self):
+        """THE DAY THEY DIFFER THE PANEL IS LYING. A derived price
+        put this panel into open contradiction with the candle
+        beside it: on a bar the chart greyed, it said "together"
+        and offered a short."""
+        for tick in ("up", "down", "", "flat"):
+            out = fr.read(ofi_dir="up", tick_dir=tick, open_px=100.0,
+                          high=120.0, low=95.0, close=110.0, **FULL)
+            assert out["tick_dir"] == out["body_dir"], tick
+
+    def test_it_is_held_through_a_tie_before_the_bar_settles(self):
+        """A candle sits exactly on its open often enough that the
+        row flickered. The settling gate exists to stop a rule
+        reading noise, and this is the reading itself."""
         unsettled = dict(net_ofi=10, ofi_target=4000, prints=20,
                          tick_target=10000)
         first = fr.read(ofi_dir="up", tick_dir="up", open_px=100.0,
                         high=120.0, low=100.0, close=120.0,
                         bar_ts=100.0, **unsettled)
         assert first["settled"] is False
-        assert first["body_dir"] == "up"
         tie = fr.read(ofi_dir="up", tick_dir="", open_px=100.0,
                       high=120.0, low=100.0, close=100.0,
                       bar_ts=100.0, prev=first["held"], **unsettled)
-        assert tie["body_dir"] == "up", \
-            "the body blanked on a tie before the bar settled"
-
-    def test_it_holds_through_a_tie_after_it_settles_too(self):
-        first = fr.read(ofi_dir="up", tick_dir="down", bar_ts=100.0,
-                        **self.CANDLE, **FULL)
-        assert first["settled"] is True
-        assert first["body_dir"] == "down"
-        tie = fr.read(ofi_dir="up", tick_dir="", bar_ts=100.0,
-                      prev=first["held"], **self.CANDLE, **FULL)
-        assert tie["body_dir"] == "down"
+        assert tie["tick_dir"] == "up"
+        assert tie["body_dir"] == "up"
 
     def test_it_does_not_survive_into_the_next_candle(self):
-        """A new bar's body is genuinely new -- holding the last
-        one's shape would be the stale-body problem all over
-        again, in the one place it is still drawn."""
+        kw = dict(open_px=100.0, high=120.0, low=100.0, close=120.0)
         first = fr.read(ofi_dir="up", tick_dir="up", bar_ts=100.0,
-                        **self.CANDLE, **FULL)
+                        **kw, **FULL)
         nxt = fr.read(ofi_dir="up", tick_dir="", bar_ts=200.0,
-                      prev=first["held"], **self.CANDLE, **FULL)
+                      prev=first["held"], **kw, **FULL)
+        assert nxt["tick_dir"] == ""
         assert nxt["body_dir"] == ""
 
-    def test_the_body_never_stands_in_for_the_price_leg(self):
-        """A FALLBACK IS THE STALE BODY COMING BACK BY THE SIDE
-        DOOR. It has to be a candle with no run off its open but a
-        body that still has an opinion, which is a bar before its
-        first print: `open` is 0.0 and every other field has a
-        value.
 
-        A mutation that wrote `hold_dir(tick_dir, body_dir)`
-        survived every other test here, because everywhere else
-        the two are blank together.
-        """
-        prev = {"ofi_dir": "up", "tick_dir": "", "body_dir": "up",
-                "bar_ts": 100.0}
-        out = fr.read(ofi_dir="up", tick_dir="up", open_px=0.0,
-                      high=20.0, low=0.0, close=12.0, bar_ts=100.0,
-                      prev=prev, **FULL)
-        assert out["settled"] is True
-        assert out["body_dir"] == "up", "the fixture proves nothing"
-        assert out["run_dir"] == ""
-        assert out["tick_dir"] == "", \
-            "the body stood in for price when the candle had no run"
-        assert out["where"] == ""
+class TestWhatItSaysAboutTheTwo:
+    """"tell me whats actually happening between the 2" -- in ups
+    and downs, with no numbers in it."""
+
+    KW = dict(open_px=7160.50, high=7184.00, low=7154.00,
+              close=7169.50)
+
+    def test_his_bar_reads_as_a_disagreement(self):
+        """Book DOWN 2,097, inner candle UP 9 points. The chart
+        greys it; so does this."""
+        out = fr.read(ofi_dir="down", tick_dir="up", net_ofi=-2097,
+                      ofi_target=4000, prints=39236,
+                      tick_target=10000, tradeable=False, **self.KW)
+        assert out["where"] == "apart"
         assert out["side"] == ""
+        assert out["grayed"] is True
+        assert out["say"] == ("the OFI candle is down and the tick "
+                              "candle is up -- they disagree, and "
+                              "the chart greys this bar")
 
-    def test_holding_the_body_moves_no_reading(self):
-        """It is drawn and it decides nothing, so a held body must
-        not change where/side/price."""
-        a = fr.read(ofi_dir="up", tick_dir="up", bar_ts=1.0,
-                    **self.CANDLE, **FULL)
-        b = fr.read(ofi_dir="up", tick_dir="down", bar_ts=1.0,
-                    **self.CANDLE, **FULL)
-        for k in ("where", "side", "tick_dir", "back", "run_dir"):
-            assert a[k] == b[k], f"the body moved {k}"
+    def test_agreeing_says_so_and_names_both(self):
+        out = fr.read(ofi_dir="up", tick_dir="up", **self.KW, **FULL)
+        assert out["where"] == "together"
+        assert out["say"] == ("the OFI candle is up and the tick "
+                              "candle is up -- they agree")
+
+    @pytest.mark.parametrize("ofi,tick,word", [
+        ("", "up", "OFI candle has no direction"),
+        ("flat", "up", "OFI candle has no direction"),
+        ("up", "", "tick candle has no direction"),
+    ])
+    def test_a_missing_direction_names_which_one(self, ofi, tick,
+                                                 word):
+        out = fr.read(ofi_dir=ofi, tick_dir=tick, **self.KW, **FULL)
+        assert word in out["say"], out["say"]
+        assert out["where"] == ""
+
+    def test_there_are_no_numbers_in_the_sentence(self):
+        """"i dont care how much just what it actually reads"."""
+        import re
+        for ofi, tick in (("up", "up"), ("down", "up"), ("up", ""),
+                          ("", "")):
+            out = fr.read(ofi_dir=ofi, tick_dir=tick, **self.KW,
+                          **FULL)
+            assert not re.search(r"\d", out["say"]), out["say"]
+
+    def test_the_panel_draws_no_percentages_in_the_reading(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        for gone in ("off the open and is", "of the way up this",
+                     "counts as turned at", "off its extreme"):
+            assert gone not in fn, f"the panel still draws: {gone}"
+
+    def test_the_candles_own_prices_are_still_drawn(self):
+        """Those are not a derived reading -- they are what lets
+        him line this panel up against the chart header, which is
+        how he caught the contradiction in the first place."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        for want in ("chPx(FG.open)", "chPx(FG.high)", "chPx(FG.low)",
+                     "chPx(FG.close)", "FG.net_ofi"):
+            assert want in fn, f"the panel no longer draws {want}"
+
+    def test_the_panel_says_they_disagree(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "where": "apart", "ofi_dir": "down",
+                       "tick_dir": "up", "body_dir": "up",
+                       "agree": False, "side": ""})
+        assert "THEY DISAGREE" in html
+        assert "outer (OFI)" in html and "inner (tick)" in html
+
+    def test_and_when_they_agree(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "where": "together", "ofi_dir": "up",
+                       "tick_dir": "up", "body_dir": "up",
+                       "agree": True, "side": "up"})
+        assert "BOTH UP" in html
