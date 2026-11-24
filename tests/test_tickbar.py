@@ -662,7 +662,16 @@ class TestThePanel:
         i = src.index('id="sInt"')
         box = src[i:src.index("</select>", i)]
         shown = {int(m) for m in re.findall(r'value="(\d+)t"', box)}
-        assert shown == set(tb.PER_BAR_CHOICES)
+        # A SUBSET, NOT AN EQUALITY. The assertion that matters is
+        # that nothing OFFERED lacks a builder -- an offered size
+        # with none snaps to its nearest neighbour and silently
+        # draws bars of the wrong length. The reverse is fine and
+        # is now true: 233, 512, 2500 and 3500 are built for the
+        # fused rule's two filters and are not on this selector,
+        # which Chris did not ask to change.
+        assert shown <= set(tb.PER_BAR_CHOICES), \
+            f"offered with no builder: {sorted(shown - set(tb.PER_BAR_CHOICES))}"
+        assert shown, "the selector offers nothing at all"
 
     def test_the_read_never_follows_the_chart_onto_a_tick_series(self):
         """The stack is built on clock intervals.

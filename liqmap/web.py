@@ -7563,23 +7563,54 @@ def create_app() -> FastAPI:
         # chance to gate on one timeframe while the panel draws
         # another.
         def _tf_read(secs):
-            """One live timeframe candle: its direction, and how
-            long it has left.
+            """One live filter bar: its direction, and what is left
+            of it.
 
-            THE COUNTDOWN IS SHOWN, NOT GATED. Chris asked for "a
+            A CLOCK CANDLE OR A TICK BAR, decided by the sign.
+            Chris: "lets add ticks to it so we will have 1m, 5m
+            15m, 233 tick, 512 tick ...". Negative is a print
+            count, positive is seconds -- the encoding `window_s`
+            has used since tick windows were added, and `_wl`
+            already renders -233 as "233t".
+
+            ONE FUNCTION, BOTH KINDS. A second reader for tick bars
+            would be a second chance to be wrong about which bar is
+            which, and this engine has made that mistake with the
+            5-minute cell and the OFI bar already.
+
+            THE TICK BAR'S DIRECTION IS THE ONE THE REST OF THE
+            ENGINE USES -- `_tick_now`, the path vote, the same
+            reading gates 2 and 3 run on. Not close-against-open.
+            A filter that read its bar differently from the gates
+            beside it would disagree with them for reasons nobody
+            could see.
+
+            WHAT IS LEFT IS SHOWN, NOT GATED. Chris asked for "a
             candle countdown that way we aren't making trades in
             the middle of nowhere" and then, asked what it should
-            do, "Just show it". A number the panel draws and the
-            rule never reads.
+            do, "Just show it". For a tick bar the analogue is
+            prints remaining, which is the same question the clock
+            answers for a candle.
             """
             if not secs:
                 return "", "", None
-            nm = _wl(float(secs))
+            n = int(secs)
+            nm = _wl(float(n))
+            if n < 0:
+                # A TICK BAR. `_tick_now` snaps an unknown size to
+                # the nearest it has, so only sizes with builders
+                # reach here -- `_snap_tf` is what guarantees that.
+                t = _tick_now(rt_, per_bar=-n) or {}
+                d = str(t.get("dir") or "")
+                done = t.get("prints")
+                left = (None if done is None
+                        else max(0.0, float(-n) - float(done)))
+                return d, nm, left
             c = _candle_now(rt_, nm) or {}
             d = str(c.get("dir") or "")
             age = c.get("seconds")
             left = (None if age is None
-                    else max(0.0, float(secs) - float(age)))
+                    else max(0.0, float(n) - float(age)))
             return d, nm, left
 
         _tf_dir, _tf_name, _tf_left = _tf_read(tf_s)
@@ -7624,9 +7655,11 @@ def create_app() -> FastAPI:
                     "reach": {}, "summary": {},
                     "tf": {"dir": "", "on": bool(tf_s),
                            "name": _tf_name, "agrees": False,
+                           "ticks": bool(int(tf_s or 0) < 0),
                            "left_s": _tf_left, "decides": bool(tf_s)},
                     "tf2": {"dir": "", "on": bool(tf2_s),
                             "name": _tf2_name, "agrees": False,
+                            "ticks": bool(int(tf2_s or 0) < 0),
                             "left_s": None, "decides": bool(tf2_s)},
                     "held_s": None, "ready": False,
                     "min_hold_s": float(_fr.DWELL_S),
@@ -7675,6 +7708,8 @@ def create_app() -> FastAPI:
             tf_left_s=_tf_left,
             tf2_dir=_tf2_dir, tf2_on=bool(tf2_s),
             tf2_name=_tf2_name or "15m",
+            tf_ticks=bool(int(tf_s or 0) < 0),
+            tf2_ticks=bool(int(tf2_s or 0) < 0),
             held_s=held_s, prev=prev,
             # THE TURNING ROW'S BAND. Resolved here rather than
             # defaulted inside the rule so that the number on the
@@ -11524,6 +11559,15 @@ has to be running before the gate stops refusing.">spike
               <option value="60">1 minute</option>
               <option value="300">5 minute</option>
               <option value="900">15 minute</option>
+              <option value="-233">233 tick</option>
+              <option value="-500">500 tick</option>
+              <option value="-512">512 tick</option>
+              <option value="-1000">1000 tick</option>
+              <option value="-1500">1500 tick</option>
+              <option value="-2000">2000 tick</option>
+              <option value="-2500">2500 tick</option>
+              <option value="-3000">3000 tick</option>
+              <option value="-3500">3500 tick</option>
             </select></label>
           <!-- A SECOND ONE BESIDE IT, same rule: both must agree
                to open, price against either one closes. -->
@@ -11535,6 +11579,15 @@ has to be running before the gate stops refusing.">spike
               <option value="60">1 minute</option>
               <option value="300">5 minute</option>
               <option value="900">15 minute</option>
+              <option value="-233">233 tick</option>
+              <option value="-500">500 tick</option>
+              <option value="-512">512 tick</option>
+              <option value="-1000">1000 tick</option>
+              <option value="-1500">1500 tick</option>
+              <option value="-2000">2000 tick</option>
+              <option value="-2500">2500 tick</option>
+              <option value="-3000">3000 tick</option>
+              <option value="-3500">3500 tick</option>
             </select></label>
           <!-- THE TURNING ROW'S BAND. Chris asked for a selector
                rather than a fixed number: the band that reads as a
@@ -17639,10 +17692,20 @@ function paintFusedGate(FG) {
        countdown that way we aren't making trades in the middle of
        nowhere" -- and, asked what it should do, "Just show it".
        Drawn, never read by the rule, and said to be so. */
+    /* WHAT IS LEFT OF THE FILTER BAR. A clock candle counts down
+       in time; a tick bar counts down in prints, which is the same
+       question asked of a bar cut by a count. The server says
+       which kind it is -- the panel does not work it out from the
+       name, because a rule hiding in the last character of a label
+       is a rule nobody can see. */
     + ((FG.tf && FG.tf.on && FG.tf.left_s != null)
         ? '<div class="thin">'
-          + esc(FG.tf.name || '') + ' candle closes in <b>'
-          + mmss(FG.tf.left_s) + '</b> '
+          + esc(FG.tf.name || '')
+          + (FG.tf.ticks
+              ? ' bar closes in <b>'
+                + Number(FG.tf.left_s).toFixed(0) + ' prints</b> '
+              : ' candle closes in <b>'
+                + mmss(FG.tf.left_s) + '</b> ')
           + '<span style="opacity:.6">&mdash; shown only, nothing '
           + 'is blocked by the clock</span></div>'
         : '')

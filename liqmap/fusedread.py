@@ -933,7 +933,14 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           min_hold_s: float = DWELL_S,
           prev: dict | None = None,
           turn_ticks: float = TURN_TICKS,
-          bounce_on: bool = False) -> dict:
+          bounce_on: bool = False,
+          # WHETHER EACH FILTER IS A TICK BAR RATHER THAN A CLOCK
+          # CANDLE. Passed, not sniffed off the label: the panel
+          # draws "closes in 2:14" for one and "412 prints to go"
+          # for the other, and deciding that by looking at the last
+          # character of a name is a rule nobody can see. ON THE
+          # END, like everything else added to this signature.
+          tf_ticks: bool = False, tf2_ticks: bool = False) -> dict:
     """The reading and the rule's verdict on it, from one place.
 
     ONE READING, NOT TWO. The panel is handed what the rule decided
@@ -968,6 +975,7 @@ def state(ofi_dir: str = "", tick_dir: str = "",
             # switched off reads as one that is not there.
             "tf": {"dir": str(tf_dir or ""), "on": bool(tf_on),
                    "name": str(tf_name or ""),
+                   "ticks": bool(tf_ticks),
                    "agrees": bool(tf_dir in SIDES
                                   and tf_dir == out["side"]),
                    # HOW LONG THIS CANDLE HAS LEFT. Chris: "a
@@ -982,6 +990,7 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                    "decides": bool(tf_on)},
             "tf2": {"dir": str(tf2_dir or ""), "on": bool(tf2_on),
                     "name": str(tf2_name or ""),
+                    "ticks": bool(tf2_ticks),
                     "agrees": bool(tf2_dir in SIDES
                                    and tf2_dir == out["side"]),
                     # ONE COUNTDOWN, ON THE FIRST TIMEFRAME. His

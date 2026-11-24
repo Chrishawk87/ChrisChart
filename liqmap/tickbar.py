@@ -75,8 +75,14 @@ from dataclasses import dataclass, field
 # few thousand stops being faster than the clock bars it is meant to
 # beat. The Fibonacci-ish middle is the conventional futures set.
 # THE SIZES CHRIS NAMED: "250tick, 500tick, 1000, 2000, 4000, 5000,
-# or even 10,000". 233 was a Fibonacci habit from retail charting
-# software and he does not use it; 4000 was missing.
+# or even 10,000"; 4000 was missing.
+#
+# 233 AND 512 ARE HIS NOW. A note here used to say 233 was "a
+# Fibonacci habit from retail charting software and he does not use
+# it". He asked for it by name, with 512, 2500 and 3500, when the
+# fused rule's two filters were opened up to tick bars. The note was
+# written about an older list and had gone stale -- which is worse
+# than no note, because it reads as a reason not to add the thing.
 # THE SIZES HE ASKED FOR, IN FULL. Chris: "i want to add a few tick
 # profiles for gate number 2 250, 500, 1000, 1500, 2000, 3000, 4000,
 # 5000, 6000, 7k, 8k, 9, and 10k".
@@ -86,9 +92,16 @@ from dataclasses import dataclass, field
 # builders, each taking a handful of adds per print. That is the cost
 # and it is paid on every trade; it buys a selector that switches
 # instantly instead of starting from an empty chart.
-PER_BAR_CHOICES: tuple[int, ...] = (250, 500, 1000, 1500, 2000, 3000,
-                                    4000, 5000, 6000, 7000, 8000,
-                                    9000, 10000)
+# FOUR MORE SIZES COST TWELVE MORE BUILDERS, MEASURED rather than
+# guessed at: 12.25 microseconds a print across all twelve, which at
+# his 107 prints a second is 0.13% of one core. The alternative was
+# offering a size with no builder behind it, and `_tick_now` falls
+# back to the NEAREST size silently -- 233 would have quietly read
+# the 250 bar and nothing on the screen would have said so.
+PER_BAR_CHOICES: tuple[int, ...] = (233, 250, 500, 512, 1000, 1500,
+                                    2000, 2500, 3000, 3500, 4000,
+                                    5000, 6000, 7000, 8000, 9000,
+                                    10000)
 DEFAULT_PER_BAR = 1000
 
 # The series the fusion rule reads unless told otherwise. Chris named

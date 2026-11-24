@@ -1737,8 +1737,8 @@ class TestTheTimeframeFilter:
                       high=20.0, low=0.0, close=20.0, held_s=9.0,
                       tf_dir="up", tf_on=True, tf_name="15m", **FULL)
         assert on["tf"] == {"dir": "up", "on": True, "name": "15m",
-                            "agrees": True, "left_s": None,
-                            "decides": True}
+                            "ticks": False, "agrees": True,
+                            "left_s": None, "decides": True}
         assert on["entry"] == "up"
 
 
@@ -1829,7 +1829,7 @@ class TestTheTimeframeFilterIsWiredThrough:
         fn = src[i:src.index("\n    def ", i + 10)]
         assert "_candle_now(rt_, nm)" in fn, \
             "the filter is not reading a live timeframe candle"
-        assert "_wl(float(secs))" in fn, \
+        assert "_wl(float(n))" in fn, \
             "the timeframe name is not built from the setting"
         # ONE READER FOR BOTH. A second spelling of this is a
         # second chance to gate on one candle while the panel
@@ -2044,8 +2044,13 @@ class TestTheCandleCountdown:
         src = (SRC / "web.py").read_text()
         i = src.index("def _fused_gate(")
         fn = src[i:src.index("\n    def ", i + 10)]
-        assert "float(secs) - float(age)" in fn, \
+        assert "float(n) - float(age)" in fn, \
             "the countdown is not the candle's own remaining time"
+        # AND THE TICK BAR'S HALF OF IT. A filter cut by a count
+        # has prints remaining where a candle has seconds, and the
+        # two must not be read off the same arithmetic.
+        assert "float(-n) - float(done)" in fn, \
+            "a tick filter has no countdown of its own"
         assert "max(0.0," in fn
 
     def test_the_panel_draws_it_as_minutes_and_seconds(self):
@@ -3118,3 +3123,218 @@ class TestTheThreeRestoredSwitches:
                              held_s=9.0)[0] == "up"
         assert fr.exit_reason("up", out["where"], bar_ts=2.0,
                               open_bar_ts=1.0) == ""
+
+
+class TestTickBarsAsFilters:
+    """Chris: "since we already have the 2 timeframes on side or
+    the turning lets add ticks to it so we will have 1m, 5m 15m,
+    233 tick, 512 tick, 500 tick, 1000 tick, 1500 tick, 2000 tick,
+    2500 tick 3000 tick and 3500 tick".
+
+    STORED NEGATIVE. These two columns already hold seconds, a
+    window of seconds is never below zero, and `window_label` has
+    rendered -233 as "233t" since tick windows were added. Reusing
+    that beats inventing a second encoding for the same idea.
+    """
+
+    TICKS = (233, 500, 512, 1000, 1500, 2000, 2500, 3000, 3500)
+
+    def test_every_size_he_named_has_a_builder(self):
+        """`_tick_now` SNAPS AN UNKNOWN SIZE TO THE NEAREST ONE IT
+        HAS, silently. A 233 with no builder would have come back
+        as a real direction off the 250 bar and nothing on the
+        screen would have said so."""
+        from liqmap.tickbar import PER_BAR_CHOICES as P
+        for n in self.TICKS:
+            assert n in P, f"{n} is offered with no builder behind it"
+
+    def test_the_snapper_takes_them_and_refuses_the_rest(self):
+        from liqmap.journal import _snap_tf
+        for n in self.TICKS:
+            assert _snap_tf(-n) == -n, f"{n} tick was refused"
+        for secs in (60, 300, 900):
+            assert _snap_tf(secs) == secs
+        assert _snap_tf(0) == 0
+        # A SIZE WITH NO BUILDER, A POSITIVE TICK COUNT, AND JUNK.
+        # Each would otherwise reach `_tick_now` and come back as
+        # a direction read off some other chart.
+        for bad in (-250, -4000, -1, 233, 77, 1000, "x", None, []):
+            assert _snap_tf(bad) == 0, f"{bad!r} got through"
+
+    def test_they_round_trip_and_label(self, tmp_path):
+        from liqmap.journal import Journal
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        s.fused_tf, s.fused_tf2 = -233, -3500
+        back = j.save_settings(s)
+        assert back.fused_tf == -233
+        assert back.fused_tf2 == -3500
+        d = j.settings("ES").to_dict()
+        assert d["fused_tf_label"] == "233t"
+        assert d["fused_tf2_label"] == "3500t"
+        # AND A CLOCK CANDLE STILL LABELS AS ONE.
+        s.fused_tf = 300
+        assert j.save_settings(s).fused_tf == 300
+        assert j.settings("ES").to_dict()["fused_tf_label"] == "5m"
+
+    def test_a_junk_size_cannot_reach_the_rule(self, tmp_path):
+        from liqmap.journal import Journal
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        s.fused_tf = -4000
+        assert j.save_settings(s).fused_tf == 0, \
+            "a size with no builder was stored as a live filter"
+
+    def test_both_selectors_offer_every_one(self):
+        src = (SRC / "web.py").read_text()
+        for sel in ("jnlFusedTf", "jnlFusedTf2"):
+            i = src.index(f'id="{sel}"')
+            box = src[i:src.index("</select>", i)]
+            for n in self.TICKS:
+                assert f'value="-{n}"' in box, f"{sel} has no {n} tick"
+            for secs in (0, 60, 300, 900):
+                assert f'value="{secs}"' in box, f"{sel} lost {secs}"
+
+    def test_the_reader_branches_on_the_sign(self):
+        """ONE FUNCTION, BOTH KINDS. A second reader for tick bars
+        is a second chance to be wrong about which bar is which,
+        and this engine has made that mistake with the 5-minute
+        cell and the OFI bar already."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _tf_read(")
+        fn = src[i:src.index("\n        def ", i + 10)]
+        assert "_tick_now(" in fn, "a tick filter never reads a tick bar"
+        assert "_candle_now(" in fn, "the clock candles stopped working"
+        assert "if n < 0:" in fn, "nothing distinguishes the two"
+        # THE TICK BAR'S DIRECTION IS THE ENGINE'S, not a second
+        # reading invented here. `_tick_now` is what gates 2 and 3
+        # run on.
+        assert "close" not in fn.split("if n < 0:")[1].split("return")[0], \
+            "the tick filter reads close-against-open, not the path vote"
+
+    def test_the_sign_reaches_every_place_that_needs_it(self):
+        """SOURCE, NOT EXECUTION, AND THE REASON IS WRITTEN DOWN.
+
+        `_tf_read` and `_tick_now` are closures inside the route
+        factory, so no test can call them, and the fused engine is
+        not running under the test client -- every live read here
+        comes back through `_nothing`. That leaves three wirings
+        that nothing else can reach, and all three survived a
+        mutation run until this test existed:
+
+            the size handed to `_tick_now` (negated, or it asks
+            for a bar of minus 233 prints and gets snapped to
+            whatever is nearest)
+            the tick flag on each of the two filters
+
+        Each one fails silently -- a direction off the wrong
+        chart, or a countdown in the wrong units -- which is why
+        they are pinned by name rather than left to the live
+        payload that cannot see them.
+        """
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "_tick_now(rt_, per_bar=-n)" in fn, \
+            "the tick filter asks for a negative bar size"
+        assert "tf_ticks=bool(int(tf_s or 0) < 0)" in fn, \
+            "the first filter never learns it is a tick bar"
+        assert "tf2_ticks=bool(int(tf2_s or 0) < 0)" in fn, \
+            "the second filter never learns it is a tick bar"
+
+    def test_the_panel_is_told_which_kind_it_is(self):
+        """NOT SNIFFED OFF THE LABEL. A rule hiding in the last
+        character of a name is a rule nobody can see."""
+        on = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                      high=20.0, low=0.0, close=20.0, held_s=9.0,
+                      tf_dir="up", tf_on=True, tf_name="233t",
+                      tf_ticks=True, tf2_dir="up", tf2_on=True,
+                      tf2_name="15m", **FULL)
+        assert on["tf"]["ticks"] is True
+        assert on["tf2"]["ticks"] is False
+
+    def test_the_countdown_says_prints_for_a_tick_bar(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "up", "ticks_off": 0.0,
+                                   "band": 4.0, "decides": False},
+                       "tf": {"dir": "up", "on": True, "name": "233t",
+                              "ticks": True, "agrees": True,
+                              "left_s": 97.0, "decides": True}})
+        assert "97 prints" in html
+        assert "233t bar closes in" in html
+        assert "shown only" in html
+
+    def test_the_countdown_still_says_time_for_a_candle(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "up", "ticks_off": 0.0,
+                                   "band": 4.0, "decides": False},
+                       "tf": {"dir": "up", "on": True, "name": "5m",
+                              "ticks": False, "agrees": True,
+                              "left_s": 97.0, "decides": True}})
+        assert "5m candle closes in" in html
+        assert "prints" not in html.split("closes in")[1][:40]
+
+    def test_a_tick_filter_gates_the_same_as_a_candle(self):
+        """THE FILTER RULE IS UNCHANGED. It was never about clocks
+        -- both must agree to open, price against either closes --
+        so a tick bar drops straight into it."""
+        blocked = fr.entry_side("together", "up", held_s=9.0,
+                                tf_dir="down", tf_on=True,
+                                tf_name="233t")
+        assert blocked[0] == ""
+        assert "233t" in blocked[1]
+        opened = fr.entry_side("together", "up", held_s=9.0,
+                               tf_dir="up", tf_on=True, tf_name="233t")
+        assert opened[0] == "up"
+        # PRICE AGAINST THE FILTER. `tick_dir` is price; the
+        # filter is the other side of the comparison. Passing them
+        # both "down" was my own mistake and the test caught it --
+        # two agreeing readings are not an exit.
+        assert "233t" in fr.exit_reason("up", "together", "up",
+                                        tf_dir="down", tf_on=True,
+                                        tf_name="233t")
+        assert fr.exit_reason("up", "together", "up", tf_dir="up",
+                              tf_on=True, tf_name="233t") == ""
+
+    def test_the_route_takes_a_tick_filter(self, client, monkeypatch):
+        _cme(monkeypatch)
+        r = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_tf": -512,
+                                "fused_tf2": -2500},
+                        headers=AUTH).json()["settings"]
+        assert r["fused_tf"] == -512
+        assert r["fused_tf_label"] == "512t"
+        assert r["fused_tf2"] == -2500
+        assert r["fused_tf2_label"] == "2500t"
+        bad = client.post("/api/journal/settings",
+                          params={"coin": "ES", "fused_tf": -4000},
+                          headers=AUTH).json()["settings"]
+        assert bad["fused_tf"] == 0
+
+    def test_the_live_panel_carries_it(self, client, monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        s.fused_tf, s.fused_tf2 = -233, 900
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        fg = jr.get("fusedgate") or {}
+        assert (fg.get("tf") or {}).get("ticks") is True
+        assert (fg.get("tf") or {}).get("name") == "233t"
+        assert (fg.get("tf2") or {}).get("ticks") is False
+        assert (fg.get("tf2") or {}).get("name") == "15m"

@@ -162,6 +162,11 @@ class Settings:
                 "fused_ofi": int(self.fused_ofi or 4000),
                 "fused_bounce": int(self.fused_bounce),
                 "fused_tf": int(self.fused_tf),
+                # `window_label` ALREADY RENDERS A NEGATIVE as
+                # "233t" -- the same encoding `window_s` has used
+                # since tick windows were added. Nothing new is
+                # needed here, and a second spelling of it would be
+                # a second chance to disagree with the selector.
                 "fused_tf_label": (window_label(float(self.fused_tf))
                                    if self.fused_tf else "off"),
                 "fused_tf2": int(self.fused_tf2),
@@ -614,12 +619,11 @@ class Journal(ThreadedDB):
                  # cannot use `or` anywhere -- zero is a choice,
                  # not an absence.
                  _snap_bounce(s.fused_bounce),
-                 # OFF, 1m, 5m OR 15m AND NOTHING ELSE. Zero is
-                 # off and is a choice, so no `or` on this path.
-                 (int(s.fused_tf)
-                  if int(s.fused_tf) in (0, 60, 300, 900) else 0),
-                 (int(s.fused_tf2)
-                  if int(s.fused_tf2) in (0, 60, 300, 900) else 0),
+                 # OFF, A CLOCK CANDLE, OR A TICK BAR -- AND
+                 # NOTHING ELSE. Zero is off and is a choice, so no
+                 # `or` on this path.
+                 _snap_tf(s.fused_tf),
+                 _snap_tf(s.fused_tf2),
                  # ONE OF THE OFFERED TICK BANDS. Unlike the
                  # bounce, zero is NOT offered here: a band of
                  # zero is a row that flips on every tick and
@@ -1096,6 +1100,43 @@ def _snap_bounce(pct: int | float) -> int:
     if want in opts:
         return want
     return min(opts, key=lambda o: abs(o - want))
+
+
+# THE CLOCK CANDLES THE FUSED FILTERS OFFER. Seconds, positive.
+TF_SECONDS: tuple[int, ...] = (60, 300, 900)
+
+# AND THE TICK BARS, as print counts. Chris, opening the two
+# filters up: "lets add ticks to it so we will have 1m, 5m 15m, 233
+# tick, 512 tick, 500 tick, 1000 tick, 1500 tick, 2000 tick, 2500
+# tick 3000 tick and 3500 tick".
+TF_TICKS: tuple[int, ...] = (233, 500, 512, 1000, 1500, 2000, 2500,
+                             3000, 3500)
+
+
+def _snap_tf(value: int | float) -> int:
+    """A fused filter setting, or 0 for off.
+
+    STORED NEGATIVE FOR A TICK BAR. The same encoding `window_s`
+    has used since tick windows were added, and for the same
+    reason: these columns already hold seconds, a window of seconds
+    is never below zero, and a negative cannot collide with one.
+    `window_label` already renders -233 as "233t".
+
+    NOTHING IT CANNOT READ GETS THROUGH. A value with no clock
+    period and no builder behind it is not a slower reading, it is
+    no reading at all -- and `_tick_now` snaps an unknown size to
+    the NEAREST one it has, silently, so a junk value would come
+    back as a real direction off the wrong chart.
+    """
+    try:
+        want = int(value)
+    except (TypeError, ValueError):
+        return 0
+    if want in TF_SECONDS:
+        return want
+    if want < 0 and -want in TF_TICKS:
+        return want
+    return 0
 
 
 def _snap_turn(ticks: int | float) -> int:

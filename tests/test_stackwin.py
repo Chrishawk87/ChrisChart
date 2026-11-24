@@ -1372,9 +1372,22 @@ class TestGateTwosChartIsPicked:
     WANTED = (250, 500, 1000, 1500, 2000, 3000, 4000, 5000,
               6000, 7000, 8000, 9000, 10000)
 
+    # AND THE FOUR THE FUSED FILTERS ADDED. Chris, opening those
+    # two selectors up to tick bars: "233 tick, 512 tick ... 2500
+    # tick ... 3500 tick". They share this builder registry, so
+    # they are built here and gate 2 can reach them too.
+    ALSO = (233, 512, 2500, 3500)
+
     def test_every_size_he_asked_for_exists(self):
         from liqmap.tickbar import PER_BAR_CHOICES as P
-        assert tuple(sorted(P)) == self.WANTED
+        for n in self.WANTED:
+            assert n in P, f"gate 2 lost the {n} bar"
+        for n in self.ALSO:
+            assert n in P, f"the fused filters have no {n} builder"
+        # NOTHING ELSE CREPT IN. Every size is three builders on
+        # every print, so the list growing by accident is a cost
+        # paid forever by nobody who asked for it.
+        assert tuple(sorted(P)) == tuple(sorted(self.WANTED + self.ALSO))
 
     def test_the_settings_carry_it(self):
         from liqmap.journal import Settings
