@@ -538,6 +538,14 @@ def read(ofi_dir: str = "", tick_dir: str = "",
          bar_ts: float = 0.0,
          tradeable: bool | None = None,
          prev: dict | None = None,
+         # THE BOUNCE, BEHIND ITS OWN SWITCH. Restored from
+         # f175c20 at Chris's ask after he ran without it: "when
+         # we kept upgrading the chart it disappeared and dont
+         # work like that anymore". OFF by default, because that
+         # is how the rule has traded since `7d961a9`, and a
+         # restored feature that turns itself on is a rule change
+         # nobody asked for.
+         bounce_on: bool = False,
          # ON THE END, NOT IN THE MIDDLE. Inserting a parameter
          # above `prev` once silently turned every existing
          # caller's `tradeable` into something else; ten tests
@@ -644,6 +652,14 @@ def read(ofi_dir: str = "", tick_dir: str = "",
     # the body is the thing that bounces: "ofi remaining down but
     # tick is bouncing from bottom or top".
     agree = bool(ofi_dir in SIDES and ofi_dir == tick_dir)
+    # BOUND BEFORE THE LADDER THAT READS IT, not inline in the
+    # payload below. It was only in the payload, and the bounce
+    # rung raised `NameError: back` the first time it ran -- in a
+    # route whose exceptions are swallowed into `journal.error`
+    # where nothing is looking. FIFTH time this exact shape has
+    # been written here; caught by an execution test, as the
+    # previous four were, and by nothing else.
+    back = back_to_open(open_px, high, low, close)
 
     if not ok:
         where = "settling"
@@ -656,6 +672,14 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         where = ""
     elif not agree:
         where = "apart"
+    elif bounce_on and back > 0.0 and back >= bounce_at:
+        # `back > 0.0` IS NOT REDUNDANT WITH THE DIAL. Zero per
+        # cent is an offered choice and it means "any give-back at
+        # all" -- the TIGHTEST setting, not off. Without this
+        # guard, a dial at zero makes `back >= 0` true on every
+        # bar including one that has not moved, and the rule never
+        # trades again. Off is the switch; zero is a setting.
+        where = "bounce"
     else:
         where = "together"
 
@@ -707,8 +731,13 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         "low": _num(low),
         "close": _num(close),
         "net_ofi": int(_num(net_ofi)),
-        "back": round(back_to_open(open_px, high, low, close), 3),
+        "back": round(back, 3),
         "bounce_at": float(bounce_at or 0.0),
+        # WHETHER THE RUNG IS LIVE AT ALL. Carried so the panel
+        # can say "bounce off" rather than drawing a percentage
+        # that decides nothing -- which is what that dial has
+        # been doing since `7d961a9`.
+        "bounce_on": bool(bounce_on),
         "legs": legs(net_ofi, ofi_target, prints, tick_target),
         "say": _say(where, ofi_dir, tick_dir),
         # WHAT THE NEXT READING NEEDS BACK. A field dropped from
@@ -756,6 +785,11 @@ def entry_side(where: str, side: str,
         return "", "the bar has not settled -- no direction yet"
     if where == "apart":
         return "", "the book and price are apart"
+    # A BOUNCE DOES NOT OPEN ANYTHING. Entering on one is entering
+    # against the retrace that just stopped the last trade. This
+    # state only exists while the bounce switch is on.
+    if where == "bounce":
+        return "", "price is bouncing off this bar's extreme"
     if where != "together" or side not in SIDES:
         return "", "nothing settled -- neither leg has committed"
     if held_s is not None and min_hold_s > 0 and held_s < min_hold_s:
@@ -796,7 +830,16 @@ def exit_reason(trade_side: str, where: str,
                 tick_dir: str = "", tf_dir: str = "",
                 tf_on: bool = False, tf_name: str = "5m",
                 tf2_dir: str = "", tf2_on: bool = False,
-                tf2_name: str = "15m") -> str:
+                tf2_name: str = "15m",
+                # THE THREE THAT CAME BACK, each behind its own
+                # switch and ALL ON THE END of the signature. Every
+                # caller passes the nine above positionally, and
+                # slotting one in among them re-reads a timeframe
+                # name as a direction -- which has happened here
+                # once already and cost ten tests to find.
+                bar_ts: float = 0.0, open_bar_ts: float = 0.0,
+                bar_exit: bool = False,
+                settle_exit: bool = False) -> str:
     """Why this trade should end now, or "" to hold it.
 
     ONE THING CLOSES IT HERE, and the take profit closes the other
@@ -825,8 +868,33 @@ def exit_reason(trade_side: str, where: str,
     """
     if trade_side not in SIDES:
         return ""
+    # THE BAR CLOSING, FIRST. Both this and a direction change can
+    # be true on the same poll and only one of them is the reason
+    # the trade ended; the clock-like one is read first so the log
+    # says the bar ended rather than blaming the legs.
+    #
+    # A MISSING STAMP IS NOT A CLOSED BAR. Zero means "we do not
+    # know which bar this opened in", and closing every such
+    # position at the first boundary is acting on missing data --
+    # the same guard `stackwin.expired` carries, for the same
+    # reason.
+    if (bar_exit and open_bar_ts and bar_ts
+            and float(bar_ts) != float(open_bar_ts)):
+        return "the fused bar this trade opened in has closed"
+    # THE BOUNCE. This state only exists while the bounce switch
+    # is on, so no second flag is read here -- one switch, one
+    # place, or the panel and the rule drift.
+    if where == "bounce":
+        return "price is bouncing off this bar's extreme"
     if where == "apart":
         return "the book and price have come apart"
+    # THE BAR NO LONGER SETTLED. In practice this fires at each
+    # new bar, because a fresh bar is unsettled by construction --
+    # which makes it very close to the bar-close exit above, and
+    # the two are separate switches so that is a choice rather
+    # than a surprise.
+    if settle_exit and where == "settling":
+        return "the bar is no longer settled"
     # PRICE AGAINST THE TIMEFRAME. Chris: "exit a trade when price
     # disagrees with the 5 minute".
     #
@@ -864,7 +932,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           held_s: float | None = None,
           min_hold_s: float = DWELL_S,
           prev: dict | None = None,
-          turn_ticks: float = TURN_TICKS) -> dict:
+          turn_ticks: float = TURN_TICKS,
+          bounce_on: bool = False) -> dict:
     """The reading and the rule's verdict on it, from one place.
 
     ONE READING, NOT TWO. The panel is handed what the rule decided
@@ -879,7 +948,7 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                tick_target=tick_target, bounce_at=bounce_at,
                min_settle=min_settle, bar_ts=bar_ts,
                tradeable=tradeable, prev=prev,
-               turn_ticks=turn_ticks)
+               turn_ticks=turn_ticks, bounce_on=bounce_on)
     side, why = entry_side(out["where"], out["side"],
                            held_s=held_s, min_hold_s=min_hold_s,
                            tf_dir=tf_dir, tf_on=tf_on,

@@ -139,6 +139,14 @@ class Settings:
     # The row is shown only -- this setting moves nothing that
     # opens or closes a trade.
     fused_turn: int = 4
+    # THE THREE THAT CAME BACK FROM f175c20, each its own switch.
+    # ALL DEFAULT OFF, because off is how the rule has traded
+    # since `7d961a9 take profit or apart: the only two exits` --
+    # a restored feature that switches itself on is a rule change
+    # nobody asked for, applied to every market at once.
+    fused_bounce_on: bool = False
+    fused_bar_exit: bool = False
+    fused_settle_exit: bool = False
     strategy: str = "ofi"
 
     def to_dict(self) -> dict:
@@ -160,6 +168,9 @@ class Settings:
                 "fused_tf2_label": (window_label(float(self.fused_tf2))
                                     if self.fused_tf2 else "off"),
                 "fused_turn": int(self.fused_turn),
+                "fused_bounce_on": bool(self.fused_bounce_on),
+                "fused_bar_exit": bool(self.fused_bar_exit),
+                "fused_settle_exit": bool(self.fused_settle_exit),
                 "strategy": self.strategy,
                 "strategy_label": STRATEGIES.get(self.strategy,
                                                  self.strategy),
@@ -473,6 +484,9 @@ _ADDED_SETTINGS = (
     ("fused_tf", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_tf2", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_turn", "INTEGER NOT NULL DEFAULT 4"),
+    ("fused_bounce_on", "INTEGER NOT NULL DEFAULT 0"),
+    ("fused_bar_exit", "INTEGER NOT NULL DEFAULT 0"),
+    ("fused_settle_exit", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -540,6 +554,9 @@ class Journal(ThreadedDB):
                         fused_tf=int(r["fused_tf"]),
                         fused_tf2=int(r["fused_tf2"]),
                         fused_turn=int(r["fused_turn"] or 4),
+                        fused_bounce_on=bool(r["fused_bounce_on"]),
+                        fused_bar_exit=bool(r["fused_bar_exit"]),
+                        fused_settle_exit=bool(r["fused_settle_exit"]),
                         strategy=(r["strategy"] or "ofi"))
 
     def save_settings(self, s: Settings) -> Settings:
@@ -549,8 +566,10 @@ class Journal(ThreadedDB):
                 " (coin, auto, tp_on, sl_on, tp_ticks, sl_ticks,"
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
                 "  fused_ticks, fused_ofi, fused_bounce,"
-                "  fused_tf, fused_tf2, fused_turn, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "  fused_tf, fused_tf2, fused_turn,"
+                "  fused_bounce_on, fused_bar_exit,"
+                "  fused_settle_exit, strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -565,6 +584,9 @@ class Journal(ThreadedDB):
                 " fused_tf=excluded.fused_tf,"
                 " fused_tf2=excluded.fused_tf2,"
                 " fused_turn=excluded.fused_turn,"
+                " fused_bounce_on=excluded.fused_bounce_on,"
+                " fused_bar_exit=excluded.fused_bar_exit,"
+                " fused_settle_exit=excluded.fused_settle_exit,"
                 " strategy=excluded.strategy",
                 (s.coin, int(s.auto), int(s.tp_on), int(s.sl_on),
                  max(0.0, float(s.tp_ticks)),
@@ -603,6 +625,9 @@ class Journal(ThreadedDB):
                  # zero is a row that flips on every tick and
                  # says nothing at all.
                  _snap_turn(s.fused_turn),
+                 int(bool(s.fused_bounce_on)),
+                 int(bool(s.fused_bar_exit)),
+                 int(bool(s.fused_settle_exit)),
                  s.strategy if s.strategy in STRATEGIES else "ofi"))
         return self.settings(s.coin)
 

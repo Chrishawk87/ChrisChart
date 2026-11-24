@@ -5710,6 +5710,9 @@ def create_app() -> FastAPI:
                              fused_tf: int | None = None,
                              fused_tf2: int | None = None,
                              fused_turn: int | None = None,
+                             fused_bounce_on: bool | None = None,
+                             fused_bar_exit: bool | None = None,
+                             fused_settle_exit: bool | None = None,
                              strategy: str | None = None
                              ) -> dict[str, Any]:
         """The switches under the column. Only what is sent changes."""
@@ -5759,6 +5762,20 @@ def create_app() -> FastAPI:
                 # that the dropdown cannot show.
                 fused_turn=(int(getattr(cur, "fused_turn", 4) or 4)
                             if fused_turn is None else int(fused_turn)),
+                # THE THREE RESTORED SWITCHES. Booleans, so no
+                # snapping -- but each is read with its own
+                # `is None` so that sending one does not quietly
+                # clear the other two.
+                fused_bounce_on=(
+                    bool(getattr(cur, "fused_bounce_on", False))
+                    if fused_bounce_on is None else bool(fused_bounce_on)),
+                fused_bar_exit=(
+                    bool(getattr(cur, "fused_bar_exit", False))
+                    if fused_bar_exit is None else bool(fused_bar_exit)),
+                fused_settle_exit=(
+                    bool(getattr(cur, "fused_settle_exit", False))
+                    if fused_settle_exit is None
+                    else bool(fused_settle_exit)),
                 strategy=(cur.strategy if strategy is None
                           else str(strategy)))
         return {"ok": True, "settings": j.save_settings(s).to_dict()}
@@ -7500,7 +7517,8 @@ def create_app() -> FastAPI:
                     tf_s: int = 0, tf2_s: int = 0,
                     # ON THE END. Every caller below passes the
                     # first six positionally.
-                    turn_ticks: float | None = None) -> dict:
+                    turn_ticks: float | None = None,
+                    bounce_on: bool = False) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -7593,7 +7611,15 @@ def create_app() -> FastAPI:
                                 "decides": False},
                     "settled": False, "settle_why": why,
                     "agree": False, "pos": None, "at": "",
-                    "back": 0.0, "legs": {},
+                    # THE BOUNCE DIAL AND ITS SWITCH, on this path
+                    # too. "EVERY PATH RETURNS THE SAME SHAPE" is
+                    # written above this function for a reason: a
+                    # key present on one path and missing on
+                    # another renders as nothing at all, and both
+                    # a real zero and an absent key look the same
+                    # to the panel's guard.
+                    "back": 0.0, "bounce_at": float(bounce or 0.0),
+                    "bounce_on": bool(bounce_on), "legs": {},
                     "say": why, "held": {},
                     "reach": {}, "summary": {},
                     "tf": {"dir": "", "on": bool(tf_s),
@@ -7656,7 +7682,11 @@ def create_app() -> FastAPI:
             # one -- the old row read a constant while the page
             # was about to offer a dial.
             turn_ticks=(_fr.TURN_TICKS if turn_ticks is None
-                        else float(turn_ticks)))
+                        else float(turn_ticks)),
+            # THE BOUNCE RUNG. With this off `where` can never
+            # read "bounce", which is what makes the switch a
+            # single place rather than a flag checked twice.
+            bounce_on=bool(bounce_on))
         return {**out, "pair": list(key), "label": label(*key),
                 "building": True, "why": "",
                 "open": float(cur.open or 0.0),
@@ -8281,12 +8311,13 @@ def create_app() -> FastAPI:
             # advance the turning row's travelling extreme twice a
             # poll against two different references.
             _fturn = int(getattr(s, "fused_turn", 4) or 4)
+            _fbon = bool(getattr(s, "fused_bounce_on", False))
             _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev,
-                                _ftf, _ftf2, _fturn)
+                                _ftf, _ftf2, _fturn, _fbon)
             _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
             fus = _fused_gate(rt_, _fpair, _fbounce,
                               _fdw.held_s(_now_f), _fprev, _ftf,
-                              _ftf2, _fturn)
+                              _ftf2, _fturn, _fbon)
             try:
                 rt_._fused_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -8457,16 +8488,19 @@ def create_app() -> FastAPI:
             if rev:
                 disagreed = why_rev
         elif strat == "together" and t is not None and t.open:
-            # THE TWO LEGS COMING APART, AND NOTHING ELSE HERE.
+            # THE LEGS COMING APART, PLUS WHATEVER IS SWITCHED ON.
             # Chris: "the only exit is TP or when book and price
-            # disagree ... thats the only exit strategy". The take
-            # profit is the journal's, checked before this; the
-            # bounce and the bar closing both closed trades for one
-            # revision and no longer do.
+            # disagree" -- and then, having run it that way for a
+            # while, "when we kept upgrading the chart it
+            # disappeared and dont work like that anymore". So the
+            # bounce, the bar close and the settling exit are back
+            # from f175c20, each behind its own switch, all three
+            # OFF unless he turns them on.
             #
-            # NO BAR STAMP IS READ. A position rides across bar
-            # boundaries now, which is why nothing here is handed
-            # the fused bar's start.
+            # THE BAR STAMP IS READ AGAIN, and only the bar-close
+            # switch acts on it. `t.bar_ts` is the fused bar the
+            # trade opened in; zero means unknown and closes
+            # nothing, which `exit_reason` enforces.
             from . import fusedread as _fre
             _tf = fus.get("tf") or {}
             _tf2 = fus.get("tf2") or {}
@@ -8476,7 +8510,12 @@ def create_app() -> FastAPI:
                 str(_tf.get("dir") or ""), bool(_tf.get("on")),
                 str(_tf.get("name") or "5m"),
                 str(_tf2.get("dir") or ""), bool(_tf2.get("on")),
-                str(_tf2.get("name") or "15m")) or disagreed
+                str(_tf2.get("name") or "15m"),
+                float(fus.get("bar_ts") or 0.0),
+                float(getattr(t, "bar_ts", 0.0) or 0.0),
+                bool(getattr(s, "fused_bar_exit", False)),
+                bool(getattr(s, "fused_settle_exit", False))
+                ) or disagreed
         elif strat == "ticks" and t is not None and t.open:
             # EITHER CHART TURNING AGAINST THE POSITION. Still no
             # clock -- "Gate 2's flip only, no clock" -- but the
@@ -8654,7 +8693,8 @@ def create_app() -> FastAPI:
                  else float(int(s.fused_bounce)) / 100.0),
                 None, _sprev, int(getattr(s, "fused_tf", 0) or 0),
                 int(getattr(s, "fused_tf2", 0) or 0),
-                int(getattr(s, "fused_turn", 4) or 4))
+                int(getattr(s, "fused_turn", 4) or 4),
+                bool(getattr(s, "fused_bounce_on", False)))
             try:
                 rt_._fused_shown_held = dict(_shown.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -11515,6 +11555,35 @@ has to be running before the gate stops refusing.">spike
               <option value="16">16t</option>
               <option value="24">24t</option>
             </select></label>
+          <!-- THE THREE THAT CAME BACK FROM f175c20. Each is its
+               own switch and each starts OFF, so applying this
+               changes nothing until one is ticked. The bounce
+               carries its percentage beside it because the
+               percentage without the switch is a dial wired to
+               nothing -- which is exactly what it has been. -->
+          <label title="a bounce blocks entries and closes trades
+                        -- price coming back off this bar's extreme
+                        by more than the percentage beside it"
+            ><input type="checkbox" id="jnlFBounce" onchange="jnlSet()"
+            > bounce
+            <select id="jnlFBouncePct" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0">0%</option>
+              <option value="5">5%</option>
+              <option value="10">10%</option>
+              <option value="15">15%</option>
+              <option value="20">20%</option>
+              <option value="25">25%</option>
+              <option value="33" selected>33%</option>
+            </select></label>
+          <label title="close the trade when the fused bar it
+                        opened in closes"
+            ><input type="checkbox" id="jnlFBarEx" onchange="jnlSet()"
+            > bar exit</label>
+          <label title="close the trade when the bar stops being
+                        settled -- in practice at each new bar"
+            ><input type="checkbox" id="jnlFSetEx" onchange="jnlSet()"
+            > settle exit</label>
           <label title="gate 3 also closes a trade when it flips"
             ><input type="checkbox" id="jnlT3Ex" onchange="jnlSet()"
             > g3 exit</label>
@@ -16518,6 +16587,11 @@ async function jnlSet() {
        appears to snap back while the save is still in flight. */
     jnlFusedTurn: $('jnlFusedTurn')
       ? String($('jnlFusedTurn').value) : undefined,
+    jnlFBouncePct: $('jnlFBouncePct')
+      ? String($('jnlFBouncePct').value) : undefined,
+    jnlFBounce: $('jnlFBounce') ? $('jnlFBounce').checked : undefined,
+    jnlFBarEx: $('jnlFBarEx') ? $('jnlFBarEx').checked : undefined,
+    jnlFSetEx: $('jnlFSetEx') ? $('jnlFSetEx').checked : undefined,
     jnlStrat: $('jnlStrat') ? $('jnlStrat').value : 'ofi',
   };
   const q = new URLSearchParams({
@@ -16540,6 +16614,16 @@ async function jnlSet() {
     fused_tf: $('jnlFusedTf') ? $('jnlFusedTf').value : 0,
     fused_tf2: $('jnlFusedTf2') ? $('jnlFusedTf2').value : 0,
     fused_turn: $('jnlFusedTurn') ? $('jnlFusedTurn').value : 4,
+    /* ZERO IS A CHOICE on the percentage -- it means "any
+       give-back at all", the tightest setting rather than off.
+       Off is the checkbox beside it, so no || on this line. */
+    fused_bounce: $('jnlFBouncePct') ? $('jnlFBouncePct').value : 33,
+    fused_bounce_on: ($('jnlFBounce') && $('jnlFBounce').checked)
+      ? 'true' : 'false',
+    fused_bar_exit: ($('jnlFBarEx') && $('jnlFBarEx').checked)
+      ? 'true' : 'false',
+    fused_settle_exit: ($('jnlFSetEx') && $('jnlFSetEx').checked)
+      ? 'true' : 'false',
     strategy: $('jnlStrat') ? $('jnlStrat').value : 'ofi' });
   try { await api('/api/journal/settings?' + q.toString(), {method: 'POST'}); }
   catch (e) { $('jnlMsg').textContent = String(e); }
@@ -18253,6 +18337,11 @@ function paintJournal(d) {
     set('jnlFusedTf2', String(Math.round(S.fused_tf2)));
   if (S.fused_turn != null)
     set('jnlFusedTurn', String(Math.round(S.fused_turn)));
+  if (S.fused_bounce != null)
+    set('jnlFBouncePct', String(Math.round(S.fused_bounce)));
+  chk('jnlFBounce', S.fused_bounce_on);
+  chk('jnlFBarEx', S.fused_bar_exit);
+  chk('jnlFSetEx', S.fused_settle_exit);
   set('jnlStrat', S.strategy || 'ofi');
   const mode = $('jnlMode');
   if (mode) mode.textContent =

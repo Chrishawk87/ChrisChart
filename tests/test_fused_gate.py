@@ -696,35 +696,140 @@ class TestTheRule:
         why = fr.exit_reason("up", "apart")
         assert "come apart" in why
 
-    @pytest.mark.parametrize("where", ["bounce", "settling",
-                                       "together", ""])
-    def test_nothing_else_closes_a_trade(self, where):
-        """WHAT WAS REMOVED, AND DELIBERATELY.
+    @pytest.mark.parametrize("where", ["settling", "together", ""])
+    def test_nothing_else_closes_a_trade_with_the_switches_off(
+            self, where):
+        """OFF IS THE DEFAULT, AND OFF MEANS UNCHANGED.
 
-        A bounce closed trades for one revision: it was cutting
-        winners the take profit was sized to collect, and the
-        pullback is a reading he wants to SEE rather than act on.
-        The bar closing closed them too -- a bar ending is
-        bookkeeping, not a change in the market -- and with it
-        gone, settling must not close them either, or the
-        bar-close exit comes straight back wearing another name.
+        The bounce, the bar close and the settling exit all came
+        back from f175c20 at Chris's ask -- "when we kept
+        upgrading the chart it disappeared and dont work like that
+        anymore" -- but each is behind its own switch and each
+        starts off, because off is how this rule has traded since
+        `7d961a9`. Applying the restore must change nothing until
+        a box is ticked.
+
+        `bounce` is not in this list because `where` cannot even
+        READ "bounce" with the switch off -- that is the point of
+        putting the switch on the rung rather than on the exit.
         """
         assert fr.exit_reason("up", where) == "", \
-            f"{where} still closes a trade"
+            f"{where} still closes a trade with every switch off"
         assert fr.exit_reason("down", where) == ""
+        # And with a bar stamp that HAS changed, which is the
+        # bar-close exit's input -- still nothing, switch off.
+        assert fr.exit_reason("up", where, bar_ts=2.0,
+                              open_bar_ts=1.0) == ""
 
-    def test_the_exit_reads_no_bar_and_no_clock(self):
-        """A POSITION RIDES ACROSS BAR BOUNDARIES NOW. Nothing
-        about which candle it opened in reaches this."""
+    def test_the_bounce_rung_is_the_switch(self):
+        """ONE SWITCH, ONE PLACE. With it off `where` can never be
+        "bounce", so nothing downstream needs a second flag and
+        the panel cannot show a state the rule is ignoring."""
+        bar = dict(ofi_dir="up", tick_dir="up", open_px=7180.0,
+                   high=7190.0, low=7179.0, close=7183.0,
+                   bar_ts=1.0, **FULL)
+        off = fr.read(**bar)
+        on = fr.read(bounce_on=True, **bar)
+        assert off["back"] >= 0.33, "this bar is not a bounce"
+        assert off["where"] == "together"
+        assert on["where"] == "bounce"
+        # THE PANEL IS TOLD WHETHER THE RUNG IS LIVE, so it can
+        # say "bounce off" rather than drawing a percentage that
+        # decides nothing -- which is what that dial did for six
+        # commits without anything saying so.
+        assert off["bounce_on"] is False
+        assert on["bounce_on"] is True
+        # THE REASON, NOT JUST THE REFUSAL. Without the bounce
+        # branch in `entry_side` the side is still "" -- it falls
+        # through to "nothing settled" -- so a test that only
+        # checks the side passes while the panel explains the
+        # refusal wrongly, which is how a day gets lost here.
+        side, why = fr.entry_side(on["where"], on["side"])
+        assert side == ""
+        assert "bouncing" in why, why
+        assert "nothing settled" not in why
+        assert "bouncing" in fr.exit_reason("up", on["where"])
+
+    def test_state_carries_the_switch_to_the_reading(self):
+        """`state` IS WHAT THE ROUTE CALLS, not `read`. A switch
+        that stops at `state`'s door leaves the checkbox, the
+        database and the panel all correct and the rung dead."""
+        bar = dict(ofi_dir="up", tick_dir="up", open_px=7180.0,
+                   high=7190.0, low=7179.0, close=7183.0,
+                   bar_ts=1.0, held_s=9.0, **FULL)
+        assert fr.state(**bar)["where"] == "together"
+        on = fr.state(bounce_on=True, **bar)
+        assert on["where"] == "bounce"
+        assert on["entry"] == "", "a bounce opened a trade"
+        assert on["bounce_on"] is True
+
+    def test_zero_per_cent_is_the_tightest_not_off(self):
+        """A DIAL AT ZERO MEANS "any give-back at all". Without
+        the `back > 0.0` guard it makes `back >= 0` true on every
+        bar including one that has not moved, and the rule never
+        trades again -- which looks exactly like the switch being
+        stuck on."""
+        still = dict(ofi_dir="up", tick_dir="up", open_px=7180.0,
+                     high=7180.0, low=7180.0, close=7180.0,
+                     bar_ts=1.0, bounce_at=0.0, bounce_on=True,
+                     **FULL)
+        assert fr.read(**still)["where"] != "bounce"
+        moved = dict(still, high=7190.0, close=7189.75)
+        assert fr.read(**moved)["where"] == "bounce"
+
+    def test_the_bar_close_and_settling_exits_are_separate(self):
+        """IN PRACTICE THEY FIRE AT NEARLY THE SAME MOMENT, since
+        a fresh bar is unsettled by construction. They are two
+        switches so that overlap is a choice rather than a
+        surprise, and each has to work on its own."""
+        assert "has closed" in fr.exit_reason(
+            "up", "together", bar_ts=2.0, open_bar_ts=1.0,
+            bar_exit=True)
+        assert fr.exit_reason("up", "settling", bar_ts=2.0,
+                              open_bar_ts=1.0, bar_exit=True) \
+            == fr.exit_reason("up", "together", bar_ts=2.0,
+                              open_bar_ts=1.0, bar_exit=True), \
+            "the bar-close reason depends on the reading"
+        assert "no longer settled" in fr.exit_reason(
+            "up", "settling", settle_exit=True)
+        # SETTLING ALONE DOES NOT CLOSE IT when only the bar-close
+        # switch is on and the bar has not changed.
+        assert fr.exit_reason("up", "settling", bar_ts=1.0,
+                              open_bar_ts=1.0, bar_exit=True) == ""
+
+    def test_a_missing_bar_stamp_closes_nothing(self):
+        """Zero is "we do not know which bar this opened in", and
+        closing every such position at the first boundary is
+        acting on missing data. The same guard `stackwin.expired`
+        carries."""
+        assert fr.exit_reason("up", "together", bar_ts=2.0,
+                              open_bar_ts=0.0, bar_exit=True) == ""
+        assert fr.exit_reason("up", "together", bar_ts=0.0,
+                              open_bar_ts=1.0, bar_exit=True) == ""
+
+    def test_the_exit_reads_no_clock(self):
+        """THE BAR STAMP IS BACK, THE CLOCK IS NOT. `bar_ts` and
+        `open_bar_ts` return with the bar-close switch; a wall
+        clock never does -- "Gate 2's flip only, no clock", and
+        nothing here expires on elapsed time.
+
+        THE NINE ORIGINAL PARAMETERS KEEP THEIR POSITIONS. Every
+        caller passes them positionally, and an argument slotted
+        in among them re-reads a timeframe name as a direction --
+        which has happened here once and cost ten tests."""
         import inspect
         sig = inspect.signature(fr.exit_reason)
-        assert list(sig.parameters) == [
+        assert list(sig.parameters)[:9] == [
             "trade_side", "where", "tick_dir", "tf_dir", "tf_on",
             "tf_name", "tf2_dir", "tf2_on", "tf2_name"]
-        for bad in ("bar_ts", "open_bar_ts", "held_s", "now_ts",
-                    "period_s"):
+        assert list(sig.parameters)[9:] == [
+            "bar_ts", "open_bar_ts", "bar_exit", "settle_exit"]
+        for p in list(sig.parameters.values())[9:]:
+            assert p.default in (0.0, False), \
+                f"{p.name} does not default to off"
+        for bad in ("held_s", "now_ts", "period_s", "min_hold_s"):
             assert bad not in sig.parameters, \
-                f"exit_reason takes {bad}"
+                f"exit_reason takes {bad} -- that is a clock"
 
     def test_an_unknown_side_is_never_closed(self):
         assert fr.exit_reason("", "apart") == ""
@@ -833,13 +938,23 @@ class TestTheStrategyIsWiredThrough:
     def test_the_exit_is_handed_what_state_resolved(self):
         blk = self._step()
         i = blk.index("_fre.exit_reason(")
-        seg = blk[i:i + 420]
+        # THE WHOLE CALL, NOT A FIXED NUMBER OF CHARACTERS. A
+        # slice like `blk[i:i + 420]` is an assertion about how
+        # long the call happens to be, and it expired the moment
+        # four arguments were added -- the test failed on a change
+        # it was meant to approve. Read to the closing paren.
+        seg = blk[i:blk.index("or disagreed", i)]
         assert 'fus.get("where")' in seg
-        # NO BAR STAMP REACHES THE EXIT. A position rides across
-        # bar boundaries now, so handing it one would be the
-        # bar-close exit coming back by the side door.
-        assert "bar_ts" not in seg, \
-            "the exit still reads which candle the trade opened in"
+        # THE BAR STAMP REACHES IT AGAIN, and it is the TRADE'S
+        # stamp against the bar's. Handing it the same value
+        # twice, or the live bar for both, is a bar-close exit
+        # that can never fire -- and nothing else here would say
+        # so, because the switch would look wired.
+        assert 'fus.get("bar_ts")' in seg
+        assert 'getattr(t, "bar_ts"' in seg, \
+            "the exit compares the live bar against itself"
+        assert 'getattr(s, "fused_bar_exit"' in seg
+        assert 'getattr(s, "fused_settle_exit"' in seg
 
     def test_the_cap_does_not_quietly_become_two(self):
         """`decide` reads `max_per_bar or MAX_PER_BAR`, so a cap of
@@ -1231,11 +1346,36 @@ class TestAfterTheTakeProfit:
     def test_a_bounce_does_not_take_it_off_first(self):
         """IT WAS CUTTING WINNERS THE TAKE PROFIT WAS SIZED TO
         COLLECT. Nine ticks into a ten-tick target, a pullback
-        used to close the trade."""
+        used to close the trade.
+
+        WITH THE SWITCH OFF -- the default -- that is still true,
+        because `where` cannot read "bounce" at all."""
         from liqmap.journal import Settings, should_close
         t, s = self._trade(), Settings(**self.SET)
+        bar = dict(ofi_dir="up", tick_dir="up", open_px=7160.0,
+                   high=7170.0, low=7159.0, close=7162.25,
+                   bar_ts=1.0, **FULL)
+        off = fr.read(**bar)
+        assert off["where"] != "bounce"
         assert should_close(t, s, 7162.25, "", window_rule=True,
-                            disagreed=fr.exit_reason("up", "bounce")) == ""
+                            disagreed=fr.exit_reason(
+                                "up", off["where"])) == ""
+
+    def test_with_the_bounce_on_it_does_close_first(self):
+        """THE OTHER HALF, SO THE SWITCH IS NOT COSMETIC. Turned
+        on, the same bar closes the trade short of the target --
+        which is the behaviour he asked to have back, and the
+        reason it is a switch rather than a restore."""
+        from liqmap.journal import Settings, should_close
+        t, s = self._trade(), Settings(**self.SET)
+        bar = dict(ofi_dir="up", tick_dir="up", open_px=7160.0,
+                   high=7170.0, low=7159.0, close=7162.25,
+                   bar_ts=1.0, bounce_on=True, **FULL)
+        on = fr.read(**bar)
+        assert on["where"] == "bounce"
+        assert should_close(t, s, 7162.25, "", window_rule=True,
+                            disagreed=fr.exit_reason(
+                                "up", on["where"])) == "disagree"
 
     def test_another_trade_follows_while_they_still_agree(self):
         """The agreement does not have to re-form: it has been
@@ -2843,3 +2983,138 @@ class TestTheTurningRow:
         j = src.index("rt_._fused_shown_held")
         assert "rt_._fused_held" not in src[i:j], \
             "the shown-only path writes the traded memory"
+
+
+class TestTheThreeRestoredSwitches:
+    """Chris: "when we kept upgrading the chart it disappeared and
+    dont work like that anymore now its different", about the
+    version at `f175c20 the fused bar traded: settle, agree, hold
+    five seconds`.
+
+    THREE THINGS WENT, ALL IN `7d961a9 take profit or apart: the
+    only two exits`: the bounce state, the bar-close exit and the
+    settling exit. Asked which he wanted back he said all of it,
+    as switches. So each is back behind its own box, and each
+    starts OFF -- off is how the rule has traded since, and a
+    restored feature that switches itself on is a rule change
+    nobody asked for, applied to every market at once.
+    """
+
+    def test_they_all_default_off(self):
+        from liqmap.journal import Settings
+        s = Settings(coin="ES")
+        assert s.fused_bounce_on is False
+        assert s.fused_bar_exit is False
+        assert s.fused_settle_exit is False
+
+    def test_they_round_trip_through_the_journal(self, tmp_path):
+        from liqmap.journal import Journal
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        assert s.fused_bounce_on is False
+        s.fused_bounce_on = True
+        s.fused_bar_exit = True
+        s.fused_settle_exit = True
+        back = j.save_settings(s)
+        for k in ("fused_bounce_on", "fused_bar_exit",
+                  "fused_settle_exit"):
+            assert getattr(back, k) is True, k
+            assert j.settings("ES").to_dict()[k] is True, k
+
+    def test_each_switch_is_independent(self, client, monkeypatch):
+        """SENDING ONE MUST NOT CLEAR THE OTHERS. Every control on
+        this page is saved by one POST that carries the whole
+        form, so a field read without its own `is None` guard
+        silently resets whatever was not sent."""
+        _cme(monkeypatch)
+        for k in ("fused_bounce_on", "fused_bar_exit",
+                  "fused_settle_exit"):
+            client.post("/api/journal/settings",
+                        params={"coin": "ES", k: "true"},
+                        headers=AUTH)
+        got = client.post("/api/journal/settings",
+                          params={"coin": "ES"},
+                          headers=AUTH).json()["settings"]
+        for k in ("fused_bounce_on", "fused_bar_exit",
+                  "fused_settle_exit"):
+            assert got[k] is True, f"{k} was cleared by another save"
+        off = client.post("/api/journal/settings",
+                          params={"coin": "ES",
+                                  "fused_bounce_on": "false"},
+                          headers=AUTH).json()["settings"]
+        assert off["fused_bounce_on"] is False
+        assert off["fused_bar_exit"] is True, \
+            "clearing one cleared another"
+
+    def test_the_page_has_all_four_controls(self):
+        src = (SRC / "web.py").read_text()
+        for el in ('id="jnlFBounce"', 'id="jnlFBouncePct"',
+                   'id="jnlFBarEx"', 'id="jnlFSetEx"'):
+            assert el in src, f"{el} is not on the page"
+        # SENT, RESTORED AND PINNED -- the three ways a control
+        # can look wired and not be.
+        for name in ("fused_bounce_on", "fused_bar_exit",
+                     "fused_settle_exit"):
+            assert f"{name}:" in src, f"{name} is never sent"
+        # `"fused_bounce:" in src` IS NOT ENOUGH -- "fused_bounce_on:"
+        # contains it, so deleting the percentage line entirely
+        # left that assertion passing. Name the control it reads.
+        assert "fused_bounce: $('jnlFBouncePct')" in src, \
+            "the bounce percentage is never sent"
+        for el in ("jnlFBounce", "jnlFBarEx", "jnlFSetEx"):
+            assert f"chk('{el}'" in src, f"{el} never comes back"
+            assert f"{el}: $('{el}')" in src, f"{el} is not pinned"
+        assert "set('jnlFBouncePct'" in src
+        assert "jnlFBouncePct: $('jnlFBouncePct')" in src
+
+    def test_the_percentage_offers_every_choice(self):
+        src = (SRC / "web.py").read_text()
+        for c in fr.BOUNCE_CHOICES:
+            assert f'value="{int(round(100.0 * c))}"' in src
+
+    def test_the_dial_reaches_the_live_rule(self, client,
+                                            monkeypatch):
+        """THE SWITCH, THROUGH THE ROUTE, TO THE READING. Dropping
+        `bounce_on` at either gate call leaves the checkbox
+        working and the database correct while the rung stays
+        dead -- a box wired to nothing, which is exactly what the
+        percentage selector has been since `7d961a9`."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+
+        def probe(strategy, on):
+            s_ = rt.journal.settings("ES")
+            s_.strategy = strategy
+            s_.fused_bounce_on = on
+            rt.journal.save_settings(s_)
+            d = client.get("/api/read",
+                           params={"coin": "ES", "interval": "15m",
+                                   "timeframes": "15m,5m,1m"},
+                           headers=AUTH).json()
+            jr = d.get("journal") or {}
+            assert "error" not in jr, jr.get("error")
+            return jr.get("fusedgate") or {}
+
+        for strategy in ("together", "stackwin"):
+            for on in (True, False):
+                fg = probe(strategy, on)
+                assert fg, f"no panel on {strategy}"
+                assert fg.get("bounce_on") is on, \
+                    f"the switch never reaches the panel on {strategy}"
+                assert "bounce_at" in fg
+
+    def test_the_restore_changes_nothing_until_a_box_is_ticked(self):
+        """THE WHOLE POINT OF SWITCHES. With all three off, every
+        reading and every exit must be byte-identical to what the
+        rule did before they came back."""
+        bar = dict(ofi_dir="up", tick_dir="up", open_px=7160.0,
+                   high=7190.0, low=7159.0, close=7165.0,
+                   bar_ts=1.0, **FULL)
+        out = fr.read(**bar)
+        assert out["back"] >= 0.33, "this bar is not a pullback"
+        assert out["where"] == "together"
+        assert fr.entry_side(out["where"], out["side"],
+                             held_s=9.0)[0] == "up"
+        assert fr.exit_reason("up", out["where"], bar_ts=2.0,
+                              open_bar_ts=1.0) == ""

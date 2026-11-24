@@ -50,6 +50,28 @@ D = "down"
 U = "up"
 
 
+def _py_func(name: str, path: str = "liqmap/web.py") -> str:
+    """One whole Python function, by indentation.
+
+    HERE BECAUSE FIXED-WIDTH SLICES EXPIRE. A `src[i:i + N]` is a
+    silent assertion that the function is shorter than N, and this
+    file has had three of them fail on unrelated changes.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parents[1]
+           / path).read_text()
+    i = src.index(f"def {name}(")
+    start = src.rfind("\n", 0, i) + 1
+    indent = i - start
+    lines = src[start:].split("\n")
+    out = [lines[0]]
+    for line in lines[1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
 def _step_block(src: str) -> str:
     """`_journal_step_un` exactly, from its `def` to the next one.
 
@@ -1723,8 +1745,14 @@ class TestGateThreeIsWiredThrough:
         src = self._src()
         assert "tick_bar_3: int | None = None," in src
         assert "tick3_exit: bool | None = None," in src
-        i = src.index("tick3_exit: bool | None = None,")
-        blk = src[i:i + 2000]
+        # THE WHOLE ROUTE, NOT TWO THOUSAND CHARACTERS OF IT.
+        # `src[i:i + 2000]` is an assertion about how long this
+        # function happens to be, and it expired the moment four
+        # settings were added above the line it was looking for --
+        # the test failed on a change that had nothing to do with
+        # gate 3. Read the function.
+        blk = _py_func("api_journal_settings")
+        assert "tick3_exit: bool | None = None," in blk
         assert "tick3_exit=(bool(getattr(cur" in blk, \
             "the route takes the parameter and drops it"
 
