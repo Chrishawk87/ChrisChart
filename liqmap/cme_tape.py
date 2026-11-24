@@ -33,6 +33,7 @@ NOTHING HERE PLACES, SIZES OR TIMES AN ORDER.
 
 from __future__ import annotations
 
+import time as _time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
@@ -240,6 +241,28 @@ class Tape:
     last_px: float = 0.0
     last_side: str = ""
     last_ts: float = 0.0
+    # HOW FAR BEHIND THE EXCHANGE THIS TAPE IS RUNNING.
+    #
+    # Chris: "its like the move has already happened on iron beam
+    # by the time it shows up on chris chart". Nothing in this
+    # service measured that, so there was no way to tell a slow
+    # feed from a rule that waits fifteen seconds by design.
+    #
+    # `lag_samples` holds (now - ts_event) for recent prints, in
+    # seconds. THE MEDIAN IS WHAT GETS REPORTED: one print that
+    # arrived during a GC pause is not the feed being slow, and a
+    # mean would let it say so.
+    #
+    # IT INCLUDES CLOCK SKEW AND SAYS SO WHEREVER IT IS SHOWN.
+    # `ts_event` is the exchange's clock and `time.time()` is this
+    # container's; if the box drifts 200ms the number drifts with
+    # it. `last_seen` below is measured entirely on this machine
+    # and has no such problem, which is why both are kept.
+    lag_samples: deque = field(default_factory=lambda: deque(maxlen=256))
+    # WALL TIME HERE WHEN THE LAST PRINT LANDED. One clock, this
+    # one, so "has the feed stalled" is answerable without
+    # trusting anybody else's.
+    last_seen: float = 0.0
     trades: int = 0
     records: int = 0
     books: int = 0
@@ -690,6 +713,13 @@ class Tape:
             return False
         self.trades += 1
         self.last_px, self.last_side, self.last_ts = t.px, t.aggressor, t.ts
+        # SAMPLED HERE, at the moment the print is taken into the
+        # tape -- not when a route asks. Asking later measures how
+        # long ago somebody asked.
+        _now = _time.time()
+        self.last_seen = _now
+        if t.ts:
+            self.lag_samples.append(_now - float(t.ts))
         self.flow.add(t)
         for fn in list(self._exec_listeners):
             try:
@@ -800,6 +830,54 @@ class Tape:
         rows = b.history(include_current=include_current)
         return rows[-limit:] if limit else rows
 
+    def lag(self) -> dict:
+        """How far behind the exchange this tape is running.
+
+        Chris: "its like the move has already happened on iron
+        beam by the time it shows up on chris chart". Three
+        numbers, because they fail in different ways and only
+        together say where the time went:
+
+            `feed_ms`   the median of (arrival here - ts_event)
+                        over recent prints. THE NUMBER HE WANTS,
+                        and the only one that can be wrong for a
+                        reason that has nothing to do with the
+                        feed: it spans two clocks, the exchange's
+                        and this container's, so a box drifting
+                        200ms reports 200ms of lag that is not
+                        there.
+
+            `since_ms`  how long since the last print landed,
+                        start to finish on this machine. No second
+                        clock, so nothing to drift. A large number
+                        here is a stalled feed, full stop.
+
+            `n`         how many samples the median came from. A
+                        median of three is not a measurement and
+                        the panel has to be able to say so.
+
+        A MEDIAN, NOT A MEAN. One print that arrived during a
+        pause is not the feed being slow, and a mean lets it say
+        so for the next two hundred samples.
+        """
+        xs = sorted(self.lag_samples)
+        n = len(xs)
+        if not n:
+            return {"feed_ms": None, "since_ms": None, "n": 0,
+                    "why": "no prints have arrived yet"}
+        mid = (xs[n // 2] if n % 2
+               else 0.5 * (xs[n // 2 - 1] + xs[n // 2]))
+        since = (_time.time() - self.last_seen) if self.last_seen else None
+        return {
+            "feed_ms": round(1000.0 * mid, 1),
+            "since_ms": None if since is None else round(1000.0 * since, 1),
+            "n": n,
+            # SAID WHEREVER IT IS SHOWN, not buried in a docstring
+            # nobody reading the panel will ever open.
+            "why": ("exchange stamp to arrival here -- spans two "
+                    "clocks, so container drift is in it"),
+        }
+
     def snapshot(self, interval: str = "1m", limit: int = 0,
                  now: float | None = None) -> dict:
         """What a panel needs, in one call."""
@@ -818,6 +896,7 @@ class Tape:
             "last_px": self.last_px,
             "last_side": self.last_side,
             "last_ts": self.last_ts,
+            "lag": self.lag(),
             "closed": {k: len(v) for k, v in self.closed.items()},
             "current": None if cur is None else {
                 "start_ts": cur.start_ts,

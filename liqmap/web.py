@@ -7510,6 +7510,26 @@ def create_app() -> FastAPI:
                 "ofi_target": bld.ofi_target,
                 "say": prog.get("say") or ""}
 
+    def _tape_lag(rt_) -> dict:
+        """The tape's own lag reading, or why there is none.
+
+        ONE SHAPE EITHER WAY. A missing key and a real zero look
+        identical to the panel's guard, and "no reading" is a
+        different thing from "no lag" -- the first means the feed
+        is not running, which is the more alarming of the two.
+        """
+        try:
+            svc = getattr(rt_, "ofi", None)
+            tape = getattr(svc, "tape", None) if svc else None
+            fn = getattr(tape, "lag", None) if tape else None
+            if fn is None:
+                return {"feed_ms": None, "since_ms": None, "n": 0,
+                        "why": "no tape is running"}
+            return dict(fn() or {})
+        except Exception as exc:                        # noqa: BLE001
+            return {"feed_ms": None, "since_ms": None, "n": 0,
+                    "why": f"{type(exc).__name__}"}
+
     def _fused_gate(rt_, pair: tuple[int, int] | None = None,
                     bounce: float | None = None,
                     held_s: float | None = None,
@@ -7679,6 +7699,7 @@ def create_app() -> FastAPI:
                     "bounce_on": bool(bounce_on), "legs": {},
                     "say": why, "held": {},
                     "reach": {}, "summary": {},
+                    "lag": _tape_lag(rt_),
                     "tf": {"dir": "", "on": bool(tf_s),
                            "name": _tf_name, "agrees": False,
                            "ticks": bool(int(tf_s or 0) < 0),
@@ -7783,6 +7804,13 @@ def create_app() -> FastAPI:
                 # wanders, so it cannot be reasoned out from the
                 # targets. This is the measurement that replaces
                 # the extrapolation.
+                # HOW FAR BEHIND THE EXCHANGE THIS READING IS.
+                # Chris: "the move has already happened on iron
+                # beam by the time it shows up on chris chart".
+                # Carried on the panel that makes the decision,
+                # not on a diagnostics page, because the question
+                # is always asked about a specific entry.
+                "lag": _tape_lag(rt_),
                 "reach": bld.reach(),
                 "summary": bld.summary()}
 
@@ -17827,6 +17855,31 @@ function paintFusedGate(FG) {
           + 'price has not travelled '
           + Number((FG.turning || {}).band || 0).toFixed(0)
           + ' ticks off this candle&rsquo;s open</div>')
+    /* HOW OLD THIS READING IS. Chris: "the move has already
+       happened on iron beam by the time it shows up on chris
+       chart". Three numbers, and the panel says which of them can
+       lie and why -- a lag figure nobody can interrogate is worse
+       than none, because it gets believed. */
+    + ((FG.lag && (FG.lag.feed_ms != null || FG.lag.since_ms != null))
+        ? '<div class="thin">behind the exchange by <b>'
+          + (FG.lag.feed_ms == null ? '?'
+              : Number(FG.lag.feed_ms).toFixed(0)) + ' ms</b>'
+          + ' <span style="opacity:.6">(median of '
+          + Number(FG.lag.n || 0).toFixed(0)
+          + ' prints &mdash; spans two clocks, container drift is '
+          + 'in it)</span>'
+          + (FG.lag.since_ms == null ? ''
+              : ' &middot; last print <b>'
+                + Number(FG.lag.since_ms).toFixed(0)
+                + ' ms</b> ago')
+          + (_readRtt == null ? ''
+              : ' &middot; this panel <b>' + Number(_readRtt).toFixed(0)
+                + ' ms</b> round trip')
+          + '</div>'
+        : (FG.lag && FG.lag.why
+            ? '<div class="thin">no lag reading &mdash; '
+              + esc(FG.lag.why) + '</div>'
+            : ''))
     + ((FG.pos == null)
         ? '<div class="thin">every print in this bar has landed on '
           + 'one price &mdash; it has no range to read yet</div>'
@@ -19449,12 +19502,23 @@ function toggleReadAuto() {
    with the laptop shut needs a stepper on the server, which this is
    not. */
 let _readBusy = false;
+/* THE ONLY LAG NUMBER MEASURED ENTIRELY ON ONE CLOCK.
+
+   `feed_ms` on the panel spans the exchange's clock and the
+   server's, so a container drifting 200ms reports 200ms of lag
+   that is not there. This one starts and stops on this machine:
+   whatever it says, no other clock is in it. */
+let _readRtt = null;
 setInterval(async () => {
   if (_readBusy) return;
   const el = $('rInt');
   if (!el) return;
   _readBusy = true;
-  try { await loadRead(); } catch (e) {} finally { _readBusy = false; }
+  const t0 = (window.performance && performance.now) ? performance.now()
+                                                     : Date.now();
+  try { await loadRead(); _readRtt = ((window.performance
+          && performance.now) ? performance.now() : Date.now()) - t0; }
+  catch (e) {} finally { _readBusy = false; }
 }, 1000);
 
 /* The order-flow ladder.

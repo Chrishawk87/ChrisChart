@@ -300,14 +300,28 @@ class TestTheRuleHasAClock:
         src = (ROOT / "liqmap" / "web.py").read_text()
         assert "_readBusy" in src
         i = src.index("let _readBusy")
-        blk = src[i:i + 400]
+        # TO THE END OF THE POLL, NOT A FIXED 400 CHARACTERS.
+        # `src[i:i + 400]` is a silent assertion that nothing is
+        # ever written between the flag and the loop, and two of
+        # these failed the moment a comment went in above the
+        # setInterval -- on a change that had nothing to do with
+        # the poll.
+        # INCLUSIVE OF THE INTERVAL ITSELF -- that is what this
+        # test is about, so the slice has to contain it.
+        blk = src[i:src.index("}, 1000);", i) + len("}, 1000);")]
         assert "await loadRead()" in blk
         assert "}, 1000);" in blk
 
     def test_it_does_not_stack_requests(self):
         src = (ROOT / "liqmap" / "web.py").read_text()
         i = src.index("let _readBusy")
-        blk = src[i:i + 400]
+        # TO THE END OF THE POLL, NOT A FIXED 400 CHARACTERS.
+        # `src[i:i + 400]` is a silent assertion that nothing is
+        # ever written between the flag and the loop, and two of
+        # these failed the moment a comment went in above the
+        # setInterval -- on a change that had nothing to do with
+        # the poll.
+        blk = src[i:src.index("}, 1000);", i)]
         assert "if (_readBusy) return;" in blk
         assert "finally { _readBusy = false; }" in blk
 
@@ -316,7 +330,13 @@ class TestTheRuleHasAClock:
         that is the whole hand-trading path."""
         src = (ROOT / "liqmap" / "web.py").read_text()
         i = src.index("let _readBusy")
-        blk = src[i:i + 400]
+        # TO THE END OF THE POLL, NOT A FIXED 400 CHARACTERS.
+        # `src[i:i + 400]` is a silent assertion that nothing is
+        # ever written between the flag and the loop, and two of
+        # these failed the moment a comment went in above the
+        # setInterval -- on a change that had nothing to do with
+        # the poll.
+        blk = src[i:src.index("}, 1000);", i)]
         assert "rAuto" not in blk
 
     def test_the_toggle_no_longer_claims_the_socket_runs_the_rule(self):

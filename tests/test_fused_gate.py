@@ -3637,3 +3637,222 @@ class TestStrength:
             assert "body" in (fg.get(row) or {}), f"{row} has no body"
             assert "travel" in (fg.get(row) or {}), f"{row} has no travel"
         assert "travel" in (fg.get("turning") or {})
+
+
+class TestTheLagReadout:
+    """Chris: "its like the move has already happened on iron beam
+    by the time it shows up on chris chart so the entries are
+    always well behind iron beam".
+
+    NOTHING MEASURED IT. Asked which to do first he said "Measure
+    the feed first" -- because about fifteen seconds of the delay
+    is the rule's own (a ~9s settle gate plus a 5s hold) and until
+    the feed leg has a number there is no way to tell a slow feed
+    from a rule that waits by design.
+    """
+
+    @staticmethod
+    def _tape(samples=(), seen=None):
+        import time
+        from liqmap.cme_tape import Tape
+        t = Tape()
+        for d in samples:
+            t.lag_samples.append(d)
+        if seen is not None:
+            t.last_seen = time.time() - seen
+        return t
+
+    def test_no_prints_is_not_no_lag(self):
+        """A MISSING READING AND A ZERO ARE DIFFERENT THINGS. The
+        first means the feed is not running, which is the more
+        alarming of the two, and the panel's guard cannot tell
+        them apart unless the payload does."""
+        r = self._tape().lag()
+        assert r["feed_ms"] is None
+        assert r["since_ms"] is None
+        assert r["n"] == 0
+        assert r["why"], "nothing says why there is no reading"
+
+    def test_it_is_a_median_not_a_mean(self):
+        """One print that arrived during a pause is not the feed
+        being slow, and a mean lets it say so for the next two
+        hundred samples."""
+        clean = self._tape((0.040, 0.050, 0.060)).lag()
+        spiked = self._tape((0.040, 0.050, 0.060, 0.050, 4.0)).lag()
+        assert clean["feed_ms"] == pytest.approx(50.0)
+        assert spiked["feed_ms"] == pytest.approx(50.0), \
+            "one outlier moved the reading"
+
+    def test_it_reports_in_milliseconds(self):
+        r = self._tape((0.0513,)).lag()
+        assert r["feed_ms"] == pytest.approx(51.3, abs=0.2)
+
+    def test_an_even_count_averages_the_middle_two(self):
+        r = self._tape((0.040, 0.060)).lag()
+        assert r["feed_ms"] == pytest.approx(50.0)
+
+    def test_the_sample_count_is_reported(self):
+        """A median of three is not a measurement and the panel
+        has to be able to say so."""
+        assert self._tape((0.05,) * 7).lag()["n"] == 7
+
+    def test_the_window_is_bounded(self):
+        """An unbounded list of every print of the session is a
+        leak and a median that stops responding to now."""
+        t = self._tape((0.05,) * 5000)
+        assert len(t.lag_samples) <= 256
+
+    def test_since_is_measured_on_one_clock(self):
+        """`feed_ms` spans the exchange's clock and this one;
+        `since_ms` starts and stops here, so a drifting container
+        cannot move it."""
+        r = self._tape((0.05,), seen=0.25).lag()
+        assert r["since_ms"] == pytest.approx(250.0, abs=60.0)
+
+    def test_the_two_clock_caveat_is_carried_not_buried(self):
+        """A lag figure nobody can interrogate is worse than none,
+        because it gets believed."""
+        r = self._tape((0.05,)).lag()
+        assert "clock" in r["why"].lower()
+
+    @staticmethod
+    def _print_rec(ts, px=7200.0, sz=3):
+        """One Databento trade record, as the tape expects it."""
+        o = type("R", (), {})()
+        o.ts_event = int(ts * 1e9)
+        o.sequence, o.instrument_id = 1, 42
+        o.action, o.side = "T", "B"
+        o.price, o.size = int(px * 1e9), sz
+        lv = []
+        for k in range(2):
+            L = type("L", (), {})()
+            L.bid_px, L.bid_sz, L.bid_ct = int((px - k * 0.25) * 1e9), 10, 1
+            L.ask_px, L.ask_sz, L.ask_ct = int((px + k * 0.25) * 1e9), 10, 1
+            lv.append(L)
+        o.levels = lv
+        return o
+
+    def test_a_real_print_lands_a_sample(self):
+        """EXECUTED, NOT SCANNED. This read the source for
+        `lag_samples.append` near `self.trades += 1`, and wrapping
+        that line in `if False:` left the text exactly where the
+        test was looking. The append has to actually happen."""
+        import time
+        from liqmap.cme_tape import Tape
+        t = Tape()
+        before = len(t.lag_samples)
+        t.offer(self._print_rec(time.time() - 0.080))
+        assert len(t.lag_samples) > before, \
+            "a print arrived and no lag sample was taken"
+        r = t.lag()
+        assert r["n"] >= 1
+        assert r["feed_ms"] == pytest.approx(80.0, abs=50.0), \
+            "the sample is not the exchange-stamp-to-arrival gap"
+        assert r["since_ms"] is not None, "last_seen was never set"
+
+    def test_the_sample_is_taken_at_ingest_not_on_request(self):
+        """Sampling when a route asks measures how long ago
+        somebody asked, which is a number about the browser."""
+        import time
+        from liqmap.cme_tape import Tape
+        t = Tape()
+        t.offer(self._print_rec(time.time() - 0.080))
+        first = t.lag()["n"]
+        for _ in range(5):
+            t.lag()
+        assert t.lag()["n"] == first, \
+            "asking for the reading added samples to it"
+
+    def test_the_panel_carries_it_on_every_path(self, client,
+                                                monkeypatch):
+        """INCLUDING THE ENGINE-NOT-RUNNING PATH. That is exactly
+        when you most want to know the feed is dead, and it is the
+        path that has shipped a short payload four times."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        lag = (jr.get("fusedgate") or {}).get("lag")
+        assert lag is not None, "the panel has no lag reading at all"
+        for k in ("feed_ms", "since_ms", "n"):
+            assert k in lag, f"lag is missing {k}"
+
+    def test_the_panel_draws_all_three(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "up", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "lag": {"feed_ms": 51.0, "since_ms": 120.0,
+                               "n": 256, "why": "two clocks"}})
+        assert "behind the exchange by" in html
+        assert "51 ms" in html
+        assert "120 ms" in html
+        assert "256 prints" in html
+        assert "two clocks" in html, \
+            "the caveat is not on screen beside the number"
+
+    def test_the_panel_says_when_there_is_no_reading(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "up", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "lag": {"feed_ms": None, "since_ms": None,
+                               "n": 0, "why": "no tape is running"}})
+        assert "no lag reading" in html
+        assert "no tape is running" in html
+
+    def test_the_browser_measures_its_own_round_trip(self):
+        """THE ONLY NUMBER WITH ONE CLOCK IN IT END TO END. It
+        starts and stops in the browser, so whatever it says, no
+        other machine's clock is involved."""
+        src = (SRC / "web.py").read_text()
+        assert "_readRtt" in src, "no round trip is measured"
+        assert "performance.now" in src, \
+            "the round trip is measured with a wall clock"
+        i = src.index("let _readRtt")
+        seg = src[i:i + 700]
+        assert "performance.now" in seg
+        # THE ASSIGNMENT INSIDE THE TRY, NOT THE DECLARATION.
+        # `_readRtt =` matched `let _readRtt = null` and the test
+        # passed with the measurement deleted.
+        assert "await loadRead(); _readRtt =" in seg, \
+            "the round trip is declared but never measured"
+
+    def test_the_building_path_carries_it_too(self):
+        """SOURCE, because the fused engine does not run under the
+        test client -- every live read here comes back through
+        `_nothing`, so dropping the lag from the path that DOES
+        have a bar is invisible to the live payload. It survived a
+        mutation run until this existed."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert fn.count("_tape_lag(rt_)") >= 2, \
+            "only one of the two payload paths carries the lag"
+
+    def test_it_decides_nothing(self):
+        """A MEASUREMENT, NOT A GATE. Nothing is blocked or opened
+        on how old the reading is -- that would be a rule nobody
+        asked for, bolted onto a number added to answer a
+        question."""
+        import inspect
+        for fn in (fr.entry_side, fr.exit_reason):
+            ps = inspect.signature(fn).parameters
+            for bad in ("lag", "feed_ms", "since_ms", "age"):
+                assert bad not in ps, f"{fn.__name__} reads {bad}"
