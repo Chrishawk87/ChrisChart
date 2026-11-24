@@ -7559,6 +7559,7 @@ def create_app() -> FastAPI:
         reading rather than the reading alone -- one computation,
         so the panel and the rule cannot disagree.
         """
+        from . import fusedcall as _fcall
         from . import fusedread as _fr
         from .fusedbar import DEFAULT_PAIR, PAIRS, label
         # IMPORTED HERE, not reached for through the enclosing
@@ -7700,6 +7701,9 @@ def create_app() -> FastAPI:
                     "say": why, "held": {},
                     "reach": {}, "summary": {},
                     "lag": _tape_lag(rt_),
+                    "call": {"side": "", "score": 0.0, "rows": [],
+                             "speaking": 0, "of": 0,
+                             "say": why, "decides": False},
                     "tf": {"dir": "", "on": bool(tf_s),
                            "name": _tf_name, "agrees": False,
                            "ticks": bool(int(tf_s or 0) < 0),
@@ -7773,6 +7777,26 @@ def create_app() -> FastAPI:
             # read "bounce", which is what makes the switch a
             # single place rather than a flag checked twice.
             bounce_on=bool(bounce_on))
+        # THE READER, OVER THE PANEL THAT WAS JUST BUILT.
+        #
+        # Chris: "a agent that can read the fused bar section like
+        # a human only whats there ... make a calculated decision
+        # while reading actual price plus what the fused bar
+        # section is saying at the same time".
+        #
+        # IT IS HANDED THE PANEL'S OWN PAYLOAD, not a second
+        # reading of the same bar. A reader that fetched its own
+        # copy would eventually disagree with the panel beside it,
+        # which is how the 5-minute cell and the OFI bar each came
+        # to contradict the rule they were drawn next to.
+        try:
+            out["call"] = _fcall.read(out, price=float(
+                getattr(cur, "close", 0.0) or 0.0))
+        except Exception as exc:                        # noqa: BLE001
+            out["call"] = {"side": "", "score": 0.0, "rows": [],
+                           "say": f"{type(exc).__name__}",
+                           "decides": False}
+
         # THE TWO LEG MEMORIES RIDE HOME BESIDE EVERYTHING ELSE.
         # `state` builds `held` and never sees these -- they are
         # the caller's, computed here from the live bar -- so they
@@ -17855,6 +17879,37 @@ function paintFusedGate(FG) {
           + 'price has not travelled '
           + Number((FG.turning || {}).band || 0).toFixed(0)
           + ' ticks off this candle&rsquo;s open</div>')
+    /* THE READER'S CALL. Chris: "a agent that can read the fused
+       bar section like a human only whats there ... make a
+       calculated decision while reading actual price plus what the
+       fused bar section is saying at the same time".
+
+       IT WEIGHS, THE RULE GATES, and the panel has to make that
+       obvious or the two numbers beside each other read as one
+       disagreeing with itself. It says SHOWN ONLY on every call
+       it makes, because a panel claiming a rule nobody is running
+       has cost him a day already. */
+    + ((FG.call && (FG.call.side || FG.call.say))
+        ? '<div class="thin" style="margin-top:4px">'
+          + (FG.call.side
+              ? '<b class="' + (FG.call.side === 'up' ? 'long' : 'short')
+                + '">READS ' + esc(FG.call.side).toUpperCase() + '</b> '
+                + Math.round(Math.abs(Number(FG.call.score || 0)) * 100)
+                + '% &middot; '
+              : '<b style="color:var(--dim)">NO CALL</b> ')
+          + esc(FG.call.say || '')
+          + ' <span style="opacity:.6">&mdash; '
+          + Number(FG.call.speaking || 0).toFixed(0) + ' of '
+          + Number(FG.call.of || 0).toFixed(0) + ' rows speaking, '
+          + '<b>shown only</b>, it opens and closes nothing</span>'
+          + (FG.call.ahead_of_rule
+              ? '<div class="thin" style="opacity:.75">it is ahead of '
+                + 'the rule &mdash; the rule waits for the bar to '
+                + 'settle and the agreement to hold 5s, this does '
+                + 'not</div>'
+              : '')
+          + '</div>'
+        : '')
     /* HOW OLD THIS READING IS. Chris: "the move has already
        happened on iron beam by the time it shows up on chris
        chart". Three numbers, and the panel says which of them can
