@@ -327,6 +327,74 @@ TICK = 0.25
 TURN_CHOICES = (2, 4, 6, 8, 12, 16, 24)
 
 
+def body_share(open_px: float, high: float, low: float,
+               close: float) -> float:
+    """How much of the bar is body rather than wick, 0 to 1.
+
+    Chris: "the direction shows but its strength dont -- is the
+    move strong or just a micro pull back or whatever". A bar that
+    closed near one end of its own range committed to a direction;
+    a small body between two long wicks went nowhere however
+    certain its direction label looks.
+
+    AGAINST THE BAR'S OWN RANGE, so it means the same thing on a
+    1-minute candle and a 3,500-tick bar. Nothing outside the bar
+    enters it.
+
+    NO RANGE, NO READING. A bar whose prints have all landed on one
+    price has no shape to measure, and 0.0 there is the truth
+    rather than a placeholder -- it has no body because it has
+    nothing at all.
+    """
+    try:
+        o, h = float(open_px or 0.0), float(high or 0.0)
+        lo, c = float(low or 0.0), float(close or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    span = h - lo
+    if span <= EPS:
+        return 0.0
+    return max(0.0, min(1.0, abs(c - o) / span))
+
+
+def leg_travel(close: float, direction: str,
+               prev: dict | None = None,
+               tick: float = TICK) -> dict:
+    """How far a direction has carried since it last changed.
+
+    Returns {"dir", "from_px", "ticks"}. The companion to
+    `body_share`: one says whether this BAR has conviction, the
+    other says how far the current MOVE has run. Chris asked for
+    both, as two numbers.
+
+    SIGNED ALONG THE LEG AND FLOORED AT ZERO. A move that has
+    given everything back has carried nothing; counting the
+    distance it travelled the wrong way as strength is the
+    opposite of the question.
+    """
+    prev = prev or {}
+    try:
+        c = float(close or 0.0)
+        t = float(tick or TICK) or TICK
+    except (TypeError, ValueError):
+        return {"dir": "", "from_px": 0.0, "ticks": 0.0}
+    d = str(direction or "")
+    was = str(prev.get("dir") or "")
+    try:
+        frm = float(prev.get("from_px"))
+    except (TypeError, ValueError):
+        frm = c
+    if d != was or d not in SIDES:
+        frm = c
+    if d == "up":
+        n = max(0.0, c - frm) / t
+    elif d == "down":
+        n = max(0.0, frm - c) / t
+    else:
+        n = 0.0
+    return {"dir": d, "from_px": frm, "ticks": round(n, 1)}
+
+
 def turn_state(close: float, band_ticks: float = TURN_TICKS,
                prev: dict | None = None,
                open_px: float = 0.0, bar_ts: float = 0.0,
@@ -362,17 +430,35 @@ def turn_state(close: float, band_ticks: float = TURN_TICKS,
         band_t = max(0.0, float(band_ticks or 0.0)) * t
         ts = float(bar_ts or 0.0)
     except (TypeError, ValueError):
-        return {"dir": "", "ticks_off": 0.0, "hi": 0.0, "lo": 0.0,
-                "bar_ts": 0.0}
+        # EVERY KEY THE GOOD PATH RETURNS. A short dict here does
+        # not fail quietly -- the payload reads it by name and
+        # raises KeyError inside a route whose exceptions are
+        # swallowed into `journal.error`, where nothing is looking.
+        return {"dir": "", "ticks_off": 0.0, "travel": 0.0,
+                "from_px": 0.0, "hi": 0.0, "lo": 0.0, "bar_ts": 0.0}
 
-    # A NEW BAR WIPES IT. Also the first reading ever, where there
-    # is no previous extreme to carry: `hi`/`lo` missing is not
-    # zero, it is "nothing has been seen yet", and treating it as
-    # zero would put the low at zero and never flip again.
+    # A NEW BAR RESTARTS THE REFERENCE BUT NOT THE DIRECTION.
+    #
+    # It used to blank the direction as well -- Chris had asked
+    # for "Start blank each candle" -- and then, having watched
+    # it: "turning and the 2 time frames goes blank before
+    # deciding instead of just rolling into the direction". A row
+    # that goes silent reads as broken, and the silence was
+    # telling him nothing he did not already know.
+    #
+    # SO THE EXTREMES RESET TO THE NEW OPEN AND THE DIRECTION
+    # CARRIES. It stays an intrabar reading -- the band is still
+    # measured inside this candle -- and the row never goes blank
+    # once it has said anything at all.
+    #
+    # `hi`/`lo` MISSING IS NOT ZERO. It is "nothing has been seen
+    # yet", and treating it as zero would put the low at zero and
+    # the row would never flip again.
     fresh = bool(float(prev.get("bar_ts") or 0.0) != ts
                  or prev.get("hi") is None or prev.get("lo") is None)
     if fresh:
-        d, hi, lo = "", (o or c), (o or c)
+        d = str(prev.get("dir") or "")
+        hi = lo = (o or c)
     else:
         d = str(prev.get("dir") or "")
         try:
@@ -380,23 +466,30 @@ def turn_state(close: float, band_ticks: float = TURN_TICKS,
             lo = float(prev.get("lo"))
         except (TypeError, ValueError):
             d, hi, lo = "", c, c
+    # WHERE THIS LEG STARTED. Carried through a new bar with the
+    # direction, because the leg did not end just because the
+    # candle did -- that is the whole point of not blanking.
+    try:
+        frm = float(prev.get("from_px"))
+    except (TypeError, ValueError):
+        frm = o or c
 
     if d == "up":
         if c >= hi:
             hi = c                       # the extreme travels
         elif band_t > 0.0 and (hi - c) >= band_t:
-            d, lo = "down", c            # and hands over
+            d, lo, frm = "down", c, c    # and hands over
     elif d == "down":
         if c <= lo:
             lo = c
         elif band_t > 0.0 and (c - lo) >= band_t:
-            d, hi = "up", c
+            d, hi, frm = "up", c, c
     else:
         hi, lo = max(hi, c), min(lo, c)
         if band_t > 0.0 and (c - lo) >= band_t:
-            d, hi = "up", c
+            d, hi, frm = "up", c, c
         elif band_t > 0.0 and (hi - c) >= band_t:
-            d, lo = "down", c
+            d, lo, frm = "down", c, c
 
     if d == "up":
         off = max(0.0, hi - c) / t
@@ -404,7 +497,25 @@ def turn_state(close: float, band_ticks: float = TURN_TICKS,
         off = max(0.0, c - lo) / t
     else:
         off = 0.0
+    # HOW FAR THIS LEG HAS CARRIED, in ticks from where it turned.
+    # Chris: "the direction shows but its strength dont -- is the
+    # move strong or just a micro pull back". `ticks_off` is the
+    # countdown to the next flip; this is the size of the move
+    # that is running, and they are different questions.
+    # SIGNED ALONG THE LEG, NOT AN ABSOLUTE DISTANCE. `abs()` here
+    # read 1 tick of progress on an UP leg that had fallen a tick
+    # BELOW where it turned -- a move going the wrong way counted
+    # as strength, which is the opposite of the question being
+    # asked. Floored at zero: a leg that has given everything back
+    # has carried nothing.
+    if d == "up":
+        travel = max(0.0, c - frm) / t
+    elif d == "down":
+        travel = max(0.0, frm - c) / t
+    else:
+        travel = 0.0
     return {"dir": d, "ticks_off": round(off, 1),
+            "travel": round(travel, 1), "from_px": frm,
             "hi": hi, "lo": lo, "bar_ts": ts}
 
 
@@ -710,6 +821,12 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         "turning": {
             "dir": turn["dir"],
             "ticks_off": turn["ticks_off"],
+            # HOW FAR THIS LEG HAS CARRIED. `ticks_off` counts
+            # down to the next flip; this counts up from the last
+            # one. A row showing only the first says a turn is
+            # near without ever saying whether what it would be
+            # turning out of was worth anything.
+            "travel": turn["travel"],
             "band": float(turn_band),
             "decides": False,
         },
@@ -940,7 +1057,15 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           # for the other, and deciding that by looking at the last
           # character of a name is a rule nobody can see. ON THE
           # END, like everything else added to this signature.
-          tf_ticks: bool = False, tf2_ticks: bool = False) -> dict:
+          tf_ticks: bool = False, tf2_ticks: bool = False,
+          # STRENGTH, BESIDE EACH DIRECTION. Chris: "the direction
+          # shows but its strength dont is the move strong or just
+          # a micro pull back or whatever" -- and, asked what it
+          # should measure, "Both, as two numbers". Computed by the
+          # caller from the live bar and passed in, because this
+          # module never fetches anything. ON THE END.
+          tf_body: float = 0.0, tf_travel: float = 0.0,
+          tf2_body: float = 0.0, tf2_travel: float = 0.0) -> dict:
     """The reading and the rule's verdict on it, from one place.
 
     ONE READING, NOT TWO. The panel is handed what the rule decided
@@ -949,6 +1074,23 @@ def state(ofi_dir: str = "", tick_dir: str = "",
     with the rule beside it, and that has happened here with the
     5-minute cell and with the OFI bar already.
     """
+    # THE FILTERS ARE HELD THROUGH A TIE, like every other
+    # direction in this engine.
+    #
+    # They were the only readings without a hold. A live candle
+    # sits exactly on its open constantly -- `_candle_now` returns
+    # "flat" for it -- and `entry_side` reads anything that is not
+    # a side as a refusal, so the filter blanked and blocked the
+    # entry every time price touched the open, and again at every
+    # new candle. Chris: "the 2 time frames goes blank before
+    # deciding instead of just rolling into the direction".
+    #
+    # `hold_dir` ONLY FILLS A BLANK. The moment the candle has a
+    # body of its own it takes over, so this bridges the gap
+    # rather than carrying a dead candle's opinion forward.
+    _p = prev or {}
+    tf_dir = hold_dir(str(tf_dir or ""), str(_p.get("tf_dir") or ""))
+    tf2_dir = hold_dir(str(tf2_dir or ""), str(_p.get("tf2_dir") or ""))
     out = read(ofi_dir=ofi_dir, tick_dir=tick_dir, open_px=open_px,
                high=high, low=low, close=close, net_ofi=net_ofi,
                ofi_target=ofi_target, prints=prints,
@@ -964,6 +1106,13 @@ def state(ofi_dir: str = "", tick_dir: str = "",
     ready = not (held_s is not None and min_hold_s > 0
                  and held_s < min_hold_s)
     return {**out,
+            # THE FILTERS' HELD DIRECTIONS RIDE HOME TOO. Dropped
+            # from here they do not error -- the hold silently
+            # resets on every poll and the rows blank again,
+            # exactly the bug this fixes, with nothing to show for
+            # it but a filter that refuses entries at random.
+            "held": {**(out.get("held") or {}),
+                     "tf_dir": tf_dir, "tf2_dir": tf2_dir},
             "entry": side,
             "why": why,
             "held_s": (None if held_s is None else float(held_s)),
@@ -976,6 +1125,12 @@ def state(ofi_dir: str = "", tick_dir: str = "",
             "tf": {"dir": str(tf_dir or ""), "on": bool(tf_on),
                    "name": str(tf_name or ""),
                    "ticks": bool(tf_ticks),
+                   # IS THE MOVE STRONG, OR A MICRO PULLBACK. Two
+                   # numbers because they answer two questions:
+                   # how much of THIS BAR is body, and how far the
+                   # MOVE has carried since it turned.
+                   "body": round(float(tf_body or 0.0), 3),
+                   "travel": round(float(tf_travel or 0.0), 1),
                    "agrees": bool(tf_dir in SIDES
                                   and tf_dir == out["side"]),
                    # HOW LONG THIS CANDLE HAS LEFT. Chris: "a
@@ -991,6 +1146,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
             "tf2": {"dir": str(tf2_dir or ""), "on": bool(tf2_on),
                     "name": str(tf2_name or ""),
                     "ticks": bool(tf2_ticks),
+                    "body": round(float(tf2_body or 0.0), 3),
+                    "travel": round(float(tf2_travel or 0.0), 1),
                     "agrees": bool(tf2_dir in SIDES
                                    and tf2_dir == out["side"]),
                     # ONE COUNTDOWN, ON THE FIRST TIMEFRAME. His

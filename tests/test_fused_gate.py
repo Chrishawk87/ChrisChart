@@ -1737,7 +1737,8 @@ class TestTheTimeframeFilter:
                       high=20.0, low=0.0, close=20.0, held_s=9.0,
                       tf_dir="up", tf_on=True, tf_name="15m", **FULL)
         assert on["tf"] == {"dir": "up", "on": True, "name": "15m",
-                            "ticks": False, "agrees": True,
+                            "ticks": False, "body": 0.0,
+                            "travel": 0.0, "agrees": True,
                             "left_s": None, "decides": True}
         assert on["entry"] == "up"
 
@@ -1847,9 +1848,15 @@ class TestTheTimeframeFilterIsWiredThrough:
         src = self._web()
         i = src.index("def _fused_gate(")
         fn = src[i:src.index("\n    def ", i + 10)]
-        assert fn.index("_tf_dir, _tf_name, _tf_left = ") \
+        assert fn.index("_tf_dir, _tf_name, _tf_left") \
             < fn.index("def _nothing("), \
             "the closure is defined before the name it reads"
+        # AND THE STRENGTH NUMBERS TOO. `_nothing` carries `body`
+        # and `travel` now, and `_strength` is another closure
+        # defined in the same stretch -- the same shape, one
+        # revision later.
+        assert fn.index("def _strength(") < fn.index("def _nothing("), \
+            "the strength helper is defined after the path that reads it"
 
     def test_the_exit_is_handed_the_filter(self):
         blk = self._step()
@@ -2659,26 +2666,44 @@ class TestTheTurningRow:
             seen.append(st["ticks_off"])
         assert seen == [1.0, 2.0, 3.0]
 
-    def test_it_starts_blank_at_every_new_candle(self):
-        """Asked what this should do when a new fused candle
-        prints, Chris chose "Start blank each candle": the
-        reference resets to the new open and the row names no
-        direction until price has travelled the band off it."""
+    def test_a_new_candle_restarts_the_reference_not_the_direction(
+            self):
+        """IT USED TO BLANK, AND HE TOOK THAT BACK.
+
+        Asked what the row should do at a new fused candle, Chris
+        first chose "Start blank each candle". Having watched it:
+        "turning and the 2 time frames goes blank before deciding
+        instead of just rolling into the direction". A row that
+        goes silent reads as broken, and the silence told him
+        nothing he did not already know.
+
+        SO THE EXTREMES RESET AND THE DIRECTION CARRIES. It stays
+        an intrabar reading -- the band is still measured inside
+        this candle -- and the row never blanks once it has said
+        anything at all.
+        """
         st = {}
         for c in (7180.25, 7180.50, 7180.75, 7181.00):
             st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
         assert st["dir"] == "up"
         fresh = fr.turn_state(7181.00, 4.0, st, open_px=7181.00,
                               bar_ts=2.0)
-        assert fresh["dir"] == "", \
-            "a direction was carried into a bar that has not happened"
-        assert fresh["ticks_off"] == 0.0
-        # And it finds one again off the NEW open, not the old high.
-        st2 = fresh
-        for c in (7181.25, 7181.50, 7181.75, 7182.00):
-            st2 = fr.turn_state(c, 4.0, st2, open_px=7181.00,
-                                bar_ts=2.0)
-        assert st2["dir"] == "up"
+        assert fresh["dir"] == "up", "the row blanked at a new candle"
+        # THE REFERENCE DID RESET. Four ticks below the NEW open
+        # flips it; four ticks below the old high would not have.
+        assert fresh["hi"] == pytest.approx(7181.00)
+        flipped = fresh
+        for c in (7180.75, 7180.50, 7180.25, 7180.00):
+            flipped = fr.turn_state(c, 4.0, flipped,
+                                    open_px=7181.00, bar_ts=2.0)
+        assert flipped["dir"] == "down"
+
+    def test_it_is_blank_only_before_it_has_ever_decided(self):
+        """The one blank that is honest: nothing has been seen
+        yet, so there is no direction to carry."""
+        first = fr.turn_state(7180.25, 4.0, None, open_px=7180.0,
+                              bar_ts=1.0)
+        assert first["dir"] == ""
 
     def test_the_first_direction_comes_off_whichever_end_it_left(self):
         """BOTH EXTREMES ARE TRACKED WHILE IT IS BLANK, so a drift
@@ -3338,3 +3363,277 @@ class TestTickBarsAsFilters:
         assert (fg.get("tf") or {}).get("name") == "233t"
         assert (fg.get("tf2") or {}).get("ticks") is False
         assert (fg.get("tf2") or {}).get("name") == "15m"
+
+
+class TestNothingGoesBlank:
+    """Chris, after running it: "turning and the 2 time frames
+    goes blank before deciding instead of just rolling into the
+    direction".
+
+    THE FILTERS WERE THE ONLY READINGS IN THE ENGINE WITHOUT A
+    HOLD. The stack's timeframe candle has one, both two-tick legs
+    have one; these two did not. A live candle sits exactly on its
+    open constantly -- `_candle_now` returns "flat" there -- and
+    `entry_side` reads anything that is not a side as a refusal,
+    so the filter blanked and blocked the entry every time price
+    touched the open, and again at every new candle.
+    """
+
+    FULL_BAR = dict(open_px=20.0, high=21.0, low=19.0, close=21.0)
+
+    def _run(self, raws, **kw):
+        prev, out = None, []
+        for raw in raws:
+            o = fr.state(ofi_dir="up", tick_dir="up", held_s=9.0,
+                         tf_dir=raw, tf_on=True, tf_name="5m",
+                         prev=prev, **self.FULL_BAR, **FULL, **kw)
+            prev = o["held"]
+            out.append((o["tf"]["dir"], o["entry"]))
+        return out
+
+    def test_a_flat_candle_no_longer_blocks_the_entry(self):
+        """THE BUG, AS HE SAW IT. "flat" is what a candle sitting
+        on its open reads as, and it used to refuse."""
+        got = self._run(["up", "flat", "", "up"])
+        assert [d for d, _ in got] == ["up"] * 4, \
+            "the filter blanked on a tie"
+        assert [e for _, e in got] == ["up"] * 4, \
+            "a blank filter refused the entry"
+
+    def test_a_real_turn_still_takes_over_immediately(self):
+        """`hold_dir` ONLY FILLS A BLANK. The moment the candle
+        has a body of its own it takes over -- this bridges a gap,
+        it does not carry a dead candle's opinion forward."""
+        got = self._run(["up", "flat", "down"])
+        assert got[-1][0] == "down"
+        assert got[-1][1] == "", "a filter against the side opened a trade"
+
+    def test_the_second_filter_holds_on_its_own(self):
+        """TWO FILTERS, TWO MEMORIES. Sharing one would make the
+        pair agree by construction, which is the opposite of what
+        a second filter is for."""
+        prev, seen = None, []
+        for a, b in (("up", "down"), ("flat", "flat"), ("", "")):
+            o = fr.state(ofi_dir="up", tick_dir="up", held_s=9.0,
+                         tf_dir=a, tf_on=True, tf_name="5m",
+                         tf2_dir=b, tf2_on=True, tf2_name="15m",
+                         prev=prev, **self.FULL_BAR, **FULL)
+            prev = o["held"]
+            seen.append((o["tf"]["dir"], o["tf2"]["dir"]))
+        assert seen == [("up", "down")] * 3
+
+    def test_the_held_filters_ride_home(self):
+        """Dropped from `held` they do not error -- the hold
+        silently resets on every poll and the rows blank again,
+        with nothing to show for it but a filter that refuses
+        entries at random."""
+        o = fr.state(ofi_dir="up", tick_dir="up", held_s=9.0,
+                     tf_dir="up", tf_on=True, tf2_dir="down",
+                     tf2_on=True, **self.FULL_BAR, **FULL)
+        assert o["held"]["tf_dir"] == "up"
+        assert o["held"]["tf2_dir"] == "down"
+
+    def test_without_the_memory_it_blanks_again(self):
+        """The failure mode stated directly."""
+        got = [fr.state(ofi_dir="up", tick_dir="up", held_s=9.0,
+                        tf_dir=raw, tf_on=True, tf_name="5m",
+                        prev=None, **self.FULL_BAR, **FULL)["tf"]["dir"]
+               for raw in ("up", "flat", "")]
+        assert got == ["up", "", ""], "this test no longer tests that"
+
+
+class TestStrength:
+    """Chris: "the direction shows but its strength dont is the
+    move strong or just a micro pull back or whatever" -- and,
+    asked what it should measure, "Both, as two numbers"."""
+
+    def test_body_share_is_body_against_the_bars_own_range(self):
+        # A close at one end of the range: half the bar is body.
+        assert fr.body_share(20.0, 21.0, 19.0, 21.0) == pytest.approx(0.5)
+        # A tiny body between two long wicks: it went nowhere.
+        assert fr.body_share(20.0, 21.0, 19.0, 20.1) == pytest.approx(0.05)
+        # A bar with no range has no shape to measure.
+        assert fr.body_share(20.0, 20.0, 20.0, 20.0) == 0.0
+        # A CLOSE OUTSIDE THE BAR'S OWN RANGE. It should not
+        # happen and it does, because the high and the low are
+        # read a moment apart from the close on a live bar. Two
+        # and a half times the range has to come back as a full
+        # body, not 250% of one.
+        assert fr.body_share(20.0, 21.0, 19.0, 25.0) == 1.0
+        assert fr.body_share(20.0, 21.0, 19.0, 15.0) == 1.0
+        # And it never leaves 0..1, whatever arrives.
+        for args in ((20.0, 19.0, 21.0, 25.0), (0, 0, 0, 0),
+                     ("a", "b", "c", "d"), (None, None, None, None)):
+            v = fr.body_share(*args)
+            assert 0.0 <= v <= 1.0
+
+    def test_body_share_is_scale_free(self):
+        """AGAINST THE BAR'S OWN RANGE, so it means the same thing
+        on a 1-minute candle and a 3,500-tick bar."""
+        small = fr.body_share(20.0, 20.5, 19.5, 20.5)
+        big = fr.body_share(7000.0, 7050.0, 6950.0, 7050.0)
+        assert small == pytest.approx(big)
+
+    def test_travel_counts_up_from_the_last_flip(self):
+        st, seen = {}, []
+        for c, d in ((20.0, "up"), (20.5, "up"), (21.0, "up")):
+            st = fr.leg_travel(c, d, st)
+            seen.append(st["ticks"])
+        assert seen == [0.0, 2.0, 4.0]
+
+    def test_a_flip_restarts_the_travel(self):
+        st = {}
+        for c, d in ((20.0, "up"), (21.0, "up")):
+            st = fr.leg_travel(c, d, st)
+        assert st["ticks"] == 4.0
+        st = fr.leg_travel(20.75, "down", st)
+        assert st["ticks"] == 0.0, "the new leg inherited the old one"
+        st = fr.leg_travel(20.0, "down", st)
+        assert st["ticks"] == 3.0
+
+    def test_travel_is_signed_along_the_leg(self):
+        """A MOVE GOING THE WRONG WAY IS NOT STRENGTH. An absolute
+        distance read a tick of progress on an UP leg that had
+        fallen a tick BELOW where it turned."""
+        st = fr.leg_travel(20.0, "up", {})
+        st = fr.leg_travel(19.75, "up", st)
+        assert st["ticks"] == 0.0
+        st = fr.leg_travel(19.0, "up", st)
+        assert st["ticks"] == 0.0
+
+    def test_the_turning_rows_travel_is_signed_too(self):
+        """THE SAME ARITHMETIC IN THE SAME MODULE, TWICE. An
+        absolute distance here read progress on an UP leg that had
+        fallen below where it turned -- and `leg_travel` being
+        correct says nothing about this one."""
+        st = {}
+        for c in (7180.25, 7180.50, 7180.75, 7181.00):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+        assert st["dir"] == "up"
+        back = fr.turn_state(7180.75, 4.0, st, open_px=7180.0,
+                             bar_ts=1.0)
+        assert back["dir"] == "up"
+        assert back["travel"] == 0.0, \
+            "a move going the wrong way counted as strength"
+
+    def test_the_turning_row_carries_its_legs_size(self):
+        """`ticks_off` COUNTS DOWN TO THE NEXT FLIP, travel counts
+        up from the last one. A row showing only the first says a
+        turn is near without saying whether what it would be
+        turning out of was worth anything."""
+        st = {}
+        for c in (7180.25, 7180.50, 7180.75, 7181.00, 7182.00):
+            st = fr.turn_state(c, 4.0, st, open_px=7180.0, bar_ts=1.0)
+        assert st["dir"] == "up"
+        assert st["travel"] == 4.0
+        assert st["ticks_off"] == 0.0
+        out = fr.read(ofi_dir="up", tick_dir="up", open_px=7180.0,
+                      high=7182.0, low=7180.0, close=7182.0,
+                      bar_ts=1.0, **FULL)
+        assert "travel" in out["turning"]
+
+    def test_both_numbers_reach_the_filter_rows(self):
+        o = fr.state(ofi_dir="up", tick_dir="up", open_px=20.0,
+                     high=21.0, low=19.0, close=21.0, held_s=9.0,
+                     tf_dir="up", tf_on=True, tf_body=0.5,
+                     tf_travel=12.0, tf2_dir="up", tf2_on=True,
+                     tf2_body=0.05, tf2_travel=1.0, **FULL)
+        assert o["tf"]["body"] == pytest.approx(0.5)
+        assert o["tf"]["travel"] == pytest.approx(12.0)
+        assert o["tf2"]["body"] == pytest.approx(0.05)
+        assert o["tf2"]["travel"] == pytest.approx(1.0)
+
+    def test_the_strength_is_measured_on_the_held_direction(self):
+        """NOT THE RAW ONE. A live candle sits on its open
+        constantly; measuring the leg off a reading that blanks
+        there would restart the move's length on an absence --
+        the same mistake the blanking filter was making one level
+        up."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _strength(")
+        fn = src[i:src.index("\n        _tf_body", i)]
+        assert "hold_dir(" in fn, "the leg is measured off a raw reading"
+        assert "leg_travel(" in fn and "body_share(" in fn
+
+    def test_the_computed_numbers_reach_the_rule(self):
+        """SOURCE, FOR THE REASON WRITTEN IN THE SIGN TEST ABOVE:
+        the fused engine does not run under the test client, so
+        every live read comes back through `_nothing`, which
+        supplies its own zeros. Hard-coding zeros at the call site
+        is therefore invisible to the live payload -- and it
+        survived a mutation run until this existed."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert 'tf_body=_tf_body, tf_travel=_tf_leg["ticks"],' in fn, \
+            "the first filter's strength is not the one measured"
+        assert 'tf2_body=_tf2_body, tf2_travel=_tf2_leg["ticks"],' in fn, \
+            "the second filter's strength is not the one measured"
+
+    def test_the_leg_memories_ride_home(self):
+        src = (SRC / "web.py").read_text()
+        assert 'out["held"]["tf_leg"] = _tf_leg' in src, \
+            "the travel restarts on every poll and reads 0 forever"
+        assert 'out["held"]["tf2_leg"] = _tf2_leg' in src
+
+    def test_the_panel_draws_both(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "up", "ticks_off": 1.0,
+                                   "travel": 18.0, "band": 4.0,
+                                   "decides": False},
+                       "tf": {"dir": "up", "on": True, "name": "5m",
+                              "ticks": False, "body": 0.72,
+                              "travel": 23.0, "agrees": True,
+                              "left_s": 97.0, "decides": True}})
+        assert "72% body" in html
+        assert "carried 23 ticks" in html
+        assert "this leg has carried <b>18 ticks</b>" in html
+
+    def test_a_micro_pullback_reads_as_one(self, page_js):
+        """THE QUESTION HE ASKED, ON SCREEN. Same direction, two
+        very different moves, and the panel has to tell them
+        apart."""
+        from tests.test_stack_strip import run_js
+
+        def draw(body, travel):
+            return run_js(page_js, "fusedGate",
+                          {**TestThePanelActuallyRenders.BAR,
+                           "tick_dir": "up", "ofi_dir": "up",
+                           "where": "together", "agree": True,
+                           "side": "up",
+                           "turning": {"dir": "up", "ticks_off": 0.0,
+                                       "travel": travel, "band": 4.0,
+                                       "decides": False},
+                           "tf": {"dir": "up", "on": True,
+                                  "name": "5m", "ticks": False,
+                                  "body": body, "travel": travel,
+                                  "agrees": True, "left_s": None,
+                                  "decides": True}})
+        strong, weak = draw(0.85, 40.0), draw(0.04, 1.0)
+        assert "85% body" in strong and "carried 40 ticks" in strong
+        assert "4% body" in weak and "carried 1 ticks" in weak
+        assert strong != weak
+
+    def test_the_live_panel_carries_both(self, client, monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        s = rt.journal.settings("ES")
+        s.strategy = "together"
+        s.fused_tf, s.fused_tf2 = 300, -233
+        rt.journal.save_settings(s)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        fg = jr.get("fusedgate") or {}
+        for row in ("tf", "tf2"):
+            assert "body" in (fg.get(row) or {}), f"{row} has no body"
+            assert "travel" in (fg.get(row) or {}), f"{row} has no travel"
+        assert "travel" in (fg.get("turning") or {})

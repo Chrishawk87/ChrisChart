@@ -7593,7 +7593,7 @@ def create_app() -> FastAPI:
             answers for a candle.
             """
             if not secs:
-                return "", "", None
+                return "", "", None, {}
             n = int(secs)
             nm = _wl(float(n))
             if n < 0:
@@ -7605,21 +7605,46 @@ def create_app() -> FastAPI:
                 done = t.get("prints")
                 left = (None if done is None
                         else max(0.0, float(-n) - float(done)))
-                return d, nm, left
+                return d, nm, left, t
             c = _candle_now(rt_, nm) or {}
             d = str(c.get("dir") or "")
             age = c.get("seconds")
             left = (None if age is None
                     else max(0.0, float(n) - float(age)))
-            return d, nm, left
+            return d, nm, left, c
 
-        _tf_dir, _tf_name, _tf_left = _tf_read(tf_s)
+        _tf_dir, _tf_name, _tf_left, _tf_bar = _tf_read(tf_s)
         # ONE COUNTDOWN, ON THE FIRST TIMEFRAME ONLY -- his
         # choice. The second one's clock is read and discarded
         # rather than not read at all, because `_tf_read` is one
         # function and a second spelling of it is a second chance
         # to be wrong about which candle is which.
-        _tf2_dir, _tf2_name, _ = _tf_read(tf2_s)
+        _tf2_dir, _tf2_name, _, _tf2_bar = _tf_read(tf2_s)
+
+        def _strength(bar, raw, key):
+            """How strong this filter's move is, as two numbers.
+
+            Chris: "the direction shows but its strength dont is
+            the move strong or just a micro pull back or
+            whatever", and then "Both, as two numbers".
+
+            MEASURED ON THE HELD DIRECTION, not the raw one. A
+            live candle sits on its open constantly; measuring the
+            leg off a reading that blanks there would restart the
+            move's length on an absence, which is the same mistake
+            the blanking filter was making one level up.
+            """
+            bar = bar or {}
+            held = _fr.hold_dir(str(raw or ""),
+                                str((prev or {}).get(key + "_dir") or ""))
+            body = _fr.body_share(bar.get("open"), bar.get("high"),
+                                  bar.get("low"), bar.get("close"))
+            leg = _fr.leg_travel(bar.get("close"), held,
+                                 (prev or {}).get(key + "_leg"))
+            return body, leg
+
+        _tf_body, _tf_leg = _strength(_tf_bar, _tf_dir, "tf")
+        _tf2_body, _tf2_leg = _strength(_tf2_bar, _tf2_dir, "tf2")
 
         def _nothing(key, why):
             """ONE SHAPE, WHETHER OR NOT A BAR IS BUILDING.
@@ -7636,6 +7661,7 @@ def create_app() -> FastAPI:
                     "ofi_dir": "", "tick_dir": "", "body_dir": "",
                     "run_dir": "", "run_pts": 0.0, "moving": "",
                     "turning": {"dir": "", "ticks_off": 0.0,
+                                "travel": 0.0,
                                 "band": float(_fr.TURN_TICKS
                                               if turn_ticks is None
                                               else turn_ticks),
@@ -7656,10 +7682,12 @@ def create_app() -> FastAPI:
                     "tf": {"dir": "", "on": bool(tf_s),
                            "name": _tf_name, "agrees": False,
                            "ticks": bool(int(tf_s or 0) < 0),
+                           "body": 0.0, "travel": 0.0,
                            "left_s": _tf_left, "decides": bool(tf_s)},
                     "tf2": {"dir": "", "on": bool(tf2_s),
                             "name": _tf2_name, "agrees": False,
                             "ticks": bool(int(tf2_s or 0) < 0),
+                            "body": 0.0, "travel": 0.0,
                             "left_s": None, "decides": bool(tf2_s)},
                     "held_s": None, "ready": False,
                     "min_hold_s": float(_fr.DWELL_S),
@@ -7710,6 +7738,8 @@ def create_app() -> FastAPI:
             tf2_name=_tf2_name or "15m",
             tf_ticks=bool(int(tf_s or 0) < 0),
             tf2_ticks=bool(int(tf2_s or 0) < 0),
+            tf_body=_tf_body, tf_travel=_tf_leg["ticks"],
+            tf2_body=_tf2_body, tf2_travel=_tf2_leg["ticks"],
             held_s=held_s, prev=prev,
             # THE TURNING ROW'S BAND. Resolved here rather than
             # defaulted inside the rule so that the number on the
@@ -7722,6 +7752,17 @@ def create_app() -> FastAPI:
             # read "bounce", which is what makes the switch a
             # single place rather than a flag checked twice.
             bounce_on=bool(bounce_on))
+        # THE TWO LEG MEMORIES RIDE HOME BESIDE EVERYTHING ELSE.
+        # `state` builds `held` and never sees these -- they are
+        # the caller's, computed here from the live bar -- so they
+        # are merged in rather than threaded through four more
+        # parameters. Dropped, the travel restarts on every poll
+        # and reads 0 forever.
+        try:
+            out["held"]["tf_leg"] = _tf_leg
+            out["held"]["tf2_leg"] = _tf2_leg
+        except Exception:                               # noqa: BLE001
+            pass
         return {**out, "pair": list(key), "label": label(*key),
                 "building": True, "why": "",
                 "open": float(cur.open or 0.0),
@@ -17676,6 +17717,22 @@ function paintFusedGate(FG) {
        invisible when switched off reads as one that is not there,
        and then a trade it would have blocked looks like the rule
        failing. */
+    /* HOW STRONG EACH FILTER'S MOVE IS. Chris: "the direction
+       shows but its strength dont is the move strong or just a
+       micro pull back or whatever" -- and, asked what it should
+       measure, "Both, as two numbers". Body is how much of THIS
+       bar is body rather than wick; carried is how far the move
+       has run since it turned. */
+    + ((FG.tf && FG.tf.on) || (FG.tf2 && FG.tf2.on)
+        ? '<div class="thin">'
+          + [FG.tf, FG.tf2].filter(f => f && f.on)
+              .map(f => esc(f.name || '') + ' '
+                   + Math.round(Number(f.body || 0) * 100) + '% body'
+                   + ', carried ' + Number(f.travel || 0).toFixed(0)
+                   + ' ticks')
+              .join(' &middot; ')
+          + '</div>'
+        : '')
     + ((FG.tf && FG.tf.on) || (FG.tf2 && FG.tf2.on)
         ? '<div class="thin">'
           + [FG.tf, FG.tf2].filter(f => f && f.on)
@@ -17761,6 +17818,9 @@ function paintFusedGate(FG) {
           + (FG.turning.dir === 'up' ? 'high' : 'low')
           + ', flipping at '
           + Number((FG.turning || {}).band || 0).toFixed(0)
+          + ' &middot; this leg has carried <b>'
+          + Number((FG.turning || {}).travel || 0).toFixed(0)
+          + ' ticks</b>'
           + ' &mdash; <b style="color:var(--dim)">shown only</b>, '
           + 'the rule reads the inner candle</div>'
         : '<div class="thin">turning has no direction yet &mdash; '
