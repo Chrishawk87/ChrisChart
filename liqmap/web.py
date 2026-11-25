@@ -3330,23 +3330,99 @@ def create_app() -> FastAPI:
     # rows; this makes those rows happen on time rather than when
     # someone happens to be looking.
     class _JournalStepper(threading.Thread):
-        """Steps every configured market once a second."""
+        """Steps every market when the tape moves, not when a clock does.
 
-        def __init__(self, rt_, every: float = 1.0):
+        Chris: "there is absolutely no doubt the fixes that you made
+        to my chart are all lagging behind extremely bad behind live
+        price the real fix is tracking live price not threw snap
+        shots but the API from DATABENTO".
+
+        THE FEED WAS NEVER THE SNAPSHOT. `ofi_live` opens a real
+        `db.Live()` session and every record is pushed straight into
+        `tape.offer`. The snapshot was HERE: this thread slept a
+        whole second between looks, so a print that should have
+        flipped a gate sat in the tape untouched while up to a
+        hundred more arrived on top of it. The rule was reading a
+        live feed on a timer.
+
+        SO A PRINT WAKES IT. `poke` is called from the tape's trade
+        listener and the loop waits on that rather than on the
+        clock.
+
+        TWO BOUNDS, AND BOTH MATTER.
+
+            `min_gap` is the floor. At a hundred prints a second an
+            unbounded wake would run the whole journal step a
+            hundred times a second, and a step reads builders, runs
+            the rule and writes the database. The floor turns a
+            burst into one step.
+
+            `every` is the ceiling, and it is why this still waits
+            on a timeout at all. A dead tape pokes nobody, and a
+            position with a time stop in a market that has stopped
+            printing still has to be looked at. Without the
+            timeout the one state that most needs the stepper --
+            nothing happening -- is the one it would sleep through.
+        """
+
+        def __init__(self, rt_, every: float = 1.0,
+                     min_gap: float = 0.05):
             super().__init__(daemon=True, name="journal-stepper")
             self.rt = rt_
             self.every = max(0.2, float(every))
+            self.min_gap = max(0.0, float(min_gap))
             self._stop = threading.Event()
+            self._wake = threading.Event()
             self.steps = 0
             self.errors = 0
             self.last_error = ""
             self.last_ts = 0.0
+            self.pokes = 0
+            self.woke = 0
 
         def stop(self) -> None:
             self._stop.set()
+            self._wake.set()
+
+        def _push(self, coin: str, out) -> None:
+            """Hand the step's own payload to the live socket."""
+            try:
+                hub = getattr(self.rt, "ingest_hub", None)
+                if hub is None or not getattr(hub, "connections", 0):
+                    return
+                if not isinstance(out, dict):
+                    return
+                # `_journal_step_un` RETURNS THE JOURNAL BLOCK
+                # ITSELF -- it is `/api/read` that files it under
+                # "journal" -- so this wraps it the same way the
+                # route does and the page needs one shape, not two.
+                hub.notify({"kind": "journal", "coin": str(coin),
+                            "journal": out, "ts": time.time()})
+            except Exception:                           # noqa: BLE001
+                # A SCREEN THAT DID NOT UPDATE IS NOT A REASON TO
+                # STOP MANAGING A POSITION.
+                pass
+
+        def poke(self) -> None:
+            """A print arrived. Called from the tape's thread.
+
+            NOTHING IS DONE HERE. Setting an Event is the whole
+            body on purpose -- this runs on the ingest thread, in
+            front of every other consumer of the tape, and work
+            put here is work added to the latency of the feed
+            itself.
+            """
+            self.pokes += 1
+            self._wake.set()
 
         def run(self) -> None:
-            while not self._stop.wait(self.every):
+            while not self._stop.is_set():
+                # A PRINT, OR THE CEILING. Whichever comes first.
+                if self._wake.wait(self.every):
+                    self.woke += 1
+                self._wake.clear()
+                if self._stop.is_set():
+                    break
                 try:
                     coins = self.rt.journal.coins()
                 except Exception as exc:                # noqa: BLE001
@@ -3355,9 +3431,29 @@ def create_app() -> FastAPI:
                     continue
                 for c in coins:
                     try:
-                        _journal_step(self.rt, c, {})
+                        _out = _journal_step(self.rt, c, {})
                         self.steps += 1
                         self.last_ts = time.time()
+                        # AND STRAIGHT OUT TO THE BROWSER, from the
+                        # step that just ran. The page polled
+                        # `/api/read` on its own one-second timer,
+                        # so what you looked at could be a second
+                        # older than what the rule had already
+                        # decided -- two clocks on the same
+                        # question.
+                        #
+                        # THE PAYLOAD IS NOT REBUILT. It is the one
+                        # the rule used; building a second copy for
+                        # the screen is how a panel comes to
+                        # disagree with the rule beside it, which
+                        # this file has done with the 5-minute cell
+                        # and the OFI bar already.
+                        #
+                        # ONLY WHEN SOMEONE IS LOOKING. No
+                        # connections, no frame -- a step with
+                        # nobody watching should cost what it cost
+                        # before.
+                        self._push(c, _out)
                     except Exception as exc:            # noqa: BLE001
                         # One bad market must not stop the others,
                         # and nothing here may take the service down
@@ -3366,6 +3462,14 @@ def create_app() -> FastAPI:
                         # to prevent.
                         self.errors += 1
                         self.last_error = f"{c}: {type(exc).__name__}: {exc}"
+                # THE FLOOR, AFTER THE WORK rather than before it.
+                # Sleeping first would add the gap to the latency
+                # of every step; sleeping after bounds the rate
+                # and costs the first print nothing. A poke during
+                # this sleep sets the event and the next loop runs
+                # immediately.
+                if self.min_gap and self._stop.wait(self.min_gap):
+                    break
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -3392,6 +3496,25 @@ def create_app() -> FastAPI:
             _stepper = _JournalStepper(rt, every=1.0)
             _stepper.start()
             rt.journal_stepper = _stepper
+            # THE PRINT THAT WAKES IT. Attached here, once, where
+            # the other tape listeners are wired -- registering it
+            # per request would add a listener on every poll and
+            # the feed would end up carrying hundreds of them.
+            #
+            # IT IS ALLOWED TO FAIL. A stepper on its 1s ceiling is
+            # the old behaviour, which worked; a service that will
+            # not start because a listener could not be attached
+            # is not an improvement on it.
+            try:
+                _svc0 = getattr(rt, "ofi", None)
+                _tape0 = getattr(_svc0, "tape", None) if _svc0 else None
+                if _tape0 is not None:
+                    _tape0.on_trade_exec(lambda _t: _stepper.poke())
+                    print("[liqmap] the rule steps on prints, not on a "
+                          "timer", flush=True)
+            except Exception as exc:                    # noqa: BLE001
+                print(f"[liqmap] stepper is on its timer only: {exc}",
+                      flush=True)
             print("[liqmap] journal stepper started -- the strategy "
                   "runs without a browser", flush=True)
         except Exception as exc:                        # noqa: BLE001
@@ -5710,6 +5833,7 @@ def create_app() -> FastAPI:
                              fused_tf: int | None = None,
                              fused_tf2: int | None = None,
                              fused_turn: int | None = None,
+                             foot_s: int | None = None,
                              fused_auto_s: int | None = None,
                              fused_bounce_on: bool | None = None,
                              fused_bar_exit: bool | None = None,
@@ -5767,6 +5891,8 @@ def create_app() -> FastAPI:
                 # snapping -- but each is read with its own
                 # `is None` so that sending one does not quietly
                 # clear the other two.
+                foot_s=(int(getattr(cur, "foot_s", 0) or 0)
+                        if foot_s is None else int(foot_s)),
                 fused_auto_s=(int(getattr(cur, "fused_auto_s", 0) or 0)
                               if fused_auto_s is None
                               else int(fused_auto_s)),
@@ -7597,6 +7723,178 @@ def create_app() -> FastAPI:
             pass
         return picked
 
+    # HOW LONG A FOOTPRINT BAR SHOULD AIM TO TAKE, and how far the
+    # measured rate has to move before the bar size is rebuilt.
+    _FOOT_EVERY_S = 60.0
+    _FOOT_MOVE = 0.25
+
+    def _foot_stream(rt_, target_s: float):
+        """A footprint stream of our own, closed by volume.
+
+        ITS OWN STREAM, NOT THE TAPE'S. `tape.footprint` is one
+        slot feeding the footprint panel on a time rule, and
+        changing its rule rebuilds it and drops its history --
+        Chris has already said that panel disappearing is a
+        problem. This one is attached as a trade listener and the
+        existing one is untouched.
+
+        SIZED FROM THE TAPE. Volume only goes up, so unlike the
+        fused pair there is no square root and no correction loop:
+        twice the time is twice the contracts.
+        """
+        import time as _t
+        from . import footread as _fo
+        from .footprint import VolumeRule as _VR
+        from .footprint_live import FootprintStream as _FS
+
+        held = getattr(rt_, "_foot", None) or {}
+        if not target_s:
+            return held if held.get("stream") else {}
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        if tape is None:
+            return {"why": "no tape is running"}
+
+        now = _t.time()
+        if (held.get("stream") is not None
+                and held.get("target_s") == float(target_s)
+                and now - float(held.get("at") or 0.0) < _FOOT_EVERY_S):
+            return held
+
+        # THE RATE. From this stream's own closed bars once it has
+        # some -- a measurement of the thing being sized -- and
+        # from the live one-minute candle before that.
+        rate = 0.0
+        st = held.get("stream")
+        done = list(getattr(st, "history", []) or [])[-30:] if st else []
+        spans = [(float(getattr(b, "total_volume", 0) or 0),
+                  max(0.0, float(getattr(b, "ts_close", 0) or 0)
+                      - float(getattr(b, "ts_open", 0) or 0)))
+                 for b in done]
+        spans = [(v, sec) for v, sec in spans if v > 0 and sec > 0]
+        if spans:
+            rate = (sum(v for v, _ in spans)
+                    / max(1e-9, sum(sec for _, sec in spans)))
+        else:
+            c = _candle_now(rt_, "1m") or {}
+            vol, age = _num(c.get("volume")), _num(c.get("seconds"))
+            if vol > 0 and age > 1.0:
+                rate = vol / age
+
+        want = _fo.size_for(rate, float(target_s))
+        if not want.get("ready"):
+            return {**held, "at": now, "target_s": float(target_s),
+                    "why": want.get("why") or "nothing to size from"}
+
+        n = int(want["contracts"])
+        cur_n = int(held.get("contracts") or 0)
+        if st is not None and cur_n > 0:
+            moved = abs(n - cur_n) / max(1.0, float(cur_n))
+            if moved < _FOOT_MOVE:
+                return {**held, "at": now,
+                        "why": (f"holding {cur_n:,} contracts a bar -- "
+                                f"the tape has moved {moved:.0%}, under "
+                                f"the {_FOOT_MOVE:.0%} it takes to "
+                                "rebuild")}
+        try:
+            stream = _FS(tick_size=0.25, rule=_VR(n))
+        except Exception as exc:                        # noqa: BLE001
+            return {**held, "at": now,
+                    "why": f"could not build: {type(exc).__name__}"}
+
+        # ONE LISTENER, EVER. Registering a second on every rebuild
+        # would feed every stream this session ever made, which is
+        # a leak that looks like the bar being too slow.
+        box = getattr(rt_, "_foot_box", None)
+        if box is None:
+            box = rt_._foot_box = {"stream": None}
+
+            def _feed(t):
+                s_ = box.get("stream")
+                if s_ is None:
+                    return
+                from .footprint import Tick as _FT
+                try:
+                    sz = int(round(float(t.sz)))
+                    if sz <= 0:
+                        return
+                    s_.on_tick(_FT(ts=float(t.ts), price=float(t.px),
+                                   size=sz, aggressor=t.aggressor))
+                except Exception:                       # noqa: BLE001
+                    pass
+            try:
+                tape.on_trade_exec(_feed)
+            except Exception:                           # noqa: BLE001
+                return {**held, "at": now,
+                        "why": "could not attach to the tape"}
+        box["stream"] = stream
+        out = {"stream": stream, "contracts": n, "at": now,
+               "target_s": float(target_s), "why": want.get("why") or ""}
+        try:
+            rt_._foot = out
+        except Exception:                               # noqa: BLE001
+            pass
+        return out
+
+    def _num(v, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _foot_gate(rt_, target_s: float = 0.0) -> dict:
+        """The forming footprint bar, graded.
+
+        Chris: "the bar should mark push and activity ... strong
+        is strong buy push up, if normal push just buy, sell
+        normal push down strong down if volume pushes activity".
+        """
+        from . import footread as _fo
+        base = {"on": bool(target_s), "target_s": float(target_s or 0.0),
+                "contracts": 0, "building": False, "why": "",
+                "call": "", "side": "", "grade": "", "decides": False}
+        if not target_s:
+            return {**base, "why": "off"}
+        box = _foot_stream(rt_, float(target_s))
+        st = box.get("stream")
+        if st is None:
+            return {**base, "why": box.get("why") or "not built yet"}
+        eng = getattr(st, "_engine", None)
+        cur = getattr(eng, "current", None) if eng else None
+        if cur is None or not getattr(cur, "total_volume", 0):
+            return {**base, "contracts": int(box.get("contracts") or 0),
+                    "sized": box.get("why") or "",
+                    "why": "no prints in this bar yet"}
+        try:
+            flags = cur.imbalances(st.cfg)
+        except Exception:                               # noqa: BLE001
+            flags = []
+        bi = sum(1 for f in flags if getattr(f, "side", "") == "buy")
+        si = sum(1 for f in flags if getattr(f, "side", "") == "sell")
+        done = list(getattr(st, "history", []) or [])[-30:]
+        spans = sorted(max(0.0, float(getattr(b, "ts_close", 0) or 0)
+                           - float(getattr(b, "ts_open", 0) or 0))
+                       for b in done)
+        med = (spans[len(spans) // 2] if spans else 0.0)
+        # A FORMING CANDLE'S `ts_close` IS ITS LAST PRINT. `add`
+        # sets it on every print, so it is the running end of the
+        # bar rather than the moment it closed -- which makes
+        # elapsed the same subtraction on a forming bar as on a
+        # finished one, and that is why this is not a wall clock.
+        # Reading `time.time()` here would charge the bar for
+        # however long the feed has been quiet.
+        secs = max(0.0, _num(getattr(cur, "ts_close", 0.0))
+                   - _num(getattr(cur, "ts_open", 0.0)))
+        r = _fo.read(delta=cur.delta, volume=cur.total_volume,
+                     seconds=secs, median_s=med,
+                     buy_imbalances=bi, sell_imbalances=si)
+        return {**base, "building": True,
+                "contracts": int(box.get("contracts") or 0),
+                "sized": box.get("why") or "",
+                "filled": int(cur.total_volume),
+                "bars": len(done), "levels": len(flags),
+                "why": "", **r, "decides": False}
+
     def _tape_lag(rt_) -> dict:
         """The tape's own lag reading, or why there is none.
 
@@ -8949,6 +9247,11 @@ def create_app() -> FastAPI:
         st = j.stats(coin_, strategy=strat)
         return {
             "settings": s.to_dict(),
+            # THE FOOTPRINT GATE. Volume-sized bars graded on push
+            # and activity. Shown only -- Chris asked for "a
+            # footprint gate, like the fused one", and that one was
+            # watched before it traded.
+            "footgate": _foot_gate(rt_, int(getattr(s, "foot_s", 0) or 0)),
             "agree": side, "says": says, "price": px,
             # WHAT A FILL WOULD ACTUALLY COST, beside the last
             # print, so a disagreement between them is visible
@@ -11664,6 +11967,7 @@ has to be running before the gate stops refusing.">spike
         <!-- THE FUSED GATE, ON ITS OWN AND ON EVERY STRATEGY. It
              describes the tape rather than a rule, and there is no
              rule behind it yet -- it is here to be watched. -->
+        <div id="jnlFootGate" style="margin-top:8px"></div>
         <div id="jnlFusedGate" style="display:none;margin-bottom:10px">
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:10px;
@@ -11763,6 +12067,19 @@ has to be running before the gate stops refusing.">spike
                the time and had the same high and low as a
                15-minute Ironbeam candle: "Size the pair from the
                tape". With this on, the pair above is ignored. -->
+          <label title="size the pair from this tape so a bar aims
+                        to close on BOTH legs in about this long --
+                        overrides the fixed pair beside it"
+            >footprint
+            <select id="jnlFootS" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0" selected>off</option>
+              <option value="60">~1 min bars</option>
+              <option value="120">~2 min bars</option>
+              <option value="180">~3 min bars</option>
+              <option value="300">~5 min bars</option>
+              <option value="600">~10 min bars</option>
+            </select></label>
           <label title="size the pair from this tape so a bar aims
                         to close on BOTH legs in about this long --
                         overrides the fixed pair beside it"
@@ -16869,6 +17186,7 @@ async function jnlSet() {
        appears to snap back while the save is still in flight. */
     jnlFusedTurn: $('jnlFusedTurn')
       ? String($('jnlFusedTurn').value) : undefined,
+    jnlFootS: $('jnlFootS') ? String($('jnlFootS').value) : undefined,
     jnlFusedAuto: $('jnlFusedAuto')
       ? String($('jnlFusedAuto').value) : undefined,
     jnlFBouncePct: $('jnlFBouncePct')
@@ -16902,6 +17220,7 @@ async function jnlSet() {
        give-back at all", the tightest setting rather than off.
        Off is the checkbox beside it, so no || on this line. */
     fused_bounce: $('jnlFBouncePct') ? $('jnlFBouncePct').value : 33,
+    foot_s: $('jnlFootS') ? $('jnlFootS').value : 0,
     fused_auto_s: $('jnlFusedAuto') ? $('jnlFusedAuto').value : 0,
     fused_bounce_on: ($('jnlFBounce') && $('jnlFBounce').checked)
       ? 'true' : 'false',
@@ -17810,6 +18129,51 @@ function mmss(v) {
   const t = Math.max(0, Math.round(Number(v) || 0));
   const m = Math.floor(t / 60), sec = t % 60;
   return m + ':' + (sec < 10 ? '0' : '') + sec;
+}
+
+/* THE FOOTPRINT GATE.
+
+   Chris: "what if we took a actual foot print chart and use that to
+   build actual candles", and on what the bar should say: "the bar
+   should mark push and activity ... strong is strong buy push up,
+   if normal push just buy, sell normal push down strong down if
+   volume pushes activity".
+
+   VOLUME CLOSES THE BAR, DELTA GRADES IT, and the clock is the
+   ACTIVITY reading rather than the bar length -- every bar holds
+   the same contracts, so how long it took is the only thing that
+   differs between them. Backwards from a time chart, on purpose. */
+function paintFootGate(FG) {
+  const el = $('jnlFootGate');
+  if (!el) return;
+  if (!FG || !FG.on) { el.innerHTML = ''; return; }
+  const cls = FG.side === 'up' ? 'long' : FG.side === 'down' ? 'short' : '';
+  el.innerHTML =
+    '<div class="thin" style="margin-bottom:4px"><b>THE FOOTPRINT BAR'
+    + (FG.contracts ? ' &mdash; ' + Number(FG.contracts).toLocaleString()
+                      + ' contracts' : '')
+    + '</b> &mdash; volume closes it, delta grades it, and how fast '
+    + 'it filled is the activity</div>'
+    + (FG.building
+        ? '<div>' + (FG.call
+            ? '<b class="' + cls + '">' + esc(FG.call) + '</b> '
+            : '<b style="color:var(--dim)">NO PUSH</b> ')
+          + '<span class="thin">' + esc(FG.say || '') + '</span></div>'
+          + '<div class="thin">' + Number(FG.filled || 0).toLocaleString()
+          + ' of ' + Number(FG.contracts || 0).toLocaleString()
+          + ' contracts in ' + Number(FG.seconds || 0).toFixed(0) + 's'
+          + (FG.median_s ? ' &middot; recent bars take '
+                           + Number(FG.median_s).toFixed(0) + 's' : '')
+          + ' &middot; delta ' + (Number(FG.delta || 0) > 0 ? '+' : '')
+          + Number(FG.delta || 0).toLocaleString()
+          + ' &middot; ' + Number(FG.buy_imbalances || 0).toFixed(0)
+          + ' buy / ' + Number(FG.sell_imbalances || 0).toFixed(0)
+          + ' sell imbalanced levels'
+          + ' &mdash; <b>shown only</b>, it opens and closes nothing'
+          + '</div>'
+        : '<div class="thin">' + esc(FG.why || 'not building') + '</div>')
+    + (FG.sized ? '<div class="thin" style="opacity:.6">'
+                  + esc(FG.sized) + '</div>' : '');
 }
 
 function paintFusedGate(FG) {
@@ -18724,6 +19088,8 @@ function paintJournal(d) {
     set('jnlFusedTf2', String(Math.round(S.fused_tf2)));
   if (S.fused_turn != null)
     set('jnlFusedTurn', String(Math.round(S.fused_turn)));
+  if (S.foot_s != null)
+    set('jnlFootS', String(Math.round(S.foot_s)));
   if (S.fused_auto_s != null)
     set('jnlFusedAuto', String(Math.round(S.fused_auto_s)));
   if (S.fused_bounce != null)
@@ -18782,6 +19148,7 @@ function paintJournal(d) {
   paintStackWin(J.stackwin);
   paintTwoTick(J.twotick);
   paintFusedGate(J.fusedgate);
+  paintFootGate(J.footgate);
 
   const ag = $('jnlAgree');
   const W = J.window || {};
@@ -19493,6 +19860,33 @@ function closeLiveStream() {
 
 function applyLiveFrame(d) {
   const kind = d.kind || (d.profile ? 'snap' : (d.e_n !== undefined ? 'ofi' : ''));
+  /* THE TRADE COLUMN, PUSHED. Chris: "there is absolutely no doubt
+     the fixes that you made to my chart are all lagging behind
+     extremely bad behind live price".
+
+     The page polled `/api/read` on a one-second timer of its own,
+     so what you looked at could be a second older than what the
+     rule had already decided. This is the rule's OWN payload,
+     arriving on the step that produced it.
+
+     THE POLL IS NOT REMOVED. It still runs and still paints the
+     chart, the stack and the rungs -- and it is the fallback if
+     the socket drops, which is the one state where a column that
+     had stopped updating would be invisible. */
+  if (kind === 'journal' && d.journal) {
+    if (!d.coin || d.coin === coin()) {
+      /* `paintJournal` TAKES THE WHOLE /api/read PAYLOAD and
+         reaches for `.journal` inside it, so the frame's block is
+         wrapped to match rather than the painter being changed.
+         One painter, one shape -- a second entry point into it is
+         a second place for the column and the poll to disagree.
+         It sets `_jnlLast` itself; setting it here as well put
+         the block where the wrapper belonged and the alert read
+         an empty object. */
+      try { paintJournal({journal: d.journal}); } catch (e) {}
+    }
+    return;
+  }
   if (kind === 'tick') {
     tickFromStream({px: d.px, trades: d.raw});
     /* THE READ LINE REPAINTS HERE, on the print, and nothing else

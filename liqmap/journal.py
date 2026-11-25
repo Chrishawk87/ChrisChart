@@ -151,6 +151,13 @@ class Settings:
     # Chris, shown that his 10,000 x 4,000 bar closed on the 900s
     # cap 92% of the time and carried the same high and low as a
     # 15-minute Ironbeam candle: "Size the pair from the tape".
+    # HOW LONG A FOOTPRINT BAR SHOULD AIM TO TAKE, in seconds, with
+    # its volume size measured off the tape to hit it. 0 is off.
+    #
+    # Chris: "what if we took a actual foot print chart and use
+    # that to build actual candles" -- and, on what the bar should
+    # say: "the bar should mark push and activity".
+    foot_s: int = 0
     fused_auto_s: int = 0
     fused_bounce_on: bool = False
     fused_bar_exit: bool = False
@@ -181,6 +188,7 @@ class Settings:
                 "fused_tf2_label": (window_label(float(self.fused_tf2))
                                     if self.fused_tf2 else "off"),
                 "fused_turn": int(self.fused_turn),
+                "foot_s": int(self.foot_s),
                 "fused_auto_s": int(self.fused_auto_s),
                 "fused_bounce_on": bool(self.fused_bounce_on),
                 "fused_bar_exit": bool(self.fused_bar_exit),
@@ -498,6 +506,7 @@ _ADDED_SETTINGS = (
     ("fused_tf", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_tf2", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_turn", "INTEGER NOT NULL DEFAULT 4"),
+    ("foot_s", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_auto_s", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_bounce_on", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_bar_exit", "INTEGER NOT NULL DEFAULT 0"),
@@ -569,6 +578,7 @@ class Journal(ThreadedDB):
                         fused_tf=int(r["fused_tf"]),
                         fused_tf2=int(r["fused_tf2"]),
                         fused_turn=int(r["fused_turn"] or 4),
+                        foot_s=int(r["foot_s"] or 0),
                         fused_auto_s=int(r["fused_auto_s"] or 0),
                         fused_bounce_on=bool(r["fused_bounce_on"]),
                         fused_bar_exit=bool(r["fused_bar_exit"]),
@@ -583,9 +593,9 @@ class Journal(ThreadedDB):
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
                 "  fused_ticks, fused_ofi, fused_bounce,"
                 "  fused_tf, fused_tf2, fused_turn,"
-                "  fused_auto_s, fused_bounce_on, fused_bar_exit,"
-                "  fused_settle_exit, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                "  foot_s, fused_auto_s, fused_bounce_on,"
+                "  fused_bar_exit, fused_settle_exit, strategy)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -600,6 +610,7 @@ class Journal(ThreadedDB):
                 " fused_tf=excluded.fused_tf,"
                 " fused_tf2=excluded.fused_tf2,"
                 " fused_turn=excluded.fused_turn,"
+                " foot_s=excluded.foot_s,"
                 " fused_auto_s=excluded.fused_auto_s,"
                 " fused_bounce_on=excluded.fused_bounce_on,"
                 " fused_bar_exit=excluded.fused_bar_exit,"
@@ -644,6 +655,7 @@ class Journal(ThreadedDB):
                  # ONE OF THE OFFERED DURATIONS. Zero is off and
                  # is a choice, so nothing on this path may use
                  # `or` -- the same trap the bounce dial has.
+                 _snap_auto(s.foot_s),
                  _snap_auto(s.fused_auto_s),
                  int(bool(s.fused_bounce_on)),
                  int(bool(s.fused_bar_exit)),
