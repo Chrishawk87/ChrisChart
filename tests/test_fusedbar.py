@@ -19,6 +19,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pathlib
+
 import pytest
 
 from liqmap import fusedbar as fb
@@ -850,3 +852,182 @@ class TestTheStrategyMovedOut:
         push_ofi(b, 40)
         assert b.last_closed is not None
         assert b.last_closed.close_reason == "both"
+
+
+class TestSizingThePairFromTheTape:
+    """Chris sent two screenshots: ChrisChart's "10000x4000" bar
+    and a 15-minute Ironbeam candle. Their HIGH AND LOW WERE
+    IDENTICAL TO THE TICK -- 7,189.25 and 7,176.00 -- because the
+    fused bar was closing on its 900-second cap every time, which
+    makes it a 15-minute bar wearing another label.
+
+    His own chart footer already said so: "92% of bars closed on
+    the CAP, not on both legs". Asked how to fix it he chose
+    "Size the pair from the tape".
+    """
+
+    # HIS TAPE, FROM THE SCREENSHOT: 1,082 prints and 871 contracts
+    # with 494s left of a 900s cap, so 406s elapsed.
+    REACH = dict(max_s=900.0, prints_at_cap=2400, ofi_at_cap=1900,
+                 bars=40, capped=37, met=3, seconds=900.0,
+                 seconds_when_met=0.0, prints=2400, ofi=1900,
+                 tick_target=10000, ofi_target=4000)
+
+    def test_the_pair_it_picks_is_reachable(self):
+        """THE WHOLE POINT. On a tape reaching 2,400 prints in 900
+        seconds, a target of 10,000 cannot be met before the cap
+        and the bar is a clock bar."""
+        r = fb.size_for(self.REACH, target_s=300)
+        assert r["ready"] is True
+        rate = 2400.0 / 900.0
+        assert r["ticks"] / rate == pytest.approx(300.0, rel=0.15), \
+            "the print leg will not land near the target duration"
+        assert r["ticks"] < 10000, "it picked an unreachable pair again"
+
+    def test_the_two_legs_do_not_scale_the_same_way(self):
+        """PRINTS ARE A COUNT, SIGNED OFI IS A WALK. Scaling the
+        book leg linearly down from a 900s sample sets it far too
+        low; it then fires immediately, the print leg does all the
+        closing, and the fused bar is a tick chart with a shell
+        drawn on it. That degenerate case looks exactly like
+        working."""
+        r = fb.size_for(self.REACH, target_s=300)
+        third = 1900 * (300.0 / 900.0)          # what linear gives
+        root = 1900 * (300.0 / 900.0) ** 0.5    # what a walk gives
+        assert r["ofi"] > third * 1.3, \
+            "the book leg was scaled linearly and will fire at once"
+        assert r["ofi"] == pytest.approx(root, rel=0.2)
+
+    def test_it_says_what_it_measured(self):
+        r = fb.size_for(self.REACH, target_s=300)
+        assert "900s cap" in r["why"]
+        assert "2,400 prints" in r["why"]
+        assert "square root" in r["why"], \
+            "the assumption behind the book leg is not stated"
+
+    def test_a_longer_target_asks_for_more_of_both(self):
+        short = fb.size_for(self.REACH, target_s=60)
+        long_ = fb.size_for(self.REACH, target_s=600)
+        assert long_["ticks"] > short["ticks"]
+        assert long_["ofi"] > short["ofi"]
+
+    def test_nothing_closed_yet_sizes_nothing(self):
+        """A GUESS DRESSED AS A MEASUREMENT IS WORSE THAN NO
+        ANSWER -- it would build a pair and look settled."""
+        r = fb.size_for({}, target_s=300)
+        assert r["ready"] is False
+        assert r["ticks"] == 0
+        assert "nothing" in r["why"]
+
+    def test_it_falls_back_to_every_closed_bar(self):
+        """NO CAPPED BARS is the good case -- it means both legs
+        are firing -- and the rate still has to come from
+        somewhere."""
+        r = fb.size_for(dict(self.REACH, prints_at_cap=0, ofi_at_cap=0,
+                             capped=0, met=40, seconds=240.0,
+                             prints=600, ofi=700), target_s=300)
+        assert r["ready"] is True
+        assert "closed bars" in r["why"]
+
+    def test_the_pair_stays_inside_the_bounds(self):
+        for mult in (0.0001, 10000.0):
+            r = fb.size_for(dict(self.REACH,
+                                 prints_at_cap=int(2400 * mult),
+                                 ofi_at_cap=int(1900 * mult)),
+                            target_s=300)
+            assert fb.MIN_TICKS <= r["ticks"] <= fb.MAX_TICKS
+            assert fb.MIN_OFI <= r["ofi"] <= fb.MAX_OFI
+
+    def test_junk_never_raises(self):
+        for bad in (None, "abc", [], {}, 0, -1):
+            r = fb.size_for(bad, target_s=bad)
+            assert isinstance(r["ticks"], int)
+            assert isinstance(r["ofi"], int)
+
+    def test_the_pair_reads_as_a_pair(self):
+        """TWO SIGNIFICANT FIGURES, AND THAT IS ALL IT DOES. It
+        was commented as the thing that keeps the pair still, and
+        it is not -- 2,400 and 2,437 prints round to 800 and 810,
+        which are two different builders. The 20% gate in the
+        caller is what stops the churn, and this test exists so
+        the two jobs do not get confused again."""
+        for n in (2400, 2437, 19, 7):
+            r = fb.size_for(dict(self.REACH, prints_at_cap=n),
+                            target_s=300)
+            t = r["ticks"]
+            assert t == fb._sig2(t), f"{t} is not two significant figures"
+        a = fb.size_for(self.REACH, target_s=300)["ticks"]
+        b = fb.size_for(dict(self.REACH, prints_at_cap=2437),
+                        target_s=300)["ticks"]
+        assert a != b, "this test no longer tests what it says"
+
+    def test_the_caller_is_what_refuses_a_small_move(self):
+        src = (pathlib.Path(__file__).resolve().parents[1]
+               / "liqmap" / "web.py").read_text()
+        assert "_AUTO_MOVE" in src, "nothing gates how often it rebuilds"
+        i = src.index("_AUTO_MOVE = ")
+        assert float(src[i + len("_AUTO_MOVE = "):i + 30].split()[0]) > 0.0
+        assert "moved < _AUTO_MOVE" in src, \
+            "the gate is defined and never applied"
+
+
+class TestCorrectingARunningPair:
+    """The seed is an assumption; this is the measurement."""
+
+    def test_still_capping_brings_the_book_leg_down(self):
+        r = fb.correct_for(dict(bars=20, capped=18, met=2,
+                                tick_target=800, ofi_target=4000,
+                                ofi_at_cap=1200, seconds_when_met=0.0),
+                           target_s=300)
+        assert r["ready"] is True
+        assert r["ofi"] < 4000
+        assert r["ticks"] == 800, "the print leg moved for no reason"
+        assert "cap" in r["why"]
+
+    def test_bars_closing_too_slowly_shrink_both_legs(self):
+        r = fb.correct_for(dict(bars=20, capped=1, met=19,
+                                tick_target=800, ofi_target=1100,
+                                ofi_at_cap=0, seconds_when_met=600.0),
+                           target_s=300)
+        assert r["ready"] is True
+        assert r["ticks"] < 800 and r["ofi"] < 1100
+        assert r["ticks"] / 800 == pytest.approx(r["ofi"] / 1100, rel=0.2), \
+            "the shape of the pair changed, not just its size"
+
+    def test_bars_closing_too_fast_grow_both_legs(self):
+        r = fb.correct_for(dict(bars=20, capped=0, met=20,
+                                tick_target=800, ofi_target=1100,
+                                ofi_at_cap=0, seconds_when_met=120.0),
+                           target_s=300)
+        assert r["ticks"] > 800 and r["ofi"] > 1100
+
+    def test_close_enough_is_left_alone(self):
+        """EVERY CHANGE COSTS AN EMPTY CHART, so a pair that is
+        nearly right is right."""
+        r = fb.correct_for(dict(bars=20, capped=0, met=20,
+                                tick_target=800, ofi_target=1100,
+                                ofi_at_cap=0, seconds_when_met=290.0),
+                           target_s=300)
+        assert r["ready"] is False
+        assert "close enough" in r["why"]
+
+    def test_too_few_bars_is_refused(self):
+        r = fb.correct_for(dict(bars=3, capped=3, met=0,
+                                tick_target=800, ofi_target=1100),
+                           target_s=300)
+        assert r["ready"] is False
+        assert "too few" in r["why"]
+
+    def test_one_correction_is_bounded(self):
+        """A median over a quiet ten minutes is not the tape, and
+        overreacting to it builds a new chart for nothing."""
+        r = fb.correct_for(dict(bars=20, capped=0, met=20,
+                                tick_target=800, ofi_target=1100,
+                                ofi_at_cap=0, seconds_when_met=5.0),
+                           target_s=300)
+        assert r["ticks"] <= 800 * 1.4
+
+    def test_junk_never_raises(self):
+        for bad in (None, "abc", [], {}, 0):
+            r = fb.correct_for(bad, target_s=bad)
+            assert isinstance(r["ticks"], int)

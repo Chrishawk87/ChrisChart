@@ -144,6 +144,14 @@ class Settings:
     # since `7d961a9 take profit or apart: the only two exits` --
     # a restored feature that switches itself on is a rule change
     # nobody asked for, applied to every market at once.
+    # HOW LONG A FUSED BAR SHOULD AIM TO TAKE, in seconds, with
+    # the pair sized from the tape to hit it. 0 is off and the
+    # fixed pair on the selector is used instead.
+    #
+    # Chris, shown that his 10,000 x 4,000 bar closed on the 900s
+    # cap 92% of the time and carried the same high and low as a
+    # 15-minute Ironbeam candle: "Size the pair from the tape".
+    fused_auto_s: int = 0
     fused_bounce_on: bool = False
     fused_bar_exit: bool = False
     fused_settle_exit: bool = False
@@ -173,6 +181,7 @@ class Settings:
                 "fused_tf2_label": (window_label(float(self.fused_tf2))
                                     if self.fused_tf2 else "off"),
                 "fused_turn": int(self.fused_turn),
+                "fused_auto_s": int(self.fused_auto_s),
                 "fused_bounce_on": bool(self.fused_bounce_on),
                 "fused_bar_exit": bool(self.fused_bar_exit),
                 "fused_settle_exit": bool(self.fused_settle_exit),
@@ -489,6 +498,7 @@ _ADDED_SETTINGS = (
     ("fused_tf", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_tf2", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_turn", "INTEGER NOT NULL DEFAULT 4"),
+    ("fused_auto_s", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_bounce_on", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_bar_exit", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_settle_exit", "INTEGER NOT NULL DEFAULT 0"),
@@ -559,6 +569,7 @@ class Journal(ThreadedDB):
                         fused_tf=int(r["fused_tf"]),
                         fused_tf2=int(r["fused_tf2"]),
                         fused_turn=int(r["fused_turn"] or 4),
+                        fused_auto_s=int(r["fused_auto_s"] or 0),
                         fused_bounce_on=bool(r["fused_bounce_on"]),
                         fused_bar_exit=bool(r["fused_bar_exit"]),
                         fused_settle_exit=bool(r["fused_settle_exit"]),
@@ -572,9 +583,9 @@ class Journal(ThreadedDB):
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
                 "  fused_ticks, fused_ofi, fused_bounce,"
                 "  fused_tf, fused_tf2, fused_turn,"
-                "  fused_bounce_on, fused_bar_exit,"
+                "  fused_auto_s, fused_bounce_on, fused_bar_exit,"
                 "  fused_settle_exit, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -589,6 +600,7 @@ class Journal(ThreadedDB):
                 " fused_tf=excluded.fused_tf,"
                 " fused_tf2=excluded.fused_tf2,"
                 " fused_turn=excluded.fused_turn,"
+                " fused_auto_s=excluded.fused_auto_s,"
                 " fused_bounce_on=excluded.fused_bounce_on,"
                 " fused_bar_exit=excluded.fused_bar_exit,"
                 " fused_settle_exit=excluded.fused_settle_exit,"
@@ -629,6 +641,10 @@ class Journal(ThreadedDB):
                  # zero is a row that flips on every tick and
                  # says nothing at all.
                  _snap_turn(s.fused_turn),
+                 # ONE OF THE OFFERED DURATIONS. Zero is off and
+                 # is a choice, so nothing on this path may use
+                 # `or` -- the same trap the bounce dial has.
+                 _snap_auto(s.fused_auto_s),
                  int(bool(s.fused_bounce_on)),
                  int(bool(s.fused_bar_exit)),
                  int(bool(s.fused_settle_exit)),
@@ -1137,6 +1153,16 @@ def _snap_tf(value: int | float) -> int:
     if want < 0 and -want in TF_TICKS:
         return want
     return 0
+
+
+def _snap_auto(secs: int | float) -> int:
+    """One of the offered bar durations, or 0 for off."""
+    from .fusedbar import AUTO_CHOICES
+    try:
+        want = int(secs)
+    except (TypeError, ValueError):
+        return 0
+    return want if want in AUTO_CHOICES else 0
 
 
 def _snap_turn(ticks: int | float) -> int:

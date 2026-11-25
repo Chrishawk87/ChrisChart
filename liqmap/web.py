@@ -5710,6 +5710,7 @@ def create_app() -> FastAPI:
                              fused_tf: int | None = None,
                              fused_tf2: int | None = None,
                              fused_turn: int | None = None,
+                             fused_auto_s: int | None = None,
                              fused_bounce_on: bool | None = None,
                              fused_bar_exit: bool | None = None,
                              fused_settle_exit: bool | None = None,
@@ -5766,6 +5767,9 @@ def create_app() -> FastAPI:
                 # snapping -- but each is read with its own
                 # `is None` so that sending one does not quietly
                 # clear the other two.
+                fused_auto_s=(int(getattr(cur, "fused_auto_s", 0) or 0)
+                              if fused_auto_s is None
+                              else int(fused_auto_s)),
                 fused_bounce_on=(
                     bool(getattr(cur, "fused_bounce_on", False))
                     if fused_bounce_on is None else bool(fused_bounce_on)),
@@ -7510,6 +7514,89 @@ def create_app() -> FastAPI:
                 "ofi_target": bld.ofi_target,
                 "say": prog.get("say") or ""}
 
+    # HOW OFTEN THE AUTO PAIR IS ALLOWED TO MOVE. Every change is
+    # a new builder starting from an empty chart, so this is slow
+    # on purpose -- the rate it is tracking changes over sessions,
+    # not over seconds.
+    _AUTO_EVERY_S = 60.0
+    # AND HOW FAR IT HAS TO MOVE TO BE WORTH IT. A pair that
+    # wobbles a few per cent is the same pair.
+    _AUTO_MOVE = 0.20
+
+    def _auto_pair(rt_, target_s: float) -> dict:
+        """The fused pair sized from what this tape is doing.
+
+        Chris, shown that his 10,000 x 4,000 bar was closing on
+        the 900-second cap 92% of the time and carried the same
+        high and low as a 15-minute Ironbeam candle: "Size the
+        pair from the tape".
+
+        IT SEEDS FROM A FIXED PAIR AND THEN CORRECTS ON ITSELF.
+        `size_for` has to assume how signed OFI scales, because it
+        is sizing a pair that has never run; once the auto pair
+        has closed bars of its own, `correct_for` moves it using
+        what those bars actually did.
+
+        A NEW PAIR IS A NEW BUILDER AND AN EMPTY CHART, which is
+        why this is rate-limited and why small moves are refused.
+        """
+        import time as _t
+        from . import fusedbar as _fb2
+        out = {"pair": None, "why": "", "at": 0.0}
+        if not target_s:
+            return out
+        svc = getattr(rt_, "ofi", None)
+        tape = getattr(svc, "tape", None) if svc else None
+        books = getattr(tape, "fusedbars", None) if tape else None
+        if not books:
+            return {**out, "why": "no tape is running"}
+
+        now = _t.time()
+        held = getattr(rt_, "_fused_auto", None) or {}
+        if (held.get("pair") and held.get("target_s") == float(target_s)
+                and now - float(held.get("at") or 0.0) < _AUTO_EVERY_S):
+            return held
+
+        cur_pair = held.get("pair")
+        src = books.get(tuple(cur_pair)) if cur_pair else None
+        if src is not None:
+            # THE AUTO PAIR'S OWN BARS. A measurement of the thing
+            # being corrected, not of a different pair.
+            want = _fb2.correct_for(src.reach(), float(target_s))
+        else:
+            seed = books.get(_fb2.DEFAULT_PAIR) or next(iter(books.values()))
+            want = _fb2.size_for(seed.reach(), float(target_s))
+        if not want.get("ready") or not want.get("ticks"):
+            return {**held, **out, "target_s": float(target_s),
+                    "pair": cur_pair, "at": now,
+                    "why": want.get("why") or "nothing to size from"}
+
+        new = (int(want["ticks"]), int(want["ofi"]))
+        if cur_pair:
+            moved = max(abs(new[0] - cur_pair[0]) / max(1.0, cur_pair[0]),
+                        abs(new[1] - cur_pair[1]) / max(1.0, cur_pair[1]))
+            if moved < _AUTO_MOVE:
+                return {**held, "at": now,
+                        "why": (f"holding {_fb.label(*cur_pair)} -- the "
+                                f"tape has moved {moved:.0%}, under the "
+                                f"{_AUTO_MOVE:.0%} it takes to rebuild")}
+        if new not in books:
+            try:
+                books[new] = _fb2.FusedBars(
+                    tick_target=new[0], ofi_target=new[1],
+                    max_s=_fb2.max_s_for(*new))
+            except Exception as exc:                    # noqa: BLE001
+                return {**held, "at": now,
+                        "why": f"could not build {new}: "
+                               f"{type(exc).__name__}"}
+        picked = {"pair": new, "at": now, "target_s": float(target_s),
+                  "why": want.get("why") or ""}
+        try:
+            rt_._fused_auto = picked
+        except Exception:                               # noqa: BLE001
+            pass
+        return picked
+
     def _tape_lag(rt_) -> dict:
         """The tape's own lag reading, or why there is none.
 
@@ -7538,7 +7625,8 @@ def create_app() -> FastAPI:
                     # ON THE END. Every caller below passes the
                     # first six positionally.
                     turn_ticks: float | None = None,
-                    bounce_on: bool = False) -> dict:
+                    bounce_on: bool = False,
+                    auto_s: float = 0.0) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -7667,6 +7755,17 @@ def create_app() -> FastAPI:
         _tf_body, _tf_leg = _strength(_tf_bar, _tf_dir, "tf")
         _tf2_body, _tf2_leg = _strength(_tf2_bar, _tf2_dir, "tf2")
 
+        # NAMED HERE, ABOVE THE CLOSURE THAT READS IT.
+        #
+        # `_nothing` is defined below and references `_auto`. With
+        # the assignment left further down, that worked only
+        # because every call happened to come after it -- which is
+        # exactly the shape that has raised a free-variable
+        # NameError in this function FOUR times, every one of them
+        # swallowed into `journal.error` where nothing was
+        # looking. It is not left to luck a fifth time.
+        _auto = _auto_pair(rt_, float(auto_s or 0.0))
+
         def _nothing(key, why):
             """ONE SHAPE, WHETHER OR NOT A BAR IS BUILDING.
 
@@ -7701,6 +7800,9 @@ def create_app() -> FastAPI:
                     "say": why, "held": {},
                     "reach": {}, "summary": {},
                     "lag": _tape_lag(rt_),
+                    "auto": {"on": bool(auto_s),
+                             "target_s": float(auto_s or 0.0),
+                             "pair": None, "why": _auto.get("why") or ""},
                     "call": {"side": "", "score": 0.0, "rows": [],
                              "speaking": 0, "of": 0,
                              "say": why, "decides": False},
@@ -7722,7 +7824,13 @@ def create_app() -> FastAPI:
         tape = getattr(svc, "tape", None) if svc else None
         books = getattr(tape, "fusedbars", None) if tape else None
         key = tuple(pair or DEFAULT_PAIR)
-        if key not in PAIRS:
+        # AN AUTO PAIR IS NOT IN `PAIRS` BY CONSTRUCTION -- it is
+        # whatever this tape needs -- so it is read BEFORE the snap
+        # below, which would otherwise drag it back to the nearest
+        # fixed pair and undo the whole thing.
+        if _auto.get("pair"):
+            key = tuple(_auto["pair"])
+        elif key not in PAIRS:
             key = min(PAIRS, key=lambda k: (abs(int(k[0]) - int(key[0]))
                                             + abs(int(k[1]) - int(key[1]))))
         if not books:
@@ -7835,6 +7943,14 @@ def create_app() -> FastAPI:
                 # not on a diagnostics page, because the question
                 # is always asked about a specific entry.
                 "lag": _tape_lag(rt_),
+                # WHAT THE PAIR IS AND WHY, when it was sized
+                # rather than picked. Drawn on the panel because a
+                # pair that changes under you with no explanation
+                # is worse than one that is wrong.
+                "auto": {"on": bool(auto_s),
+                         "target_s": float(auto_s or 0.0),
+                         "pair": list(key) if _auto.get("pair") else None,
+                         "why": _auto.get("why") or ""},
                 "reach": bld.reach(),
                 "summary": bld.summary()}
 
@@ -8440,12 +8556,13 @@ def create_app() -> FastAPI:
             # poll against two different references.
             _fturn = int(getattr(s, "fused_turn", 4) or 4)
             _fbon = bool(getattr(s, "fused_bounce_on", False))
+            _fauto = int(getattr(s, "fused_auto_s", 0) or 0)
             _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev,
-                                _ftf, _ftf2, _fturn, _fbon)
+                                _ftf, _ftf2, _fturn, _fbon, _fauto)
             _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
             fus = _fused_gate(rt_, _fpair, _fbounce,
                               _fdw.held_s(_now_f), _fprev, _ftf,
-                              _ftf2, _fturn, _fbon)
+                              _ftf2, _fturn, _fbon, _fauto)
             try:
                 rt_._fused_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -8822,7 +8939,8 @@ def create_app() -> FastAPI:
                 None, _sprev, int(getattr(s, "fused_tf", 0) or 0),
                 int(getattr(s, "fused_tf2", 0) or 0),
                 int(getattr(s, "fused_turn", 4) or 4),
-                bool(getattr(s, "fused_bounce_on", False)))
+                bool(getattr(s, "fused_bounce_on", False)),
+                int(getattr(s, "fused_auto_s", 0) or 0))
             try:
                 rt_._fused_shown_held = dict(_shown.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -11639,6 +11757,24 @@ has to be running before the gate stops refusing.">spike
               <option value="5000x2000">5000t &times; 2000</option>
               <option value="10000x4000" selected>10000t &times; 4000</option>
               <option value="100000x40000">100000t &times; 40000</option>
+            </select></label>
+          <!-- SIZED FROM THE TAPE INSTEAD OF PICKED. Chris, shown
+               that 10000x4000 was closing on the 900s cap 92% of
+               the time and had the same high and low as a
+               15-minute Ironbeam candle: "Size the pair from the
+               tape". With this on, the pair above is ignored. -->
+          <label title="size the pair from this tape so a bar aims
+                        to close on BOTH legs in about this long --
+                        overrides the fixed pair beside it"
+            >auto
+            <select id="jnlFusedAuto" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0" selected>off</option>
+              <option value="60">~1 min bars</option>
+              <option value="120">~2 min bars</option>
+              <option value="180">~3 min bars</option>
+              <option value="300">~5 min bars</option>
+              <option value="600">~10 min bars</option>
             </select></label>
           <!-- THE LIVE TIMEFRAME BESIDE PRICE, as a filter on the
                fused rule. Off is a real setting, not an absence. -->
@@ -16733,6 +16869,8 @@ async function jnlSet() {
        appears to snap back while the save is still in flight. */
     jnlFusedTurn: $('jnlFusedTurn')
       ? String($('jnlFusedTurn').value) : undefined,
+    jnlFusedAuto: $('jnlFusedAuto')
+      ? String($('jnlFusedAuto').value) : undefined,
     jnlFBouncePct: $('jnlFBouncePct')
       ? String($('jnlFBouncePct').value) : undefined,
     jnlFBounce: $('jnlFBounce') ? $('jnlFBounce').checked : undefined,
@@ -16764,6 +16902,7 @@ async function jnlSet() {
        give-back at all", the tightest setting rather than off.
        Off is the checkbox beside it, so no || on this line. */
     fused_bounce: $('jnlFBouncePct') ? $('jnlFBouncePct').value : 33,
+    fused_auto_s: $('jnlFusedAuto') ? $('jnlFusedAuto').value : 0,
     fused_bounce_on: ($('jnlFBounce') && $('jnlFBounce').checked)
       ? 'true' : 'false',
     fused_bar_exit: ($('jnlFBarEx') && $('jnlFBarEx').checked)
@@ -17910,6 +18049,23 @@ function paintFusedGate(FG) {
               : '')
           + '</div>'
         : '')
+    /* WHAT THE PAIR IS AND WHY, when it was sized rather than
+       picked. A pair that changes under you with no explanation
+       is worse than one that is simply wrong -- you cannot tell
+       the change from a bug. */
+    + ((FG.auto && FG.auto.on)
+        ? '<div class="thin">pair sized from this tape for '
+          + '<b>~' + Math.round(Number(FG.auto.target_s || 0) / 60)
+          + ' min</b> bars'
+          + (FG.auto.pair
+              ? ' &mdash; <b>' + Number(FG.auto.pair[0]).toLocaleString()
+                + 't &times; ' + Number(FG.auto.pair[1]).toLocaleString()
+                + '</b>'
+              : ' &mdash; <b>not sized yet</b>')
+          + (FG.auto.why ? ' <span style="opacity:.6">'
+                           + esc(FG.auto.why) + '</span>' : '')
+          + '</div>'
+        : '')
     /* HOW OLD THIS READING IS. Chris: "the move has already
        happened on iron beam by the time it shows up on chris
        chart". Three numbers, and the panel says which of them can
@@ -18568,6 +18724,8 @@ function paintJournal(d) {
     set('jnlFusedTf2', String(Math.round(S.fused_tf2)));
   if (S.fused_turn != null)
     set('jnlFusedTurn', String(Math.round(S.fused_turn)));
+  if (S.fused_auto_s != null)
+    set('jnlFusedAuto', String(Math.round(S.fused_auto_s)));
   if (S.fused_bounce != null)
     set('jnlFBouncePct', String(Math.round(S.fused_bounce)));
   chk('jnlFBounce', S.fused_bounce_on);

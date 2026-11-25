@@ -3856,3 +3856,172 @@ class TestTheLagReadout:
             ps = inspect.signature(fn).parameters
             for bad in ("lag", "feed_ms", "since_ms", "age"):
                 assert bad not in ps, f"{fn.__name__} reads {bad}"
+
+
+class TestTheAutoSizedPair:
+    """Chris sent ChrisChart's "10000x4000" bar beside a 15-minute
+    Ironbeam candle. Identical high and low -- 7,189.25 and
+    7,176.00 -- because the fused bar closed on its 900s cap every
+    time. He chose "Size the pair from the tape"."""
+
+    def test_the_setting_round_trips(self, tmp_path):
+        from liqmap.fusedbar import AUTO_CHOICES
+        from liqmap.journal import Journal
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        assert s.fused_auto_s == 0, "it switched itself on"
+        s.fused_auto_s = 300
+        assert j.save_settings(s).fused_auto_s == 300
+        assert j.settings("ES").to_dict()["fused_auto_s"] == 300
+        s.fused_auto_s = 77
+        assert j.save_settings(s).fused_auto_s == 0
+        for c in AUTO_CHOICES:
+            s.fused_auto_s = c
+            assert j.save_settings(s).fused_auto_s == c
+
+    def test_the_route_takes_it(self, client, monkeypatch):
+        _cme(monkeypatch)
+        r = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_auto_s": 180},
+                        headers=AUTH).json()["settings"]
+        assert r["fused_auto_s"] == 180
+        bad = client.post("/api/journal/settings",
+                          params={"coin": "ES", "fused_auto_s": 9999},
+                          headers=AUTH).json()["settings"]
+        assert bad["fused_auto_s"] == 0
+
+    def test_the_selector_is_on_the_page(self):
+        from liqmap.fusedbar import AUTO_CHOICES
+        src = (SRC / "web.py").read_text()
+        assert 'id="jnlFusedAuto"' in src
+        i = src.index('id="jnlFusedAuto"')
+        box = src[i:src.index("</select>", i)]
+        for c in AUTO_CHOICES:
+            assert f'value="{int(c)}"' in box, f"no {c}s option"
+        assert "fused_auto_s: $('jnlFusedAuto')" in src, "never sent"
+        assert "set('jnlFusedAuto'" in src, "never restored"
+        assert "jnlFusedAuto: $('jnlFusedAuto')" in src, "not pinned"
+
+    def test_an_auto_pair_escapes_the_snap_to_the_fixed_list(self):
+        """AN AUTO PAIR IS NOT IN `PAIRS` BY CONSTRUCTION. The
+        snap below it would drag 800x1100 back to 1000x500 and
+        undo the whole thing, so the order of those two is the
+        feature."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        a = fn.index('if _auto.get("pair"):')
+        b = fn.index("elif key not in PAIRS:")
+        assert a < b, "the auto pair is snapped to the fixed list"
+
+    def test_the_name_is_bound_before_the_closure_reads_it(self):
+        """THE FIFTH TIME THIS SHAPE HAS COME UP HERE. `_nothing`
+        references `_auto`; with the assignment below the closure
+        it worked only because every call happened to come after
+        it, and the previous four of these raised free-variable
+        NameErrors into `journal.error` where nothing was
+        looking."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert fn.index("_auto = _auto_pair(") < fn.index("def _nothing("), \
+            "the closure is defined before the name it reads"
+
+    def test_it_is_rate_limited_and_gated(self):
+        """Every change is a new builder and an empty chart."""
+        src = (SRC / "web.py").read_text()
+        assert "_AUTO_EVERY_S" in src and "_AUTO_MOVE" in src
+        i = src.index("def _auto_pair(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "_AUTO_EVERY_S" in fn, "it re-sizes on every poll"
+        assert "moved < _AUTO_MOVE" in fn, "any wobble rebuilds"
+        # THE CALLS, NOT THE NAMES. `"correct_for" in fn` passed
+        # with the call replaced by `size_for`, because the
+        # docstring above it mentions `correct_for` -- a test
+        # reading prose instead of code.
+        assert "_fb2.correct_for(src.reach()" in fn, \
+            "a running pair is re-seeded instead of corrected"
+        assert "_fb2.size_for(seed.reach()" in fn, \
+            "a pair with no history is never seeded"
+        # AND THE BUILDER IS ACTUALLY MADE. Without this the pair
+        # is computed, reported on the panel, and nothing is ever
+        # built for it -- the gate then finds no builder and the
+        # whole feature reads as "no builder for that pair".
+        assert "if new not in books:" in fn, \
+            "the builder for a new pair is never created"
+        assert "books[new] = _fb2.FusedBars(" in fn
+
+    def test_off_changes_nothing(self, client, monkeypatch):
+        """OFF IS THE DEFAULT and off has to mean the fixed pair
+        behaves exactly as it did."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        st = rt.journal.settings("ES")
+        st.strategy = "together"
+        st.fused_auto_s = 0
+        rt.journal.save_settings(st)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        auto = (jr.get("fusedgate") or {}).get("auto") or {}
+        assert auto.get("on") is False
+        assert auto.get("pair") is None
+
+    def test_the_live_panel_carries_the_reason(self, client,
+                                               monkeypatch):
+        """A PAIR THAT CHANGES UNDER YOU WITH NO EXPLANATION is
+        worse than one that is simply wrong -- you cannot tell the
+        change from a bug."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        st = rt.journal.settings("ES")
+        st.strategy = "together"
+        st.fused_auto_s = 300
+        rt.journal.save_settings(st)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        auto = (jr.get("fusedgate") or {}).get("auto") or {}
+        assert auto.get("on") is True
+        assert auto.get("target_s") == 300.0
+        assert "why" in auto
+
+    def test_the_panel_draws_it(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "up", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "auto": {"on": True, "target_s": 300.0,
+                                "pair": [800, 1100],
+                                "why": "from bars that ran the full 900s cap"}})
+        assert "sized from this tape" in html
+        assert "~5 min" in html
+        assert "800t" in html and "1,100" in html
+        assert "900s cap" in html
+
+    def test_the_panel_says_when_it_has_not_sized_yet(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "auto": {"on": True, "target_s": 300.0,
+                                "pair": None,
+                                "why": "nothing has closed yet"}})
+        assert "not sized yet" in html
+        assert "nothing has closed yet" in html

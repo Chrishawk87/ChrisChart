@@ -688,5 +688,180 @@ def parse_interval(interval: str) -> tuple[int, int] | None:
             max(MIN_OFI, min(ofi, MAX_OFI)))
 
 
+# WHAT A BAR SHOULD AIM TO TAKE, in seconds, when the pair is
+# sized from the tape rather than picked. Chris, shown that his
+# 10,000 x 4,000 bar was closing on the 900s cap 92% of the time
+# and had the same high and low as a 15-minute Ironbeam candle,
+# chose "Size the pair from the tape".
+AUTO_CHOICES: tuple[int, ...] = (0, 60, 120, 180, 300, 600)
+AUTO_DEFAULT = 300
+
+
+def _sig2(n: float) -> int:
+    """Two significant figures, so a pair reads as a pair.
+
+    LEGIBILITY ONLY. This does NOT keep the pair still -- 2,400
+    and 2,437 prints round to 800 and 810, which are different
+    builders. What stops the pair moving on every poll is the
+    caller refusing a change under 20%, and saying so here is the
+    point: a comment claiming a guard that lives somewhere else
+    is how the guard gets deleted.
+    """
+    v = max(0.0, float(n or 0.0))
+    if v < 10.0:
+        return int(round(v))
+    import math as _m
+    mag = 10 ** (int(_m.floor(_m.log10(v))) - 1)
+    return int(round(v / mag) * mag)
+
+
+def size_for(reach: dict | None, target_s: float = AUTO_DEFAULT,
+             max_s: float = MAX_S) -> dict:
+    """Targets that should close a bar on BOTH legs in `target_s`.
+
+    THE TWO LEGS DO NOT SCALE THE SAME WAY and getting that wrong
+    is how a fused bar quietly becomes a tick bar.
+
+        PRINTS ARE A COUNT. They arrive at a rate, so twice the
+        time is twice the prints, and a straight ratio is right.
+
+        SIGNED OFI IS A WALK. The accumulator resets every bar and
+        wanders either way, so |net| after t seconds grows nearer
+        to the square root of t than to t. Scaling it linearly
+        down from a 900s sample sets the target far too LOW -- the
+        book leg then fires almost immediately, the print leg does
+        all the closing, and the bar is a tick chart with an OFI
+        shell drawn on it. That is the degenerate case this whole
+        function exists to avoid, and it looks exactly like
+        working.
+
+    MEASURED, NOT EXTRAPOLATED, WHERE IT CAN BE. `reach()` reports
+    medians over bars that ran the full cap, and a capped bar is a
+    clean sample precisely because its duration is known: it ran
+    `max_s` seconds, no more and no less.
+
+    THE SQUARE ROOT IS AN ASSUMPTION AND IT IS NAMED IN THE
+    OUTPUT. A walk is the honest default for a resetting signed
+    accumulator, but this tape is not obliged to be one -- so the
+    pair it produces is a STARTING pair, and `correct_for` below
+    moves it using what the auto bars themselves then do.
+    """
+    import math as _m
+    r = reach if isinstance(reach, dict) else {}
+    try:
+        want = max(1.0, float(target_s or AUTO_DEFAULT))
+        cap = max(1.0, float(r.get("max_s") or max_s or MAX_S))
+    except (TypeError, ValueError):
+        want, cap = float(AUTO_DEFAULT), float(MAX_S)
+
+    # THE CAPPED BARS FIRST. They ran a known number of seconds,
+    # which is what makes them a rate measurement rather than a
+    # number of prints that happened.
+    p_at, o_at = _num(r.get("prints_at_cap")), _num(r.get("ofi_at_cap"))
+    over = cap
+    why = f"from bars that ran the full {int(cap)}s cap"
+    if p_at <= 0.0 or o_at <= 0.0:
+        # NO CAPPED BARS: use every closed bar and its own median
+        # duration. Less clean -- the durations vary -- but it is
+        # a measurement and the alternative is a guess.
+        p_at, o_at = _num(r.get("prints")), _num(r.get("ofi"))
+        over = max(1.0, _num(r.get("seconds")))
+        why = f"from {int(_num(r.get('bars')))} closed bars"
+    if p_at <= 0.0 or over <= 0.0:
+        return {"ticks": 0, "ofi": 0, "target_s": want,
+                "why": "nothing has closed yet -- nothing to size from",
+                "ready": False}
+
+    ticks = _sig2(p_at * (want / over))
+    ofi = _sig2(o_at * _m.sqrt(want / over))
+    ticks = max(MIN_TICKS, min(int(ticks), MAX_TICKS))
+    ofi = max(MIN_OFI, min(int(ofi), MAX_OFI))
+    return {
+        "ticks": ticks, "ofi": ofi, "target_s": want,
+        "prints_rate": round(p_at / over, 3),
+        "ofi_over": int(o_at), "ofi_over_s": round(over, 1),
+        "why": (f"{label(ticks, ofi)} for a ~{int(want)}s bar -- "
+                f"{why}: {int(p_at):,} prints and {int(o_at):,} "
+                f"contracts in {int(over)}s. Prints scale with time, "
+                "signed OFI with its square root"),
+        "ready": True,
+    }
+
+
+def correct_for(reach: dict | None, target_s: float = AUTO_DEFAULT,
+                step: float = 0.35) -> dict:
+    """Nudge a running auto pair toward closing on both legs.
+
+    THE SEED IS AN ASSUMPTION; THIS IS THE MEASUREMENT. `size_for`
+    has to guess how signed OFI scales because it is sizing a pair
+    that has never run. Once the auto pair HAS run, its own bars
+    say what actually happens, and this moves the targets using
+    them rather than the square root.
+
+        STILL CAPPING means a leg is not firing inside the cap.
+        `ofi_at_cap` says how far the book actually got; the book
+        target comes down to meet it.
+
+        CLOSING TOO FAST OR TOO SLOW on both legs means the pair
+        is the right SHAPE and the wrong size, so both legs move
+        by the same ratio and the balance between them is kept.
+
+    ONE STEP AT A TIME. `step` bounds how far a single correction
+    moves anything, because a median taken over a quiet ten
+    minutes is not the tape and overreacting to it produces a new
+    builder and an empty chart for nothing.
+    """
+    r = reach if isinstance(reach, dict) else {}
+    ticks, ofi = int(_num(r.get("tick_target"))), int(_num(r.get("ofi_target")))
+    if ticks <= 0 or ofi <= 0:
+        return {"ticks": 0, "ofi": 0, "why": "no pair to correct",
+                "ready": False}
+    bars = int(_num(r.get("bars")))
+    if bars < 6:
+        return {"ticks": ticks, "ofi": ofi, "ready": False,
+                "why": f"only {bars} closed bars -- too few to correct on"}
+
+    want = max(1.0, _num(target_s, AUTO_DEFAULT))
+    lo, hi = 1.0 - max(0.0, min(0.9, step)), 1.0 + max(0.0, min(3.0, step))
+    capped, met = int(_num(r.get("capped"))), int(_num(r.get("met")))
+
+    if capped > met:
+        # THE BOOK LEG IS THE ONE NOT FIRING. Bring it down to
+        # what the book is actually reaching, not to what a square
+        # root said it would.
+        at = _num(r.get("ofi_at_cap"))
+        new_ofi = _sig2(max(float(MIN_OFI), at * 0.9)) if at > 0 else ofi
+        new_ofi = int(max(ofi * lo, min(float(new_ofi), ofi * hi)))
+        return {"ticks": ticks, "ofi": max(MIN_OFI, min(new_ofi, MAX_OFI)),
+                "ready": True,
+                "why": (f"{capped} of {bars} bars still closed on the "
+                        f"cap -- the book reached {int(at):,} of "
+                        f"{ofi:,}, so the book target comes down")}
+
+    took = _num(r.get("seconds_when_met")) or _num(r.get("seconds"))
+    if took <= 0.0:
+        return {"ticks": ticks, "ofi": ofi, "ready": False,
+                "why": "no bar has met both legs yet"}
+    ratio = max(lo, min(want / took, hi))
+    if 0.85 <= ratio <= 1.18:
+        return {"ticks": ticks, "ofi": ofi, "ready": False,
+                "why": (f"bars are meeting both legs in {took:.0f}s "
+                        f"against a {int(want)}s target -- close enough")}
+    return {
+        "ticks": max(MIN_TICKS, min(_sig2(ticks * ratio), MAX_TICKS)),
+        "ofi": max(MIN_OFI, min(_sig2(ofi * ratio), MAX_OFI)),
+        "ready": True,
+        "why": (f"bars are meeting both legs in {took:.0f}s against a "
+                f"{int(want)}s target -- both legs move {ratio:.2f}x"),
+    }
+
+
+def _num(v, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def label(ticks: int, ofi: int) -> str:
     return f"{int(ticks)}x{int(ofi)}"
