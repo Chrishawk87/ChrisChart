@@ -5833,6 +5833,9 @@ def create_app() -> FastAPI:
                              fused_tf: int | None = None,
                              fused_tf2: int | None = None,
                              fused_turn: int | None = None,
+                             fused_src: int | None = None,
+                             fused_ofi_bar: int | None = None,
+                             fused_tick_bar: int | None = None,
                              foot_s: int | None = None,
                              fused_auto_s: int | None = None,
                              fused_bounce_on: bool | None = None,
@@ -5891,6 +5894,14 @@ def create_app() -> FastAPI:
                 # snapping -- but each is read with its own
                 # `is None` so that sending one does not quietly
                 # clear the other two.
+                fused_src=(int(getattr(cur, "fused_src", 0) or 0)
+                           if fused_src is None else int(fused_src)),
+                fused_ofi_bar=(
+                    int(getattr(cur, "fused_ofi_bar", 500) or 500)
+                    if fused_ofi_bar is None else int(fused_ofi_bar)),
+                fused_tick_bar=(
+                    int(getattr(cur, "fused_tick_bar", 1000) or 1000)
+                    if fused_tick_bar is None else int(fused_tick_bar)),
                 foot_s=(int(getattr(cur, "foot_s", 0) or 0)
                         if foot_s is None else int(foot_s)),
                 fused_auto_s=(int(getattr(cur, "fused_auto_s", 0) or 0)
@@ -7895,6 +7906,35 @@ def create_app() -> FastAPI:
                 "bars": len(done), "levels": len(flags),
                 "why": "", **r, "decides": False}
 
+    def _ofi_bar_read(rt_, target: int = 0) -> dict:
+        """The OFI chart's own reading, at a named size.
+
+        `bar_read["read"]` IS THE COLOUR THE CANDLE WILL BE -- the
+        accumulator's sign past its deadband, which is what Chris
+        reads a candle by. Not price against the open; those two
+        disagree often and pairing them refused nearly every trade
+        once already.
+
+        NO BUILDER, NO READING. `ofibars` is keyed by target and a
+        size with no builder returns nothing rather than the
+        nearest one, because a row quietly reading a different
+        chart is worse than a blank row.
+        """
+        try:
+            svc = getattr(rt_, "ofi", None)
+            tape = getattr(svc, "tape", None) if svc else None
+            bars = getattr(tape, "ofibars", None) if tape else None
+            if not bars:
+                return {}
+            b = bars.get(int(target or 0))
+            if b is None:
+                return {}
+            out = dict(b.bar_read or {})
+            out.setdefault("target", int(target or 0))
+            return out
+        except Exception:                               # noqa: BLE001
+            return {}
+
     def _tape_lag(rt_) -> dict:
         """The tape's own lag reading, or why there is none.
 
@@ -7924,7 +7964,12 @@ def create_app() -> FastAPI:
                     # first six positionally.
                     turn_ticks: float | None = None,
                     bounce_on: bool = False,
-                    auto_s: float = 0.0) -> dict:
+                    auto_s: float = 0.0,
+                    # THE TWO ROWS' SOURCE, AND THE SIZE OF EACH
+                    # CHART. All on the end; every caller passes
+                    # the rest positionally.
+                    src: int = 0, ofi_bar: int = 0,
+                    tick_bar: int = 0) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -8101,6 +8146,9 @@ def create_app() -> FastAPI:
                     "auto": {"on": bool(auto_s),
                              "target_s": float(auto_s or 0.0),
                              "pair": None, "why": _auto.get("why") or ""},
+                    "src": {"two_charts": bool(src),
+                            "ofi_bar": int(ofi_bar or 0),
+                            "tick_bar": int(tick_bar or 0), "say": ""},
                     "call": {"side": "", "score": 0.0, "rows": [],
                              "speaking": 0, "of": 0,
                              "say": why, "decides": False},
@@ -8144,8 +8192,37 @@ def create_app() -> FastAPI:
             # error, and not a reading either.
             return _nothing(
                 key, "between bars -- the last event closed one")
+        # THE TWO ROWS, FROM WHEREVER THEY ARE SOURCED.
+        #
+        # Chris: "make the outer OFI actually read the OFI chart
+        # and the inner tick read the actual tick chart itself 2
+        # different reading from 2 individual charts".
+        #
+        # THE BAR STAYS THE FUSED BAR either way. It is what the
+        # panel draws, what the settle gate counts and what the
+        # turning row measures inside -- only the two DIRECTIONS
+        # move. Swapping the bar as well would change five things
+        # at once and leave nothing to compare against.
+        #
+        # A CHART WITH NO READING YET LEAVES THE ROW BLANK rather
+        # than falling back to the fused bar's own leg. A row that
+        # quietly reads a different source when its own is not
+        # ready cannot be trusted on the one bar where it matters.
+        _src = int(src or 0)
+        _ofi_row, _tick_row = cur.ofi_dir, cur.tick_dir
+        _rows_from = "the fused bar's own two legs"
+        if _src:
+            _ob = _ofi_bar_read(rt_, int(ofi_bar or 0))
+            _tb = _tick_now(rt_, per_bar=int(tick_bar or 0)) or {}
+            _ofi_row = str(_ob.get("read") or "")
+            _tick_row = str(_tb.get("dir") or "")
+            _rows_from = (
+                f"the {int(_ob.get('target') or ofi_bar or 0):,}"
+                f"-contract OFI chart and the "
+                f"{int(_tb.get('per_bar') or tick_bar or 0):,}"
+                "-print tick chart")
         out = _fr.state(
-            ofi_dir=cur.ofi_dir, tick_dir=cur.tick_dir,
+            ofi_dir=_ofi_row, tick_dir=_tick_row,
             open_px=cur.open, high=cur.high, low=cur.low,
             close=cur.close,
             net_ofi=cur.net_ofi, ofi_target=bld.ofi_target,
@@ -8241,6 +8318,14 @@ def create_app() -> FastAPI:
                 # not on a diagnostics page, because the question
                 # is always asked about a specific entry.
                 "lag": _tape_lag(rt_),
+                # WHERE THE TWO ROWS CAME FROM. On the panel,
+                # because two rows that look identical and mean
+                # different things is the worst state this box can
+                # be in -- and it has been in it.
+                "src": {"two_charts": bool(_src),
+                        "ofi_bar": int(ofi_bar or 0),
+                        "tick_bar": int(tick_bar or 0),
+                        "say": _rows_from},
                 # WHAT THE PAIR IS AND WHY, when it was sized
                 # rather than picked. Drawn on the panel because a
                 # pair that changes under you with no explanation
@@ -8855,12 +8940,17 @@ def create_app() -> FastAPI:
             _fturn = int(getattr(s, "fused_turn", 4) or 4)
             _fbon = bool(getattr(s, "fused_bounce_on", False))
             _fauto = int(getattr(s, "fused_auto_s", 0) or 0)
+            _fsrc = int(getattr(s, "fused_src", 0) or 0)
+            _fob = int(getattr(s, "fused_ofi_bar", 500) or 500)
+            _ftb = int(getattr(s, "fused_tick_bar", 1000) or 1000)
             _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev,
-                                _ftf, _ftf2, _fturn, _fbon, _fauto)
+                                _ftf, _ftf2, _fturn, _fbon, _fauto,
+                                _fsrc, _fob, _ftb)
             _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
             fus = _fused_gate(rt_, _fpair, _fbounce,
                               _fdw.held_s(_now_f), _fprev, _ftf,
-                              _ftf2, _fturn, _fbon, _fauto)
+                              _ftf2, _fturn, _fbon, _fauto,
+                              _fsrc, _fob, _ftb)
             try:
                 rt_._fused_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -9238,7 +9328,10 @@ def create_app() -> FastAPI:
                 int(getattr(s, "fused_tf2", 0) or 0),
                 int(getattr(s, "fused_turn", 4) or 4),
                 bool(getattr(s, "fused_bounce_on", False)),
-                int(getattr(s, "fused_auto_s", 0) or 0))
+                int(getattr(s, "fused_auto_s", 0) or 0),
+                int(getattr(s, "fused_src", 0) or 0),
+                int(getattr(s, "fused_ofi_bar", 500) or 500),
+                int(getattr(s, "fused_tick_bar", 1000) or 1000))
             try:
                 rt_._fused_shown_held = dict(_shown.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -12061,6 +12154,46 @@ has to be running before the gate stops refusing.">spike
               <option value="5000x2000">5000t &times; 2000</option>
               <option value="10000x4000" selected>10000t &times; 4000</option>
               <option value="100000x40000">100000t &times; 40000</option>
+            </select></label>
+          <!-- WHERE THE TWO ROWS READ FROM. Chris: "make the outer
+               OFI actually read the OFI chart and the inner tick
+               read the actual tick chart itself 2 different reading
+               from 2 individual charts". The fused bar is still the
+               bar on the panel either way -- only the two
+               directions move. -->
+          <label title="read the two rows off the fused bar's own
+                        legs, or off the OFI chart and the tick
+                        chart as two independent sources"
+            >rows
+            <select id="jnlFusedSrc" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0" selected>the fused bar</option>
+              <option value="1">two charts</option>
+            </select></label>
+          <label title="which OFI chart the outer row reads, when
+                        the rows come from two charts"
+            >OFI chart
+            <select id="jnlFusedOfiBar" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="125">125 contracts</option>
+              <option value="250">250 contracts</option>
+              <option value="500" selected>500 contracts</option>
+              <option value="1000">1000 contracts</option>
+              <option value="2000">2000 contracts</option>
+            </select></label>
+          <label title="which tick chart the inner row reads, when
+                        the rows come from two charts"
+            >tick chart
+            <select id="jnlFusedTickBar" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="233">233t</option>
+              <option value="500">500t</option>
+              <option value="1000" selected>1000t</option>
+              <option value="1500">1500t</option>
+              <option value="2000">2000t</option>
+              <option value="3000">3000t</option>
+              <option value="5000">5000t</option>
+              <option value="10000">10000t</option>
             </select></label>
           <!-- SIZED FROM THE TAPE INSTEAD OF PICKED. Chris, shown
                that 10000x4000 was closing on the 900s cap 92% of
@@ -17186,6 +17319,12 @@ async function jnlSet() {
        appears to snap back while the save is still in flight. */
     jnlFusedTurn: $('jnlFusedTurn')
       ? String($('jnlFusedTurn').value) : undefined,
+    jnlFusedSrc: $('jnlFusedSrc')
+      ? String($('jnlFusedSrc').value) : undefined,
+    jnlFusedOfiBar: $('jnlFusedOfiBar')
+      ? String($('jnlFusedOfiBar').value) : undefined,
+    jnlFusedTickBar: $('jnlFusedTickBar')
+      ? String($('jnlFusedTickBar').value) : undefined,
     jnlFootS: $('jnlFootS') ? String($('jnlFootS').value) : undefined,
     jnlFusedAuto: $('jnlFusedAuto')
       ? String($('jnlFusedAuto').value) : undefined,
@@ -17220,6 +17359,10 @@ async function jnlSet() {
        give-back at all", the tightest setting rather than off.
        Off is the checkbox beside it, so no || on this line. */
     fused_bounce: $('jnlFBouncePct') ? $('jnlFBouncePct').value : 33,
+    fused_src: $('jnlFusedSrc') ? $('jnlFusedSrc').value : 0,
+    fused_ofi_bar: $('jnlFusedOfiBar') ? $('jnlFusedOfiBar').value : 500,
+    fused_tick_bar: $('jnlFusedTickBar')
+      ? $('jnlFusedTickBar').value : 1000,
     foot_s: $('jnlFootS') ? $('jnlFootS').value : 0,
     fused_auto_s: $('jnlFusedAuto') ? $('jnlFusedAuto').value : 0,
     fused_bounce_on: ($('jnlFBounce') && $('jnlFBounce').checked)
@@ -18413,6 +18556,13 @@ function paintFusedGate(FG) {
               : '')
           + '</div>'
         : '')
+    /* WHERE THE TWO ROWS READ FROM. Two rows that look identical
+       and mean different things is the worst state this box can be
+       in, and it has been in it. */
+    + ((FG.src && FG.src.two_charts)
+        ? '<div class="thin">rows read from <b>two charts</b> &mdash; '
+          + esc(FG.src.say || '') + '</div>'
+        : '')
     /* WHAT THE PAIR IS AND WHY, when it was sized rather than
        picked. A pair that changes under you with no explanation
        is worse than one that is simply wrong -- you cannot tell
@@ -19088,6 +19238,12 @@ function paintJournal(d) {
     set('jnlFusedTf2', String(Math.round(S.fused_tf2)));
   if (S.fused_turn != null)
     set('jnlFusedTurn', String(Math.round(S.fused_turn)));
+  if (S.fused_src != null)
+    set('jnlFusedSrc', String(Math.round(S.fused_src)));
+  if (S.fused_ofi_bar != null)
+    set('jnlFusedOfiBar', String(Math.round(S.fused_ofi_bar)));
+  if (S.fused_tick_bar != null)
+    set('jnlFusedTickBar', String(Math.round(S.fused_tick_bar)));
   if (S.foot_s != null)
     set('jnlFootS', String(Math.round(S.foot_s)));
   if (S.fused_auto_s != null)

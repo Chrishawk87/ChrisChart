@@ -344,8 +344,13 @@ class TestItIsWiredThrough:
         src = self._web()
         assert "fused_ticks: int | None = None," in src
         assert "fused_ofi: int | None = None," in src
-        i = src.index("fused_ofi: int | None = None,")
-        blk = src[i:i + 2500]
+        # THE WHOLE ROUTE, NOT 2,500 CHARACTERS OF IT. That slice
+        # is a silent assertion that nothing is ever added above
+        # the line it looks for, and it broke the moment three
+        # settings went in -- on a change that had nothing to do
+        # with the pair. Eighth of these across the suite.
+        blk = _py_func("api_journal_settings")
+        assert "fused_ofi: int | None = None," in blk
         assert "fused_ticks=(int(getattr(cur" in blk, \
             "the route takes the parameter and drops it"
         assert "fused_ofi=(int(getattr(cur" in blk
@@ -446,6 +451,27 @@ from tests.test_cme_panels import _cme, client  # noqa: E402,F401
 from tests.test_stack_strip import page_js  # noqa: E402,F401
 
 AUTH = {"Authorization": "Bearer t0ken"}
+
+
+def _py_func(name: str, path: str = "liqmap/web.py") -> str:
+    """One whole Python function, by indentation.
+
+    Here because fixed character counts expire. A `src[i:i + N]`
+    asserts the code is shorter than N, and this suite has had
+    eight of them fail on unrelated changes.
+    """
+    import pathlib as _pl
+    src = (_pl.Path(__file__).resolve().parents[1] / path).read_text()
+    i = src.index(f"def {name}(")
+    start = src.rfind("\n", 0, i) + 1
+    indent = i - start
+    lines = src[start:].split("\n")
+    out = [lines[0]]
+    for line in lines[1:]:
+        if line.strip() and (len(line) - len(line.lstrip())) <= indent:
+            break
+        out.append(line)
+    return "\n".join(out)
 
 
 class TestItActuallySteps:
@@ -4025,3 +4051,232 @@ class TestTheAutoSizedPair:
                                 "why": "nothing has closed yet"}})
         assert "not sized yet" in html
         assert "nothing has closed yet" in html
+
+
+class TestTheRowsReadTwoSeparateCharts:
+    """Chris: "i have 2 charts on chris charts one is a OFI chart
+    that ranges from 125,250, 500, 1000 and 2000 contracts and the
+    other chart is my normal chart ... i want you to make the outer
+    OFI actually read the OFI chart and the inner tick read the
+    actual tick chart itself 2 different reading from 2 individual
+    charts what this does is give a better reading from 2 different
+    sources for better trades".
+
+    AND HE IS RIGHT, AGAINST WHAT THIS FILE USED TO ARGUE. The
+    fused bar's two legs covering the same prints was defended as a
+    virtue -- agreement about one event rather than two. Two legs
+    sharing a bar boundary are not independent evidence; they are
+    one event described twice.
+    """
+
+    def test_the_three_settings_round_trip(self, tmp_path):
+        from liqmap.journal import Journal
+        from liqmap.ofibar import LADDER
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        assert s.fused_src == 0, "it switched itself on"
+        s.fused_src, s.fused_ofi_bar, s.fused_tick_bar = 1, 2000, 233
+        back = j.save_settings(s)
+        assert (back.fused_src, back.fused_ofi_bar,
+                back.fused_tick_bar) == (1, 2000, 233)
+        d = j.settings("ES").to_dict()
+        assert d["fused_ofi_bar"] == 2000
+        for n in LADDER:
+            s.fused_ofi_bar = n
+            assert j.save_settings(s).fused_ofi_bar == n
+
+    def test_a_size_with_no_builder_cannot_be_saved(self, tmp_path):
+        """`_tick_now` AND THE OFI LADDER BOTH SNAP SILENTLY. A
+        size with no builder would come back as a real direction
+        read off some other chart, and nothing on screen would say
+        so."""
+        from liqmap.journal import Journal
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        s.fused_ofi_bar, s.fused_tick_bar = 999, 777
+        back = j.save_settings(s)
+        assert back.fused_ofi_bar == 500
+        assert back.fused_tick_bar == 1000
+
+    def test_the_route_takes_them(self, client, monkeypatch):
+        _cme(monkeypatch)
+        r = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_src": 1,
+                                "fused_ofi_bar": 125,
+                                "fused_tick_bar": 2000},
+                        headers=AUTH).json()["settings"]
+        assert r["fused_src"] == 1
+        assert r["fused_ofi_bar"] == 125
+        assert r["fused_tick_bar"] == 2000
+
+    def test_the_outer_row_reads_the_ofi_charts_colour(self):
+        """`bar_read["read"]` IS THE COLOUR THE CANDLE WILL BE --
+        the accumulator's sign past its deadband. NOT price against
+        the open; those two disagree often and pairing them refused
+        nearly every trade once already."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _ofi_bar_read(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "b.bar_read" in fn, "it reads something else"
+        assert "ofibars" in fn
+
+    def test_an_unbuilt_ofi_size_returns_nothing_not_the_nearest(self):
+        """A ROW QUIETLY READING A DIFFERENT CHART IS WORSE THAN A
+        BLANK ROW."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _ofi_bar_read(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        code = "\n".join(ln for ln in fn.splitlines()
+                         if not ln.strip().startswith("#"))
+        assert "min(" not in code and "max(bars)" not in code, \
+            "it falls back to the nearest built size"
+        assert "if b is None:" in code and "return {}" in code
+
+    def test_the_gate_swaps_only_the_two_directions(self):
+        """THE BAR STAYS THE FUSED BAR. It is what the panel draws,
+        what the settle gate counts and what the turning row
+        measures inside -- swapping it too would change five things
+        at once and leave nothing to compare against."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "ofi_dir=_ofi_row, tick_dir=_tick_row," in fn
+        # The bar's own prices still come from `cur`.
+        assert "open_px=cur.open, high=cur.high, low=cur.low," in fn
+        assert "prints=cur.prints" in fn
+
+    def test_a_chart_with_nothing_to_say_blanks_the_row(self):
+        """NOT A FALLBACK TO THE FUSED BAR'S OWN LEG. A row that
+        quietly changes source when its own is not ready cannot be
+        trusted on the one bar where it matters."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        j = fn.index("if _src:")
+        seg = fn[j:fn.index("out = _fr.state(", j)]
+        assert 'str(_ob.get("read") or "")' in seg
+        assert "cur.ofi_dir" not in seg, \
+            "it falls back to the fused bar's leg"
+        assert "cur.tick_dir" not in seg
+
+    def test_each_size_reaches_the_chart_it_names(self):
+        """SOURCE, AND THE REASON IS THE USUAL ONE: the fused
+        engine does not run under the test client, so every live
+        read comes back through `_nothing` and the BUILDING path
+        is invisible to the payload. Dropping either size there
+        leaves the selectors working, the database correct and the
+        panel honest, while both rows read whatever chart happened
+        to be default. All four of these survived a mutation run
+        until this test existed."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "_ofi_bar_read(rt_, int(ofi_bar or 0))" in fn, \
+            "the outer row does not read the size it was given"
+        assert "_tick_now(rt_, per_bar=int(tick_bar or 0))" in fn, \
+            "the inner row does not read the size it was given"
+        assert '"src": {"two_charts": bool(_src),' in fn, \
+            "the building path does not report its own source"
+
+    def test_the_shown_only_call_site_passes_all_three(self):
+        """OFF ITS OWN STRATEGY THE PANEL IS COMPUTED FRESH, and
+        that call takes every setting positionally -- three
+        constants there would make the panel read different charts
+        from the rule while looking identical."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("_shown = _fused_gate(")
+        seg = src[i:i + 900]
+        assert 'getattr(s, "fused_src"' in seg
+        assert 'getattr(s, "fused_ofi_bar"' in seg
+        assert 'getattr(s, "fused_tick_bar"' in seg
+
+    def test_off_reads_the_fused_bars_own_legs(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "_ofi_row, _tick_row = cur.ofi_dir, cur.tick_dir" in fn
+
+    def test_the_live_panel_says_where_the_rows_came_from(
+            self, client, monkeypatch):
+        """TWO ROWS THAT LOOK IDENTICAL AND MEAN DIFFERENT THINGS
+        is the worst state this box can be in, and it has been in
+        it."""
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        st = rt.journal.settings("ES")
+        st.strategy = "together"
+        st.fused_src, st.fused_ofi_bar, st.fused_tick_bar = 1, 1000, 2000
+        rt.journal.save_settings(st)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        jr = d.get("journal") or {}
+        assert "error" not in jr, jr.get("error")
+        s_ = (jr.get("fusedgate") or {}).get("src") or {}
+        assert s_.get("two_charts") is True
+        assert s_.get("ofi_bar") == 1000
+        assert s_.get("tick_bar") == 2000
+
+    def test_off_says_so_on_every_path(self, client, monkeypatch):
+        from liqmap import web
+        _cme(monkeypatch)
+        rt = web.runtime()
+        st = rt.journal.settings("ES")
+        st.strategy = "together"
+        st.fused_src = 0
+        rt.journal.save_settings(st)
+        d = client.get("/api/read",
+                       params={"coin": "ES", "interval": "15m",
+                               "timeframes": "15m,5m,1m"},
+                       headers=AUTH).json()
+        s_ = ((d.get("journal") or {}).get("fusedgate") or {}).get("src")
+        assert s_ is not None, "the path has no src block at all"
+        assert s_.get("two_charts") is False
+
+    def test_the_selectors_are_on_the_page(self):
+        from liqmap.ofibar import LADDER
+        src = (SRC / "web.py").read_text()
+        for el in ('id="jnlFusedSrc"', 'id="jnlFusedOfiBar"',
+                   'id="jnlFusedTickBar"'):
+            assert el in src, f"{el} is not on the page"
+        i = src.index('id="jnlFusedOfiBar"')
+        box = src[i:src.index("</select>", i)]
+        for n in LADDER:
+            assert f'value="{n}"' in box, f"no {n}-contract option"
+        for name in ("fused_src", "fused_ofi_bar", "fused_tick_bar"):
+            assert f"{name}: $('jnlFused" in src, f"{name} is never sent"
+        for el in ("jnlFusedSrc", "jnlFusedOfiBar", "jnlFusedTickBar"):
+            assert f"set('{el}'" in src, f"{el} never comes back"
+            assert f"{el}: $('{el}')" in src, f"{el} is not pinned"
+
+    def test_the_panel_draws_the_source(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "src": {"two_charts": True, "ofi_bar": 1000,
+                               "tick_bar": 2000,
+                               "say": "the 1,000-contract OFI chart and "
+                                      "the 2,000-print tick chart"}})
+        assert "two charts" in html
+        assert "1,000-contract OFI chart" in html
+        assert "2,000-print tick chart" in html
+
+    def test_the_panel_is_quiet_when_it_is_off(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "src": {"two_charts": False, "ofi_bar": 0,
+                               "tick_bar": 0, "say": ""}})
+        assert "two charts" not in html

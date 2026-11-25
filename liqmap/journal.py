@@ -157,6 +157,29 @@ class Settings:
     # Chris: "what if we took a actual foot print chart and use
     # that to build actual candles" -- and, on what the bar should
     # say: "the bar should mark push and activity".
+    # WHERE THE FUSED PANEL'S TWO ROWS COME FROM.
+    #
+    # 0 is the fused bar's own two legs, which is how it has always
+    # worked. 1 reads them off the two INDEPENDENT charts instead:
+    # the OFI chart for the outer row, the tick chart for the inner.
+    #
+    # Chris: "i want you to make the outer OFI actually read the OFI
+    # chart and the inner tick read the actual tick chart itself 2
+    # different reading from 2 individual charts what this does is
+    # give a better reading from 2 different sources for better
+    # trades".
+    #
+    # HE IS RIGHT AND THE OLD ARGUMENT WAS WRONG. The fused bar's
+    # two legs covering the same prints was defended here as a
+    # virtue -- agreement about one event rather than two. But two
+    # legs sharing a bar boundary are not independent evidence, they
+    # are one event described twice. Two series cut by different
+    # rules that happen to agree is a real confirmation.
+    fused_src: int = 0
+    # THE SIZE OF EACH OF THOSE CHARTS, when they are what is being
+    # read. Contracts for the OFI chart, prints for the tick chart.
+    fused_ofi_bar: int = 500
+    fused_tick_bar: int = 1000
     foot_s: int = 0
     fused_auto_s: int = 0
     fused_bounce_on: bool = False
@@ -188,6 +211,9 @@ class Settings:
                 "fused_tf2_label": (window_label(float(self.fused_tf2))
                                     if self.fused_tf2 else "off"),
                 "fused_turn": int(self.fused_turn),
+                "fused_src": int(self.fused_src),
+                "fused_ofi_bar": int(self.fused_ofi_bar),
+                "fused_tick_bar": int(self.fused_tick_bar),
                 "foot_s": int(self.foot_s),
                 "fused_auto_s": int(self.fused_auto_s),
                 "fused_bounce_on": bool(self.fused_bounce_on),
@@ -506,6 +532,9 @@ _ADDED_SETTINGS = (
     ("fused_tf", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_tf2", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_turn", "INTEGER NOT NULL DEFAULT 4"),
+    ("fused_src", "INTEGER NOT NULL DEFAULT 0"),
+    ("fused_ofi_bar", "INTEGER NOT NULL DEFAULT 500"),
+    ("fused_tick_bar", "INTEGER NOT NULL DEFAULT 1000"),
     ("foot_s", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_auto_s", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_bounce_on", "INTEGER NOT NULL DEFAULT 0"),
@@ -578,6 +607,9 @@ class Journal(ThreadedDB):
                         fused_tf=int(r["fused_tf"]),
                         fused_tf2=int(r["fused_tf2"]),
                         fused_turn=int(r["fused_turn"] or 4),
+                        fused_src=int(r["fused_src"] or 0),
+                        fused_ofi_bar=int(r["fused_ofi_bar"] or 500),
+                        fused_tick_bar=int(r["fused_tick_bar"] or 1000),
                         foot_s=int(r["foot_s"] or 0),
                         fused_auto_s=int(r["fused_auto_s"] or 0),
                         fused_bounce_on=bool(r["fused_bounce_on"]),
@@ -593,9 +625,10 @@ class Journal(ThreadedDB):
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
                 "  fused_ticks, fused_ofi, fused_bounce,"
                 "  fused_tf, fused_tf2, fused_turn,"
+                "  fused_src, fused_ofi_bar, fused_tick_bar,"
                 "  foot_s, fused_auto_s, fused_bounce_on,"
                 "  fused_bar_exit, fused_settle_exit, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -610,6 +643,9 @@ class Journal(ThreadedDB):
                 " fused_tf=excluded.fused_tf,"
                 " fused_tf2=excluded.fused_tf2,"
                 " fused_turn=excluded.fused_turn,"
+                " fused_src=excluded.fused_src,"
+                " fused_ofi_bar=excluded.fused_ofi_bar,"
+                " fused_tick_bar=excluded.fused_tick_bar,"
                 " foot_s=excluded.foot_s,"
                 " fused_auto_s=excluded.fused_auto_s,"
                 " fused_bounce_on=excluded.fused_bounce_on,"
@@ -655,6 +691,13 @@ class Journal(ThreadedDB):
                  # ONE OF THE OFFERED DURATIONS. Zero is off and
                  # is a choice, so nothing on this path may use
                  # `or` -- the same trap the bounce dial has.
+                 (1 if int(s.fused_src or 0) else 0),
+                 # ONE OF THE SIZES THAT HAS A BUILDER. A size with
+                 # none is not a slower reading, it is no reading
+                 # at all -- and both of these snap to the NEAREST
+                 # silently if they get through.
+                 _snap_ofi_bar(s.fused_ofi_bar),
+                 _snap_tick_bar(s.fused_tick_bar),
                  _snap_auto(s.foot_s),
                  _snap_auto(s.fused_auto_s),
                  int(bool(s.fused_bounce_on)),
@@ -1165,6 +1208,26 @@ def _snap_tf(value: int | float) -> int:
     if want < 0 and -want in TF_TICKS:
         return want
     return 0
+
+
+def _snap_ofi_bar(n: int | float) -> int:
+    """One of the OFI chart's own sizes, in contracts."""
+    from .ofibar import LADDER
+    try:
+        want = int(n)
+    except (TypeError, ValueError):
+        return 500
+    return want if want in LADDER else 500
+
+
+def _snap_tick_bar(n: int | float) -> int:
+    """One of the tick chart's own sizes, in prints."""
+    from .tickbar import PER_BAR_CHOICES
+    try:
+        want = int(n)
+    except (TypeError, ValueError):
+        return 1000
+    return want if want in PER_BAR_CHOICES else 1000
 
 
 def _snap_auto(secs: int | float) -> int:
