@@ -118,9 +118,15 @@ class TestTheTapeFeedsRawIntegers:
 
 class TestTheRouteAndPanel:
 
-    def test_the_ladder_spans_125_to_2000(self):
+    def test_the_ladder_spans_125_to_4000(self):
         from liqmap.ofibar import LADDER
-        assert LADDER == (125, 250, 500, 1000, 2000)
+        # 4,000 WAS ADDED when Chris ran the fused panel's rows off
+        # the OFI chart: "also there is no 4000 contracts for the
+        # OFI". Pinned as a whole tuple rather than a membership
+        # check because every size is a builder on the live stream,
+        # and the list growing by accident is a cost paid forever
+        # by nobody who asked for it.
+        assert LADDER == (125, 250, 500, 1000, 2000, 4000)
 
     def test_the_ladder_lives_with_the_builder_not_in_a_closure(self):
         """It was briefly a local inside create_app, where the runtime's

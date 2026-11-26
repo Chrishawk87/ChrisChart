@@ -88,7 +88,12 @@ CHOP = "chop"
 # passage to +/-L goes as L squared. Measured on 55M real ES book
 # updates, 4,000 produced one bar every 52 minutes, so this ladder spans
 # roughly three seconds to thirteen minutes a bar.
-LADDER: tuple[int, ...] = (125, 250, 500, 1000, 2000)
+# 4,000 IS HIS, ADDED AFTER HE RAN THE TWO-CHART ROWS AT 2,000.
+# Chris: "also there is no 4000 contracts for the OFI". One more
+# size is one more builder on the same stream -- the same cost the
+# other five already pay, which is a handful of adds per book
+# update.
+LADDER: tuple[int, ...] = (125, 250, 500, 1000, 2000, 4000)
 
 # Price-aggression labels.
 BUY_AGGRESSIVE = "BUY_PRICE_AGGRESSIVE"

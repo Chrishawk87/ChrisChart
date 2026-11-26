@@ -8211,6 +8211,7 @@ def create_app() -> FastAPI:
         _src = int(src or 0)
         _ofi_row, _tick_row = cur.ofi_dir, cur.tick_dir
         _rows_from = "the fused bar's own two legs"
+        _src_rows = {}
         if _src:
             _ob = _ofi_bar_read(rt_, int(ofi_bar or 0))
             _tb = _tick_now(rt_, per_bar=int(tick_bar or 0)) or {}
@@ -8221,6 +8222,32 @@ def create_app() -> FastAPI:
                 f"-contract OFI chart and the "
                 f"{int(_tb.get('per_bar') or tick_bar or 0):,}"
                 "-print tick chart")
+            # WHAT EACH CHART ACTUALLY SAID, carried raw.
+            #
+            # Chris: "there is no way to know if it is actually
+            # reading the settings swapping from fused bar to the
+            # 2 charts strategy". A row that says UP is not
+            # evidence it read the chart you picked -- these
+            # numbers are, because you can hold them against the
+            # chart itself.
+            #
+            # `read` IS "flat" INSIDE THE CALL-LEVEL DEADBAND, and
+            # that level is a SEPARATE number from the 2,000 that
+            # closes the bar. A candle can be visibly leaning
+            # while this says flat, and until the level was on
+            # screen there was no way to tell that from a bug.
+            _src_rows = {
+                "ofi": {"read": str(_ob.get("read") or ""),
+                        "raw": str(_ob.get("raw_side") or ""),
+                        "imbalance": int(_ob.get("imbalance") or 0),
+                        "level": int(_ob.get("level") or 0),
+                        "target": int(_ob.get("target") or 0),
+                        "held_s": float(_ob.get("held_s") or 0.0),
+                        "flips": int(_ob.get("flips") or 0)},
+                "tick": {"read": str(_tb.get("dir") or ""),
+                         "per_bar": int(_tb.get("per_bar") or 0),
+                         "prints": int(_tb.get("prints") or 0)},
+            }
         out = _fr.state(
             ofi_dir=_ofi_row, tick_dir=_tick_row,
             open_px=cur.open, high=cur.high, low=cur.low,
@@ -8244,6 +8271,14 @@ def create_app() -> FastAPI:
             tf_left_s=_tf_left,
             tf2_dir=_tf2_dir, tf2_on=bool(tf2_s),
             tf2_name=_tf2_name or "15m",
+            # A CHART-SOURCED ROW FOLLOWS ITS CHART, INCLUDING
+            # WHEN THE CHART SAYS NEITHER. The hold exists for the
+            # fused bar's own legs, where a forming bar sits on
+            # its open constantly; applied to an independent
+            # chart it showed the previous direction through that
+            # chart's flat and Chris watched it say DOWN while
+            # the OFI chart was UP.
+            hold_legs=not _src,
             tf_ticks=bool(int(tf_s or 0) < 0),
             tf2_ticks=bool(int(tf2_s or 0) < 0),
             tf_body=_tf_body, tf_travel=_tf_leg["ticks"],
@@ -8325,6 +8360,7 @@ def create_app() -> FastAPI:
                 "src": {"two_charts": bool(_src),
                         "ofi_bar": int(ofi_bar or 0),
                         "tick_bar": int(tick_bar or 0),
+                        "rows": _src_rows,
                         "say": _rows_from},
                 # WHAT THE PAIR IS AND WHY, when it was sized
                 # rather than picked. Drawn on the panel because a
@@ -12180,6 +12216,7 @@ has to be running before the gate stops refusing.">spike
               <option value="500" selected>500 contracts</option>
               <option value="1000">1000 contracts</option>
               <option value="2000">2000 contracts</option>
+              <option value="4000">4000 contracts</option>
             </select></label>
           <label title="which tick chart the inner row reads, when
                         the rows come from two charts"
@@ -18559,9 +18596,44 @@ function paintFusedGate(FG) {
     /* WHERE THE TWO ROWS READ FROM. Two rows that look identical
        and mean different things is the worst state this box can be
        in, and it has been in it. */
+    /* WHAT EACH CHART ACTUALLY SAID. Chris: "there is no way to
+       know if it is actually reading the settings swapping from
+       fused bar to the 2 charts strategy". A row saying UP is not
+       evidence it read the chart you picked -- these numbers are,
+       because you can hold them against the chart itself.
+
+       THE LEVEL IS ON SCREEN BECAUSE IT IS NOT THE TARGET. The
+       OFI chart calls a side only once its accumulator clears a
+       CALL LEVEL, which is a different number from the 2,000 that
+       closes the bar. A candle can be visibly leaning while this
+       reads FLAT, and without the level beside it there is no way
+       to tell that apart from a bug. */
     + ((FG.src && FG.src.two_charts)
         ? '<div class="thin">rows read from <b>two charts</b> &mdash; '
           + esc(FG.src.say || '') + '</div>'
+          + (((FG.src.rows || {}).ofi)
+              ? '<div class="thin">OFI chart <b>'
+                + esc((FG.src.rows.ofi.read || '-')).toUpperCase()
+                + '</b> &mdash; imbalance '
+                + (Number(FG.src.rows.ofi.imbalance || 0) > 0 ? '+' : '')
+                + Number(FG.src.rows.ofi.imbalance || 0).toLocaleString()
+                + ' against a call level of '
+                + Number(FG.src.rows.ofi.level || 0).toLocaleString()
+                + ' (the bar closes at '
+                + Number(FG.src.rows.ofi.target || 0).toLocaleString()
+                + ')'
+                + (Number(FG.src.rows.ofi.flips || 0)
+                    ? ' &middot; ' + Number(FG.src.rows.ofi.flips)
+                      + ' flips this bar' : '')
+                + '</div>'
+                + '<div class="thin">tick chart <b>'
+                + esc(((FG.src.rows.tick || {}).read || '-')).toUpperCase()
+                + '</b> &mdash; '
+                + Number((FG.src.rows.tick || {}).prints || 0).toLocaleString()
+                + ' of '
+                + Number((FG.src.rows.tick || {}).per_bar || 0).toLocaleString()
+                + ' prints</div>'
+              : '')
         : '')
     /* WHAT THE PAIR IS AND WHY, when it was sized rather than
        picked. A pair that changes under you with no explanation

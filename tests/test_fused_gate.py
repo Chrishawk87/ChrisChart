@@ -4280,3 +4280,202 @@ class TestTheRowsReadTwoSeparateCharts:
                        "src": {"two_charts": False, "ofi_bar": 0,
                                "tick_bar": 0, "say": ""}})
         assert "two charts" not in html
+
+
+class TestAChartSourcedRowFollowsItsChart:
+    """Chris, after running the rows at 2,000 contracts and 1,500
+    ticks: "i noticed that the OFI 2000 contracts can be up and the
+    2 charts reading will blank out or still be showing down".
+
+    TWO CAUSES, ONE OF THEM A BUG.
+
+        `bar_read["read"]` RETURNS "flat", NOT "". The OFI chart
+        calls a side only once its accumulator clears a CALL
+        LEVEL, which is a separate number from the target that
+        closes the bar. Flat is a real third state there, not a
+        tie.
+
+        AND THE HOLD TURNED THAT INTO A STALE DIRECTION. `hold_dir`
+        exists because the fused bar's own price leg sits exactly
+        on its open constantly and an absence must not read as a
+        reversal. Applied to an independent chart it carried the
+        PREVIOUS direction through that chart's flat -- so the row
+        said DOWN while the chart he was looking at was UP.
+    """
+
+    FULL_BAR = dict(open_px=20.0, high=21.0, low=19.0, close=21.0)
+
+    def _walk(self, raws, hold_legs):
+        prev, out = None, []
+        for raw in raws:
+            o = fr.read(ofi_dir=raw, tick_dir="up", bar_ts=1.0,
+                        prev=prev, hold_legs=hold_legs,
+                        **self.FULL_BAR, **FULL)
+            prev = o["held"]
+            out.append(o["ofi_dir"])
+        return out
+
+    def test_the_old_hold_showed_a_stale_direction_through_flat(self):
+        """The bug, stated as the behaviour it was."""
+        got = self._walk(["down", "flat", "flat"], hold_legs=True)
+        assert got == ["down", "down", "down"], \
+            "this test no longer describes the hold"
+
+    def test_a_chart_sourced_row_goes_flat_when_its_chart_does(self):
+        got = self._walk(["down", "flat", "up"], hold_legs=False)
+        assert got[1] != "down", "it held a direction the chart dropped"
+        assert got[2] == "up"
+
+    def test_it_follows_the_chart_straight_up_from_flat(self):
+        got = self._walk(["flat", "flat", "up", "up"], hold_legs=False)
+        assert got[-1] == "up"
+        assert got[0] not in ("up", "down")
+
+    def test_the_price_leg_is_not_held_either(self):
+        """BOTH ROWS COME FROM CHARTS in this mode, so both holds
+        have to go -- holding one and not the other is the same
+        bug surviving on the other side of the panel."""
+        prev, seen = None, []
+        for raw in ("up", "", "down"):
+            o = fr.read(ofi_dir="up", tick_dir=raw, bar_ts=1.0,
+                        prev=prev, hold_legs=False,
+                        **self.FULL_BAR, **FULL)
+            prev = o["held"]
+            seen.append(o["tick_dir"])
+        assert seen[1] != "up", "the price row held through a blank"
+
+    def test_the_fused_bars_own_legs_are_still_held(self):
+        """OFF ITS OWN SOURCE THE HOLD IS RIGHT and must not be
+        collateral damage: a forming fused bar sits exactly on its
+        open constantly, and an absence there IS a tie."""
+        prev, seen = None, []
+        for raw in ("up", "", "up"):
+            o = fr.read(ofi_dir="up", tick_dir=raw, bar_ts=1.0,
+                        prev=prev, **self.FULL_BAR, **FULL)
+            prev = o["held"]
+            seen.append(o["tick_dir"])
+        assert seen == ["up", "up", "up"], \
+            "the tie hold was removed from the fused bar too"
+
+    def test_state_passes_the_flag_down_to_read(self):
+        """`state` IS WHAT THE ROUTE CALLS, not `read`. A flag that
+        stops at `state`'s door leaves every test above passing
+        and the live panel holding stale directions exactly as
+        before."""
+        prev, seen = None, []
+        for raw in ("down", "flat", "flat"):
+            o = fr.state(ofi_dir=raw, tick_dir="up", held_s=9.0,
+                         bar_ts=1.0, prev=prev, hold_legs=False,
+                         **self.FULL_BAR, **FULL)
+            prev = o["held"]
+            seen.append(o["ofi_dir"])
+        assert seen[1] != "down", \
+            "state accepted the flag and did not pass it on"
+        held, prev2 = [], None
+        for raw in ("down", "flat"):
+            o = fr.state(ofi_dir=raw, tick_dir="up", held_s=9.0,
+                         bar_ts=1.0, prev=prev2,
+                         **self.FULL_BAR, **FULL)
+            prev2 = o["held"]
+            held.append(o["ofi_dir"])
+        assert held == ["down", "down"], "state lost the default"
+
+    def test_the_gate_turns_the_hold_off_only_for_two_charts(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "hold_legs=not _src," in fn, \
+            "the hold is applied to chart-sourced rows"
+
+
+class TestYouCanSeeWhichChartItRead:
+    """Chris: "there is no way to know if it is actually reading
+    the settings swapping from fused bar to the 2 charts
+    strategy". A row saying UP is not evidence it read the chart
+    you picked."""
+
+    def test_the_raw_readings_ride_on_the_payload(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert '"rows": _src_rows,' in fn
+        # THE VALUES, NOT THE KEYS. A key present with a constant
+        # behind it reports a call level of zero forever, which
+        # reads as "there is no deadband" -- the opposite of the
+        # thing that caused the confusion.
+        for k in ('"imbalance": int(_ob.get("imbalance")',
+                  '"level": int(_ob.get("level")',
+                  '"target": int(_ob.get("target")',
+                  '"per_bar": int(_tb.get("per_bar")',
+                  '"prints": int(_tb.get("prints")'):
+            assert k in fn, f"{k} is not read from the chart"
+        # AND THE OFI ROW IS THE CALLED SIDE, not the bare sign.
+        # `raw_side` flips every time the accumulator crosses zero
+        # -- three times a bar measured, which is what the call
+        # level exists to stop.
+        assert '"ofi": {"read": str(_ob.get("read")' in fn, \
+            "the row reports the bare sign instead of the called side"
+
+    def test_the_level_is_carried_because_it_is_not_the_target(self):
+        """A candle can be visibly leaning while the reading is
+        FLAT, because the call level and the bar's target are two
+        different numbers. Without the level beside it there is no
+        way to tell that apart from a bug -- which is exactly what
+        happened."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("function paintFusedGate(")
+        fn = src[i:src.index("\nfunction ", i + 10)]
+        assert "call level" in fn
+        assert "the bar closes at" in fn
+
+    def test_the_panel_shows_both_charts(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "", "where": "",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "src": {"two_charts": True, "ofi_bar": 2000,
+                               "tick_bar": 1500,
+                               "say": "the 2,000-contract OFI chart",
+                               "rows": {
+                                   "ofi": {"read": "flat", "raw": "up",
+                                           "imbalance": 640,
+                                           "level": 800,
+                                           "target": 2000,
+                                           "held_s": 0.0, "flips": 2},
+                                   "tick": {"read": "down",
+                                            "per_bar": 1500,
+                                            "prints": 310}}}})
+        assert "OFI chart <b>FLAT</b>" in html
+        assert "+640" in html
+        assert "call level of 800" in html
+        assert "the bar closes at 2,000" in html
+        assert "2 flips this bar" in html
+        # VISIBLE, not merely present. A row inside a hidden
+        # element is still in the HTML and still matches a
+        # substring test.
+        assert 'class="thin">tick chart <b>DOWN</b>' in html, \
+            "the tick chart line is not drawn as a visible row"
+        assert "310 of 1,500 prints" in html
+        assert "display:none" not in html
+
+    def test_the_four_thousand_size_exists(self):
+        from liqmap.journal import _snap_ofi_bar
+        from liqmap.ofibar import LADDER
+        assert 4000 in LADDER, "the size he asked for is not built"
+        assert _snap_ofi_bar(4000) == 4000
+        src = (SRC / "web.py").read_text()
+        i = src.index('id="jnlFusedOfiBar"')
+        box = src[i:src.index("</select>", i)]
+        assert 'value="4000"' in box, "it is built but not offered"
+
+    def test_every_ladder_size_has_a_builder(self):
+        """A size on the selector with no builder behind it is a
+        row reading nothing at all."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("svc.tape.ofibars = {")
+        seg = src[i:i + 300]
+        assert "for t in _OFI_LADDER" in seg, \
+            "the builders are not made from the ladder"

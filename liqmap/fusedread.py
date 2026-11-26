@@ -661,7 +661,24 @@ def read(ofi_dir: str = "", tick_dir: str = "",
          # above `prev` once silently turned every existing
          # caller's `tradeable` into something else; ten tests
          # caught it and nothing else would have.
-         turn_ticks: float = TURN_TICKS) -> dict:
+         turn_ticks: float = TURN_TICKS,
+         # WHETHER THE TWO LEGS ARE HELD THROUGH A BLANK.
+         #
+         # True is right when they ARE the fused bar's own legs: a
+         # forming bar sits exactly on its open constantly and an
+         # absence must not read as a reversal.
+         #
+         # False is right when they come from somewhere else.
+         # Chris, running the rows off the OFI chart: "the OFI 2000
+         # contracts can be up and the 2 charts reading will blank
+         # out or still be showing down". That was this hold. The
+         # OFI chart returns "flat" inside its own call-level
+         # deadband -- a real third state, not a tie -- and holding
+         # the PREVIOUS direction through it showed DOWN while the
+         # chart he was looking at was UP. A row sourced from a
+         # chart has to follow that chart, including when the chart
+         # says neither.
+         hold_legs: bool = True) -> dict:
     """The whole reading of one forming fused bar.
 
     `where` is the headline and it is one of:
@@ -721,7 +738,7 @@ def read(ofi_dir: str = "", tick_dir: str = "",
                     == float(bar_ts or 0.0))
     ok, settle_why = settled(net_ofi, ofi_target, prints,
                              tick_target, min_settle)
-    if same_bar:
+    if same_bar and hold_legs:
         # HELD THROUGH A TIE. A candle sitting exactly on its open
         # for an instant has not turned, and an absence must never
         # read as a reversal. This is the only guard the reading
@@ -741,7 +758,7 @@ def read(ofi_dir: str = "", tick_dir: str = "",
         # bar, and a candle sits exactly on its open often enough
         # that the row flickered.
         body_dir = hold_dir(body_dir, str(prev.get("body_dir") or ""))
-    if ok and same_bar:
+    if ok and same_bar and hold_legs:
         # HELD THROUGH A TIE, once the bar has settled. A bar that
         # ticks back to flat for an instant has not changed its
         # mind, and an absence must never read as a reversal.
@@ -1065,7 +1082,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
           # caller from the live bar and passed in, because this
           # module never fetches anything. ON THE END.
           tf_body: float = 0.0, tf_travel: float = 0.0,
-          tf2_body: float = 0.0, tf2_travel: float = 0.0) -> dict:
+          tf2_body: float = 0.0, tf2_travel: float = 0.0,
+          hold_legs: bool = True) -> dict:
     """The reading and the rule's verdict on it, from one place.
 
     ONE READING, NOT TWO. The panel is handed what the rule decided
@@ -1097,7 +1115,8 @@ def state(ofi_dir: str = "", tick_dir: str = "",
                tick_target=tick_target, bounce_at=bounce_at,
                min_settle=min_settle, bar_ts=bar_ts,
                tradeable=tradeable, prev=prev,
-               turn_ticks=turn_ticks, bounce_on=bounce_on)
+               turn_ticks=turn_ticks, bounce_on=bounce_on,
+               hold_legs=hold_legs)
     side, why = entry_side(out["where"], out["side"],
                            held_s=held_s, min_hold_s=min_hold_s,
                            tf_dir=tf_dir, tf_on=tf_on,
