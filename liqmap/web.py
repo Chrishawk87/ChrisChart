@@ -8215,8 +8215,36 @@ def create_app() -> FastAPI:
         if _src:
             _ob = _ofi_bar_read(rt_, int(ofi_bar or 0))
             _tb = _tick_now(rt_, per_bar=int(tick_bar or 0)) or {}
-            _ofi_row = str(_ob.get("read") or "")
-            _tick_row = str(_tb.get("dir") or "")
+            # THE CANDLE, NOT A GATED READING OF IT.
+            #
+            # Chris: "these goes flat when there is actual movement
+            # in the OFI and the tick chart there is no reason for
+            # them to be flat almost ever if the actual ofi isnt
+            # flat or the tick chart isnt flat". He is right, and
+            # both rows were reading something other than what the
+            # chart draws.
+            #
+            # `read` IS THE CALLED SIDE, gated on a call level that
+            # defaults to 500 contracts. On the 2,000-contract bar
+            # he was running that is a quarter of the whole bar, so
+            # the row sat FLAT through most of it -- and on the 125
+            # and 250 bars the level is larger than the bar's own
+            # target and the row could never call a side at all.
+            # `raw_side` is the accumulator's sign, which is what
+            # paints the candle.
+            #
+            # `dir` IS THE PATH VOTE, gated on `PATH_BAND` and a
+            # minimum vote count, so it reads flat early in every
+            # bar and whenever the prints are balanced. `body_dir`
+            # is close against open -- the candle itself.
+            #
+            # THE GATED READINGS ARE NOT LOST, they are drawn
+            # beside these on the panel. They were protections that
+            # someone measured, and the honest thing is to show
+            # when they would have disagreed rather than to delete
+            # them or to keep silently overriding the chart.
+            _ofi_row = str(_ob.get("raw_side") or "")
+            _tick_row = str(_tb.get("body_dir") or "")
             _rows_from = (
                 f"the {int(_ob.get('target') or ofi_bar or 0):,}"
                 f"-contract OFI chart and the "
@@ -8237,14 +8265,17 @@ def create_app() -> FastAPI:
             # while this says flat, and until the level was on
             # screen there was no way to tell that from a bug.
             _src_rows = {
-                "ofi": {"read": str(_ob.get("read") or ""),
-                        "raw": str(_ob.get("raw_side") or ""),
+                "ofi": {"read": str(_ob.get("raw_side") or ""),
+                        "called": str(_ob.get("read") or ""),
                         "imbalance": int(_ob.get("imbalance") or 0),
                         "level": int(_ob.get("level") or 0),
                         "target": int(_ob.get("target") or 0),
                         "held_s": float(_ob.get("held_s") or 0.0),
                         "flips": int(_ob.get("flips") or 0)},
-                "tick": {"read": str(_tb.get("dir") or ""),
+                "tick": {"read": str(_tb.get("body_dir") or ""),
+                         "path": str(_tb.get("dir") or ""),
+                         "votes": int(_tb.get("votes") or 0),
+                         "votes_needed": int(_tb.get("votes_needed") or 0),
                          "per_bar": int(_tb.get("per_bar") or 0),
                          "prints": int(_tb.get("prints") or 0)},
             }
@@ -18617,14 +18648,27 @@ function paintFusedGate(FG) {
                 + '</b> &mdash; imbalance '
                 + (Number(FG.src.rows.ofi.imbalance || 0) > 0 ? '+' : '')
                 + Number(FG.src.rows.ofi.imbalance || 0).toLocaleString()
-                + ' against a call level of '
-                + Number(FG.src.rows.ofi.level || 0).toLocaleString()
-                + ' (the bar closes at '
+                + ' of the '
                 + Number(FG.src.rows.ofi.target || 0).toLocaleString()
-                + ')'
+                + ' that closes the bar'
                 + (Number(FG.src.rows.ofi.flips || 0)
                     ? ' &middot; ' + Number(FG.src.rows.ofi.flips)
                       + ' flips this bar' : '')
+                /* WHAT THE GATED READING WOULD HAVE SAID. The row
+                   reads the candle now; this is the called side,
+                   which needs the accumulator past a CALL LEVEL
+                   that is a different number from the target. It
+                   is drawn so a disagreement is visible rather
+                   than silently overriding the chart -- which is
+                   what it was doing. */
+                + ((FG.src.rows.ofi.called
+                    && FG.src.rows.ofi.called !== FG.src.rows.ofi.read)
+                    ? '<br><span style="opacity:.6">the called side is '
+                      + esc(FG.src.rows.ofi.called).toUpperCase()
+                      + ' &mdash; needs ' + Number(
+                          FG.src.rows.ofi.level || 0).toLocaleString()
+                      + ' past zero, shown only</span>'
+                    : '')
                 + '</div>'
                 + '<div class="thin">tick chart <b>'
                 + esc(((FG.src.rows.tick || {}).read || '-')).toUpperCase()
@@ -18632,7 +18676,18 @@ function paintFusedGate(FG) {
                 + Number((FG.src.rows.tick || {}).prints || 0).toLocaleString()
                 + ' of '
                 + Number((FG.src.rows.tick || {}).per_bar || 0).toLocaleString()
-                + ' prints</div>'
+                + ' prints'
+                + (((FG.src.rows.tick || {}).path
+                    && FG.src.rows.tick.path !== FG.src.rows.tick.read)
+                    ? '<br><span style="opacity:.6">the path vote is '
+                      + esc(FG.src.rows.tick.path).toUpperCase()
+                      + ' &mdash; ' + Number(
+                          FG.src.rows.tick.votes || 0).toLocaleString()
+                      + ' of ' + Number(
+                          FG.src.rows.tick.votes_needed || 0).toLocaleString()
+                      + ' votes, shown only</span>'
+                    : '')
+                + '</div>'
               : '')
         : '')
     /* WHAT THE PAIR IS AND WHY, when it was sized rather than

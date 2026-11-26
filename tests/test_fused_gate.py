@@ -4409,24 +4409,48 @@ class TestYouCanSeeWhichChartItRead:
                   '"per_bar": int(_tb.get("per_bar")',
                   '"prints": int(_tb.get("prints")'):
             assert k in fn, f"{k} is not read from the chart"
-        # AND THE OFI ROW IS THE CALLED SIDE, not the bare sign.
-        # `raw_side` flips every time the accumulator crosses zero
-        # -- three times a bar measured, which is what the call
-        # level exists to stop.
-        assert '"ofi": {"read": str(_ob.get("read")' in fn, \
-            "the row reports the bare sign instead of the called side"
+        # AND THE OFI ROW IS THE CANDLE, NOT THE CALLED SIDE.
+        #
+        # This asserted the opposite for one revision. The called
+        # side needs the accumulator past a CALL LEVEL that
+        # defaults to 500 contracts -- a quarter of the
+        # 2,000-contract bar Chris runs, and larger than the whole
+        # target on the 125 and 250 bars, where it could never
+        # call a side at all. He watched the row sit FLAT while
+        # the chart moved and said so twice.
+        #
+        # THE CALLED SIDE IS STILL CARRIED, beside it, so a
+        # disagreement is visible instead of silent.
+        assert '"ofi": {"read": str(_ob.get("raw_side")' in fn, \
+            "the row reports a gated side instead of the candle"
+        assert '"called": str(_ob.get("read")' in fn, \
+            "the called side is dropped rather than shown beside it"
+        assert '"tick": {"read": str(_tb.get("body_dir")' in fn, \
+            "the tick row reports the path vote, not the candle"
+        assert '"path": str(_tb.get("dir")' in fn
 
-    def test_the_level_is_carried_because_it_is_not_the_target(self):
-        """A candle can be visibly leaning while the reading is
-        FLAT, because the call level and the bar's target are two
-        different numbers. Without the level beside it there is no
-        way to tell that apart from a bug -- which is exactly what
-        happened."""
+    def test_the_gated_readings_are_drawn_but_marked_shown_only(self):
+        """A candle can be visibly leaning while the GATED reading
+        says FLAT, because the call level is a different number
+        from the bar's target. Showing both, with the gated one
+        marked, is what turns that from a bug report into a
+        reading.
+
+        THE RENDERED STRINGS, NOT THE COMMENTS. The previous
+        version of this asserted `"call level" in fn` and the
+        panel's own comment contained it in capitals -- a test
+        passing on prose, for the fourth time in this suite."""
         src = (SRC / "web.py").read_text()
         i = src.index("function paintFusedGate(")
         fn = src[i:src.index("\nfunction ", i + 10)]
-        assert "call level" in fn
-        assert "the bar closes at" in fn
+        code = "\n".join(ln for ln in fn.splitlines()
+                         if not ln.strip().startswith("/*")
+                         and not ln.strip().startswith("*"))
+        assert "that closes the bar" in code
+        assert "the called side is " in code
+        assert "past zero, shown only" in code
+        assert "the path vote is " in code
+        assert "votes, shown only" in code
 
     def test_the_panel_shows_both_charts(self, page_js):
         from tests.test_stack_strip import run_js
@@ -4440,19 +4464,29 @@ class TestYouCanSeeWhichChartItRead:
                                "tick_bar": 1500,
                                "say": "the 2,000-contract OFI chart",
                                "rows": {
-                                   "ofi": {"read": "flat", "raw": "up",
+                                   "ofi": {"read": "up",
+                                           "called": "flat",
                                            "imbalance": 640,
                                            "level": 800,
                                            "target": 2000,
                                            "held_s": 0.0, "flips": 2},
                                    "tick": {"read": "down",
+                                            "path": "flat",
+                                            "votes": 40,
+                                            "votes_needed": 120,
                                             "per_bar": 1500,
                                             "prints": 310}}}})
-        assert "OFI chart <b>FLAT</b>" in html
+        # THE ROW IS THE CANDLE -- up, because the accumulator is
+        # +640 -- while the gated reading disagrees at FLAT.
+        assert "OFI chart <b>UP</b>" in html
         assert "+640" in html
-        assert "call level of 800" in html
-        assert "the bar closes at 2,000" in html
+        assert "of the 2,000 that closes the bar" in html
         assert "2 flips this bar" in html
+        # AND THE DISAGREEMENT IS VISIBLE, not silent.
+        assert "the called side is FLAT" in html
+        assert "needs 800 past zero" in html
+        assert "the path vote is FLAT" in html
+        assert "40 of 120 votes" in html
         # VISIBLE, not merely present. A row inside a hidden
         # element is still in the HTML and still matches a
         # substring test.
@@ -4479,3 +4513,110 @@ class TestYouCanSeeWhichChartItRead:
         seg = src[i:i + 300]
         assert "for t in _OFI_LADDER" in seg, \
             "the builders are not made from the ladder"
+
+
+class TestTheRowsAreTheCandlesThemselves:
+    """Chris, watching the two-chart rows at 2,000 contracts and
+    1,500 ticks: "these goes flat when there is actual movement in
+    the OFI and the tick chart there is no reason for them to be
+    flat almost ever if the actual ofi isnt flat or the tick chart
+    isnt flat".
+
+    BOTH ROWS WERE READING A GATE, NOT A CHART.
+
+        The OFI row read the CALLED side, which needs the
+        accumulator past a call level that defaults to 500
+        contracts. On his 2,000-contract bar that is a quarter of
+        the whole bar; on the 125 and 250 bars it is larger than
+        the target, so the row could never call a side at all.
+
+        The tick row read the PATH VOTE, gated on a 2% margin and
+        a minimum vote count, so it reads flat early in every bar
+        and whenever the prints are balanced.
+
+    Neither is what the chart draws. `raw_side` is the
+    accumulator's sign, which paints the OFI candle; `body_dir` is
+    close against open, which is the tick candle.
+    """
+
+    def test_the_ofi_row_is_the_accumulators_sign(self):
+        """NOT THE CALLED SIDE. A chart that is visibly green has
+        a positive accumulator -- that IS the colour."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        j = fn.index("if _src:")
+        seg = fn[j:fn.index("out = _fr.state(", j)]
+        code = "\n".join(ln for ln in seg.splitlines()
+                         if not ln.strip().startswith("#"))
+        assert '_ofi_row = str(_ob.get("raw_side") or "")' in code
+        assert '_ofi_row = str(_ob.get("read")' not in code
+
+    def test_the_tick_row_is_the_candles_body(self):
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        j = fn.index("if _src:")
+        seg = fn[j:fn.index("out = _fr.state(", j)]
+        code = "\n".join(ln for ln in seg.splitlines()
+                         if not ln.strip().startswith("#"))
+        assert '_tick_row = str(_tb.get("body_dir") or "")' in code
+        assert '_tick_row = str(_tb.get("dir")' not in code
+
+    def test_the_call_level_can_exceed_the_small_bars_target(self):
+        """THE ARITHMETIC THAT MADE THIS UNARGUABLE. At the default
+        call level a 125-contract bar can never call a side: the
+        bar closes before the accumulator could reach it."""
+        from liqmap.ofibar import CALL_LEVEL, LADDER
+        assert CALL_LEVEL == 500
+        unreachable = [t for t in LADDER if t <= CALL_LEVEL]
+        assert unreachable, "this test no longer tests anything"
+        assert 125 in unreachable and 250 in unreachable
+
+    def test_the_gated_readings_survive_as_evidence(self):
+        """THEY WERE PROTECTIONS SOMEBODY MEASURED. Deleting them
+        loses the measurement; keeping them in charge overrode the
+        chart. Drawn beside, they say when they would disagree."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert '"called": str(_ob.get("read")' in fn
+        assert '"path": str(_tb.get("dir")' in fn
+        assert '"votes_needed": int(_tb.get("votes_needed")' in fn
+
+    def test_the_panel_only_says_it_when_they_disagree(self, page_js):
+        """A LINE THAT IS ALWAYS THERE IS NOT READ. The gated
+        reading matters exactly when it differs from the candle."""
+        from tests.test_stack_strip import run_js
+
+        def draw(called, path):
+            return run_js(page_js, "fusedGate",
+                          {**TestThePanelActuallyRenders.BAR,
+                           "tick_dir": "up", "ofi_dir": "up",
+                           "where": "together", "agree": True,
+                           "side": "up",
+                           "turning": {"dir": "", "ticks_off": 0.0,
+                                       "travel": 0.0, "band": 4.0,
+                                       "decides": False},
+                           "src": {"two_charts": True,
+                                   "ofi_bar": 2000, "tick_bar": 1500,
+                                   "say": "two charts",
+                                   "rows": {
+                                       "ofi": {"read": "up",
+                                               "called": called,
+                                               "imbalance": 640,
+                                               "level": 800,
+                                               "target": 2000,
+                                               "flips": 0},
+                                       "tick": {"read": "up",
+                                                "path": path,
+                                                "votes": 40,
+                                                "votes_needed": 120,
+                                                "per_bar": 1500,
+                                                "prints": 310}}}})
+        agree = draw("up", "up")
+        assert "the called side" not in agree
+        assert "the path vote" not in agree
+        differ = draw("flat", "down")
+        assert "the called side is FLAT" in differ
+        assert "the path vote is DOWN" in differ
