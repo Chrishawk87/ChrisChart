@@ -81,6 +81,33 @@ GREEN = "green"
 RED = "red"
 CHOP = "chop"
 
+
+def paint_of(direction: str, ofi: int) -> str:
+    """The colour the chart draws this bar, as a direction word.
+
+    THIS IS A TRANSCRIPTION OF THE RENDERER, not a second opinion
+    about the bar. The page draws every OFI candle with:
+
+        if (b.direction === 'green') return GREEN_HEX;
+        if (b.direction === 'red')   return RED_HEX;
+        return (b.ofi || 0) < 0 ? RED_HEX : GREEN_HEX;
+
+    and the forming candle reaches that function with no direction
+    of its own, so its colour is the bare sign of the accumulator
+    it has so far. Those three lines are this function, in the same
+    order, and if one of them changes this must change with it.
+
+    THERE IS NO FLAT. The chart has two colours and zero is drawn
+    green, so a reading that mirrors the chart has two words and
+    says UP at zero. Chris: "red down green up ... a continuous
+    reading".
+    """
+    if direction == GREEN:
+        return "up"
+    if direction == RED:
+        return "down"
+    return "down" if int(ofi or 0) < 0 else "up"
+
 # The thresholds the live chart can switch between, all accumulating at
 # once so a switch is instant and carries its whole history.
 #
@@ -855,6 +882,38 @@ class OfiBarBuilder:
         return self._acc
 
     @property
+    def paint(self) -> str:
+        """The colour of the RIGHTMOST CANDLE ON THE CHART, now.
+
+        Chris: "i want this to actually look at the footprint OFI
+        chart and say what its doing ... its not calculating
+        anything just saying what it see the bar doing immediately
+        ... always looking at it red down green up".
+
+        So this is not a reading of the flow. It is the answer to
+        "what colour is that candle", and the only reason it lives
+        on the builder is that the builder is what the chart is
+        drawn from -- a copy of the rule anywhere else is a second
+        thing to keep in step with the renderer.
+
+        WHICH CANDLE. The forming one while prints are arriving,
+        and the last closed one in the gap between bars, because
+        that is which one is on the right-hand edge of the screen
+        at each of those moments. The route that feeds the chart
+        decides it the same way: `cur.updates > 0`.
+        """
+        bar = self._bar
+        if bar is not None and bar.updates > 0:
+            # No direction yet -- it gets one when it closes -- so
+            # this takes the renderer's fall-through branch, which
+            # is the sign of the accumulator.
+            return paint_of(CHOP, self._acc)
+        last = self.bars[-1] if self.bars else None
+        if last is None:
+            return ""
+        return paint_of(last.direction, last.ofi)
+
+    @property
     def live_pai(self) -> float:
         """Aggression of the bar in progress, so the forming candle can
         be drawn in the colour it currently is."""
@@ -989,7 +1048,7 @@ class OfiBarBuilder:
         if bar is None:
             return {"read": "", "imbalance": 0, "imb": "",
                     "level": max(0, int(self._level)),
-                    "raw_side": "",
+                    "raw_side": "", "paint": self.paint,
                     "delta": 0.0, "delta_side": "",
                     "cvd_since_flip": 0.0, "flip_ts": 0.0,
                     "flip_ok": False,
@@ -1043,6 +1102,10 @@ class OfiBarBuilder:
             "level": band,
             "raw_side": ("up" if acc > 0 else "down" if acc < 0
                          else "flat"),
+            # THE COLOUR ON SCREEN, carried so a row that is
+            # supposed to mirror the chart does not have to work
+            # out what the chart would have done.
+            "paint": self.paint,
             "imb": ofi_side,
             # THE PAID-FOR COLUMN, and the other half of the pair.
             # The imbalance is the book leaning; the delta is size

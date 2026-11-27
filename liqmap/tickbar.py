@@ -746,6 +746,34 @@ class TickBars:
     def last_closed(self) -> TickBar | None:
         return self.done[-1] if self.done else None
 
+    @property
+    def paint(self) -> str:
+        """The colour of the RIGHTMOST CANDLE ON THE CHART, now.
+
+        Chris: "same for the tick chart it reads whatever is there
+        green up red down a continuous reading".
+
+        A TRANSCRIPTION OF THE RENDERER. A tick candle carries no
+        direction of its own to the page, so it takes the plain
+        branch of the chart's colour rule:
+
+            c = (b.c >= b.o) ? UP_COLOUR : DOWN_COLOUR
+
+        which is `direction` EXCEPT at close == open, where the
+        candle is drawn green and `direction` says "flat". The
+        chart has two colours; so does this. Reporting flat here
+        would blank the row at the open of every bar, which is the
+        complaint that started this: "these goes flat when there is
+        actual movement".
+
+        The forming bar while one is forming, the last closed one
+        in the gap, same as the OFI side and same as the chart.
+        """
+        bar = self._cur if self._cur is not None else self.last_closed
+        if bar is None:
+            return ""
+        return "up" if bar.close >= bar.open else "down"
+
     def rows(self, limit: int = 200, include_live: bool = True) -> list[dict]:
         """Closed bars oldest-first, with the forming bar appended.
 

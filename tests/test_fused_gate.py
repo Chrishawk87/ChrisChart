@@ -4415,24 +4415,26 @@ class TestYouCanSeeWhichChartItRead:
                   '"per_bar": int(_tb.get("per_bar")',
                   '"prints": int(_tb.get("prints")'):
             assert k in fn, f"{k} is not read from the chart"
-        # AND THE OFI ROW IS THE CANDLE, NOT THE CALLED SIDE.
+        # AND THE ROW IS THE COLOUR ON SCREEN.
         #
-        # This asserted the opposite for one revision. The called
-        # side needs the accumulator past a CALL LEVEL that
-        # defaults to 500 contracts -- a quarter of the
-        # 2,000-contract bar Chris runs, and larger than the whole
-        # target on the 125 and 250 bars, where it could never
-        # call a side at all. He watched the row sit FLAT while
-        # the chart moved and said so twice.
+        # This line has named three different readings. `read` is
+        # gated on a CALL LEVEL that defaults to 500 contracts --
+        # a quarter of the 2,000-contract bar Chris runs, and
+        # larger than the whole target on the 125 and 250 bars,
+        # where it could never call a side at all. `raw_side` is
+        # the bare accumulator sign, which goes flat at zero. Both
+        # were answers about the bar; neither was the colour of
+        # it. `paint` is the renderer\'s own rule -- see
+        # tests/test_paint.py, which fails if the renderer moves.
         #
-        # THE CALLED SIDE IS STILL CARRIED, beside it, so a
+        # THE GATED READINGS ARE STILL CARRIED, beside it, so a
         # disagreement is visible instead of silent.
-        assert '"ofi": {"read": str(_ob.get("raw_side")' in fn, \
-            "the row reports a gated side instead of the candle"
+        assert '"ofi": {"read": str(_ob.get("paint")' in fn, \
+            "the row reports a reading instead of the colour"
         assert '"called": str(_ob.get("read")' in fn, \
             "the called side is dropped rather than shown beside it"
-        assert '"tick": {"read": str(_tb.get("body_dir")' in fn, \
-            "the tick row reports the path vote, not the candle"
+        assert '"tick": {"read": str(_tb.get("paint")' in fn, \
+            "the tick row reports a reading, not the colour"
         assert '"path": str(_tb.get("dir")' in fn
 
     def test_the_gated_readings_are_drawn_but_marked_shown_only(self):
@@ -4555,16 +4557,19 @@ class TestTheRowsAreTheCandlesThemselves:
         seg = fn[j:fn.index("out = _fr.state(", j)]
         code = "\n".join(ln for ln in seg.splitlines()
                          if not ln.strip().startswith("#"))
-        # THE CHART'S OWN ACCUMULATOR, THROUGH THE BAND. The row
-        # read `raw_side` for one revision -- the bare sign -- and
-        # Chris watched it chatter against a chart that does not:
-        # "the OFI is bouncing all over the place when im looking
-        # at the chart OFI is pretty stable". `ofi_side` takes the
-        # accumulator and the chart's own target so the band means
-        # the same thing on a 125-contract bar as on a 4,000.
-        assert '_fr.ofi_side(_ob.get("imbalance")' in code
-        assert '_ob.get("target"), _band, _was)' in code
+        # THE COLOUR, AND NOTHING ON TOP OF IT. Chris: "i dont
+        # care about cutting in halves ... its not calculating
+        # anything just saying what it see the bar doing
+        # immediately". Three readings have been this row and each
+        # was a different answer from the candle he was watching:
+        # `read` (gated on the call level, so blank for most of a
+        # bar), `raw_side` (the bare sign, flat at zero), and
+        # `ofi_side` (a band with hysteresis over that sign).
+        assert '_ofi_row = str(_ob.get("paint") or "")' in code
+        assert "_fr.ofi_side(" not in code, \
+            "the chart-sourced row is computing something again"
         assert '_ofi_row = str(_ob.get("read")' not in code
+        assert '_ofi_row = str(_ob.get("raw_side")' not in code
 
     def test_the_tick_row_is_the_candles_body(self):
         src = (SRC / "web.py").read_text()
@@ -4574,7 +4579,7 @@ class TestTheRowsAreTheCandlesThemselves:
         seg = fn[j:fn.index("out = _fr.state(", j)]
         code = "\n".join(ln for ln in seg.splitlines()
                          if not ln.strip().startswith("#"))
-        assert '_tick_row = str(_tb.get("body_dir") or "")' in code
+        assert '_tick_row = str(_tb.get("paint") or "")' in code
         assert '_tick_row = str(_tb.get("dir")' not in code
 
     def test_the_call_level_can_exceed_the_small_bars_target(self):
@@ -4842,3 +4847,57 @@ class TestTheBookIsSteadiedWithHysteresis:
                        "band": {"pct": 10.0, "called": "", "edge": 400,
                                 "acc": 120, "target": 4000}})
         assert "not called yet" in html
+
+    def test_the_dial_is_marked_as_not_applying_to_a_chart_row(self):
+        """THE DIAL STILL EXISTS AND STILL DOES SOMETHING -- just
+        not to the row in front of you.
+
+        Chris: "i dont care about cutting in halves". On the
+        two-chart path the outer row is the colour of a candle and
+        nothing is banded; the dial goes on governing the fused
+        bar's own book leg, which is a different reading of a
+        different series. A panel that described the band while
+        the row ignored it would be the exact confusion this box
+        has already been in twice.
+        """
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert '"applies": not bool(_src),' in fn, \
+            "the panel cannot tell whether the band is doing anything"
+
+    def test_the_panel_says_the_row_is_the_candle(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "band": {"pct": 10.0, "called": "up",
+                                "edge": 400, "acc": 640,
+                                "target": 4000, "applies": False}})
+        assert "the colour of the candle" in html
+        assert "flips past" not in html, \
+            "it describes a band the row is not using"
+
+    def test_the_fused_bars_own_leg_still_gets_the_band(self, page_js):
+        """`applies` ABSENT OR TRUE IS THE OLD BEHAVIOUR. Every
+        caller that does not set it must be unaffected."""
+        from tests.test_stack_strip import run_js
+        for band in ({"pct": 10.0, "called": "up", "edge": 400,
+                      "acc": 640, "target": 4000},
+                     {"pct": 10.0, "called": "up", "edge": 400,
+                      "acc": 640, "target": 4000, "applies": True}):
+            html = run_js(page_js, "fusedGate",
+                          {**TestThePanelActuallyRenders.BAR,
+                           "tick_dir": "up", "ofi_dir": "up",
+                           "where": "together", "agree": True,
+                           "side": "up",
+                           "turning": {"dir": "", "ticks_off": 0.0,
+                                       "travel": 0.0, "band": 4.0,
+                                       "decides": False},
+                           "band": band})
+            assert "flips past" in html
+            assert "the colour of the candle" not in html

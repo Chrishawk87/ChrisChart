@@ -7348,6 +7348,10 @@ def create_app() -> FastAPI:
             roll = {}
         if cur is None:
             return {"per_bar": bld.per_bar, "dir": "", "prints": 0,
+                    # THE COLOUR ON SCREEN. Between bars the chart
+                    # still shows the last closed candle, so this
+                    # is a word here rather than a blank.
+                    "paint": bld.paint,
                     "smooth": sm, "pace": pace, "roll": roll,
                     "reset_s": getattr(bld, "period_s", 0.0),
                     "by_clock": bool(getattr(bld, "last_by_clock", False)),
@@ -7396,6 +7400,9 @@ def create_app() -> FastAPI:
                 # traded the other, which is the reading the body
                 # alone cannot give.
                 "body_dir": body_dir,
+                # THE COLOUR THE CHART PAINTS THIS CANDLE, which is
+                # the body with no flat in it -- see TickBars.paint.
+                "paint": bld.paint,
                 "up_prints": cur.up_prints,
                 "down_prints": cur.down_prints,
                 "path_share": round(cur.path_share, 3),
@@ -8261,27 +8268,47 @@ def create_app() -> FastAPI:
             # the row sat FLAT through most of it -- and on the 125
             # and 250 bars the level is larger than the bar's own
             # target and the row could never call a side at all.
-            # `raw_side` is the accumulator's sign, which is what
-            # paints the candle.
-            #
             # `dir` IS THE PATH VOTE, gated on `PATH_BAND` and a
             # minimum vote count, so it reads flat early in every
-            # bar and whenever the prints are balanced. `body_dir`
-            # is close against open -- the candle itself.
+            # bar and whenever the prints are balanced.
+            #
+            # `paint` is neither: it is the renderer's own colour
+            # rule, run on the candle at the right-hand edge.
             #
             # THE GATED READINGS ARE NOT LOST, they are drawn
             # beside these on the panel. They were protections that
             # someone measured, and the honest thing is to show
             # when they would have disagreed rather than to delete
             # them or to keep silently overriding the chart.
-            # THE SAME BAND ON THE CHART'S OWN ACCUMULATOR. Its
-            # target is that chart's threshold, not the fused
-            # bar's -- a 2,000-contract chart and a 4,000-contract
-            # book leg are different series and a band in
-            # contracts would mean different things on each.
-            _ofi_row = _fr.ofi_side(_ob.get("imbalance"),
-                                    _ob.get("target"), _band, _was)
-            _tick_row = str(_tb.get("body_dir") or "")
+            # THE COLOUR, AND NOTHING ON TOP OF IT.
+            #
+            # Chris: "i dont care about cutting in halves i want
+            # this to actually look at the footprint OFI chart and
+            # say what its doing for the outer OFI and the inner
+            # tick to look at the tick chart and represent what its
+            # saying visually up or down its not calculating
+            # anything just saying what it see the bar doing
+            # immediately".
+            #
+            # So the rows are a TRANSCRIPTION OF THE RENDERER.
+            # `paint` on each builder is the chart's own colour
+            # rule, copied line for line from the drawing code and
+            # evaluated on the candle at the right-hand edge --
+            # forming while prints arrive, last closed in the gap.
+            # Nothing here chooses, bands, holds or smooths.
+            #
+            # WHAT THIS REPLACED, so the next person does not put
+            # one of them back: the row has read `read` (the
+            # call-level gate, which blanks for most of a bar),
+            # `raw_side` (the bare accumulator sign, which is the
+            # colour but flat at zero), and `ofi_side` (a band with
+            # hysteresis over that sign). Each was a different
+            # answer from the candle Chris was looking at. The
+            # gated readings are still carried in `_src_rows` and
+            # drawn beside these, because they are measurements
+            # worth seeing -- they are just not the row.
+            _ofi_row = str(_ob.get("paint") or "")
+            _tick_row = str(_tb.get("paint") or "")
             _rows_from = (
                 f"the {int(_ob.get('target') or ofi_bar or 0):,}"
                 f"-contract OFI chart and the "
@@ -8302,14 +8329,20 @@ def create_app() -> FastAPI:
             # while this says flat, and until the level was on
             # screen there was no way to tell that from a bug.
             _src_rows = {
-                "ofi": {"read": str(_ob.get("raw_side") or ""),
+                # `read` IS THE ROW, and the row is the colour.
+                # `called` and `path` are the gated readings that
+                # used to be the row, kept beside it so a
+                # disagreement is visible instead of silently
+                # overriding the chart.
+                "ofi": {"read": str(_ob.get("paint") or ""),
                         "called": str(_ob.get("read") or ""),
                         "imbalance": int(_ob.get("imbalance") or 0),
                         "level": int(_ob.get("level") or 0),
                         "target": int(_ob.get("target") or 0),
                         "held_s": float(_ob.get("held_s") or 0.0),
                         "flips": int(_ob.get("flips") or 0)},
-                "tick": {"read": str(_tb.get("body_dir") or ""),
+                "tick": {"read": str(_tb.get("paint") or ""),
+                         "body": str(_tb.get("body_dir") or ""),
                          "path": str(_tb.get("dir") or ""),
                          "votes": int(_tb.get("votes") or 0),
                          "votes_needed": int(_tb.get("votes_needed") or 0),
@@ -8431,6 +8464,14 @@ def create_app() -> FastAPI:
                 # different things is the worst state this box can
                 # be in -- and it has been in it.
                 "band": {"pct": round(100.0 * _band, 1),
+                         # THE DIAL DOES NOTHING ON THE CHART-
+                         # SOURCED PATH, and the panel has to say
+                         # so. The outer row there is the colour of
+                         # a candle; a band over it would be the
+                         # calculating Chris asked to have removed.
+                         # It still governs the fused bar's own
+                         # book leg, which is what the dial is for.
+                         "applies": not bool(_src),
                          "called": _ofi_row,
                          "edge": int(round(
                              abs(float(_ob.get("target") or 0) if _src
@@ -18719,7 +18760,11 @@ function paintFusedGate(FG) {
           + ' &mdash; '
           + (Number(FG.band.acc || 0) > 0 ? '+' : '')
           + Number(FG.band.acc || 0).toLocaleString()
-          + (Number(FG.band.pct || 0) > 0
+          + (FG.band.applies === false
+              ? ' &mdash; <b>the colour of the candle</b>, nothing '
+                + 'on top of it; the band dial below applies to the '
+                + 'fused bar&rsquo;s own book leg, not to this row'
+              : Number(FG.band.pct || 0) > 0
               ? ', flips past &plusmn;'
                 + Number(FG.band.edge || 0).toLocaleString()
                 + ' (' + Number(FG.band.pct || 0).toFixed(0)
