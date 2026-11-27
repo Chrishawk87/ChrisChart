@@ -327,6 +327,70 @@ TICK = 0.25
 TURN_CHOICES = (2, 4, 6, 8, 12, 16, 24)
 
 
+# HOW FAR PAST ZERO A SIGNED ACCUMULATOR HAS TO GET before it
+# counts as a side, AS A SHARE OF THE BAR'S OWN TARGET.
+#
+# A FRACTION, NOT A NUMBER OF CONTRACTS. The OFI chart's own call
+# level is a flat 500 whatever the bar is: a quarter of a
+# 2,000-contract bar, and LARGER THAN THE WHOLE TARGET on the 125
+# and 250 bars, where it can therefore never call a side at all.
+# An accumulator's noise scales with the size it is accumulating
+# toward, so the band has to as well.
+OFI_BAND = 0.10
+OFI_BAND_CHOICES = (0.0, 0.05, 0.10, 0.15, 0.20, 0.25)
+
+
+def ofi_side(net_ofi: float, target: float,
+             band: float = OFI_BAND, prev: str = "") -> str:
+    """Which way the book has committed, held until it reverses.
+
+    HYSTERESIS, NOT A DEADBAND, and the difference is the whole
+    point. Chris has now complained about both halves of the same
+    dial: with no band, "the OFI is bouncing all over the place
+    when im looking at the chart OFI is pretty stable"; with a
+    symmetric deadband, "these goes flat when there is actual
+    movement ... there is no reason for them to be flat almost
+    ever".
+
+    Both are true of a plain threshold. A signed accumulator
+    resets every bar and wanders through zero, so a bare sign
+    chatters; a deadband stops the chatter by going FLAT in the
+    middle, which is the other complaint.
+
+    SO THE BAND IS ASYMMETRIC AGAINST ITSELF. A side is called
+    when the accumulator clears +band or -band, and then it is
+    KEPT until the accumulator clears the band on the OTHER side.
+    Between those two it reads what it already read. The result
+    chatters on neither edge and is flat only before the first
+    call of a bar, which is the one moment the book genuinely has
+    not committed to anything.
+
+    A BAND OF ZERO IS THE BARE SIGN, deliberately. It is on the
+    dial so the old behaviour can be put back and compared rather
+    than argued about.
+    """
+    try:
+        acc = float(net_ofi or 0.0)
+        tgt = abs(float(target or 0.0))
+        frac = max(0.0, min(1.0, float(band)))
+    except (TypeError, ValueError):
+        return ""
+    was = str(prev or "")
+    if was not in SIDES:
+        was = ""
+    edge = tgt * frac
+    if edge <= EPS:
+        # NO BAND: the bare sign, and flat only at exactly zero.
+        return "up" if acc > 0 else "down" if acc < 0 else ""
+    if acc >= edge:
+        return "up"
+    if acc <= -edge:
+        return "down"
+    # INSIDE THE BAND. Hold what it already said; say nothing only
+    # if it has not said anything yet this bar.
+    return was
+
+
 def body_share(open_px: float, high: float, low: float,
                close: float) -> float:
     """How much of the bar is body rather than wick, 0 to 1.

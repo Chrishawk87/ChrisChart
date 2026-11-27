@@ -5833,6 +5833,7 @@ def create_app() -> FastAPI:
                              fused_tf: int | None = None,
                              fused_tf2: int | None = None,
                              fused_turn: int | None = None,
+                             fused_ofi_band: int | None = None,
                              fused_src: int | None = None,
                              fused_ofi_bar: int | None = None,
                              fused_tick_bar: int | None = None,
@@ -5894,6 +5895,9 @@ def create_app() -> FastAPI:
                 # snapping -- but each is read with its own
                 # `is None` so that sending one does not quietly
                 # clear the other two.
+                fused_ofi_band=(
+                    int(getattr(cur, "fused_ofi_band", 10))
+                    if fused_ofi_band is None else int(fused_ofi_band)),
                 fused_src=(int(getattr(cur, "fused_src", 0) or 0)
                            if fused_src is None else int(fused_src)),
                 fused_ofi_bar=(
@@ -7969,7 +7973,7 @@ def create_app() -> FastAPI:
                     # CHART. All on the end; every caller passes
                     # the rest positionally.
                     src: int = 0, ofi_bar: int = 0,
-                    tick_bar: int = 0) -> dict:
+                    tick_bar: int = 0, ofi_band: float = 0.10) -> dict:
         """What the tick chart is doing inside the forming fused bar.
 
         Chris: "what i want to see is what the tick chart is doing
@@ -8209,9 +8213,36 @@ def create_app() -> FastAPI:
         # quietly reads a different source when its own is not
         # ready cannot be trusted on the one bar where it matters.
         _src = int(src or 0)
-        _ofi_row, _tick_row = cur.ofi_dir, cur.tick_dir
+        # THE BOOK LEG, STEADIED.
+        #
+        # `FusedBar.ofi_dir` is a BARE SIGN of a signed
+        # accumulator that resets every bar, so it crosses zero
+        # constantly. Chris: "the OFI is bouncing all over the
+        # place when im looking at the chart OFI is pretty stable
+        # ofi dont bounce all over the place at all its the steady
+        # one of the bunch".
+        #
+        # `ofi_side` calls a side when the accumulator clears a
+        # band scaled to THIS bar's own target, and then holds it
+        # until the accumulator clears the band the other way. The
+        # previous call rides home in `held` like every other
+        # memory here; without it the hysteresis has nothing to
+        # hold and the function degenerates into the deadband that
+        # produced the opposite complaint.
+        _band = float(ofi_band or 0.0)
+        _was = str((prev or {}).get("ofi_called") or "")
+        _ofi_row = _fr.ofi_side(cur.net_ofi, bld.ofi_target,
+                                _band, _was)
+        _tick_row = cur.tick_dir
         _rows_from = "the fused bar's own two legs"
         _src_rows = {}
+        # BOUND WHETHER OR NOT THE BRANCH BELOW RUNS. The payload
+        # reads `_ob` inside a conditional, which Python does not
+        # evaluate on the other branch -- so this is not needed to
+        # work, and it is here anyway. Every free-variable
+        # NameError this function has shipped (five now) was
+        # written by someone who had just reasoned exactly that.
+        _ob = {}
         if _src:
             _ob = _ofi_bar_read(rt_, int(ofi_bar or 0))
             _tb = _tick_now(rt_, per_bar=int(tick_bar or 0)) or {}
@@ -8243,7 +8274,13 @@ def create_app() -> FastAPI:
             # someone measured, and the honest thing is to show
             # when they would have disagreed rather than to delete
             # them or to keep silently overriding the chart.
-            _ofi_row = str(_ob.get("raw_side") or "")
+            # THE SAME BAND ON THE CHART'S OWN ACCUMULATOR. Its
+            # target is that chart's threshold, not the fused
+            # bar's -- a 2,000-contract chart and a 4,000-contract
+            # book leg are different series and a band in
+            # contracts would mean different things on each.
+            _ofi_row = _fr.ofi_side(_ob.get("imbalance"),
+                                    _ob.get("target"), _band, _was)
             _tick_row = str(_tb.get("body_dir") or "")
             _rows_from = (
                 f"the {int(_ob.get('target') or ofi_bar or 0):,}"
@@ -8355,6 +8392,11 @@ def create_app() -> FastAPI:
         try:
             out["held"]["tf_leg"] = _tf_leg
             out["held"]["tf2_leg"] = _tf2_leg
+            # THE HYSTERESIS'S ONE PIECE OF STATE. Dropped here it
+            # does not error -- the band simply becomes a
+            # symmetric deadband that goes FLAT in the middle,
+            # which is the complaint this replaced.
+            out["held"]["ofi_called"] = _ofi_row
         except Exception:                               # noqa: BLE001
             pass
         return {**out, "pair": list(key), "label": label(*key),
@@ -8388,6 +8430,16 @@ def create_app() -> FastAPI:
                 # because two rows that look identical and mean
                 # different things is the worst state this box can
                 # be in -- and it has been in it.
+                "band": {"pct": round(100.0 * _band, 1),
+                         "called": _ofi_row,
+                         "edge": int(round(
+                             abs(float(_ob.get("target") or 0) if _src
+                                 else float(bld.ofi_target or 0))
+                             * _band)),
+                         "acc": int(float(_ob.get("imbalance") or 0) if _src
+                                    else float(cur.net_ofi or 0)),
+                         "target": int(float(_ob.get("target") or 0) if _src
+                                       else float(bld.ofi_target or 0))},
                 "src": {"two_charts": bool(_src),
                         "ofi_bar": int(ofi_bar or 0),
                         "tick_bar": int(tick_bar or 0),
@@ -9008,16 +9060,21 @@ def create_app() -> FastAPI:
             _fbon = bool(getattr(s, "fused_bounce_on", False))
             _fauto = int(getattr(s, "fused_auto_s", 0) or 0)
             _fsrc = int(getattr(s, "fused_src", 0) or 0)
+            # ZERO IS THE BARE SIGN AND IS A CHOICE, so `or` is
+            # wrong on this line in a way that would be invisible.
+            _fband = float(int(getattr(s, "fused_ofi_band", 10)
+                               if getattr(s, "fused_ofi_band", None)
+                               is not None else 10)) / 100.0
             _fob = int(getattr(s, "fused_ofi_bar", 500) or 500)
             _ftb = int(getattr(s, "fused_tick_bar", 1000) or 1000)
             _peek = _fused_gate(rt_, _fpair, _fbounce, None, _fprev,
                                 _ftf, _ftf2, _fturn, _fbon, _fauto,
-                                _fsrc, _fob, _ftb)
+                                _fsrc, _fob, _ftb, _fband)
             _fdw.on_tick(str(_peek.get("side") or ""), _now_f)
             fus = _fused_gate(rt_, _fpair, _fbounce,
                               _fdw.held_s(_now_f), _fprev, _ftf,
                               _ftf2, _fturn, _fbon, _fauto,
-                              _fsrc, _fob, _ftb)
+                              _fsrc, _fob, _ftb, _fband)
             try:
                 rt_._fused_held = dict(fus.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -9398,7 +9455,10 @@ def create_app() -> FastAPI:
                 int(getattr(s, "fused_auto_s", 0) or 0),
                 int(getattr(s, "fused_src", 0) or 0),
                 int(getattr(s, "fused_ofi_bar", 500) or 500),
-                int(getattr(s, "fused_tick_bar", 1000) or 1000))
+                int(getattr(s, "fused_tick_bar", 1000) or 1000),
+                float(int(getattr(s, "fused_ofi_band", 10)
+                          if getattr(s, "fused_ofi_band", None)
+                          is not None else 10)) / 100.0)
             try:
                 rt_._fused_shown_held = dict(_shown.get("held") or {})
             except Exception:                           # noqa: BLE001
@@ -12228,6 +12288,19 @@ has to be running before the gate stops refusing.">spike
                from 2 individual charts". The fused bar is still the
                bar on the panel either way -- only the two
                directions move. -->
+          <label title="read the two rows off the fused bar's own
+                        legs, or off the OFI chart and the tick
+                        chart as two independent sources"
+            >OFI band
+            <select id="jnlOfiBand" onchange="jnlSet()"
+              style="margin:0 4px">
+              <option value="0">0% (bare sign)</option>
+              <option value="5">5%</option>
+              <option value="10" selected>10%</option>
+              <option value="15">15%</option>
+              <option value="20">20%</option>
+              <option value="25">25%</option>
+            </select></label>
           <label title="read the two rows off the fused bar's own
                         legs, or off the OFI chart and the tick
                         chart as two independent sources"
@@ -17387,6 +17460,8 @@ async function jnlSet() {
        appears to snap back while the save is still in flight. */
     jnlFusedTurn: $('jnlFusedTurn')
       ? String($('jnlFusedTurn').value) : undefined,
+    jnlOfiBand: $('jnlOfiBand')
+      ? String($('jnlOfiBand').value) : undefined,
     jnlFusedSrc: $('jnlFusedSrc')
       ? String($('jnlFusedSrc').value) : undefined,
     jnlFusedOfiBar: $('jnlFusedOfiBar')
@@ -17427,6 +17502,7 @@ async function jnlSet() {
        give-back at all", the tightest setting rather than off.
        Off is the checkbox beside it, so no || on this line. */
     fused_bounce: $('jnlFBouncePct') ? $('jnlFBouncePct').value : 33,
+    fused_ofi_band: $('jnlOfiBand') ? $('jnlOfiBand').value : 10,
     fused_src: $('jnlFusedSrc') ? $('jnlFusedSrc').value : 0,
     fused_ofi_bar: $('jnlFusedOfiBar') ? $('jnlFusedOfiBar').value : 500,
     fused_tick_bar: $('jnlFusedTickBar')
@@ -18627,6 +18703,31 @@ function paintFusedGate(FG) {
     /* WHERE THE TWO ROWS READ FROM. Two rows that look identical
        and mean different things is the worst state this box can be
        in, and it has been in it. */
+    /* THE BOOK'S BAND, AND WHERE THE ACCUMULATOR SITS IN IT.
+       Chris: "ofi dont bounce all over the place at all its the
+       steady one of the bunch". A bare sign of a resetting
+       accumulator crosses zero constantly; this is the band that
+       stops it, as a share of the bar's own target, and the
+       number it is actually at. Drawn always, because it is the
+       one control that decides whether the outer row chatters. */
+    + ((FG.band && FG.band.target)
+        ? '<div class="thin">book '
+          + (FG.band.called
+              ? '<b class="' + (FG.band.called === 'up' ? 'long' : 'short')
+                + '">' + esc(FG.band.called).toUpperCase() + '</b>'
+              : '<b style="color:var(--dim)">not called yet</b>')
+          + ' &mdash; '
+          + (Number(FG.band.acc || 0) > 0 ? '+' : '')
+          + Number(FG.band.acc || 0).toLocaleString()
+          + (Number(FG.band.pct || 0) > 0
+              ? ', flips past &plusmn;'
+                + Number(FG.band.edge || 0).toLocaleString()
+                + ' (' + Number(FG.band.pct || 0).toFixed(0)
+                + '% of ' + Number(FG.band.target || 0).toLocaleString()
+                + ') and holds until it clears the other side'
+              : ', no band &mdash; the bare sign, which crosses zero')
+          + '</div>'
+        : '')
     /* WHAT EACH CHART ACTUALLY SAID. Chris: "there is no way to
        know if it is actually reading the settings swapping from
        fused bar to the 2 charts strategy". A row saying UP is not
@@ -19365,6 +19466,8 @@ function paintJournal(d) {
     set('jnlFusedTf2', String(Math.round(S.fused_tf2)));
   if (S.fused_turn != null)
     set('jnlFusedTurn', String(Math.round(S.fused_turn)));
+  if (S.fused_ofi_band != null)
+    set('jnlOfiBand', String(Math.round(S.fused_ofi_band)));
   if (S.fused_src != null)
     set('jnlFusedSrc', String(Math.round(S.fused_src)));
   if (S.fused_ofi_bar != null)

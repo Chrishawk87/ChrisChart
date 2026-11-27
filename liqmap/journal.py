@@ -175,6 +175,16 @@ class Settings:
     # legs sharing a bar boundary are not independent evidence, they
     # are one event described twice. Two series cut by different
     # rules that happen to agree is a real confirmation.
+    # HOW FAR PAST ZERO THE BOOK HAS TO GET before the outer row
+    # calls a side, as a PERCENTAGE OF THAT BAR'S OWN TARGET, with
+    # the side then held until it clears the band the other way.
+    #
+    # Chris has complained about both halves of this: with no band
+    # "the OFI is bouncing all over the place when im looking at
+    # the chart OFI is pretty stable"; with the chart's own flat
+    # 500-contract level, "these goes flat when there is actual
+    # movement". 0 is the bare sign, which is what it did before.
+    fused_ofi_band: int = 10
     fused_src: int = 0
     # THE SIZE OF EACH OF THOSE CHARTS, when they are what is being
     # read. Contracts for the OFI chart, prints for the tick chart.
@@ -211,6 +221,7 @@ class Settings:
                 "fused_tf2_label": (window_label(float(self.fused_tf2))
                                     if self.fused_tf2 else "off"),
                 "fused_turn": int(self.fused_turn),
+                "fused_ofi_band": int(self.fused_ofi_band),
                 "fused_src": int(self.fused_src),
                 "fused_ofi_bar": int(self.fused_ofi_bar),
                 "fused_tick_bar": int(self.fused_tick_bar),
@@ -532,6 +543,7 @@ _ADDED_SETTINGS = (
     ("fused_tf", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_tf2", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_turn", "INTEGER NOT NULL DEFAULT 4"),
+    ("fused_ofi_band", "INTEGER NOT NULL DEFAULT 10"),
     ("fused_src", "INTEGER NOT NULL DEFAULT 0"),
     ("fused_ofi_bar", "INTEGER NOT NULL DEFAULT 500"),
     ("fused_tick_bar", "INTEGER NOT NULL DEFAULT 1000"),
@@ -607,6 +619,7 @@ class Journal(ThreadedDB):
                         fused_tf=int(r["fused_tf"]),
                         fused_tf2=int(r["fused_tf2"]),
                         fused_turn=int(r["fused_turn"] or 4),
+                        fused_ofi_band=int(r["fused_ofi_band"]),
                         fused_src=int(r["fused_src"] or 0),
                         fused_ofi_bar=int(r["fused_ofi_bar"] or 500),
                         fused_tick_bar=int(r["fused_tick_bar"] or 1000),
@@ -625,10 +638,11 @@ class Journal(ThreadedDB):
                 "  window_s, tick_bar, tick_bar_3, tick3_exit,"
                 "  fused_ticks, fused_ofi, fused_bounce,"
                 "  fused_tf, fused_tf2, fused_turn,"
-                "  fused_src, fused_ofi_bar, fused_tick_bar,"
+                "  fused_ofi_band, fused_src, fused_ofi_bar,"
+                "  fused_tick_bar,"
                 "  foot_s, fused_auto_s, fused_bounce_on,"
                 "  fused_bar_exit, fused_settle_exit, strategy)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(coin) DO UPDATE SET"
                 " auto=excluded.auto, tp_on=excluded.tp_on,"
                 " sl_on=excluded.sl_on, tp_ticks=excluded.tp_ticks,"
@@ -643,6 +657,7 @@ class Journal(ThreadedDB):
                 " fused_tf=excluded.fused_tf,"
                 " fused_tf2=excluded.fused_tf2,"
                 " fused_turn=excluded.fused_turn,"
+                " fused_ofi_band=excluded.fused_ofi_band,"
                 " fused_src=excluded.fused_src,"
                 " fused_ofi_bar=excluded.fused_ofi_bar,"
                 " fused_tick_bar=excluded.fused_tick_bar,"
@@ -691,6 +706,9 @@ class Journal(ThreadedDB):
                  # ONE OF THE OFFERED DURATIONS. Zero is off and
                  # is a choice, so nothing on this path may use
                  # `or` -- the same trap the bounce dial has.
+                 # ZERO IS A CHOICE -- the bare sign -- so nothing
+                 # on this path may use `or`.
+                 _snap_band(s.fused_ofi_band),
                  (1 if int(s.fused_src or 0) else 0),
                  # ONE OF THE SIZES THAT HAS A BUILDER. A size with
                  # none is not a slower reading, it is no reading
@@ -1208,6 +1226,22 @@ def _snap_tf(value: int | float) -> int:
     if want < 0 and -want in TF_TICKS:
         return want
     return 0
+
+
+def _snap_band(pct: int | float) -> int:
+    """One of the offered OFI bands, as a percentage.
+
+    ZERO IS THE BARE SIGN and is a real choice, so this cannot
+    fall back on `or` anywhere -- the same trap the bounce dial
+    has.
+    """
+    from .fusedread import OFI_BAND, OFI_BAND_CHOICES
+    opts = [int(round(100.0 * c)) for c in OFI_BAND_CHOICES]
+    try:
+        want = int(pct)
+    except (TypeError, ValueError):
+        return int(round(100.0 * OFI_BAND))
+    return want if want in opts else int(round(100.0 * OFI_BAND))
 
 
 def _snap_ofi_bar(n: int | float) -> int:

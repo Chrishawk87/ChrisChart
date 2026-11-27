@@ -4191,10 +4191,16 @@ class TestTheRowsReadTwoSeparateCharts:
         assert 'getattr(s, "fused_tick_bar"' in seg
 
     def test_off_reads_the_fused_bars_own_legs(self):
+        """THE BOOK LEG GOES THROUGH THE SAME BAND. `ofi_dir` on a
+        FusedBar is a bare sign of a resetting accumulator, which
+        is what was chattering."""
         src = (SRC / "web.py").read_text()
         i = src.index("def _fused_gate(")
         fn = src[i:src.index("\n    def ", i + 10)]
-        assert "_ofi_row, _tick_row = cur.ofi_dir, cur.tick_dir" in fn
+        assert "_fr.ofi_side(cur.net_ofi, bld.ofi_target," in fn
+        assert "_tick_row = cur.tick_dir" in fn
+        assert "_ofi_row, _tick_row = cur.ofi_dir, cur.tick_dir" not in fn, \
+            "the book leg is the bare sign again"
 
     def test_the_live_panel_says_where_the_rows_came_from(
             self, client, monkeypatch):
@@ -4549,7 +4555,15 @@ class TestTheRowsAreTheCandlesThemselves:
         seg = fn[j:fn.index("out = _fr.state(", j)]
         code = "\n".join(ln for ln in seg.splitlines()
                          if not ln.strip().startswith("#"))
-        assert '_ofi_row = str(_ob.get("raw_side") or "")' in code
+        # THE CHART'S OWN ACCUMULATOR, THROUGH THE BAND. The row
+        # read `raw_side` for one revision -- the bare sign -- and
+        # Chris watched it chatter against a chart that does not:
+        # "the OFI is bouncing all over the place when im looking
+        # at the chart OFI is pretty stable". `ofi_side` takes the
+        # accumulator and the chart's own target so the band means
+        # the same thing on a 125-contract bar as on a 4,000.
+        assert '_fr.ofi_side(_ob.get("imbalance")' in code
+        assert '_ob.get("target"), _band, _was)' in code
         assert '_ofi_row = str(_ob.get("read")' not in code
 
     def test_the_tick_row_is_the_candles_body(self):
@@ -4620,3 +4634,211 @@ class TestTheRowsAreTheCandlesThemselves:
         differ = draw("flat", "down")
         assert "the called side is FLAT" in differ
         assert "the path vote is DOWN" in differ
+
+
+class TestTheBookIsSteadiedWithHysteresis:
+    """Chris has now complained about both halves of one dial.
+
+        No band: "the OFI is bouncing all over the place when im
+        looking at the chart OFI is pretty stable ofi dont bounce
+        all over the place at all its the steady one of the
+        bunch".
+
+        The chart's own flat 500-contract level: "these goes flat
+        when there is actual movement ... there is no reason for
+        them to be flat almost ever".
+
+    Both are true of a plain threshold on a signed accumulator
+    that resets every bar. A bare sign chatters through zero; a
+    deadband stops the chatter by going FLAT in the middle, which
+    is the other complaint. Hysteresis has neither edge.
+    """
+
+    def test_a_bare_sign_chatters_and_the_band_does_not(self):
+        """THE SAME PATH THROUGH BOTH, so the difference is the
+        mechanism and not the data."""
+        # ONE REAL PUSH, THEN CHOP AROUND ZERO, THEN A REAL
+        # REVERSAL. The first version of this used a path whose
+        # bare sign only crossed zero twice, so both readings gave
+        # two flips and the test proved nothing while passing.
+        path = [210, 50, -40, 60, -70, 30, -210]
+
+        def walk(band):
+            prev, flips, out = "", 0, []
+            for acc in path:
+                now = fr.ofi_side(acc, 2000, band, prev)
+                if now and prev and now != prev:
+                    flips += 1
+                prev = now
+                out.append(now)
+            return flips, out
+
+        bare, _ = walk(0.0)
+        banded, seen = walk(0.10)
+        assert bare >= 5, "the path is not noisy enough to test this"
+        assert banded == 1, "the band let the chop through"
+        assert banded < bare, "the band did not steady anything"
+        # AND IT NEVER WENT FLAT once it had called a side.
+        after = seen[seen.index("up"):]
+        assert "" not in after, "it went flat in the middle of the band"
+
+    def test_it_holds_through_the_band_and_flips_past_it(self):
+        prev = ""
+        for acc in (150, 210):
+            prev = fr.ofi_side(acc, 2000, 0.10, prev)
+        assert prev == "up"
+        for acc in (80, -50, -150, -190):
+            prev = fr.ofi_side(acc, 2000, 0.10, prev)
+            assert prev == "up", f"it let go at {acc}"
+        assert fr.ofi_side(-205, 2000, 0.10, prev) == "down"
+
+    def test_it_is_flat_only_before_the_first_call(self):
+        """THE ONE MOMENT THE BOOK GENUINELY HAS NOT COMMITTED."""
+        assert fr.ofi_side(0, 2000, 0.10, "") == ""
+        assert fr.ofi_side(150, 2000, 0.10, "") == ""
+        assert fr.ofi_side(210, 2000, 0.10, "") == "up"
+        assert fr.ofi_side(0, 2000, 0.10, "up") == "up"
+
+    def test_the_band_scales_with_the_bars_own_target(self):
+        """A FRACTION, NOT A NUMBER OF CONTRACTS. The chart's own
+        call level is a flat 500 whatever the bar is -- larger
+        than the whole target on the 125 and 250 bars, where it
+        can never call a side at all."""
+        assert fr.ofi_side(30, 250, 0.10, "") == "up"      # edge 25
+        assert fr.ofi_side(30, 4000, 0.10, "") == ""       # edge 400
+        from liqmap.ofibar import CALL_LEVEL, LADDER
+        for t in LADDER:
+            edge = t * fr.OFI_BAND
+            assert edge < t, f"the band is the whole {t} bar"
+            if t <= CALL_LEVEL:
+                assert edge < CALL_LEVEL, \
+                    "the fractional band is no better than the flat one"
+
+    def test_a_band_of_zero_is_the_bare_sign(self):
+        """On the dial so the old behaviour can be put back and
+        compared rather than argued about."""
+        assert fr.ofi_side(1, 2000, 0.0, "") == "up"
+        assert fr.ofi_side(-1, 2000, 0.0, "") == "down"
+        assert fr.ofi_side(0, 2000, 0.0, "up") == ""
+
+    def test_junk_never_raises(self):
+        for bad in (None, "abc", [], {}):
+            assert fr.ofi_side(bad, bad, bad, bad) in ("", "up", "down")
+
+    def test_a_junk_previous_side_is_not_held(self):
+        """REACHED ONLY WITH VALID NUMBERS. The test above feeds
+        junk to every argument, so the conversion fails first and
+        the held side is never looked at -- it passed with the
+        validation deleted. Inside the band is the only place a
+        junk `prev` can escape."""
+        for bad in ("sideways", "UP", 7, [], {}, None):
+            got = fr.ofi_side(50, 2000, 0.10, bad)
+            assert got in ("", "up", "down"), f"{bad!r} got through"
+            assert got == "", "a junk side was held as a direction"
+
+    def test_the_band_reaches_the_gate_and_zero_survives(self):
+        """SOURCE, because the fused engine does not run under the
+        test client. A constant here leaves the selector working,
+        the database correct and the row chattering -- and `or`
+        on this line would read a 0% band as absent and silently
+        substitute the default, which is the one value that
+        turns the whole mechanism off."""
+        src = (SRC / "web.py").read_text()
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert "_band = float(ofi_band or 0.0)" in fn, \
+            "the band is a constant inside the gate"
+        j = src.index("_fband = float(int(getattr(s,")
+        seg = src[j:j + 260]
+        assert "is not None else 10" in seg, \
+            "a 0% band is read as absent and replaced by the default"
+
+    def test_the_called_side_rides_home(self):
+        """WITHOUT THE MEMORY THE HYSTERESIS HAS NOTHING TO HOLD
+        and the function degenerates into the deadband that
+        produced the opposite complaint."""
+        src = (SRC / "web.py").read_text()
+        assert 'out["held"]["ofi_called"] = _ofi_row' in src
+        i = src.index("def _fused_gate(")
+        fn = src[i:src.index("\n    def ", i + 10)]
+        assert '(prev or {}).get("ofi_called")' in fn
+
+    def test_without_the_memory_it_goes_flat_in_the_middle(self):
+        """The failure mode stated directly."""
+        for acc in (80, -50, -150):
+            assert fr.ofi_side(acc, 2000, 0.10, "") == "", \
+                "this test no longer tests that"
+
+    def test_the_setting_round_trips_and_zero_survives(self, tmp_path):
+        from liqmap.journal import Journal
+        j = Journal(str(tmp_path / "j.db"))
+        s = j.settings("ES")
+        assert s.fused_ofi_band == 10
+        for v in (0, 5, 15, 25):
+            s.fused_ofi_band = v
+            assert j.save_settings(s).fused_ofi_band == v, \
+                f"{v}% did not survive -- zero is a choice"
+        s.fused_ofi_band = 7
+        assert j.save_settings(s).fused_ofi_band == 10
+
+    def test_the_route_takes_it(self, client, monkeypatch):
+        _cme(monkeypatch)
+        r = client.post("/api/journal/settings",
+                        params={"coin": "ES", "fused_ofi_band": 0},
+                        headers=AUTH).json()["settings"]
+        assert r["fused_ofi_band"] == 0, "zero was read as absent"
+
+    def test_the_selector_is_on_the_page(self):
+        src = (SRC / "web.py").read_text()
+        assert 'id="jnlOfiBand"' in src
+        i = src.index('id="jnlOfiBand"')
+        box = src[i:src.index("</select>", i)]
+        for pct in (0, 5, 10, 15, 20, 25):
+            assert f'value="{pct}"' in box, f"no {pct}% option"
+        assert "fused_ofi_band: $('jnlOfiBand')" in src
+        assert "set('jnlOfiBand'" in src
+        assert "jnlOfiBand: $('jnlOfiBand')" in src
+
+    def test_the_panel_shows_the_band_and_where_it_sits(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "band": {"pct": 10.0, "called": "up",
+                                "edge": 400, "acc": 640,
+                                "target": 4000}})
+        assert "book <b" in html and "UP</b>" in html
+        assert "+640" in html
+        assert "flips past &plusmn;400" in html or "flips past ±400" in html
+        assert "10% of 4,000" in html
+        assert "holds until it clears the other side" in html
+
+    def test_the_panel_says_when_there_is_no_band(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "up",
+                       "where": "together", "agree": True, "side": "up",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "band": {"pct": 0.0, "called": "up",
+                                "edge": 0, "acc": 12, "target": 4000}})
+        assert "no band" in html
+        assert "crosses zero" in html
+
+    def test_the_panel_says_before_the_first_call(self, page_js):
+        from tests.test_stack_strip import run_js
+        html = run_js(page_js, "fusedGate",
+                      {**TestThePanelActuallyRenders.BAR,
+                       "tick_dir": "up", "ofi_dir": "", "where": "",
+                       "turning": {"dir": "", "ticks_off": 0.0,
+                                   "travel": 0.0, "band": 4.0,
+                                   "decides": False},
+                       "band": {"pct": 10.0, "called": "", "edge": 400,
+                                "acc": 120, "target": 4000}})
+        assert "not called yet" in html
